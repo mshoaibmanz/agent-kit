@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# PreToolUse(Bash) on `git push`, in order:
+#   review    unreviewed code since the last COMPLETED review, sized by lib/review-state:
+#               under 40 lines -> allow, with a self-check note in additionalContext
+#               40+ lines      -> DENY with the tier instruction review-trigger would give, so the
+#                                 deny IS the review trigger (and records the round)
+#   sprawl    a ticket that already has 3+ commits on the branch -> deny
+#   tests     no local test run recorded this session            -> ask
+# `# push-now` on the command skips review and sprawl. Skipped inside the ci-watch repair agent.
+# Fails closed: a push is refused while a lib it needs is missing.
+set -uo pipefail
+
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+
+. "${0%/*}/lib/hook-io" 2>/dev/null || {
+  case "$(cat)" in *'git push'*)
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pre-push-gate: hooks/lib/hook-io is missing, so the push gate cannot run and refuses the push. Restore it: git -C ~/.claude checkout -- hooks/lib"}}' ;;
+  esac
+  exit 0
+}
+# The bare view below can only contain `git push` if the raw payload does.
+hook_input
+case "$HOOK_INPUT" in *"git push"*) ;; *) exit 0 ;; esac
+hook_lib closed
+hook_read cmd='.tool_input.command // ""' sid='.session_id // "nosession"' cwd='.cwd // ""'
+[ -n "$cmd" ] || exit 0
+[ -n "$cwd" ] || cwd="$PWD"
+hook_lib closed cmd-view state test-run review-state
+
+# Only real publishing pushes, matched on the bare view: a push named in `gh pr create --body "…
+# git push after merge"`, a commit message or a comment is not a push.
+cmd_view "$cmd"
+case "$CMD_BARE" in
+  *"git push"*) ;;
+  *) exit 0 ;;
+esac
+case "$CMD_BARE" in
+  *--dry-run*|*"push --delete"*|*"push -d "*|*--help*) exit 0 ;;
+esac
+
+top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+
+# Files in the commits about to be pushed (upstream range, else commits not yet on any remote),
+# plus any uncommitted edits.
+range_files=$(git -C "$cwd" diff --name-only '@{u}..HEAD' 2>/dev/null || true)
+[ -z "$range_files" ] && range_files=$(git -C "$cwd" log --name-only --pretty=format: HEAD --not --remotes 2>/dev/null | sort -u || true)
+unc=$(git -C "$cwd" diff HEAD --name-only 2>/dev/null || true)
+
+has_code=0
+while IFS= read -r f; do
+  rv_is_code "$f" && { has_code=1; break; }
+done <<EOF
+$range_files
+$unc
+EOF
+[ "$has_code" = 1 ] || exit 0
+
+ctx=""
+OVERRIDE="append \`# push-now\` to push anyway: CI-only check, WIP share"
+
+# Push AFTER the review, not before: once a commit is pushed it cannot be rewritten, so every
+# later review/CI/test fix becomes its own commit (audit 2026-09-05: 25 sessions pushed before
+# any local review ran vs 10 after; 137 of 208 commits came after a push had closed the amend
+# door). Deny rather than ask: an ask cost a median 205s of idle agent per interruption.
+# Sized, not binary: denying ANY unreviewed edit drew 92 denials in two weeks, half answered by
+# `# push-now`, including 3-line changes a Stop would only self-check.
+if ! cmd_flag push-now; then
+  if [ -n "$top" ] && rv_edited "$top" && rv_snapshot "$top"; then
+    rv_measure "$sid"
+    delta=$RV_DELTA
+    selfcheck="~$delta lines changed since the last completed review ($RV_RANGE). Before relying on this push, self-check them: re-read that diff, delete filler comments and dead code, confirm a test that ran covers the change. Fix anything clearly wrong in the next commit."
+    if [ "$delta" -ge "$RV_MIN" ]; then
+      if rv_pending "$sid" "$top"; then
+        deny "Denied: ~$delta lines since the last completed review, and the review round issued for them has not returned ($OVERRIDE).
+Wait for its agents (spawn them now if you never did), run the critic on their findings, fix what it CONFIRMS, then push."
+      fi
+      rv_decide "$sid"
+      case "$RV_KIND" in
+        agents) deny "Denied: ~$delta lines since the last completed review ($OVERRIDE). This deny is the review trigger:
+$RV_TEXT
+Then push." ;;
+        self) ctx="$RV_TEXT" ;;
+        *) ctx="$selfcheck" ;;
+      esac
+    elif [ "$delta" -gt 0 ]; then
+      ctx="$selfcheck"
+    fi
+  fi
+
+  # The review gate passes once a review has run, so a push-per-review-round is individually
+  # legitimate while the total still grows: one ticket reached 8 commits for 4 instructions that
+  # way. Count what this ticket has already shipped on the branch instead. Ticket prefix, not a
+  # base-branch diff: the base can be a rolling release branch, and enumerating remote refs to
+  # infer it costs seconds on 9k refs.
+  # Skipped once a PR is open: amend is then forbidden, so every push adds a commit by design and
+  # this count would deny each push after the third.
+  tprefix=$(git -C "$cwd" log -1 --format=%s 2>/dev/null | grep -oE '^[A-Z]+-[0-9]+' || true)
+  pr_open "$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)" && tprefix=''
+  if [ -n "$tprefix" ]; then
+    shipped=$(git -C "$cwd" log --format=%s -n 50 '@{u}' 2>/dev/null | grep -c "^${tprefix}:" || echo 0)
+    adding=$(git -C "$cwd" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+    case "$shipped" in ''|*[!0-9]*) shipped=0 ;; esac
+    case "$adding" in ''|*[!0-9]*) adding=0 ;; esac
+    if [ "$shipped" -ge 3 ] && [ "$adding" -ge 1 ]; then
+      deny "Denied: $tprefix already has $shipped commits on this branch and this push adds $adding (append \`# push-now\` if it must ship now: red CI, someone waiting).
+Otherwise hold until the review cycle ends, keep follow-ups uncommitted, then commit once and push once."
+    fi
+  fi
+fi
+
+# Checked AFTER the review gate: a tested-but-unreviewed push is the case that produces the
+# commit sprawl.
+if tr_ran "$sid" "$top"; then
+  [ -n "$ctx" ] && add_context PreToolUse "$ctx"
+  exit 0
+fi
+
+decide ask "Pushing without a recorded local test run this session. CLAUDE.md requires a representative local test subset before pushing, or, if infra is down, watching CI to a green/red verdict in this session. Proceed with the push?" "$ctx"

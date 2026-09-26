@@ -1,0 +1,87 @@
+claude-kit
+Copyright (c) 2026 Shoaib Manzoor
+
+Licensed under the MIT License (see LICENSE), except where a file or directory
+states otherwise. This product includes or adapts the third-party material below.
+Each item keeps its own copyright and licence.
+
+--------------------------------------------------------------------------------
+1. mattpocock/skills
+   https://github.com/mattpocock/skills
+   Copyright (c) 2026 Matt Pocock
+   MIT License (text below)
+
+   Included, under plugins/skills-core/skills/:
+   - domain-modeling (SKILL.md, CONTEXT-FORMAT.md, ADR-FORMAT.md,
+     agents/openai.yaml), unmodified
+   - grilling, modified (structured question tool, provisional
+     recommendations)
+   - grill-with-docs, modified (description)
+   - handoff, modified (save location, description)
+   - prototype, modified (UI.md component-family guidance added)
+   Adapted, under plugins/auto-review/agents/rubrics/:
+   - architecture.md: vocabulary (module, interface, depth, seam, adapter,
+     leverage, locality) and the deletion test, from
+     skills/engineering/codebase-design
+   - design-critique.md: the "design it twice" check, from
+     skills/engineering/codebase-design/DESIGN-IT-TWICE.md
+
+--------------------------------------------------------------------------------
+2. pstack, by Lauren Tan, distributed in cursor/plugins
+   https://github.com/cursor/plugins/tree/main/pstack
+   Copyright (c) 2026 Lauren Tan
+   MIT License (text below)
+
+   Included, under plugins/skills-core/skills/:
+   - typescript-best-practices, unmodified copy of cursor/plugins@c8402bc
+   - unslop, unmodified copy of cursor/plugins@99559f2
+   Adapted:
+   - plugins/auto-review/agents/rubrics/design-critique.md: the "bolted on"
+     check, from skills/principle-redesign-from-first-principles
+
+--------------------------------------------------------------------------------
+3. thermos, by Cursor, distributed in cursor/plugins
+   https://github.com/cursor/plugins/tree/main/thermos
+   Copyright (c) 2026 Cursor
+   MIT License (text below)
+
+   Adapted:
+   - plugins/auto-review/agents/thermo-bugs.md, from
+     agents/thermo-nuclear-review-subagent.md
+   - plugins/auto-review/agents/thermo-quality.md, from
+     agents/thermo-nuclear-code-quality-review-subagent.md
+   The thermos rubric skills are not redistributed. The agents read them from
+   an installed thermos plugin when one is present.
+
+--------------------------------------------------------------------------------
+4. Sentry agent skills
+   https://github.com/getsentry/sentry-agent-skills
+   Copyright Sentry and contributors
+   Apache License 2.0 (declared in the skill's frontmatter and the upstream
+   README; full text in LICENSES/Apache-2.0.txt)
+
+   Included:
+   - plugins/skills-core/skills/sentry-fix-issues/SKILL.md, modified:
+     description rewritten, "MCP traps" section added. The file carries a
+     modification notice.
+
+--------------------------------------------------------------------------------
+MIT License (applies to items 1 to 3, each under its own copyright line above)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

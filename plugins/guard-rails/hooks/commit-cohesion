@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# One commit per push (CLAUDE.md "One commit per push"). Before a PR exists, amend the unpushed
+# commit; once a PR is open, never amend or rebase: follow-ups stay uncommitted and are committed
+# once, right before the push. Never amend a commit that is already on a remote. Registered on
+# three events, branches on hook_event_name:
+#   PreToolUse(Bash)    -> gate a `git commit` (the decision table at the end)
+#   UserPromptSubmit    -> touch turn-<sid>  (no-remote fallback boundary)
+#   PostToolUse(Bash)   -> touch last-<sid>  (no-remote fallback only)
+#
+# The invariant is on git state, not on messages: a branch carries at most ONE unpushed commit,
+# and a new commit is earned only by a push. A per-prompt budget cannot express "changes ->
+# review -> changes = one commit": every prompt ("ci failing", "apply all", an answer to the
+# model's own question) earned a commit, and in a 2026-09-08 audit 16 of its 28 denials were
+# followed by a plain new commit anyway. Git state has no marker to go stale, no session id to
+# reset at /clear, and covers a subagent by the same rule. "PR open" is ci-watch's branch -> PR
+# pointer (lib/state pr_open), so this makes no network call.
+# `# separate-change` on the command line is the escape for truly unrelated work the user asked
+# to split. Fails closed: a commit is refused while a lib it needs is missing.
+set -uo pipefail
+
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+
+. "${0%/*}/lib/hook-io" 2>/dev/null || {
+  case "$(cat)" in *commit*)
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"commit-cohesion: hooks/lib/hook-io is missing, so the commit gate cannot run and refuses the commit. Restore it: git -C ~/.claude checkout -- hooks/lib"}}' ;;
+  esac
+  exit 0
+}
+hook_input
+case "$HOOK_INPUT" in *commit*|*UserPromptSubmit*) ;; *) exit 0 ;; esac
+hook_lib closed
+hook_read event='.hook_event_name // ""' sid='.session_id // "nosession"' cmd='.tool_input.command // ""' \
+  cwd='.cwd // ""' aid='.agent_id // ""' rc='.tool_response.exit_code // .tool_response.exitCode // 0'
+dir="$HOME/.claude/tmp/claude-commit"
+
+if [ "$event" = "UserPromptSubmit" ]; then
+  mkdir -p "$dir"
+  find "$dir" -type f -mtime +2 -delete 2>/dev/null || true
+  touch "$dir/turn-$sid"
+  exit 0
+fi
+
+[ -n "$cmd" ] || exit 0
+[ -n "$cwd" ] || cwd="$PWD"
+case "$cmd" in *commit*) ;; *) exit 0 ;; esac
+
+# A throwaway repo under a scratch/tmp path is not the user's work — it is a fixture built to
+# TEST something (a hook, a git behaviour), and its commits are part of the test, not of the
+# task. Gating them denies the fixture and points the model at `--amend` on a commit that has
+# nothing to do with the session. `review-trigger` already skips these paths; so does this.
+#
+# LIMIT: this catches a LITERAL scratch path only. `cwd` is the session's, not the one a `cd`
+# inside a compound command moved to, and a `-C "$TMP"` argument reaches the hook unexpanded,
+# so a fixture addressed through a variable still trips the gate. `# separate-change` remains
+# the escape for that case; widening this to guess at variables would fail open on real repos.
+scratch() {
+  case "$1" in
+    */private/tmp/*|/tmp/*|*/var/folders/*|*scratchpad*|*/.git/rebase-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+scratch "$cwd" && exit 0
+
+hook_lib closed cmd-view state
+cmd_view "$cmd"
+commit_re='(^|[;&|[:space:]])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+commit([[:space:]]|$)'
+[[ $CMD_BARE =~ $commit_re ]] || exit 0
+
+# Honor `git -C <path>` — the recommended form runs from OUTSIDE the repo, so cwd alone would
+# inspect the wrong repo. A quoted literal path works; an unexpanded $var falls back to cwd.
+gdir=$(printf '%s' "$cmd" | sed -nE "s/.*git[[:space:]]+-C[[:space:]]+['\"]?([^'\"[:space:]]+).*/\1/p")
+[ -n "$gdir" ] && scratch "$gdir" && exit 0
+[ -n "$gdir" ] && [ -d "$gdir" ] && cwd="$gdir"
+git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || exit 0
+
+if [ "$event" = "PostToolUse" ]; then
+  # Only used by the no-remote fallback below. Only a commit that LANDED counts: PostToolUse
+  # fires on a non-zero exit too, and marking a commit that does not exist ("nothing added to
+  # commit", a rejected pre-commit hook) denies the next, correct attempt with "--amend
+  # instead", pointing it at whatever HEAD is: an earlier task's commit, or the user's.
+  case "${rc:-0}" in 0|null|"") mkdir -p "$dir"; touch "$dir/last-$sid" ;; esac
+  exit 0
+fi
+
+# --- PreToolUse: compute the state, then one decision ---
+# Matched on the bare view: a commit MESSAGE that mentions --amend must not wave a commit through.
+amend=0
+case "$CMD_BARE" in *--amend*) amend=1 ;; esac
+[ "$amend" = 0 ] && cmd_flag separate-change && exit 0
+
+# A commit CONCLUDING a merge, cherry-pick, revert or rebase is git's own control flow, not a
+# task commit — and it has no amendable predecessor. `git merge` in the release-merge worktree
+# is a real workflow here (7 commits in the audit), so denying it would break it outright.
+# --absolute-git-dir, not --git-dir/--git-path: those return a path relative to $cwd, which
+# this hook is NOT running in, so every -e test below would silently miss.
+gd=$(git -C "$cwd" rev-parse --absolute-git-dir 2>/dev/null || echo "$cwd/.git")
+for f in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+  [ -e "$gd/$f" ] && exit 0
+done
+# A detached HEAD is a rebase/bisect/scratch checkout, never the branch the task lands on.
+branch=$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
+[ "$branch" = "HEAD" ] && exit 0
+
+# remote  has | none
+# tip     ahead   unpushed commits; with no remote to reset the budget, a commit since the user's
+#                 last prompt (the only boundary available; 23 of 275 audited commits)
+#         pushed  HEAD is on a remote
+#         none    no HEAD yet, or nothing committed this turn
+# pr      open | none (ci-watch's pointer)
+# who     main | sub: agent_id is present only in a subagent's payload; a missing turn marker
+#         covers older builds, where a subagent had its own session_id
+remote=none; tip=none; unpushed=0
+if [ -n "$(git -C "$cwd" remote 2>/dev/null)" ]; then
+  remote=has
+  if unpushed=$(git -C "$cwd" rev-list --count HEAD --not --remotes 2>/dev/null); then
+    case "$unpushed" in ''|*[!0-9]*) unpushed=0 ;; esac
+    tip=pushed; [ "$unpushed" -ge 1 ] && tip=ahead
+  else
+    unpushed=0
+  fi
+elif [ -f "$dir/last-$sid" ] && ! [ "$dir/turn-$sid" -nt "$dir/last-$sid" ]; then
+  tip=ahead
+fi
+pr=none; pr_open "$branch" && pr=open
+who=main; { [ -n "$aid" ] || [ ! -f "$dir/turn-$sid" ]; } && who=sub
+
+# An amend of an unpushed commit IS the fold. An amend of a pushed commit rewrites published
+# history and lands only with a force-push; bash-guards catches that only when HEAD is exactly
+# @{u}, which misses a branch pushed without upstream tracking. A subagent must not commit onto
+# the PARENT's HEAD in a shared worktree, so its remedy is to leave the change uncommitted.
+SPLIT="Append \`# separate-change\` only if the user asked to split off unrelated work."
+case "$amend:$remote:$tip:$pr:$who" in
+  1:has:pushed:*)
+    deny "Denied: HEAD is already on a remote, so --amend rewrites pushed history and needs a force-push. Never force-push: leave follow-ups uncommitted and commit them once, as a new commit, right before the next push." ;;
+  1:*:*:open:*)
+    deny "Denied: this branch has an open PR, and the repo rule forbids --amend once a PR is open. Push the existing commit when its review is done, then commit this change once, right before its own push." ;;
+  0:*:ahead:*:sub)
+    deny "Denied: this branch already has an unpushed commit and you are a subagent. Do not commit or amend: that HEAD belongs to the session that spawned you. Leave the change uncommitted and report what you altered." ;;
+  0:none:ahead:*)
+    deny "Denied: you already committed since the user's last message, and this repo has no remote to push. $SPLIT
+One commit per instruction: fold this in with \`git commit --amend --no-edit\` (or \`--amend -F <msgfile>\`)." ;;
+  0:has:ahead:open:*)
+    deny "Denied: this branch has an open PR and already $unpushed unpushed commit(s). $SPLIT
+One commit per push, and once a PR is open never amend or rebase: keep this change uncommitted, push the existing commit when its review is done, then commit this once, right before its own push." ;;
+  0:has:ahead:*)
+    deny "Denied: this branch already has $unpushed unpushed commit(s). $SPLIT
+One commit per push: fold this in with \`git commit --amend --no-edit\` (or \`--amend -F <msgfile>\`), then push once the review cycle ends." ;;
+esac
+exit 0

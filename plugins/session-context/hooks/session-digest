@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""SessionEnd: write a one-screen digest of the session to ~/.claude/local/session-digests/.
+
+Usage by hand:  session-digest <transcript.jsonl> [--print]
+"""
+import json
+import os
+import re
+import sys
+from datetime import datetime
+
+OUT_DIR = os.path.expanduser("~/.claude/local/session-digests")
+
+
+def test_run_re() -> re.Pattern[str]:
+    """pytest, plus the overlay's runner (hooks/lib/kit_env.py) when it names one."""
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+    try:
+        from kit_env import kit_env
+
+        kit = kit_env()
+        runner = kit.get("TEST_RUNNER_RE") or kit.get("TEST_RUNNER")
+        if runner:
+            return re.compile(rf"\bpytest\b|\b(?:{runner})\b")
+    except (ImportError, re.error):
+        pass
+    return re.compile(r"\bpytest\b")
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def digest(path):
+    prompts, edits, commits, pushes, prs, agents, denials = [], [], [], 0, [], {}, {}
+    tests, test_last, cost, first_ts, last_ts, final_text, cwd = 0, "", {}, None, None, "", ""
+    tid = {}
+    test_re = test_run_re()
+    for line in open(path, errors="replace"):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        t = d.get("type")
+        ts = d.get("timestamp")
+        if ts:
+            first_ts = first_ts or ts
+            last_ts = ts
+        cwd = cwd or d.get("cwd", "")
+        if t == "pr-link":
+            prs.append(d.get("prUrl", ""))
+        elif t == "cost-state":
+            cost = d
+        elif t == "assistant":
+            for b in d.get("message", {}).get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and b["text"].strip():
+                    final_text = b["text"]
+                elif b.get("type") == "tool_use":
+                    nm, inp = b.get("name"), b.get("input") or {}
+                    tid[b.get("id")] = nm
+                    if nm in ("Edit", "Write", "MultiEdit"):
+                        fp = inp.get("file_path", "")
+                        if fp and fp not in edits and "scratchpad" not in fp:
+                            edits.append(fp)
+                    elif nm == "Agent":
+                        k = inp.get("subagent_type") or "default"
+                        agents[k] = agents.get(k, 0) + 1
+                    elif nm == "Bash":
+                        c = inp.get("command", "") or ""
+                        m = re.search(r"git (?:-C \S+ )?commit[^\n]*?-m\s+['\"]([^'\"\n]{1,90})", c)
+                        if m:
+                            commits.append(m.group(1))
+                        elif re.search(r"git (?:-C \S+ )?commit\b", c):
+                            commits.append("(message from file)")
+                        if re.search(r"git (?:-C \S+ )?push\b", c):
+                            pushes += 1
+                        if test_re.search(c):
+                            tests += 1
+        elif t == "user":
+            m = d.get("message", {})
+            c = m.get("content")
+            if d.get("toolDenialKind"):
+                fl = text_of(c).strip().split("\n")[0][:70]
+                denials[fl] = denials.get(fl, 0) + 1
+                continue
+            if not d.get("isMeta") and not d.get("isSidechain"):
+                tx = text_of(c).strip()
+                if tx and not tx.startswith("<") and not tx.startswith("[Request interrupted"):
+                    prompts.append(tx[:140].replace("\n", " "))
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "tool_result" and tid.get(b.get("tool_use_id")) == "Bash":
+                        tx = text_of(b.get("content"))
+                        m = re.search(r"(\d+ passed[^\n]{0,60}|\d+ failed[^\n]{0,60}|FAILED[^\n]{0,60})", tx)
+                        if m:
+                            test_last = m.group(1)
+    sid = os.path.basename(path).replace(".jsonl", "")
+    day = (first_ts or datetime.now().isoformat())[:10]
+    dur = ""
+    if first_ts and last_ts:
+        try:
+            a = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            b = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            dur = f"{(b - a).total_seconds() / 3600:.1f}h"
+        except ValueError:
+            pass
+    lines = [f"# Session {sid[:8]} — {day} — {os.path.basename(cwd) or '?'} — {dur}", ""]
+    if cost:
+        lines.append(f"cost ${cost.get('totalCostUSD', 0):.0f} · +{cost.get('totalLinesAdded', 0)}/-{cost.get('totalLinesRemoved', 0)} lines")
+    lines.append(f"prompts {len(prompts)} · edits {len(edits)} files · commits {len(commits)} · pushes {pushes} · test runs {tests}"
+                 + (f" (last: {test_last})" if test_last else "") + f" · agents {sum(agents.values())}")
+    lines.append("")
+    lines.append("## Asked")
+    lines += [f"- {p}" for p in prompts[:12]]
+    if len(prompts) > 12:
+        lines.append(f"- … {len(prompts) - 12} more")
+    if commits or prs:
+        lines += ["", "## Shipped"]
+        lines += [f"- commit: {c}" for c in commits[:10]]
+        lines += [f"- PR: {u}" for u in dict.fromkeys(prs)]
+    if edits:
+        lines += ["", "## Files touched"]
+        lines += [f"- {e.replace(os.path.expanduser('~'), '~')}" for e in edits[:25]]
+    if agents:
+        lines += ["", "## Agents"] + [f"- {k}: {v}" for k, v in sorted(agents.items(), key=lambda kv: -kv[1])]
+    if denials:
+        lines += ["", "## Denied tool calls"] + [f"- {v}× {k}" for k, v in sorted(denials.items(), key=lambda kv: -kv[1])[:6]]
+    if final_text:
+        lines += ["", "## Last message", final_text.strip()[-1200:]]
+    return f"{day}-{sid[:8]}.md", "\n".join(lines) + "\n"
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args:
+        path = args[0]
+    else:
+        # ci-watch's headless repair agents inherit this; they wrote 13 digests for one PR.
+        if os.environ.get("CI_WATCH_ACTIVE"):
+            return
+        try:
+            path = json.load(sys.stdin).get("transcript_path", "")
+        except ValueError:
+            path = ""
+    if not path or not os.path.isfile(path):
+        return
+    name, body = digest(path)
+    if "--print" in sys.argv:
+        print(body)
+        return
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(os.path.join(OUT_DIR, name), "w") as f:
+        f.write(body)
+
+
+if __name__ == "__main__":
+    main()

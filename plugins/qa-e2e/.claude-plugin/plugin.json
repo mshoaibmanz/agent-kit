@@ -1,0 +1,9 @@
+{
+  "name": "qa-e2e",
+  "description": "The qa-e2e skill: an end-to-end QA pass on a feature (backend up and seeded, the app driven on an Android emulator or the web, screenshots, findings by verification level, an ops SOP). Repo paths and seeds come from ~/.claude/local/qa-e2e/.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Shoaib Manzoor"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# Review state, sizing and tiering. Sourced (functions and constants only) by review-mark-changes
+# (PostToolUse on an edit), review-trigger (Stop), pre-push-gate (PreToolUse on `git push`, whose
+# deny carries the instruction a Stop would) and review-agent-mark (SubagentStop, and
+# PostToolUse(Agent) for the critic). Callers use the rv_* functions, never the files.
+#
+# The reviewed state is a git TREE: HEAD plus tracked worktree edits plus untracked code files,
+# written through a throwaway copy of the index so the real index and worktree are untouched.
+# Diffing two trees gives the exact lines changed since the last round. The measure it replaces,
+# the difference of two line counts against HEAD at the first edit, re-reviewed the whole session
+# diff on every heavy round (session 1231b9ed ran 3 in 53 minutes, repeating items) and read a
+# same-size rewrite as zero.
+#
+# Files in $RV_DIR, swept after ~48h (BSD `find -mtime +1`) by review-trigger:
+#   wt-<rk>        code changed in the worktree with root key <rk> since its last completed review,
+#                  so the gates apply. Per worktree, not per session: a Stop or push from another
+#                  session there (a second terminal, a headless worker) still sees the edit.
+#   session-<sid>  one session's state as key=value lines, replaced whole (tmp + mv) on each write,
+#                  under session-<sid>.lock because SubagentStop and Stop race. Keys ending .<rk>
+#                  are per worktree root: a session can work in several, and each has its own base.
+#     base.<rk>                  HEAD at the session's first code edit there; round 1 starts here
+#     issued.<rk>, ihead.<rk>    tree of the last round issued (Stop block or push deny), and the
+#                                commit it was built on (MERGE_HEAD mid-merge)
+#     tier.<rk>                  that round's tier if it spawned agents, else 0
+#     pending.<rk>               1 until that round's review agent returns
+#     reviewed.<rk>, rhead.<rk>  tree and commit of the last COMPLETED review
+#     rounds                     agent rounds completed this session: the churn budget
+#     qdone                      thermo-quality returned this session
+#     chain                      review-trigger started the current Stop chain
+#     critic                     the review agent whose findings still owe a critic
+# A subagent's hook input carries its parent's session_id, so one <sid> covers delegated work.
+# macOS bash 3.2: no mapfile, no associative arrays.
+
+. "${BASH_SOURCE[0]%/*}/state" || return 1
+
+RV_DIR="${TMPDIR:-/tmp}/claude-review"
+RV_MIN="${REVIEW_MIN_LINES:-40}"
+RV_HEAVY="${REVIEW_HEAVY_LINES:-150}"
+RV_STATE=''; RV_OWED=''; RV_MEASURED=''; RV_ROOT=''; RV_TREE=''; RV_HEAD=''; RV_MERGE=''
+_RV_NL=$'\n'
+
+# Agent names as the Agent tool resolves them: a user-level <config>/agents/<name>.md is addressed
+# bare, the auto-review plugin's copy as auto-review:<name>. A name that does not resolve raises no
+# error; the session improvises the review instead.
+_RV_AGENTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/agents"
+_rv_ns() { if [ -f "$_RV_AGENTS/$1.md" ]; then printf -v "$2" '%s' "$1"; else printf -v "$2" 'auto-review:%s' "$1"; fi; }
+_rv_ns reviewer RV_A_REVIEWER; _rv_ns thermo-bugs RV_A_BUGS; _rv_ns thermo-quality RV_A_QUALITY; _rv_ns critic RV_A_CRITIC
+
+# Instruction fragments: every tier's text is built from these, and review-trigger's critic
+# reminder reuses RV_CRITIC.
+# Critic pass: a critic that audits the review with typed, evidence-bearing verdicts beat two
+# parallel reviewers and a 4-agent debate on SWE-PRBench (arXiv:2608.18167, F1 0.533 vs 0.503);
+# without the evidence constraint it scored below one reviewer (0.457). Mandatory, because 12 of
+# 65 thermo-bugs runs never got one when it read as optional.
+RV_CRITIC="MANDATORY CRITIC: if the review reports ANY finding, spawn ONE subagent_type \"$RV_A_CRITIC\" Agent before acting, with the objective, the diff scope and the finding list VERBATIM (unranked, complete, none of your own reasoning: a critic handed your verdict re-derives it). Act only on CONFIRMED; report UNPROVEN as unverified; drop FALSE_POSITIVE; list OPINION as ranked options. Zero findings: say so and skip it. Only if the Agent tool rejects \"$RV_A_CRITIC\": verify each mechanism yourself and say so."
+RV_DISCIPLINE="FIX DISCIPLINE: verify each finding's mechanism in the code before acting (review agents are confidently wrong often enough to matter); apply only verified correctness/security fixes and trivial nits; structural proposals are ranked OPTIONS for the user, never implemented unprompted; at most 5 blocking issues in a brief list, then stop. One review pass per stop; never re-trigger this turn."
+RV_NOANCHOR="NO ANCHORING: give the agents ONLY the objective and the diff scope: no list of deliberate changes, no provenance of who wrote what, no invariant you already checked. Everything you pre-declare gets lighter scrutiny."
+RV_MAIN="YOU are the main session: spawn the agents yourself; a subagent has no Agent tool."
+_RV_SELF="yourself for NEW blocking correctness/security issues: no subagents, no re-litigating reviewed structure, style or comments. Fix verified defects only, report in one short list."
+
+rv_is_code() {
+  case "$1" in
+    *.py|*.pyi|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.go|*.rs|*.java|*.kt|*.scala|*.sql|*.rb|*.php|*.cs|*.cpp|*.cc|*.c|*.h|*.hpp|*.swift|*.m|*.mm) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# rv_review_agent <agent_type>: its return feeds a review round. Not critic: it audits findings,
+# not the tree, so its return must not close a later round.
+rv_review_agent() {
+  case "$1" in
+    reviewer|thermo-bugs|thermo-quality|thermos:thermo-nuclear-review-subagent|thermos:thermo-nuclear-code-quality-review-subagent) return 0 ;;
+    auto-review:reviewer|auto-review:thermo-bugs|auto-review:thermo-quality) return 0 ;;
+  esac
+  return 1
+}
+
+# --- session state: builtins only, since review-mark-changes loads it on every edit ---
+
+_rv_load() { # _rv_load <sid>: session-<sid> into RV_STATE
+  RV_STATE=''
+  [ -f "$RV_DIR/session-$1" ] || return 0
+  IFS= read -r -d '' RV_STATE < "$RV_DIR/session-$1" || true
+}
+
+_rv_get() { # _rv_get <var> <key>: set <var> to <key>'s value in RV_STATE; fails when absent
+  local s="$_RV_NL$RV_STATE"
+  case $s in
+    *"$_RV_NL$2="*) s=${s#*"$_RV_NL$2="}; printf -v "$1" '%s' "${s%%"$_RV_NL"*}" ;;
+    *) printf -v "$1" '%s' ''; return 1 ;;
+  esac
+}
+
+_rv_int() { case ${!1} in ''|*[!0-9]*) printf -v "$1" 0 ;; esac; } # _rv_int <var>: 0 unless a count
+
+# _rv_lock <sid>: take session-<sid>'s write lock, a directory (mkdir is atomic; bash 3.2 has no
+# flock) holding the owner's pid. A write holds it for milliseconds, so after ~2s a lock whose owner
+# is gone is broken and retaken; one whose owner still runs is left alone and this writer proceeds
+# unlocked (returns 1) rather than stall the hook.
+_rv_lock() {
+  local l="$RV_DIR/session-$1.lock" n=0 pid
+  until mkdir "$l" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -ge 40 ]; then
+      pid=''
+      { IFS= read -r pid < "$l/pid"; } 2>/dev/null || true
+      { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } && return 1
+      rm -rf "$l"
+      mkdir "$l" 2>/dev/null || return 1
+      break
+    fi
+    sleep 0.05
+  done
+  { printf '%s\n' "$$" > "$l/pid"; } 2>/dev/null
+}
+
+# _rv_set <sid> key=value...: merge into session-<sid>, an empty value deleting the key. The read
+# and the write happen under _rv_lock: unlocked, two writers each merged into the state as they
+# read it and the later mv dropped the other's keys (a lost pending.<rk>=, then every push denied).
+_rv_set() {
+  local sid=$1 f="$RV_DIR/session-$1" l kv keep out='' locked=0
+  shift
+  mkdir -p "$RV_DIR" 2>/dev/null
+  _rv_lock "$sid" && locked=1
+  _rv_load "$sid"
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    keep=1
+    for kv in "$@"; do [ "${l%%=*}" = "${kv%%=*}" ] && { keep=0; break; }; done
+    [ "$keep" = 0 ] || out="$out$l$_RV_NL"
+  done <<<"$RV_STATE"
+  for kv in "$@"; do [ -z "${kv#*=}" ] || out="$out$kv$_RV_NL"; done
+  RV_STATE=$out
+  printf '%s' "$out" > "$f.$$" && mv -f "$f.$$" "$f"
+  [ "$locked" = 0 ] || rm -rf "$RV_DIR/session-$sid.lock"
+}
+
+_rv_valid() { [ -n "$2" ] && git -C "$1" cat-file -e "$2" 2>/dev/null; } # _rv_valid <root> <rev>
+
+# rv_mark_edit <sid> <root>: a code file in <root> changed. Records the session base there once.
+rv_mark_edit() {
+  local rk b
+  rk=$(path_key "$2")
+  mkdir -p "$RV_DIR" 2>/dev/null
+  touch "$RV_DIR/wt-$rk"
+  _rv_load "$1"
+  _rv_get b "base.$rk" && return 0
+  b=$(git -C "$2" rev-parse -q --verify HEAD 2>/dev/null) || return 0
+  _rv_set "$1" "base.$rk=$b"
+}
+
+rv_edited() { [ -f "$RV_DIR/wt-$(path_key "$1")" ]; }      # rv_edited <root>
+rv_clear_edits() { rm -f "$RV_DIR/wt-$(path_key "$1")"; }  # rv_clear_edits <root>
+
+# rv_base <sid> <root>: HEAD at the session's first code edit there, else HEAD (which misses
+# committed work but is never wrong about uncommitted work).
+rv_base() {
+  local b
+  _rv_load "$1"; _rv_get b "base.$(path_key "$2")"
+  _rv_valid "$2" "$b" || b=HEAD
+  printf '%s\n' "$b"
+}
+
+rv_pending() { # rv_pending <sid> <root>: the round issued there has not returned
+  local p
+  _rv_load "$1"; _rv_get p "pending.$(path_key "$2")"
+  [ "$p" = 1 ]
+}
+
+rv_critic_owed() { _rv_load "$1"; _rv_get RV_OWED critic; } # sets RV_OWED to the agent type
+rv_critic_settle() { rv_critic_owed "$1" || return 0; _rv_set "$1" critic=; }
+rv_chain_open() { _rv_set "$1" chain=1; }
+rv_chain_close() { # rv_chain_close <sid>: end the Stop chain review-trigger started; fails if none
+  local c
+  _rv_load "$1"; _rv_get c chain || return 1
+  _rv_set "$1" chain=
+}
+rv_sweep() { # a lock dir is never empty, so -delete skips one left by a killed writer
+  find "$RV_DIR" -maxdepth 1 -mtime +1 -delete 2>/dev/null
+  find "$RV_DIR" -maxdepth 1 -name '*.lock' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+}
+
+# --- sizing ---
+
+# rv_snapshot <root>: snapshot the worktree as it stands. Sets RV_ROOT, RV_TREE, RV_MERGE (the
+# MERGE_HEAD of a merge in progress) and RV_HEAD, the commit the tree builds on (RV_MERGE when set,
+# since the tree then holds that side too). Untracked code files are capped at 200 (a worktree can
+# hold thousands, and hashing them all would outrun the hook timeout).
+rv_snapshot() {
+  local root="$1" out gd idx
+  RV_ROOT=$root; RV_TREE=''; RV_HEAD=''; RV_MERGE=''
+  out=$(git -C "$root" rev-parse --absolute-git-dir HEAD 2>/dev/null)
+  gd=${out%%"$_RV_NL"*}
+  { [ -n "$gd" ] && [ -d "$gd" ]; } || return 1
+  case ${out#*"$_RV_NL"} in *[!0-9a-f]*|'') ;; *) RV_HEAD=${out#*"$_RV_NL"} ;; esac
+  if [ -f "$gd/MERGE_HEAD" ]; then
+    IFS= read -r RV_MERGE < "$gd/MERGE_HEAD" || true
+    [ -z "$RV_MERGE" ] || RV_HEAD=$RV_MERGE
+  fi
+  mkdir -p "$RV_DIR" 2>/dev/null
+  idx=$(mktemp "$RV_DIR/idx.XXXXXX") || return 1
+  if [ -f "$gd/index" ]; then
+    cp "$gd/index" "$idx" 2>/dev/null || { rm -f "$idx"; return 1; }
+  else
+    rm -f "$idx"
+  fi
+  GIT_INDEX_FILE="$idx" git -C "$root" add -u -- . >/dev/null 2>&1
+  git -C "$root" ls-files --others --exclude-standard 2>/dev/null \
+    | while IFS= read -r f; do rv_is_code "$f" && printf '%s\n' "$f"; done \
+    | head -200 > "$idx.new"
+  [ -s "$idx.new" ] && GIT_LITERAL_PATHSPECS=1 GIT_INDEX_FILE="$idx" \
+    git -C "$root" add --pathspec-from-file="$idx.new" >/dev/null 2>&1
+  RV_TREE=$(GIT_INDEX_FILE="$idx" git -C "$root" write-tree 2>/dev/null)
+  rm -f "$idx" "$idx.new"
+  [ -n "$RV_TREE" ]
+}
+
+# rv_lines <root> <from> <to>: lines added plus deleted between two tree-ishes.
+rv_lines() {
+  local n
+  n=$(git -C "$1" diff --numstat "$2" "$3" 2>/dev/null \
+    | awk '{a=$1;d=$2; if(a=="-")a=0; if(d=="-")d=0; s+=a+d} END{print s+0}')
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s\n' "$n"
+}
+
+rv_short() { case $1 in HEAD) printf 'HEAD' ;; *) printf '%s' "${1:0:12}" ;; esac; }
+
+# _rv_upstream <root> <rhead>: print the side a merge brought in, when HEAD gained a merge commit
+# (or one is in progress) whose other side <rhead>, the commit the last review built on, lacks.
+_rv_upstream() {
+  local u=$RV_MERGE
+  if [ -z "$u" ]; then
+    u=$(git -C "$1" rev-list --merges --parents -n1 HEAD --not "$2" 2>/dev/null) || return 1
+    u=${u#* }; u=${u#* }; u=${u%% *} # "<merge> <parent1> <parent2>" -> parent2
+  fi
+  [ -n "$u" ] || return 1
+  git -C "$1" merge-base --is-ancestor "$u" "$2" 2>/dev/null && return 1
+  printf '%s\n' "$u"
+}
+
+# _rv_unmerge <root> <tree-ish> <its commit> <upstream>: print <tree-ish> with <upstream> merged
+# in. Its conflicts keep their markers, so a diff to the worktree shows each resolution.
+# Needs `merge-tree --write-tree` (git 2.38); older git fails here and nothing is subtracted.
+_rv_unmerge() {
+  local c t
+  c=$(git -C "$1" -c user.name=review -c user.email=review@localhost \
+    commit-tree --no-gpg-sign "$2^{tree}" -p "$3" -m review 2>/dev/null) || return 1
+  t=$(git -C "$1" merge-tree --write-tree --no-messages "$c" "$4" 2>/dev/null)
+  t=${t%%"$_RV_NL"*}
+  case $t in ''|*[!0-9a-f]*) return 1 ;; esac
+  printf '%s\n' "$t"
+}
+
+# rv_measure <sid>: size the snapshot rv_snapshot last took against the session's last completed
+# review there, else its base. Sets RV_DELTA and RV_CHANGED (lines since each), RV_FROM and RV_BASE
+# (their left sides), RV_RANGE (`git diff <from> <tree>`) and RV_SCOPE (the range and what it
+# covers). A merge since that review brought in teammates' already-reviewed work, so both left
+# sides get the merged-in side applied: the delta is then this session's own changes, conflict
+# resolutions included, not the upstream it pulled.
+rv_measure() {
+  local sid=$1 root=$RV_ROOT cur=$RV_TREE rk base from rhead up=''
+  rk=$(path_key "$root")
+  _rv_load "$sid"
+  _rv_get base "base.$rk"; _rv_valid "$root" "$base" || base=HEAD
+  _rv_get from "reviewed.$rk"; _rv_get rhead "rhead.$rk"
+  { _rv_valid "$root" "$from" && _rv_valid "$root" "$rhead"; } || { from=$base; rhead=$base; }
+  RV_BASE=$base; RV_FROM=$from
+  if up=$(_rv_upstream "$root" "$rhead"); then
+    RV_BASE=$(_rv_unmerge "$root" "$base" "$base" "$up") || RV_BASE=$base
+    if [ "$from" = "$base" ]; then
+      RV_FROM=$RV_BASE
+    else
+      RV_FROM=$(_rv_unmerge "$root" "$from" "$rhead" "$up") || RV_FROM=$from
+    fi
+  fi
+  RV_CHANGED=$(rv_lines "$root" "$RV_BASE" "$cur")
+  RV_DELTA=$(rv_lines "$root" "$RV_FROM" "$cur")
+  RV_RANGE="git diff $(rv_short "$RV_FROM") $(rv_short "$cur")"
+  if [ "$from" = "$base" ]; then
+    RV_SCOPE="\`$RV_RANGE\`: this session's work, committed or not, untracked code included"
+  else
+    RV_SCOPE="\`$RV_RANGE\`: ONLY what changed since the last review round; earlier work was already reviewed, do not re-review it"
+  fi
+  [ "$RV_FROM" = "$from" ] || RV_SCOPE="$RV_SCOPE. Its left side has the merged-in $(rv_short "$up") applied, so teammates' merged changes do not show; a resolved conflict shows as its marker block replaced by the resolution"
+  RV_MEASURED="$sid $root $cur"
+}
+
+# rv_decide <sid>: pick the review for the snapshot rv_snapshot last took, record it in one write,
+# and set RV_KIND (none | self | agents), RV_TIER, RV_DELTA and RV_TEXT (the instruction, without
+# any caller framing). A self round is trusted as done; an agent round stays pending until its
+# review agent returns (rv_complete).
+#   tree unchanged since the last round issued -> none
+#   delta <  RV_MIN (40)                       -> tier 0, self-check (none under the 10-line floor)
+#   delta <  RV_HEAVY (150)                    -> tier 1, ONE `reviewer`, then the critic
+#   delta >= RV_HEAVY                          -> tier 2, thermo-bugs (+ thermo-quality until one
+#                                                 has returned this session), then the critic
+#   agent budget spent                         -> self-review of the delta (churn brake)
+# Size picks a tier; two escalations then raise a FLOOR, because size is a bad proxy for risk and a
+# BACKWARDS one for fix-ups. A diff touching auth/secrets/money/migrations floors at heavy; a delta
+# after a round that spawned a reviewer floors at light (never self-check a fix-up). Both stand
+# down with the budget, or `sensitive`, which reads the cumulative file list, fires every round.
+rv_decide() {
+  local sid=$1 root=$RV_ROOT cur=$RV_TREE budget=${REVIEW_MAX_ROUNDS:-3}
+  local rk issued last_tier rounds qdone left touched hits sensitive=0 size_tier tier esc='' note=''
+  local size lead what spawn
+  RV_KIND=none; RV_TIER=0; RV_TEXT=''
+  rk=$(path_key "$root")
+  _rv_load "$sid"
+  _rv_get issued "issued.$rk"
+  [ "$issued" = "$cur" ] && return 0
+  [ "$RV_MEASURED" = "$sid $root $cur" ] || rv_measure "$sid"
+  # Nothing measurable changed in THIS repo (the edit was in another worktree, or ~/.claude from a
+  # project session): 10 of 258 blocks in 30 days were "~0 line delta" self-checks.
+  [ "$RV_CHANGED" -eq 0 ] && [ "$RV_DELTA" -eq 0 ] && return 0
+
+  # Re-list untracked files UNCAPPED: the snapshot's 200-file cap bounds hashing work, but a name
+  # match costs nothing, and reusing a capped list hid every sensitive path past the 200th entry.
+  touched=$( { git -C "$root" diff "$RV_BASE" "$cur" --name-only 2>/dev/null
+               git -C "$root" ls-files --others --exclude-standard 2>/dev/null; } | sed '/^$/d')
+  # Match a component STEM, after splitting on separators AND camelCase. Measured against
+  # `git ls-files` on a Python backend and a TypeScript monorepo: a substring alternation matched
+  # `authors.py` and `tokenizer.py`; whole-component `-x` lost `AuthContext.ts` and
+  # `authorization.py`; a stem prefix on case-split components keeps both and rejects `authors`.
+  # `session`, `token`, `policy` and `pricing` carried nearly all the noise and are gone. Re-run
+  # both comparisons before editing this list. `grep -c`, not `-q`: under pipefail a `-q` exits at
+  # the first match, the writer takes EPIPE, and the non-zero status silently disabled this.
+  hits=$(printf '%s\n' "$touched" \
+    | sed 's/\([a-z0-9]\)\([A-Z]\)/\1 \2/g' | tr '/._- ' '\n\n\n\n\n' \
+    | grep -ciE '^(authoriz|authentic|authn|authz|auth|oauth|jwt|login|logout|credential|password|passwd|secret|crypto|encrypt|decrypt|signing|signature|permission|acl|rbac|payment|billing|invoice|refund|payout|ledger|wallet|migrat)' \
+    2>/dev/null || true)
+  case "${hits:-0}" in 0) ;; *) sensitive=1 ;; esac
+
+  _rv_get last_tier "tier.$rk"; _rv_get rounds rounds; _rv_get qdone qdone
+  _rv_int last_tier; _rv_int rounds; _rv_int qdone
+  left=$((budget - rounds))
+
+  size_tier=1
+  { [ "$RV_CHANGED" -lt "$RV_MIN" ] || [ "$RV_DELTA" -lt "$RV_MIN" ]; } && size_tier=0
+  { [ "$RV_CHANGED" -ge "$RV_HEAVY" ] && [ "$RV_DELTA" -ge "$RV_HEAVY" ]; } && size_tier=2
+  tier=$size_tier
+
+  # One budget of agent rounds per session, spent when a round's review agent RETURNS: counting
+  # Stop blocks used it up while the model waited on its own edit agents and spawned nothing.
+  # Measured 2026-08-13..09-11: the fix-up escalation spawned a `reviewer` for 1-7 line deltas ~40
+  # times, and 17 sessions ran 6-13 review agents.
+  if [ "$left" -gt 0 ]; then
+    if [ "$last_tier" -ge 1 ] && [ "$tier" -lt 1 ]; then
+      tier=1
+      esc="$esc ESCALATED (fix-up): this delta is a FIX to code a reviewer already passed. Review it as NEW work: confirm the original finding is resolved per the EFFICACY rule and that the fix broke nothing the earlier pass cleared."
+    fi
+    if [ "$sensitive" = 1 ] && [ "$tier" -lt 2 ]; then
+      tier=2
+      esc="$esc ESCALATED (sensitive path): this diff touches auth/secrets/money/migrations; depth follows blast radius, not line count. Name the trust boundary and who can now reach it."
+    fi
+  elif [ "$sensitive" = 1 ]; then
+    note=" Sensitive path (auth/secrets/money/migrations) with the agent budget spent: name the trust boundary yourself, and say this was a self-review if you report a clean pass."
+  fi
+
+  # A 1-9 line delta on non-sensitive, non-fix-up code is not worth a turn (45 of 258 blocks in
+  # 30 days were this shape and none produced a change). It keeps accumulating until it is.
+  if [ "$tier" = 0 ] && [ "$RV_DELTA" -lt "${REVIEW_FLOOR_LINES:-10}" ] && [ "$sensitive" = 0 ]; then
+    return 0
+  fi
+
+  size="~$RV_DELTA line delta; $RV_SCOPE"
+  if [ "$tier" = 0 ]; then
+    _rv_round "$sid" "$rk" self 0 "Code changed since the last review ($size). SELF-CHECK, no subagent: re-read that diff; delete filler comments and dead code; check the change against neighbouring patterns; confirm the changed behaviour is covered by a test that ran. Fix what is clearly wrong, report in one line.$note"
+    return 0
+  fi
+  if [ "$left" -le 0 ]; then
+    _rv_round "$sid" "$rk" self "$tier" "Review agents already completed $rounds rounds this session, the budget (churn brake). Review ONLY the delta since the last pass ($size) $_RV_SELF$note"
+    return 0
+  fi
+
+  if [ "$tier" = 1 ]; then
+    lead="Code changed since the last review"; what="ONE light review pass"
+    spawn="Spawn ONE subagent_type \"$RV_A_REVIEWER\" Agent with (1) the task objective and (2) a summary of the files in that diff and what changed in each (a fresh agent cannot see what changed)."
+  elif ! grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null; then
+    # The local thermo-bugs / thermo-quality agents Read the thermos rubric themselves (the
+    # plugin's own agents call the Skill tool, which a subagent cannot: 34 of 34 such calls failed
+    # in 30 days). Kit installs without the thermos plugin fall back to one reviewer.
+    lead="A large change since the last review"
+    what="DEEP single-agent review (thermos plugin not installed, so the two-agent audit is unavailable)"
+    spawn="Spawn ONE subagent_type \"$RV_A_REVIEWER\" Agent with the objective and a file-by-file summary of that diff; tell it to cover correctness/security AND structure."
+  elif [ "$qdone" = 0 ]; then
+    # thermo-quality runs once per session: 58% of its graded verdicts were OPINION, and a second
+    # pass over fix-ups re-raised the same structure points.
+    lead="A large change since the last review"; what="FULL review"
+    spawn="State the task OBJECTIVE in one line, then spawn BOTH agents IN PARALLEL (one message, two Agent calls): subagent_type \"$RV_A_BUGS\" and subagent_type \"$RV_A_QUALITY\", each given the objective and the diff scope (they load their own rubric and run in the working tree); merge and dedupe what they return. $RV_NOANCHOR $RV_MAIN"
+  else
+    lead="A large change since the last review"; what="correctness review"
+    spawn="State the task OBJECTIVE in one line, then spawn ONE subagent_type \"$RV_A_BUGS\" Agent with the objective and the diff scope (it loads its own rubric and runs in the working tree); thermo-quality already ran this session, do not spawn it again. $RV_NOANCHOR $RV_MAIN"
+  fi
+  _rv_round "$sid" "$rk" agents "$tier" "$lead ($size): $what.$esc $spawn $RV_CRITIC $RV_DISCIPLINE"
+}
+
+# _rv_round <sid> <rk> <self|agents> <tier> <text>: set RV_KIND, RV_TIER and RV_TEXT, and record the
+# round in one write. A self round is trusted as done, so it is also the last completed review.
+_rv_round() {
+  RV_KIND=$3; RV_TIER=$4; RV_TEXT=$5
+  if [ "$3" = agents ]; then
+    _rv_set "$1" "issued.$2=$RV_TREE" "ihead.$2=$RV_HEAD" "tier.$2=$4" "pending.$2=1"
+  else
+    _rv_set "$1" "issued.$2=$RV_TREE" "ihead.$2=$RV_HEAD" "tier.$2=0" "pending.$2=" \
+      "reviewed.$2=$RV_TREE" "rhead.$2=$RV_HEAD"
+  fi
+}
+
+# rv_complete <sid> <root> <agent_type> [final message]: a review agent returned. It promotes the
+# pending round to reviewed and spends one round of the budget; a correctness pass owes a critic
+# unless its final message says it found nothing; the edit marker clears only if nothing changed
+# since the round's snapshot (edits made while a background review ran are unreviewed). A
+# thermo-quality return only marks it done for the session, in either order with thermo-bugs. A
+# round the hooks did not issue (an agent spawned for unrelated work) records nothing.
+rv_complete() {
+  local sid=$1 root=$2 at=$3 msg=${4:-} rk p tree head rounds none
+  local -a kv
+  rk=$(path_key "$root")
+  _rv_load "$sid"
+  case $at in
+    thermo-quality|auto-review:thermo-quality|thermos:thermo-nuclear-code-quality-review-subagent)
+      _rv_get p "tier.$rk"
+      [ "$p" = 2 ] && _rv_set "$sid" qdone=1
+      return 0 ;;
+  esac
+  _rv_get p "pending.$rk"
+  [ "$p" = 1 ] || return 0
+  _rv_get tree "issued.$rk"; _rv_get head "ihead.$rk"; _rv_get rounds rounds; _rv_int rounds
+  kv=("reviewed.$rk=$tree" "rhead.$rk=$head" "pending.$rk=" "rounds=$((rounds + 1))")
+  none=$(printf '%s' "$msg" | grep -Eic '(^|[^a-z])(no|zero|0) findings|no (issues|defects|bugs) (found|to report)|nothing to report' || true)
+  case "${none:-0}" in 0) kv+=("critic=$at") ;; esac
+  _rv_set "$sid" "${kv[@]}"
+  rv_snapshot "$root" && [ "$RV_TREE" = "$tree" ] && rv_clear_edits "$root"
+  return 0
+}

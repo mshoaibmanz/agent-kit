@@ -1,0 +1,34 @@
+Shared hook libs. Hooks source them as "${0%/*}/lib/<name>", so a hooks copy under test uses its own.
+This directory is the ONE source: scripts/build.sh copies it into every plugin's hooks/lib, and
+tests/run-tests.sh fails when a copy drifts. Edit here, then run scripts/build.sh.
+hook-io      hook_lib <open|closed> [lib...] (jq + libs; closed denies on PreToolUse and tells the user elsewhere, open tells the user; both exit 0)
+             hook_input, hook_read VAR='jq expr'... (one jq), decide <deny|ask> <reason> [context],
+             deny, ask, add_context <event> <text>, stop_block <sid> <reason>; HOOK_LIB, STOP_BLOCK_DIR
+             kit_env: load the per-user overlay once (below)
+kit_env.py   kit_env() -> dict: the same overlay for Python hooks (comment-guard, session-digest)
+cmd-view     cmd_view <cmd> (CMD_MASKED, CMD_BARE), cmd_mask <text>, cmd_flag <word>,
+             cmd_tokens (CMD_TOKENS), cmd_invokes <ere> [tokens]
+state        path_key <path>; branch -> PR pointer: pr_open, pr_number, pr_ptr_set, pr_ptr_clear <branch>
+test-run     tr_invoked, tr_scope <raw cmd>, tr_state <sid> <agent_id> <root> (TR_STATE, TR_LASTRUN),
+             tr_covered <scope>, tr_record <scope>, tr_mark <run|edit> <sid> <root>, tr_ran <sid> <root>,
+             tr_refused_each <fn>, tr_refused_md
+notify       notify <title> <body> [sound] (macOS banner)
+review-state review sizing and rounds (rv_*), shared by review-trigger, pre-push-gate, review-*-mark
+cmd-tokens   awk: the words of a command in command position, one per line; defines WRAPPERS, the one wrapper list (bash-guards reads it)
+strip-heredocs  awk: a command with heredoc bodies removed, unless the body is fed to a shell
+db-registry  the ~/.ssh/config db-tunnel registry, derived as ro-mysql derives it (tests compare the two)
+
+Overlay: $KIT_ENV, else ${CLAUDE_CONFIG_DIR:-~/.claude}/local/kit.env (KIT_ENV=/dev/null = none).
+KEY=value lines, value literal, optionally quoted; parsed, never sourced. An absent key is empty
+and turns its check off, so a hook without an overlay is inert; the prod-data guards need no key.
+Documented with placeholder values in kit.env.example at the repo root.
+  GIT_AUTHOR         commit author the docs name (CLAUDE.md); git config when unset
+  RELEASE_BRANCH_RE  extra local bases for bash-guards' two-dot diff check (ERE)
+  TEST_GATE_FILE     file at a repo root that turns on test-exec-gate and the SessionStart TESTS line
+  TEST_RUNNER        the one test wrapper allowed there; ci-watch allowlists it for its repair agent
+  TEST_RUNNER_RE     runner names that count as a test run (ERE; default TEST_RUNNER): test-run, session-digest
+  TEST_REFUSED_CMDS  '|'-separated command prefixes test-exec-gate refuses in a gated repo
+  TEST_NOTE          sentence appended to the gate's refusal and the TESTS line
+  PROTOTYPE_DIRS     extra sandbox dir names (ERE): review-mark-changes, comment-guard
+  CODE_DIRS          dirs holding the repos claude-gc sweeps; unset skips its repo-based steps
+  BQRO_PROJECT       BigQuery jobs project for bqro (prod-data); bqro refuses to run without it

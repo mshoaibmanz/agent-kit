@@ -1,0 +1,3 @@
+# Images and PDFs allowed in this repo, one repo-relative path per line (scripts/scan.sh). Empty on
+# purpose: screenshots of internal apps belong in a private overlay. Review an image for names,
+# emails, hosts and ids before adding it here.

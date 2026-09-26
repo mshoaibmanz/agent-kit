@@ -1,0 +1,12 @@
+# Company data never lives in this repo: it goes in ~/.claude/local/ (see README, "Overlay config").
+/local/
+kit.env
+*.env
+!kit.env.example
+.env.*
+
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
+*~

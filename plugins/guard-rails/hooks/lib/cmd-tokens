@@ -1,0 +1,95 @@
+#!/usr/bin/env awk -f
+# Read a shell command on stdin; print one line per token that is in COMMAND POSITION —
+# i.e. the program actually being executed, not a path or pattern handed to something else.
+#
+# This is the difference between denying `bqro 'SELECT …'` (correct) and denying
+# `cat ~/bin/bqro` or `which bqro` (six wasted round-trips in the last 35 days). A plain
+# word-boundary grep cannot tell them apart; both hooks that tried it were wrong.
+#
+# Transparent wrappers (env, nohup, time, sudo, …) are stepped over so the mandated
+# `env -u VIRTUAL_ENV run-tests …` form still reports `run-tests`. Env assignments
+# (`TIMEOUT=900 run-tests …`) likewise.
+#
+# Callers pipe in the bare view (lib/cmd-view cmd_tokens): a runner named inside a string is
+# not invoked either, and this program deliberately does not parse quoting.
+#
+# macOS awk (BWK, not gawk) — no gensub, no length(array) on old builds, keep it plain.
+
+# Transparent wrappers: the real command is further right. `sh|bash|zsh` are here so
+# `sh …/run-tests.sh` reports the script, not the interpreter; `eval` for the same reason as
+# `env`: `eval mysql -e …` runs mysql. `command` and `builtin` are deliberately NOT here:
+# `command -v foo` is an inspection, and treating them as transparent would report `foo` as
+# invoked. The ONE copy of this list: bash-guards reads this line for its runtime-path anchor.
+BEGIN { WRAPPERS = "env|nohup|time|exec|stdbuf|sudo|doas|xargs|eval|sh|bash|zsh|ksh" }
+
+function emit(w) {
+    sub(/^.*\//, "", w)          # /Users/x/bin/run-tests -> run-tests
+    if (w != "") print w
+}
+
+{
+    n = split($0, w, /[ \t]+/)
+    cmdpos = 1                   # start of line is command position
+    skip_arg = 0                 # next word is an argument to a wrapper flag, not the command
+    for (i = 1; i <= n; i++) {
+        t = w[i]
+        if (t == "") continue
+
+        # A pure separator resets us to command position.
+        if (t ~ /^[;&|(){}]+$/) { cmdpos = 1; skip_arg = 0; continue }
+
+        # --- Normalise a token that CARRIES a command start ------------------------------
+        # Each of these was a one-character bypass of every command-position guard, verified
+        # 2026-08-25 as live `allow` on `-e 'DROP TABLE t'` against a credential that could write:
+        #     true&&mysql …      x&&(mysql …      $(mysql …)      x=$(mysql …)
+        #     echo $(ro-mysql -e 'DELETE …')      eval $(command -v mysql) …
+        # Only the fully-spaced spelling fired. Order matters: substitution is handled before
+        # the env-assignment rule, or `x=$(mysql …)` is swallowed whole and emits nothing.
+
+        # 1. Command substitution invokes its body WHEREVER it appears — argument position
+        #    included. Greedy on purpose: with nesting, the innermost start is still a command.
+        if (t ~ /\$\(/)   { sub(/^.*\$\(/, "", t);  cmdpos = 1; skip_arg = 0 }
+        else if (t ~ /`/) { sub(/^[^`]*`/, "", t);  cmdpos = 1; skip_arg = 0 }
+        if (t == "") continue
+
+        # 2. A separator glued between words restarts the command, wherever we are.
+        if (t ~ /[;&|]/) {
+            sub(/^[^;&|]*[;&|]+/, "", t); cmdpos = 1; skip_arg = 0
+            if (t == "") continue
+        }
+
+        # 3. Grouping glued to the front of a command: `(mysql -e …`, `{cat big.md`.
+        #    Restricted to command position — in argument position `{a,b}.txt` is brace
+        #    expansion, and stripping there would invent tokens.
+        if (cmdpos) {
+            while (t ~ /^[(){}]+[^(){}]/) sub(/^[(){}]+/, "", t)
+            if (t == "") continue
+        }
+
+        # 4. Shell keywords, tested only AFTER any glued separator is gone: tested earlier,
+        #    `true;then` never equals "then", is emitted as a command and sets cmdpos=0, which
+        #    hides `mysql` in `if true;then mysql -e 'DROP TABLE t';fi`.
+        if (t == "then" || t == "do" || t == "else" || t == "elif" || t == "fi" || \
+            t == "done" || t == "esac" || t == "in" || t == "!" || t == "{" || t == "}") {
+            cmdpos = 1; skip_arg = 0; continue
+        }
+
+        if (!cmdpos) continue
+        if (skip_arg) { skip_arg = 0; continue }
+
+        # Env assignments prefixing a command: VAR=value cmd. A substitution on the right was
+        # already unwrapped by rule 1, so this only drops genuinely inert assignments.
+        if (t ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue
+
+        if (t ~ ("^(" WRAPPERS ")$")) continue
+
+        # Flags belonging to a wrapper. -u/-C/-S take a separate argument.
+        if (t ~ /^-/) {
+            if (t ~ /^(-u|-C|-S|--unset|--chdir)$/) skip_arg = 1
+            continue
+        }
+
+        emit(t)
+        cmdpos = 0
+    }
+}

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# PostToolUse(Bash): after a `git push` OR `gh pr create`, launch ci-watch in the background to
+# watch the PR's `tests` CI run and auto-repair failures until it passes.
+#
+# Self-gating: ci-watch exits quietly if there's no PR or no run for HEAD, so firing broadly is
+# safe. Skips when CI_WATCH_ACTIVE is set — that means the repair agent itself is pushing, and
+# re-launching would recurse.
+set -uo pipefail
+
+# Recursion guard: don't spawn a watcher for the repair agent's own pushes.
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+hook_lib open
+# Trigger on a publishing push, a new PR, or a label add — CI is often gated on a label
+# (CI_WATCH_LABEL in local/<repo>-ci.env), so labeling is the moment the run actually starts.
+# Matched on the raw payload first, so every other Bash call exits before jq.
+hook_input
+case "$HOOK_INPUT" in *"git push"*|*"gh pr create"*|*"--add-label"*) ;; *) exit 0 ;; esac
+hook_read cmd='.tool_input.command // ""' cwd='.cwd // "."'
+case "$cmd" in
+  *"git push"*|*"gh pr create"*|*"--add-label"*) ;;
+  *) exit 0 ;;
+esac
+# Skip pushes that don't publish commits.
+case "$cmd" in
+  *--dry-run*|*"push --delete"*|*"push -d "*|*--help*) exit 0 ;;
+esac
+
+log="${TMPDIR:-/tmp}/ci-watch-launch.log"
+nohup "${0%/*}/ci-watch" "$cwd" >>"$log" 2>&1 &
+disown 2>/dev/null || true
+exit 0

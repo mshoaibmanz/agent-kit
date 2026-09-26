@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Read-only BigQuery for agents: dry-runs first and refuses any statementType other than
+SELECT (Google's parser is the authority, not local regex), then executes with a hard
+--maximum_bytes_billed cap.
+
+usage: bqro 'SELECT ...' [--project_id=X] [--parameter=...]
+env:   BQ_MAX_BYTES_BILLED (cap in bytes, default 200 GiB)
+       BQRO_PROJECT (jobs project when --project_id is absent; else the overlay's BQRO_PROJECT)
+
+The overlay is $KIT_ENV, else ${CLAUDE_CONFIG_DIR:-~/.claude}/local/kit.env, parsed exactly as
+hooks/lib/kit_env.py parses it (copied here so bqro runs from anywhere on PATH).
+"""
+import json
+import os
+import re
+import shutil
+import sys
+import subprocess
+
+DEFAULT_CAP_BYTES = 200 * 1024**3
+ON_DEMAND_USD_PER_TIB = 6.25
+BLOCKED_FLAGS = (
+    "--destination_table",
+    "--append_table",
+    "--replace",
+    "--use_legacy_sql",
+    "--nouse_legacy_sql",
+    "--maximum_bytes_billed",
+    "--dry_run",
+    "--flagfile",
+    "--bigqueryrc",
+)
+
+
+def die(msg: str) -> None:
+    print(f"bqro: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def kit_env() -> dict[str, str]:
+    """KEY=value pairs from $KIT_ENV, else <config dir>/local/kit.env; empty when there is none."""
+    config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    path = os.environ.get("KIT_ENV") or os.path.join(config, "local", "kit.env")
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if not sep or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def main() -> None:
+    sql: str | None = None
+    passthru: list[str] = []
+    for a in sys.argv[1:]:
+        if a.startswith("-"):
+            if any(a == f or a.startswith(f + "=") for f in BLOCKED_FLAGS):
+                die(f"flag not allowed: {a}")
+            passthru.append(a)
+        elif sql is None:
+            sql = a
+        else:
+            die("exactly one SQL positional arg")
+    if not sql or not sql.strip():
+        die("usage: bqro 'SELECT ...' [--project_id=X]")
+    if sql.lstrip().split(None, 1)[0].lower() not in ("select", "with"):
+        die("SELECT/WITH queries only")
+    if not any(a.startswith("--project_id") for a in passthru):
+        project = os.environ.get("BQRO_PROJECT") or kit_env().get("BQRO_PROJECT")
+        if not project:
+            die(
+                "no jobs project: pass --project_id=<project>, or set BQRO_PROJECT in "
+                "~/.claude/local/kit.env (see kit.env.example)"
+            )
+        passthru.append(f"--project_id={project}")
+
+    bq = shutil.which("bq") or die("bq not found on PATH") or ""
+    base = [bq, "-q", "--format=json", "query", "--nouse_legacy_sql", *passthru]
+    dry = subprocess.run([*base, "--dry_run", sql], capture_output=True, text=True)
+    if dry.returncode != 0:
+        sys.stderr.write(dry.stderr or dry.stdout)
+        sys.exit(dry.returncode or 1)
+    try:
+        stats = json.loads(dry.stdout)["statistics"]["query"]
+        stype = stats["statementType"]
+        scanned = int(stats.get("totalBytesProcessed", 0))
+    except (json.JSONDecodeError, KeyError, TypeError):
+        die(f"could not verify statementType from dry run; refusing to execute. Output was:\n{dry.stdout[:800]}")
+        return
+    if stype != "SELECT":
+        die(f"statementType={stype} rejected; SELECT only")
+
+    cap = int(os.environ.get("BQ_MAX_BYTES_BILLED", DEFAULT_CAP_BYTES))
+    gib = scanned / 1024**3
+    est = scanned / 1024**4 * ON_DEMAND_USD_PER_TIB
+    print(f"bqro: will scan {gib:.2f} GiB (~${est:.2f} on-demand); cap {cap / 1024**3:.0f} GiB", file=sys.stderr)
+    if scanned > cap:
+        die(f"scan exceeds cap ({gib:.1f} GiB > {cap / 1024**3:.0f} GiB); narrow the query "
+            f"(partition filter / column pruning) or raise BQ_MAX_BYTES_BILLED explicitly")
+    os.execv(bq, [*base, f"--maximum_bytes_billed={cap}", sql])
+
+
+main()

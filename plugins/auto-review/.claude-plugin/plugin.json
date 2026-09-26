@@ -1,0 +1,9 @@
+{
+  "name": "auto-review",
+  "description": "Tiered review at Stop, sized by the delta since the LAST completed review. Under 40 lines: a self-check. Under 150: one reviewer agent. Above: a parallel bugs + code-quality audit (with the thermos plugin installed; one deep reviewer without it). Every agent round is followed by a critic that issues typed, evidence-bearing verdicts before anything is fixed. Ships the reviewer, thermo-bugs, thermo-quality, critic, adversary and worker agents and their rubrics.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Shoaib Manzoor"
+  },
+  "license": "MIT"
+}

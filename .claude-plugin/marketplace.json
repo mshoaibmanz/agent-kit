@@ -1,0 +1,67 @@
+{
+  "name": "claude-kit",
+  "owner": {
+    "name": "Shoaib Manzoor"
+  },
+  "metadata": {
+    "description": "A Claude Code setup split into pick-and-choose plugins: guard rails, review, CI, prod-data safety, workflow commands and skills. Read README.md's matrix before installing.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "guard-rails",
+      "source": "./plugins/guard-rails",
+      "description": "Safety rails on Bash. DENIES: uncapped file dumps into context (points at Read/Grep), a re-dump of a file already in context, git commits missing the Claude trailers, --amend on pushed history, a second unpushed commit on a branch. ASKS before: force-push, reset --hard, git clean -f, branch delete, stash drop, worktree remove, two-dot diffs against a base. Nudges on comment-heavy edits. Silent on everything else."
+    },
+    {
+      "name": "prod-data",
+      "source": "./plugins/prod-data",
+      "description": "Read-only production data. DENIES raw MySQL clients by any spelling, MySQL drivers from scripts, a swapped ro-mysql client and Keychain secret reads. Ships ro-mysql (one read-only statement per call over the ~/.ssh/config db-tunnel-* forwards, Keychain credentials, staging/prod labels) and bqro (dry-run, SELECT-only, byte cap) on PATH, the debug skill (RCA method and data-reading traps), and a nudge to load it on prod-data prompts. Company schemas and hosts come from ~/.claude/local/."
+    },
+    {
+      "name": "ci-babysitter",
+      "source": "./plugins/ci-babysitter",
+      "description": "Owns the push-to-green loop. After git push it starts a background CI watcher on the PR (needs gh auth); DENIES a push carrying unreviewed code and ASKS when no test ran this session; BLOCKS ending the session while the branch's CI is red or pending. With TEST_GATE_FILE/TEST_RUNNER in ~/.claude/local/kit.env it also routes a repo's tests through one runner. Per-repo tuning via ~/.claude/local/<repo>-ci.env."
+    },
+    {
+      "name": "auto-review",
+      "source": "./plugins/auto-review",
+      "description": "Tiered review at Stop, sized by the delta since the LAST completed review. Under 40 lines: a self-check. Under 150: one reviewer agent. Above: a parallel bugs + code-quality audit (with the thermos plugin installed; one deep reviewer without it). Every agent round is followed by a critic that issues typed, evidence-bearing verdicts before anything is fixed. Ships the reviewer, thermo-bugs, thermo-quality, critic, adversary and worker agents and their rubrics."
+    },
+    {
+      "name": "session-context",
+      "source": "./plugins/session-context",
+      "description": "Injects per-repo framing at SessionStart: pointers to your ~/.claude/local/<repo>-*.md docs, the repo's code-invariants TL;DR, CONTEXT-MAP navigation, the test-runner line, a prod-data line for repos listed in ~/.claude/local/prod-data-repos, a handoff for the branch, and one-line warnings. Hard-caps its payload. Writes a one-screen session digest at SessionEnd. Ships claude-gc (housekeeping for ~/.claude state and stale worktrees)."
+    },
+    {
+      "name": "python-hygiene",
+      "source": "./plugins/python-hygiene",
+      "description": "Runs ruff on every edited .py file, only in repos that already carry a ruff config (never reformats a repo that has not adopted it). Ships the conventions house-style skill for Python and SQL. No effect on non-Python edits."
+    },
+    {
+      "name": "terminal-signals",
+      "source": "./plugins/terminal-signals",
+      "description": "Cosmetic only: names your VS Code/iTerm terminal tab after the task and flags it busy/idle/needs-attention per session, with macOS completion sounds and banners. The completion chime fires only when the turn is really over, not when another Stop hook blocked. Changes no tool behavior."
+    },
+    {
+      "name": "skills-core",
+      "source": "./plugins/skills-core",
+      "description": "10 passive skills: session-review, grilling, grill-with-docs, domain-modeling, pr-study, prototype, handoff, sentry-fix-issues, unslop, typescript-best-practices. Inert until invoked: installs no hooks."
+    },
+    {
+      "name": "workflow",
+      "source": "./plugins/workflow",
+      "description": "Ticket-to-merge-ready commands: /kickoff (Jira ticket, worktree, one commit, PR, CI and review comments to green; takeover and sync modes), /jira (find/create/transition, driven by per-user prefs in ~/.claude/local/jira-prefs.md) and /address-review. Needs the Atlassian MCP and gh."
+    },
+    {
+      "name": "docs",
+      "source": "./plugins/docs",
+      "description": "The process-doc skill: a self-contained standalone HTML process guide (industrial design system, numbered floor steps, gate chips, config flow, screenshots from a reusable catalog). The screenshot catalog and company config notes live in ~/.claude/local/process-doc/."
+    },
+    {
+      "name": "qa-e2e",
+      "source": "./plugins/qa-e2e",
+      "description": "The qa-e2e skill: an end-to-end QA pass on a feature (backend up and seeded, the app driven on an Android emulator or the web, screenshots, findings by verification level, an ops SOP). Repo paths and seeds come from ~/.claude/local/qa-e2e/."
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+# Secret and internal-data scan for this public repo (gitleaks >= 8.25). Run by scripts/scan.sh over
+# the tree AND the git history, in CI and in the pre-push hook. The generic rules below catch what a
+# company config tends to leak; the company's own names are checked from a denylist that is never
+# committed (LEAK_TERMS, see scripts/scan.sh). Every allowlist entry says why it is safe.
+title = "claude-kit public scan"
+
+[extend]
+# gitleaks' built-in token and key rules (cloud keys, GitHub/Slack/Atlassian tokens, private keys).
+useDefault = true
+
+[[rules]]
+id = "private-ipv4"
+description = "RFC 1918 address: an internal host or network"
+regex = '''\b(?:10\.(?:25[0-5]|2[0-4]\d|1?\d?\d)|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\.(?:25[0-5]|2[0-4]\d|1?\d?\d)\b'''
+  [[rules.allowlists]]
+  description = "ro-mysql and bash-guards test fixtures: made-up ssh-config targets in 10.0.0.0/23"
+  paths = ['''^tests/hooks/(ro-mysql|bash-guards)\.test\.py$''']
+  regexTarget = "match"
+  regexes = ['''^10\.0\.[01]\.\d{1,3}$''']
+
+[[rules]]
+id = "email-address"
+description = "An email address that is not a noreply or documentation address"
+regex = '''\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b'''
+  [[rules.allowlists]]
+  description = "the Claude co-author trailer, GitHub noreply identities and RFC 2606 example domains"
+  regexTarget = "match"
+  regexes = [
+    '''^noreply@anthropic\.com$''',
+    '''@users\.noreply\.github\.com$''',
+    '''@example\.(?:com|org|net)$''',
+  ]
+
+[[rules]]
+id = "atlassian-site"
+description = "A Jira or Confluence cloud site"
+regex = '''(?i)\b[a-z0-9][a-z0-9-]*\.atlassian\.net\b'''
+
+[[rules]]
+id = "uuid"
+description = "A UUID: a cloud id, account id, tenant or record id"
+regex = '''(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'''
+
+[[rules]]
+id = "tracking-or-order-id"
+description = "An id shaped like a waybill, order or shipment number: 2-4 letters, 8-12 digits, optional letter"
+regex = '''\b[A-Z]{2,4}[0-9]{8,12}[A-Z]?\b'''
+  [[rules.allowlists]]
+  description = "prod-data-nudge's comment giving the id shape it matches, with sequential placeholder digits"
+  paths = ['''^plugins/prod-data/hooks/prod-data-nudge$''']
+  regexTarget = "match"
+  regexes = ['''^AB12345678901C$''']
+
+[[rules]]
+id = "google-drive-id"
+description = "A Google Drive/Docs file or folder id, bare or in a URL"
+regex = '''(?:(?:drive|docs)\.google\.com/[^\s"'<>)]*|\b1[A-Za-z0-9_-]{32,43}\b)'''
+entropy = 3.5
+
+[[rules]]
+id = "cloud-project-ref"
+description = "A named cloud project: --project[_id]=<id>, projects/<id>, gcloud's set project (service accounts are emails)"
+regex = '''(?:--project(?:_id)?=|\bprojects/|config set project )([a-z][a-z0-9-]{4,28}[a-z0-9])\b'''
+secretGroup = 1
+  [[rules.allowlists]]
+  description = "the made-up jobs projects tests/run-tests.sh passes to bqro"
+  paths = ['''^tests/run-tests\.sh$''']
+  regexTarget = "secret"
+  regexes = ['''^(?:kit-jobs|env-jobs|flag-jobs)$''']
+
+[[rules]]
+id = "internal-hostname"
+description = "A host on an internal-only or company-vanity TLD"
+regex = '''(?i)\b(?:[a-z0-9-]+\.)+(?:internal|intranet|corp|lan|team)\b'''

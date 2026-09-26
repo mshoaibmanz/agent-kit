@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Stop hook: tiered review gate. Sizing, tiers, their instructions and the state behind them live in
+# lib/review-state, shared with pre-push-gate so a push deny carries the same instruction a Stop
+# would. This file owns the Stop plumbing:
+#   critic owed        -> block once: a reviewer/thermo-bugs round returned and no critic ran
+#   end of our chain   -> clear the edit marker unless an agent round is still out
+#   code edited        -> rv_decide on the work since the last completed review; block with its text
+# Rounds are scoped: round 1 reviews this session's work since its first edit, rounds 2+ only the
+# tree diff since the last completed review. Loop-guarded via stop_hook_active and a chain marker,
+# so another hook's block never ends (or starts) a review chain. Skipped in the ci-watch agent.
+set -uo pipefail
+
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+hook_lib open review-state
+hook_read session_id='.session_id // "unknown"' stop_hook_active='.stop_hook_active // false' \
+  cwd='.cwd // ""'
+[ -n "$cwd" ] || cwd="$PWD"
+
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+
+# This hook necessarily fires after the model has written its completion summary, which the
+# review pass then buries. Measured 2026-09-05 over 54 blocking sessions: 94% had written a full
+# summary before the block, and a median 15,820 chars and 100 tool calls landed on top of it.
+CLOSING="FINISH WITH THE SUMMARY, NOT THE REVIEW: your final message is the completion summary (what changed, how to verify, what is open) with the review folded in; restate it, the earlier copy is off-screen. Size it to the change."
+
+root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+
+# Checked first and in both branches: a foreground round returns inside the chain, a background
+# one in a later turn. Settled before blocking, so it fires once per round.
+if rv_critic_owed "$session_id"; then
+  rv_critic_settle "$session_id"
+  stop_block "$session_id" "The ${RV_OWED:-review} pass returned and no critic has run. $RV_CRITIC $CLOSING"
+fi
+
+if [ "$stop_hook_active" = "true" ]; then
+  # The stop that ends a chain THIS hook started. A tier-0 self-check and a foreground agent
+  # round are done by now, including their fixes, so the marker goes; an agent round still
+  # running in the background keeps it until review-agent-mark sees it return. A chain some
+  # other hook started (unfinished-work) is not a review, so it clears nothing.
+  if rv_chain_close "$session_id" && [ -n "$root" ]; then
+    rv_pending "$session_id" "$root" || rv_clear_edits "$root"
+  fi
+  exit 0
+fi
+
+rv_sweep
+{ [ -n "$root" ] && rv_edited "$root"; } || exit 0
+
+# The marker stays until a review completes: clearing it here, before sizing, let a Stop that
+# ran no review (unchanged tree, under the floor) wave the next push through. An unchanged tree
+# costs one snapshot and a silent exit.
+rv_snapshot "$root" || exit 0
+rv_decide "$session_id"
+[ "$RV_KIND" = none ] && exit 0
+rv_chain_open "$session_id"
+stop_block "$session_id" "$RV_TEXT $CLOSING"

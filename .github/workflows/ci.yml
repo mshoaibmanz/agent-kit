@@ -1,0 +1,45 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # The hooks target macOS (bash 3.2, afplay, the Keychain); test them there.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ro-mysql needs 3.10+; the runner's /usr/bin/python3 may be older.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Hook suites, plugin manifests and copies
+        run: bash tests/run-tests.sh
+
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the scan reads every commit
+      - name: Install gitleaks (pinned, checksum-verified)
+        env:
+          V: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        # Outside the checkout: the scan reads untracked files too.
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
+          echo "${SHA256}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+          echo "GITLEAKS=$PWD/gitleaks" >> "$GITHUB_ENV"
+      - name: Leak scan (tree, history, org denylist, identities, images)
+        env:
+          # Newline-separated EREs naming the org's hosts, projects and repos. A hit prints only the
+          # term's line number, so the list never reaches these public logs.
+          LEAK_TERMS: ${{ secrets.LEAK_TERMS }}
+          # Fork PRs get no secrets; a push without the list is a failure, not a pass.
+          REQUIRE_LEAK_TERMS: ${{ github.event_name == 'push' && '1' || '0' }}
+        run: bash scripts/scan.sh

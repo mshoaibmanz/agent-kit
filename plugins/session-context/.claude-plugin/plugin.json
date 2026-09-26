@@ -1,0 +1,9 @@
+{
+  "name": "session-context",
+  "description": "Injects per-repo framing at SessionStart: pointers to your ~/.claude/local/<repo>-*.md docs, the repo's code-invariants TL;DR, CONTEXT-MAP navigation, the test-runner line, a prod-data line for repos listed in ~/.claude/local/prod-data-repos, a handoff for the branch, and one-line warnings. Hard-caps its payload. Writes a one-screen session digest at SessionEnd. Ships claude-gc (housekeeping for ~/.claude state and stale worktrees).",
+  "version": "1.0.0",
+  "author": {
+    "name": "Shoaib Manzoor"
+  },
+  "license": "MIT"
+}

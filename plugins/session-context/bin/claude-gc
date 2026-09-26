@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# claude-gc — idempotent housekeeping for ~/.claude state.
+# Run weekly via a launchd agent or by hand. Safe to re-run.
+# Complements Claude Code's own cleanupPeriodDays transcript cleanup.
+#   claude-gc                    sweep state, prune worktree METADATA, write the prunable-worktree
+#                                report. Never removes a worktree.
+#   claude-gc --prune-worktrees  remove exactly the worktrees in that report, nothing else.
+# The repos come from the overlay's CODE_DIRS (hooks/lib/hook-io kit_env); without it every
+# repo-based step is skipped, including the dead-worktree transcript prune, which would otherwise
+# read "no live worktree anywhere" and delete every worktree's transcripts.
+set -uo pipefail
+CLAUDE_DIR="$HOME/.claude"
+REPORT="$CLAUDE_DIR/state/prunable-worktrees.txt"
+# launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin, which has no gh.
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+log() { printf '%s claude-gc: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
+CODE_DIRS=''
+# hooks/lib sits beside bin/ in both layouts (~/.claude and a plugin install).
+{ . "${0%/*}/../hooks/lib/hook-io" || . "$CLAUDE_DIR/hooks/lib/hook-io"; } 2>/dev/null && kit_env
+
+# First file under a worktree matching a find predicate, skipping dependency and cache trees
+# that tooling touches and that are slow to walk. Prints one path, or nothing.
+recent_under() { # $1 dir, then the predicate (e.g. -mmin -10080, or -newer FILE)
+  local d="$1"; shift
+  find "$d" \( -name node_modules -o -name .venv -o -name venv -o -name __pycache__ \
+    -o -name .mypy_cache -o -name .pytest_cache -o -name .ruff_cache \) -prune \
+    -o "$@" -print -quit 2>/dev/null
+}
+
+# repos [any]: the repos under CODE_DIRS. Main repos only (a .git FILE is a linked worktree whose
+# repo is already listed); `any` adds those linked worktrees.
+repos() {
+  local d g
+  for d in $CODE_DIRS; do
+    case $d in '~/'*) d="$HOME/${d#'~/'}" ;; esac
+    for g in "$d"/*/.git; do
+      if [ -d "$g" ] || { [ "${1:-}" = any ] && [ -e "$g" ]; }; then printf '%s\n' "${g%/.git}"; fi
+    done
+  done
+}
+
+case "${1:-}" in
+  "") ;;
+  --prune-worktrees)
+    [ -f "$REPORT" ] || { log "no report at $REPORT; run claude-gc first"; exit 1; }
+    while IFS=$'\t' read -r wt br reason size; do
+      case "$wt" in ''|'#'*) continue ;; esac
+      [ -d "$wt" ] || { log "skip (already gone): $wt"; continue; }
+      # The report was reviewed as written; a worktree used since then is no longer that entry.
+      [ -z "$(recent_under "$wt" -newer "$REPORT")" ] || { log "skip (touched since the report): $wt"; continue; }
+      common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || { log "skip (not a git worktree): $wt"; continue; }
+      # No --force: git refuses a dirty or locked worktree, which is the last safety net.
+      if out=$(git -C "$(dirname "$common")" worktree remove "$wt" 2>&1); then
+        log "removed worktree: $wt ($br; $reason; $size)"
+      else
+        log "FAILED to remove $wt: $(printf '%s' "$out" | tr '\n' ' ')"
+      fi
+    done < "$REPORT"
+    exit 0
+    ;;
+  *) echo "usage: claude-gc [--prune-worktrees]" >&2; exit 2 ;;
+esac
+
+# Dead-worktree transcript dirs: a project dir whose worktree no longer exists AND untouched
+# for >7 days (guard avoids nuking a just-closed worktree's logs). Liveness is derived from
+# `git worktree list` across ALL repos (any layout — .claude/worktrees/, sibling .worktrees/,
+# etc.), then FORWARD-encoded to the project-dir name (Claude Code maps '/' and '.' → '-').
+# Never reverse-decode the encoded name (lossy) or hardcode a repo — both delete live
+# transcripts. Runs BEFORE the worktree metadata prune below, so a worktree whose dir vanished
+# still counts as live for one more week and its transcripts get that grace.
+live="|"
+while IFS= read -r repo; do
+  [ -n "$repo" ] || continue
+  for wt in $(git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}'); do
+    live="${live}$(printf '%s' "$wt" | sed 's#[/.]#-#g')|"
+  done
+done <<EOF
+$(repos any)
+EOF
+if [ "$live" = "|" ]; then
+  log "no repos under CODE_DIRS (local/kit.env); skipped the dead-worktree transcript prune"
+else
+  for d in "$CLAUDE_DIR"/projects/*worktrees-*; do
+    [ -d "$d" ] || continue
+    case "$live" in *"|${d##*/}|"*) continue ;; esac   # matches a live worktree → keep
+    [ -z "$(find "$d" -mtime -7 -print -quit 2>/dev/null)" ] && rm -rf "$d" && log "pruned dead-worktree transcripts: ${d##*worktrees-}"
+  done
+fi
+
+find "$CLAUDE_DIR"/session-env -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null && log "pruned empty session-env stubs"
+
+find "$CLAUDE_DIR"/file-history -type f -mtime +30 -delete 2>/dev/null
+find "$CLAUDE_DIR"/file-history -type d -empty -delete 2>/dev/null
+log "pruned file-history >30d"
+
+# A job dir is an orphan only while no job is pinned.
+if [ -f "$CLAUDE_DIR/jobs/pins.json" ] && [ "$(tr -d ' \n' < "$CLAUDE_DIR/jobs/pins.json")" = "[]" ]; then
+  find "$CLAUDE_DIR"/jobs -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null && log "pruned orphaned jobs (no pins)"
+fi
+
+find "$CLAUDE_DIR" -name .DS_Store -delete 2>/dev/null
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'ci-watch-*' -mtime +7 -delete 2>/dev/null
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cbm-code-discovery-gate-*' -delete 2>/dev/null
+
+# unfinished-work ignores a ci-watch status older than 12h, so a 14-day-old status or
+# branch -> PR pointer is read by nothing.
+n=$(find "$CLAUDE_DIR/tmp" -maxdepth 1 \( -name 'ci-watch-*.status' -o -name 'ci-branch-*.pr' \) -mtime +14 -print -delete 2>/dev/null | wc -l | tr -d ' ')
+log "pruned $n ci-watch status/pointer files >14d"
+
+# Worktree metadata whose directory is gone. Metadata only; never touches a checkout.
+while IFS= read -r repo; do
+  git -C "$repo" worktree prune 2>/dev/null || log "worktree prune failed: $repo"
+done <<EOF
+$(repos)
+EOF
+log "pruned stale worktree metadata"
+
+# Prunable-worktree REPORT (removal is the separate --prune-worktrees run). Prunable means:
+# nothing under it modified for 7 days, no uncommitted or untracked (non-ignored) changes, and
+# nothing to lose upstream: its branch's PR is MERGED/CLOSED, or the branch has no commits ahead
+# of its upstream, or (detached HEAD, the merge-worktree shape) HEAD is on a remote branch.
+# Cheap checks first: gh is a network call.
+prunable_reason() { # $1 repo, $2 worktree, $3 branch (empty when detached) -> echoes a reason
+  local repo="$1" wt="$2" br="$3" st state ahead
+  [ -z "$(recent_under "$wt" -mmin -10080)" ] || return 1
+  st=$(git -C "$wt" status --porcelain 2>/dev/null) || return 1
+  [ -z "$st" ] || return 1
+  if [ -z "$br" ]; then
+    [ -n "$(git -C "$wt" branch -r --contains HEAD 2>/dev/null | head -1)" ] \
+      && { echo "detached, HEAD on a remote branch"; return 0; }
+    return 1
+  fi
+  state=$(cd "$repo" && gh pr view "$br" --json state -q .state 2>/dev/null)
+  case "$state" in MERGED|CLOSED) echo "PR $state"; return 0 ;; esac
+  ahead=$(git -C "$wt" rev-list --count '@{u}..HEAD' 2>/dev/null) && [ "$ahead" = 0 ] \
+    && { echo "no commits ahead of upstream"; return 0; }
+  return 1
+}
+
+mkdir -p "$(dirname "$REPORT")"
+tmp="$REPORT.tmp"
+{
+  printf '# claude-gc %s: worktrees safe to remove. Columns (tab-separated): path, branch, reason, size.\n' "$(date '+%Y-%m-%d %H:%M')"
+  printf '# Review, then `claude-gc --prune-worktrees` removes exactly these (git worktree remove, never --force).\n'
+} > "$tmp"
+count=0
+while IFS= read -r repo; do
+  [ -n "$repo" ] || continue
+  wt=""; br=""; skip=0; first=1
+  # Porcelain blocks end with a blank line; the trailing echo guarantees the last one gets it
+  # (process substitution, not a heredoc of $(...), which strips trailing newlines). The first
+  # block is the main worktree, which is never a candidate.
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }"; br=""; skip=0 ;;
+      "branch refs/heads/"*) br="${line#branch refs/heads/}" ;;
+      bare|locked*|prunable*) skip=1 ;;
+      "")
+        if [ -n "$wt" ] && [ "$first" = 0 ] && [ "$skip" = 0 ] && [ -d "$wt" ] \
+           && reason=$(prunable_reason "$repo" "$wt" "$br" </dev/null); then
+          size=$(du -sh "$wt" 2>/dev/null | awk '{print $1}')
+          printf '%s\t%s\t%s\t%s\n' "$wt" "${br:-(detached)}" "$reason" "${size:-?}" >> "$tmp"
+          count=$((count + 1))
+        fi
+        [ -n "$wt" ] && first=0
+        wt="" ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain 2>/dev/null; echo)
+done <<EOF
+$(repos)
+EOF
+mv "$tmp" "$REPORT"
+log "prunable worktrees: $count (report: $REPORT; remove with claude-gc --prune-worktrees)"
+log "done"

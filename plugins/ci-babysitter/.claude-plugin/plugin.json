@@ -1,0 +1,9 @@
+{
+  "name": "ci-babysitter",
+  "description": "Owns the push-to-green loop. After git push it starts a background CI watcher on the PR (needs gh auth); DENIES a push carrying unreviewed code and ASKS when no test ran this session; BLOCKS ending the session while the branch's CI is red or pending. With TEST_GATE_FILE/TEST_RUNNER in ~/.claude/local/kit.env it also routes a repo's tests through one runner. Per-repo tuning via ~/.claude/local/<repo>-ci.env.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Shoaib Manzoor"
+  },
+  "license": "MIT"
+}
