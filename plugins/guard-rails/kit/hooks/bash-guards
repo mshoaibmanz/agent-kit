@@ -1,0 +1,1729 @@
+#!/usr/bin/env bash
+# PreToolUse(Bash) guard rail. One process, several checks — each converts a CLAUDE.md
+# prose rule into something that fires at the violation and reaches subagents too.
+# Guards are NAMED, not numbered: the numbering collapsed once insertion order stopped
+# matching it (the index read 1,2,3,3b,4 while the body ran 1,2,1b,1c,2b,3,3b,4,5). In body
+# order:
+#   raw-client        any mention of a raw mysql/mariadb client        -> deny
+#   prod-write        a DML/DDL verb handed to ro-mysql / bqro         -> deny
+#   romysql-env       swapped ro-mysql client, Keychain password read    -> deny
+#   bq-project        bqro without --project_id                        -> deny
+#   py-driver         a MySQL driver imported from a script            -> deny
+#   commit-trailers   git commit missing the required trailers         -> deny
+#   hooks-bypass      --no-verify, commit -n, core.hooksPath/GIT_CONFIG_* -> deny
+#                     overrides, AGENT_GIT_HOOKS=, unset agent markers
+#   destructive-git   force-push, reset --hard, branch delete, …       -> ask
+#   two-dot-diff      <base>..HEAD instead of <base>...HEAD            -> ask
+#   inplace-edit      sed -i / perl -i rewriting a file                -> deny
+#   zsh-modifier      unbraced $name:<letter>, eaten as a zsh modifier  -> deny
+#   context-dumps     an uncapped file read into context               -> deny
+# macOS bash is 3.2 — no mapfile/readarray/declare -A.
+# Fails CLOSED: without jq, hook-io, cmd-view or cmd-tokens every command-position guard reads
+# an empty token list and allows (verified 2026-08-25: `mysql -e 'DROP TABLE t'` returned allow,
+# exit 0, no stderr, with cmd-tokens renamed away), so the hook refuses every Bash call instead.
+set -uo pipefail
+
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+
+. "${0%/*}/lib/hook-io" 2>/dev/null || {
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"bash-guards: hooks/lib/hook-io is missing, so no guard can inspect this command and the hook refuses all Bash calls. Restore it: git -C ~/.agents checkout -- hooks/lib"}}'
+  exit 0
+}
+hook_lib closed cmd-view cmd-repo
+hook_read cmd='.tool_input.command // ""' cwd='.cwd // ""'
+[ -n "$cmd" ] || exit 0
+
+# What is INVOKED, not merely named: CMD_BARE masks quoted spans and drops comments, and
+# CMD_TOKENS holds the words in COMMAND POSITION. A word-boundary grep cannot tell
+# `bqro 'SELECT …'` from `cat ~/bin/bqro`, and over 35 days it got that wrong on 5 of 6 bqro
+# denials. Every check below keys off these two.
+cmd_view "$cmd"
+bare=$CMD_BARE
+cmd_tokens || \
+  deny "bash-guards: the command tokenizer (hooks/lib/cmd-tokens) failed on this command, so no command-position guard can run. Refusing rather than allowing an unchecked call. Re-run to confirm, then check the awk script."
+tokens=$CMD_TOKENS
+
+# --- INVERTED SCAN: default DENY on any mention, then subtract inspection ---------------
+# A security audit on 2026-08-25 found 38 live bypasses of the command-position check, from
+# `'mysql' -e 'DROP TABLE t'` (one apostrophe) to `echo don't; mysql …` (an ordinary English
+# contraction desyncs the quote-stripping sed). Five rounds of hole-patching had each left
+# ~38 open, because a whitespace tokenizer over a sed-mangled string DEFAULTS TO ALLOW when
+# it cannot parse — the wrong default for the only thing standing in front of a superuser
+# credential on a writable primary.
+#
+# So for the raw clients specifically, invert it: strip backslashes and quote CHARACTERS
+# (keeping their content, unlike $bare), delete the spans that are genuinely inspection, and
+# deny if a client name survives anywhere. Failure direction becomes a wasted round-trip
+# instead of a production write. The command-position loop below still runs, because it names
+# the exact client in its message; this scan is the backstop that cannot be parsed around.
+#
+# One exception keeps an inspection span whole: stripping turned a pipe inside a quoted pattern
+# (`grep -n "A\|MYSQL_RO_CLIENT\|B" f`, `rg -n 'A|MYSQL_RO_CLIENT' f`) into a separator that ended
+# the span. _esc_pipes makes that `\|` or `|` a `,` only where no shell can read it again: one line,
+# no substitution or heredoc, every segment run by a read-only tool, the pipe inside quotes and not
+# itself escaped. A nested shell undoes one escape level (`bash -c 'bash -c cat\ x\|mysql'` pipes
+# into mysql), so it keeps the plain scan.
+# One awk pass converts and, on its own quote-masked copy, checks each segment's first word: the
+# bash loop it replaced split with ${b//[;&|()]/…}, which bash 3.2 runs in quadratic time (a
+# 23KB command took 9s on one such expansion). It exits 1, leaving the scan plain, when a segment
+# is not a read-only tool.
+_ESC_PIPE_AWK='{
+  n = length($0); out = ""; bare = ""; q = ""
+  for (i = 1; i <= n; i++) {
+    c = substr($0, i, 1); d = substr($0, i + 1, 1)
+    if (q == "") {
+      if (c == "\\") { out = out c d; bare = bare "x"; i++; continue }
+      if ((c == ">" && d == "&") || (c == "&" && d == ">")) { out = out c d; bare = bare ">"; i++; continue }
+      if (c == "\"" || c == "\047") { q = c; bare = bare "Q" } else bare = bare c
+    } else if (c == q) {
+      q = ""
+    } else if (c == "\\" && d == "|" && substr($0, i - 1, 1) != "\\") {
+      out = out ","; i++; continue
+    } else if (c == "\\" && q == "\"") {
+      out = out c d; i++; continue
+    } else if (c == "|") {
+      c = ","
+    }
+    out = out c
+  }
+  if (q != "") exit 1
+  ns = split(bare, S, /[;&|()]/)
+  for (s = 1; s <= ns; s++) {
+    split(S[s], W, /[ \t]+/)
+    f = (W[1] == "") ? W[2] : W[1]
+    if (f == "") continue
+    sub(/.*\//, "", f)
+    if (f !~ /^(grep|egrep|fgrep|rg|head|tail|wc|sort|uniq|cut|cat|ls|tr|nl|column)$/) exit 1
+  }
+  print out
+}'
+_esc_pipes() {
+  case $cmd in *$'\n'*|*'`'*|*'$('*|*"\$'"*|*'<<'*|*'<('*|*'>('*) return 0 ;; esac
+  _src=$(printf '%s' "$cmd" | awk "$_ESC_PIPE_AWK") || _src=$cmd
+}
+_src=$cmd
+case $cmd in *'|'*) case $cmd in *\"*|*\'*) _esc_pipes ;; esac ;; esac
+# A backslash-newline is a line continuation, so `my\<newline>sql` runs the client: join those
+# lines first (an odd run of trailing backslashes; `a\\` ends its line). In awk: bash 3.2 runs
+# ${_src//\\$'\n'/} in time that grows with length times matches.
+case $_src in
+  *\\$'\n'*)
+    _flat=$(printf '%s' "$_src" \
+      | awk '{ if (match($0, /\\+$/) && RLENGTH % 2) printf "%s", substr($0, 1, length($0) - 1); else print }' \
+      | tr -d "\\\\\"'") ;;
+  *) _flat=$(printf '%s' "$_src" | tr -d "\\\\\"'") ;;
+esac
+# Inspection spans: a tool, its options, and the ONE argument it reads or lists. rg's --pre and
+# --hostname-bin name a command rg runs, and the span took it for that argument (`rg --pre
+# /opt/homebrew/bin/mysql x f` ran the client), so each becomes a separator first and its value stays
+# in the scan. vim (-c, +cmd) and open (a binary opens in Terminal) run what they are handed, so they
+# are not inspection. Neither is a copy: cp and mv are not spans, and a cat/head/tail whose output
+# goes to a file loses its span (`cp /opt/homebrew/bin/mysql ./m && ./m -e …` ran the client under
+# another name; ln, install and dd were never spans).
+_STRIP=(-E
+  -e 's/(^|[[:space:]])--(pre|hostname-bin)(=|[[:space:]]+)/ ; /g'
+  -e 's/[A-Za-z0-9_.\/-]*(mysql|mariadb)(-[a-z]+)?:[A-Za-z0-9._-]+//g'
+  -e 's/--grep=[^[:space:]]*//g')
+_SPANS=(
+  -e 's/(^|[[:space:]])(cat|head|tail)(([[:space:]]+-[A-Za-z-]+)*[[:space:]]+[^[:space:];&|()]+[[:space:]]*(1|&)?>)/\1:\3/g'
+  -e 's/(command[[:space:]]+-v|which|type[[:space:]]+-p)[[:space:]]+[A-Za-z0-9_./-]+//g'
+  -e 's/(^|[[:space:]])(ls|ll|stat|file|less|more|realpath|readlink|basename|dirname|code|nano|rm|touch|chmod|test)([[:space:]]+-[A-Za-z-]+)*[[:space:]]+[^[:space:];&|()]+//g'
+  -e 's/(^|[[:space:]])(cat|grep|rg|head|tail|echo|printf|brew|port|apt|yum|dnf|pacman)([[:space:]]+-[A-Za-z-]+)*[[:space:]]+[^[:space:];&|()]+//g')
+# A shell that runs text it is handed makes every span a possible command: `echo 'mysql -e "DROP
+# TABLE t"' | sh` ran the client once the echo span hid its name. Piped into a shell (through env,
+# sudo, nohup, exec or command), a shell -c, eval, or a shell or source reading <(…): scan it whole.
+_SH='([^[:space:];&|()]*/)?(sh|bash|zsh|ksh|dash)'
+_SHFEED="\\|[[:space:]]*((env|sudo|nohup|exec|command)([[:space:]]+-[^[:space:]]+)*[[:space:]]+)*$_SH([[:space:]]|\$)|(^|[^A-Za-z0-9_.-])$_SH[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*c|(^|[^A-Za-z0-9_.-])eval([[:space:]]|\$)|(^|[^A-Za-z0-9_.-])(source|\\.|$_SH)[[:space:]]+<\\("
+if [[ $_flat =~ $_SHFEED ]]; then
+  _scan=$(printf '%s' "$_flat" | sed "${_STRIP[@]}")
+else
+  _scan=$(printf '%s' "$_flat" | sed "${_STRIP[@]}" "${_SPANS[@]}")
+fi
+
+# ---- prod-write ----------------------------------------------------------------------------
+# Enforced by the wrappers on the REAL SQL, not here: ro-mysql rejects any write token in
+# statement position (one statement per call, no OUTFILE) and bqro dry-runs the query and
+# refuses any statementType other than SELECT. A text check over the command's quoted spans
+# false-fires on a SELECT whose VALUES are "UPDATE"/"DELETE" (binlog event types).
+
+# ---- romysql-env: checked UNCONDITIONALLY -----------------------------
+# Keyed off literal text, outside any `uses_romysql` gate: inside one, every parsing bypass
+# disarmed them too. ro-mysql itself refuses a non-local MYSQL_RO_HOST, a port no db-tunnel-*
+# LocalForward serves, and a --login-path whose staging/prod kind differs from the tunnel's
+# (hooks/tests/ro-mysql.test.py). This hook's text copies of those checks false-denied a script
+# taking `--login-path <db>-staging`, and read two ro-mysql lines as one "doubled" host.
+# Where a route to DB reads is named, it is this one.
+_ROUTE="Reads go through \`ro-mysql --tunnel=<name> -D <db> -e 'SELECT …'\` (tunnels: \`ro-mysql --tunnels\`)."
+
+# Older ro-mysql copies (a kit install not yet synced) ran $MYSQL_RO_CLIENT *after* the SQL
+# validation, so the swap spent the gate and ran anything with a credential in hand; this one runs
+# a fixed client and ignores it. Any mention outside an inspection span denies: `=` alone missed
+# `+=`, `read`, `printf -v` and `declare`.
+case $_scan in *MYSQL_RO_CLIENT*)
+  deny "Denied: MYSQL_RO_CLIENT tries to swap the binary ro-mysql runs AFTER its read-only checks, credential in hand.
+Run ro-mysql unmodified. $_ROUTE" ;;
+esac
+
+# ro-mysql keeps DB passwords in the Keychain; `security` prints them into the transcript. ro-mysql
+# calls it itself, never through this tool, so no Bash call needs -i/-p (they read the subcommand
+# from stdin) or a secret subcommand.
+# Only a word in COMMAND POSITION counts. Matched anywhere in the text, the name denied `find -path
+# ./security -prune`, `mkdir -p src/{security,x}` and a PR titled 'Security [P1] fix'. _KC_AWK is a
+# shell lexer: quotes, escapes, $'…', $(…), `…`, <(…), heredocs and redirections are read as a shell
+# reads them; keywords, assignments and wrappers (env, sudo, xargs, timeout, command, …) are stepped
+# over; and what bash -c, eval, ssh, find -exec, su -c, watch, an interpreter one-liner or a shell
+# reading stdin runs is judged in turn. The command word is security through any path, case (the
+# disk is case-insensitive), glob, brace, $(…) naming it, zsh =name, or $V after V=<one of those>.
+# Its next words decide: -h/-l/-q/-v and redirections are stepped over, then -i/-p, a word an
+# expansion, glob or brace could turn into one (`$X`, `-i{,}`, `-[i]`), or a secret subcommand
+# denies. It prints "H <word>" for a denying word, "R" when security runs with a plain subcommand
+# (then a secret subcommand anywhere denies: `xargs` or a pipe can hand it over), else nothing.
+# Its work is linear and bounded: a command over 64KB, a glob word over 256 characters, or nesting
+# past 16 levels is refused rather than timed out, since a hook timeout fails open.
+# LIMIT: a text scan cannot follow a name built from expansions (`s$x`, `${S}y`, `for x in …`,
+# `set --`) or a script written to a file first; the settings.json deny rules and ro-mysql's own
+# guards are the backstop.
+_KC_AWK='
+function hit(w) { print "H " w; exit }
+
+# The same lexer can report actual amend commands, excluding printed/quoted examples.
+function amend(i, e, depth,   j, k, n, op, has, uncertain, A) {
+  if (WL[i] == "cd") {
+    if (depth == 0 && i + 2 == e && !WD[i + 1]) print "T\t" WV[i + 1]
+    else print "T\t$UNKNOWN"
+    return
+  }
+  if (WL[i] != "git") return
+  n = 0; uncertain = depth > 0
+  for (j = i + 1; j < e; j++) {
+    if (WT[j] != "w") { j++; continue }
+    op = WV[j]
+    if (op == "-C") { A[++n] = ++j; continue }
+    if (op == "-c" || op == "--config-env") { j++; continue }
+    if (op ~ /^(-c|--config-env=)/) continue
+    if (op ~ /^-C./) { uncertain = 1; continue }
+    if (op ~ /^--(git-dir|work-tree)(=|$)/) { uncertain = 1; if (op !~ /=/) j++; continue }
+    if (op ~ /^-/) continue
+    break
+  }
+  if (WV[j] != "commit") return
+  for (k = j + 1; k < e; k++) if (WV[k] == "--amend") has = 1
+  if (!has) return
+  print "B"
+  if (uncertain) print "U"
+  for (k = 1; k <= n; k++) {
+    j = A[k]
+    if (WD[j] || WV[j] ~ /[\n\t]/) print "U"
+    else print "G\t" WV[j]
+  }
+  print "A"
+}
+
+# base(w): the lower-case name w runs as, without its path or a zsh =name prefix.
+function base(w) { w = tolower(w); if (match(w, /\/[^\/]*$/)) w = substr(w, RSTART + 1); sub(/^=/, "", w); return w }
+# Text sits one character per C[] slot: BWK awk substr() measures its whole string on every call, so
+# scanning with it is quadratic (1MB took 17s). Words are pieces joined pairwise (take), not a copy
+# per piece.
+function add(x) { PB[++PN] = x }
+function take(b,   n, s, k) {
+  n = PN - b
+  for (s = 1; s < n; s *= 2)
+    for (k = b + 1; k + s <= PN; k += 2 * s) PB[k] = PB[k] PB[k + s]
+  PN = b
+  return n > 0 ? PB[b + 1] : ""
+}
+function addseg(a, b,   t, m) {
+  for (t = ""; a < b; a++) { t = t C[a]; if (++m == 64) { add(t); t = ""; m = 0 } }
+  add(t)
+}
+function seg(a, b,   s) { s = PN; addseg(a, b); return take(s) }
+# gm(p, s): glob p matches all of s. Iterative, backtracking only to the last `*`, so linear in
+# length(p): the recursive matcher it replaced took ~C(8+k, k) steps for k stars against "security"
+# (16 stars 1.7s, 22 stars 15s).
+function gm(p, s,   np, ns, i, j, si, sj, k) {
+  np = length(p); ns = length(s); i = 1; j = 1; si = 0
+  while (j <= ns) {
+    if (i <= np && substr(p, i, 1) == "*") {
+      while (i <= np && substr(p, i, 1) == "*") i++
+      si = i; sj = j
+    } else if (i <= np && (k = one(p, i, substr(s, j, 1)))) {
+      i += k; j++
+    } else if (si) {
+      i = si; j = ++sj
+    } else return 0
+  }
+  while (i <= np && substr(p, i, 1) == "*") i++
+  return i > np
+}
+# one(p, i, c): the length of the glob token at p[i] when it matches character c, else 0.
+function one(p, i, c,   q, n, j, neg, ok, first, e, lo, hi) {
+  q = substr(p, i, 1)
+  if (q == "?") return 1
+  if (q != "[") return q == c
+  n = length(p); j = i + 1; neg = 0; ok = 0; first = 1
+  if (substr(p, j, 1) == "!" || substr(p, j, 1) == "^") { neg = 1; j++ }
+  while (j <= n && (first || substr(p, j, 1) != "]")) {
+    first = 0
+    if (substr(p, j, 2) == "[:" && (e = index(substr(p, j + 2), ":]")) > 0) {
+      if (c ~ /[a-z0-9]/) ok = 1
+      j += e + 3
+    } else if (substr(p, j + 1, 1) == "-" && j + 2 <= n && substr(p, j + 2, 1) != "]") {
+      lo = substr(p, j, 1); hi = substr(p, j + 2, 1)
+      if (c >= lo && c <= hi) ok = 1
+      j += 3
+    } else {
+      if (c == substr(p, j, 1)) ok = 1
+      j++
+    }
+  }
+  if (j > n) return c == "["
+  return ok != neg ? j - i + 1 : 0
+}
+# spell(w, d, b): 1 when w (base b, if known) runs security, as a glob only when d (unquoted); 3 when
+# it is a glob too long to be a real name; else 0.
+function spell(w, d, b) {
+  if (b == "") b = base(w)
+  if (b == "security") return 1
+  if (!d || b !~ /[*?[]/ || b !~ /[a-z]/) return 0
+  if (length(b) > 256 || gsub(/[*?[]/, "&", b) > 64) return 3
+  return gm(b, "security")
+}
+function bparts(w,   n, i, A) {
+  n = split(w, A, /[{},]/)
+  for (i = 1; i <= n; i++) if (A[i] != "" && spell(A[i], 1)) return 1
+  return 0
+}
+# bexp(w): the brace expansion of w in BX[1..NBX], at most 64 words.
+function bexp(w) { NBX = 0; bx1(w) }
+function bx1(w,   n, i, c, d, o, cm, body, pre, post, j, s) {
+  if (NBX >= 64) return
+  n = length(w); d = 0
+  for (i = 1; i <= n; i++) {
+    c = substr(w, i, 1)
+    if (c == "{") { if (d++ == 0) { o = i; cm = 0 } }
+    else if (c == "}" && d) { if (--d == 0 && cm) break }
+    else if (c == "," && d == 1) cm = 1
+  }
+  if (i > n) { BX[++NBX] = w; return }
+  pre = substr(w, 1, o - 1); post = substr(w, i + 1); body = substr(w, o + 1, i - o - 1)
+  n = length(body); d = 0; s = 1
+  for (j = 1; j <= n + 1; j++) {
+    c = substr(body, j, 1)
+    if (c == "{") d++
+    else if (c == "}") d--
+    else if (j > n || (c == "," && d == 0)) { bx1(pre substr(body, s, j - s) post); s = j + 1 }
+  }
+}
+# var(w): the name a $V or ${V} word expands, else w itself (an alias or zsh hash name).
+function var(w) { if (w ~ /^\$\{?[~=^]*[A-Za-z_][A-Za-z0-9_]*\}?$/) gsub(/[${}~=^]/, "", w); return w }
+
+# The word stack: value WV, base name WL, unquoted-expansion flag WD, type WT (w word, r redirection
+# whose target is the next word, s here-string, g a { or } that ends a command).
+function put(v, d, t) { WV[TOP] = v; WL[TOP] = base(v); WD[TOP] = d; WT[TOP] = t; TOP++ }
+function push(v, d,   t, nm) {
+  t = (v == "{" || v == "}") ? "g" : "w"
+  put(v, d, t)
+  if (match(v, /^[A-Za-z_][A-Za-z0-9_]*\+?=/)) {
+    nm = substr(v, 1, RLENGTH - 1); sub(/\+$/, "", nm)
+    if (spell(substr(v, RLENGTH + 1), d)) V[nm] = 1
+  }
+  if (spell(v, d, WL[TOP - 1]) || (d && index(v, "{") && bparts(v))) NM = 1
+  if (!d && v == "case") CS++
+  else if (!d && v == "esac" && CS) CS--
+}
+function endword(   v) {
+  if (!CH) return
+  v = take(WB)
+  if (HDN) { HQ[HN] = v; HT[HN] = HDN == 2; HN++; HDN = 0 }
+  else push(v, CD)
+  CH = 0; CD = 0
+}
+function endseg(b, depth,   e, k, s) {
+  endword()
+  e = TOP; s = b
+  for (k = b; k < e; k++) if (WT[k] == "g") { if (k > s) judge(s, k, depth, 1); s = k + 1 }
+  if (e > s) judge(s, e, depth, 1)
+  TOP = b
+}
+
+# lex(term, depth): read C[P..N], or through the ) closing a $( body when term is ")", judging each
+# simple command. Returns 1 when a word in it names security.
+function lex(term, depth,   b, hb, nm0, cs0, pd, c) {
+  if (depth > 16) hit("<it nests commands too deep>")
+  b = TOP; hb = HN; nm0 = NM; NM = 0; cs0 = CS; CS = 0; pd = 0
+  while (P <= N) {
+    c = C[P]
+    if (!index(LX, c) || (c == "#" && CH)) wordpart(depth)
+    else if (c == " " || c == "\t") { endword(); P++ }
+    else if (c == "\n") { endseg(b, depth); HDN = 0; P++; if (HN > hb) heredocs(hb, depth) }
+    else if (c == "&" && P < N && C[P + 1] == ">") redir(depth)
+    else if (c == ";" || c == "&" || c == "|") { endseg(b, depth); P++ }
+    else if (c == "(" && !CH && P < N && C[P + 1] == "(") { arith(depth); CH = 1; CD = 1; add("$_") }
+    else if (c == "(") { endseg(b, depth); pd++; P++ }
+    else if (c == ")") {
+      endseg(b, depth); P++
+      if (pd) pd--
+      else if (term == ")" && !CS) break
+    }
+    else if (c == "<" || c == ">") redir(depth)
+    else while (P <= N && C[P] != "\n") P++
+  }
+  endseg(b, depth); HN = hb; HDN = 0
+  c = NM; NM = nm0; CS = cs0
+  return c
+}
+function wordpart(depth,   c, j) {
+  c = C[P]; CH = 1
+  if (c == "\\") {
+    if (P < N && C[P + 1] != "\n") add(C[P + 1])
+    else if (PN == WB) CH = 0
+    P += 2
+  } else if (c == "\047") {
+    for (j = P + 1; j <= N && C[j] != "\047"; j++) ;
+    addseg(P + 1, j); P = j + 1
+  } else if (c == "\"") { P++; dq(depth) }
+  else if (c == "$") dollar(depth, 0)
+  else if (c == "`") backtick(depth)
+  else {
+    for (j = P; j <= N && !index(SP, C[j]); j++) if (index("*?[{", C[j])) CD = 1
+    addseg(P, j); P = j
+  }
+}
+function dq(depth,   j, d) {
+  while (P <= N) {
+    for (j = P; j <= N && !index(DQSP, C[j]); j++) ;
+    addseg(P, j); P = j
+    if (P > N) return
+    d = C[P]
+    if (d == "\"") { P++; return }
+    if (d == "\\") {
+      d = P < N ? C[P + 1] : ""
+      if (d != "\n") add(index(DQSP, d) ? d : "\\" d)
+      P += 2
+    } else if (d == "$") dollar(depth, 1)
+    else backtick(depth)
+  }
+}
+function dollar(depth, inq,   d, j, k, c, body) {
+  d = P < N ? C[P + 1] : ""
+  if (d == "(" && P + 1 < N && C[P + 2] == "(") { P++; arith(depth); add("$_"); CD = 1; return }
+  if (d == "(") { P += 2; add(nest(")", depth) ? "security" : "$_"); CD = 1; return }
+  if (d == "{") {
+    k = 0
+    for (j = P + 1; j <= N; j++) {
+      c = C[j]
+      if (c == "{") k++
+      else if (c == "}" && --k == 0) break
+    }
+    body = seg(P + 2, j); P = j + 1
+    if (body ~ /\$\(|`/) run(body, depth)
+    add("${" body "}"); CD = 1; return
+  }
+  if (!inq && d == "\047") { ansi(); return }
+  if (!inq && d == "\"") { P += 2; dq(depth); return }
+  j = P + 1
+  if (d != "" && index("~=^", d)) j++
+  if (j <= N && C[j] ~ /[A-Za-z_]/) {
+    for (k = j; k <= N && C[k] ~ /[A-Za-z0-9_]/; k++) ;
+    add("$" seg(j, k)); P = k; CD = 1; return
+  }
+  if (d != "" && index("0123456789?#@*$!-", d)) { add("$" d); P += 2; CD = 1; return }
+  add("$"); P++
+}
+# ansi(): an ANSI-C quoted string, its \x and octal escapes decoded (\x73ecurity is security).
+function ansi(   j, k, c, d, v, n) {
+  j = P + 2
+  while (j <= N) {
+    for (k = j; k <= N && (c = C[k]) != "\047" && c != "\\"; k++) ;
+    addseg(j, k); j = k
+    if (k > N || c == "\047") break
+    d = j < N ? C[j + 1] : ""; j += 2
+    if (d == "x") {
+      v = 0; n = 0
+      while (n < 2 && j <= N && (c = index("0123456789abcdef", tolower(C[j])))) { v = v * 16 + c - 1; j++; n++ }
+      add(n ? sprintf("%c", v) : "x")
+    } else if (d ~ /^[0-7]$/) {
+      v = d + 0; n = 1
+      while (n < 3 && j <= N && C[j] ~ /[0-7]/) { v = v * 8 + C[j]; j++; n++ }
+      add(sprintf("%c", v))
+    } else if (d == "n") add("\n")
+    else if (d == "t") add("\t")
+    else add(d)
+  }
+  P = j + 1
+}
+function backtick(depth,   b, j, k, c) {
+  b = PN
+  for (j = P + 1; j <= N; j += 2) {
+    for (k = j; k <= N && (c = C[k]) != "`" && c != "\\"; k++) ;
+    addseg(j, k); j = k
+    if (k > N || c == "`") break
+    c = j < N ? C[j + 1] : ""
+    add(index("$`\\", c) ? c : "\\" c)
+  }
+  P = j + 1
+  c = take(b)
+  add(run(c, depth) ? "security" : "$_"); CD = 1
+}
+# arith(depth): skip the (( ... )) at P; a substitution inside it still runs.
+function arith(depth,   j, k, c) {
+  k = 0
+  for (j = P; j <= N; j++) {
+    c = C[j]
+    if (c == "(") k++
+    else if (c == ")" && --k == 0) break
+  }
+  c = seg(P + 2, j - 1)
+  P = j + 1
+  if (c ~ /\$\(|`/) run(c, depth)
+}
+# nest(term, depth): lex from P (a $( body when term is ")"), keeping the enclosing word.
+function nest(term, depth,   wb, ch, cd, hd, r) {
+  wb = WB; ch = CH; cd = CD; hd = HDN
+  WB = PN; CH = 0; CD = 0; HDN = 0
+  r = lex(term, depth + 1)
+  WB = wb; CH = ch; CD = cd; HDN = hd
+  return r
+}
+# run(str, depth): lex str as a script of its own, its characters in C[] above the current text.
+function run(str, depth,   p0, n0, n, k, T, r) {
+  p0 = P; n0 = N
+  n = split(str, T, "")
+  for (k = 1; k <= n; k++) C[CN + k] = T[k]
+  P = CN + 1; N = CN + n; CN = N
+  r = nest("", depth)
+  for (k = N - n + 1; k <= N; k++) delete C[k]
+  CN = N - n; P = p0; N = n0
+  return r
+}
+function redir(depth,   c, v) {
+  c = C[P]
+  if (c != "&" && P < N && C[P + 1] == "(") { P += 2; CH = 1; CD = 1; add(nest(")", depth) ? "security" : "$_"); return }
+  if (CH && !CD) { v = take(WB); if (v ~ /^[0-9]+$/) CH = 0; else add(v) }
+  endword()
+  if (c == "<" && P + 2 <= N && C[P + 1] C[P + 2] == "<<") { put("<<<", 0, "s"); P += 3; return }
+  if (c == "<" && P < N && C[P + 1] == "<") {
+    P += 2; HDN = 1
+    if (P <= N && C[P] == "-") { HDN = 2; P++ }
+    return
+  }
+  for (P++; P <= N && index(">&|", C[P]); P++) ;
+  put(c, 0, "r")
+}
+# heredocs(hb, depth): read the bodies queued since hb, each kept for a shell reading stdin.
+function heredocs(hb, depth,   k, j, d, b, body) {
+  for (k = hb; k < HN; k++) {
+    b = PN; d = HQ[k]
+    while (P <= N) {
+      for (j = P; j <= N && C[j] != "\n"; j++) ;
+      if ((HT[k] || j - P == length(d)) && line(P, j, HT[k]) == d) { P = j + 1; break }
+      addseg(P, j); add("\n")
+      P = j + 1
+    }
+    body = take(b)
+    if (QIN) run(body, depth)
+    else fed(body)
+  }
+  HN = hb
+}
+function line(a, b, tabs) {
+  if (tabs) while (a < b && C[a] == "\t") a++
+  return seg(a, b)
+}
+# fed(x): keep text a shell reading stdin may be handed (each command arguments, here-strings,
+# heredoc bodies); when one runs (SHIN), it is all judged as commands at the end.
+function fed(x) { if (!QIN && x != "") QB[++QN] = x "\n" }
+function join(a, e,   b, k) {
+  b = PN
+  for (k = a; k < e; k++) {
+    if (WT[k] == "r" || WT[k] == "s") { k++; continue }
+    add(WV[k]); add(" ")
+  }
+  return take(b)
+}
+
+# judge(b, e, depth, top): one simple command, words b..e-1. Keywords, assignments, redirections
+# and wrappers are stepped over to the word that runs; that word is judged, and whatever it runs in
+# turn. A command after `--` is judged in the same loop, not by recursion. top: a whole command.
+function judge(b, e, depth, top,   t0, i, j, k, w, lw, hs, vx, s, x, first) {
+  if (depth > 16) hit("<it nests commands too deep>")
+  t0 = TOP; first = -1
+  while (b < e) {
+    i = b; vx = 0
+    while (i < e) {
+      if (WT[i] != "w") { if (WT[i] == "s") hs = WV[i + 1]; i += 2; continue }
+      w = WV[i]
+      if ((!WD[i] && w ~ KEYW) || w ~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) { i++; continue }
+      lw = WL[i]
+      if (WD[i] || !(lw in WA)) break
+      if ((lw == "command" && WV[i + 1] ~ /^-[a-zA-Z]*[vV]/) || (lw == "xcrun" && WV[i + 1] ~ /^(-f|--find|--show)/)) return
+      if (lw == "xargs") vx = 1
+      for (i++; i < e && WT[i] == "w" && WV[i] ~ /^-./; i++) {
+        if (WV[i] == "--") { i++; break }
+        if (lw == "env" && WV[i] ~ /^(-S|--split-string)$/) run(WV[i + 1], depth)
+        if (WA[lw] != "" && WV[i] ~ ("^(" WA[lw] ")$")) i++
+      }
+      if (lw ~ /^g?timeout$/) i++
+    }
+    if (i >= e) break
+    if (first < 0) first = i
+    w = WV[i]
+    # Braces expand before the word runs: {/usr/bin/security,-i} is security -i.
+    if (WD[i] && index(w, "{")) {
+      if (length(w) > 256) { if (bparts(w)) hit(w) }
+      else if (w ~ /\{.*,.*\}/) {
+        bexp(w)
+        if (NBX > 1) {
+          j = TOP
+          for (k = 1; k <= NBX; k++) put(BX[k], 1, "w")
+          for (k = i + 1; k < e; k++) put(WV[k], WD[k], WT[k])
+          judge(j, TOP, depth, top); TOP = t0; return
+        }
+      }
+    }
+    lw = WL[i]
+    if (AMENDMODE) amend(i, e, depth)
+    s = spell(w, WD[i], lw)
+    if (s == 3) hit("<its command word is too long a glob>")
+    x = var(w)
+    if (!s && (x in V)) s = 1
+    if (s) {
+      REACH = 1; VX = vx
+      x = walk(i + 1, e)
+      if (x != "") hit(x)
+      return
+    }
+    if (lw == "eval") run(join(i + 1, e), depth)
+    else if (lw ~ SHELLS) shell(i, e, depth, hs, 1)
+    else if (lw == "ssh") {
+      for (k = i + 1; k < e; k++) {
+        if (WT[k] != "w") { k++; continue }
+        if (WV[k] ~ /^-[BbcDEeFIiJLlmOoPpQRSWw]$/) { k++; continue }
+        if (WV[k] !~ /^-/) break
+      }
+      if (k + 1 < e) run(join(k + 1, e), depth)
+      else SHIN = 1
+    }
+    else if (lw == "find") {
+      for (k = i + 1; k < e; k++) {
+        if (WV[k] !~ /^-(exec|execdir|ok|okdir)$/) continue
+        for (j = k + 1; j < e && WV[j] != ";" && WV[j] != "+"; j++) ;
+        if (j > k + 1) judge(k + 1, j, depth + 1, 0)
+        k = j
+      }
+    }
+    else if (lw == "su") { for (k = i + 1; k < e - 1; k++) if (WV[k] ~ /^(-c|--command)$/) run(WV[k + 1], depth) }
+    else if (lw == "watch") {
+      for (k = i + 1; k < e && WV[k] ~ /^-/; k++) if (WV[k] ~ /^(-n|--interval|-q|--equexit)$/) k++
+      run(join(k, e), depth)
+    }
+    else if (lw == "source" || lw == ".") SHIN = 1
+    # Runners this list does not know (docker exec, uv run, kubectl exec --) still hand on a shell -c
+    # script, an interpreter one-liner, or the command after `--`.
+    b = e
+    for (k = i; k < e; k++) {
+      if (WT[k] != "w") { k++; continue }
+      x = WL[k]
+      if (k > i && x ~ SHELLS) shell(k, e, depth, "", 0)
+      else if (x ~ INTERP) {
+        for (j = k + 1; j < e && WV[j] ~ /^-/; j++) {
+          if (j > k + 64) hit("<an interpreter in it has over 64 options>")
+          if (WV[j] ~ /^(-[A-Za-z]*[ce]|--eval)$/) { code(WV[j + 1]); break }
+        }
+      } else if (k > i && WV[k] == "--") { b = k + 1; break }
+    }
+  }
+  if (top && !QIN && first >= 0 && first + 1 < e) fed(join(first + 1, e))
+  fed(hs)
+  TOP = t0
+}
+# shell(k, e, depth, hs, cmd): the shell at word k. Its -c script runs; as the command word (cmd)
+# with no script operand it reads stdin, so what is piped or redirected into it runs too.
+function shell(k, e, depth, hs, cmd,   c, j) {
+  c = 0
+  for (j = k + 1; j < e; j++) {
+    if (j > k + 64) hit("<a shell in it has over 64 options>")
+    if (WT[j] != "w") { j++; continue }
+    if (WV[j] == "--") { j++; break }
+    if (WV[j] ~ /^[-+][oO]$/) { j++; continue }
+    if (WV[j] ~ /^-[A-Za-z]*c[A-Za-z]*$/) { c = 1; continue }
+    if (WV[j] !~ /^[-+]/) break
+  }
+  while (j < e && WT[j] != "w") j += 2
+  if (c) { if (j < e) run(WV[j], depth); return }
+  if (!cmd) return
+  if (j >= e || WD[j] || WV[j] ~ /^\/dev\//) SHIN = 1
+  if (hs != "") run(hs, depth)
+}
+# walk(i, e): the word after security that decides what it runs: an -i/-p option, a word an
+# expansion, glob or brace could turn into one, or a secret subcommand; "" for a plain subcommand.
+function walk(i, e,   x) {
+  for (; i < e; i++) {
+    if (WT[i] != "w") { i++; continue }
+    x = WV[i]
+    if (x ~ /^-[hlqv]+$/) continue
+    if (x ~ /^-[hlqv]*[ip]/ || WD[i] || x ~ SECRET) return x
+    if (x !~ /^-/) return ""
+  }
+  return VX ? "(a subcommand xargs reads from stdin)" : ""
+}
+# code(v): an interpreter one-liner naming security, then -i/-p or a secret subcommand.
+function code(v,   t) {
+  t = tolower(v)
+  if (!match(t, /(^|[^a-z0-9_.-])security([^a-z0-9_.-]|$)/)) return
+  t = substr(t, RSTART + RLENGTH - 1)
+  if (match(t, /(^|[^a-z0-9_-])(-[hlqv]*[ip]|find-generic-password|find-internet-password|dump-keychain)([^a-z0-9_-]|$)/)) {
+    t = substr(t, RSTART, RLENGTH); gsub(/^[^a-z-]+|[^a-z]+$/, "", t)
+    hit(t)
+  }
+}
+BEGIN {
+  RS = "\001"
+  SP = " \t\n;&|()<>\\\"$`\047"
+  LX = " \t\n;&|()<>#"
+  DQSP = "\"\\$`"
+  SECRET = "^(find-generic-password|find-internet-password|dump-keychain)$"
+  SHELLS = "^(sh|bash|zsh|ksh|dash|fish|csh|tcsh)$"
+  INTERP = "^(python[0-9.]*|pypy[0-9.]*|perl[0-9.]*|ruby|node|nodejs|deno|bun|osascript|php|lua|tclsh|swift|julia)$"
+  KEYW = "^(!|if|then|else|elif|fi|while|until|do|done|esac|-|noglob|nocorrect)$"
+  # Wrappers run the word after their options; each maps to its options that take an argument.
+  split("nohup time exec builtin command setsid unbuffer chronic", A, " ")
+  for (k in A) WA[A[k]] = ""
+  WA["env"] = "-u|-C|-P|--unset|--chdir"; WA["sudo"] = "-u|-g|-C|-D|-h|-p|-r|-t|-U|-T|-R"
+  WA["doas"] = "-u|-C"; WA["xargs"] = "-I|-J|-L|-n|-P|-R|-S|-s|-d|-a|-E"; WA["nice"] = "-n"
+  WA["timeout"] = WA["gtimeout"] = "-k|-s"; WA["caffeinate"] = "-t|-w"; WA["arch"] = "-arch|-e|-d"
+  WA["xcrun"] = "--sdk|-sdk|--toolchain"; WA["stdbuf"] = "-i|-o|-e"; WA["exec"] = "-a"
+}
+{ S = (NR > 1) ? S "\001" $0 : $0 }
+END {
+  # Bounds the work: 64KB of the costliest shape (one-letter commands piped into sh) takes ~1.4s.
+  if (length(S) > 65536) hit("<it is over 64KB>")
+  CN = N = split(S, C, ""); S = ""; P = 1
+  lex("", 0)
+  if (SHIN) {
+    QIN = 1
+    for (s = 1; s < QN; s *= 2) for (k = 1; k + s <= QN; k += 2 * s) QB[k] = QB[k] QB[k + s]
+    if (QN) run(QB[1], 0)
+  }
+  if (REACH) print "R"
+}'
+_kcsub='(^|[[:space:];&|(])(find-generic-password|find-internet-password|dump-keychain)([[:space:];&|)]|$)'
+# Cheap gate: the name in any case, a glob beside a letter (`secur?ty`, `s*`, `[s]ecurity`), or an
+# unquoted brace or ANSI-C string that may spell it (`secu{r,}ity`).
+_kcglob='[A-Za-z][*?[]|[]*?][A-Za-z]'
+_kcbrace='\{[^{}]*,[^{}]*\}'
+_kchit=''
+if [[ $_flat == *[Ss][Ee][Cc][Uu][Rr]* || $_flat =~ $_kcglob || $bare =~ $_kcbrace || $cmd == *"\$'"* ]]; then
+  _kcv=$(printf '%s' "$cmd" | awk "$_KC_AWK" 2>/dev/null) || _kcv='H <its parser failed on it>'
+  case $_kcv in
+    'H '*) _kchit=${_kcv#H } ;;
+    R) [[ $_flat =~ $_kcsub ]] && _kchit=${BASH_REMATCH[2]} ;;
+  esac
+fi
+case $_kchit in
+  '') ;;
+  '<'*) deny "Denied: the Keychain guard cannot check this command: ${_kchit:1:${#_kchit}-2}.
+Split it up, or write a long script to a file with the Write tool and run the file." ;;
+  *) deny "Denied: \`security $_kchit\` can print Keychain secrets, DB passwords included, into the transcript.
+To check a DB credential run \`ro-mysql --tunnels\`; rotating one is the user's (\`ro-mysql --rotate\` in a terminal)." ;;
+esac
+
+# ---- bq-project: bqro supplies a default --project_id itself (the overlay's BQRO_PROJECT) ----
+# No text check here: one fired 20 times in 30 days, every time on an inspection (`which bqro`,
+# `sed -n … ~/.local/bin/bqro`), never on a query. The wrapper is the right place.
+
+# ---- raw-client: no raw MySQL client, by any spelling --------------------------------------
+# settings.json `deny` is PREFIX-matched, so it only stops the spellings it enumerates.
+# Verified 2026-08-25 that all four of these reached the client unchallenged:
+#   /opt/homebrew/bin/mysql …   (the actual PATH entry; the deny list names mysql-client
+#                                and mysql@8.0 cellar paths, not the bin symlink)
+#   MYSQL_PWD=x mysql …         (an env assignment means the command no longer *starts* with
+#                                `mysql`, so no prefix rule matches)
+#   $(command -v mysql) …       (path resolved at runtime — nothing to prefix-match)
+#   /opt/homebrew/bin/mysqldump …
+# cmd-tokens already basenames each token and steps over env assignments and wrappers, so
+# one command-position check covers every one of those without enumerating paths.
+# ONE list, used by all three checks below. Two hand-kept lists drifted within a day:
+# `command mysqlcheck` / `mariadb-dump` / `mariadb-admin` were denied bare but allowed via
+# `command`, because the regex enumerated 9 of the 12.
+_CLIENTS='mysql mysqlsh mysqladmin mysqldump mysqlimport mysqlbinlog mysqlcheck mariadb mariadb-dump mariadb-admin mycli usql'
+_cli=$(printf '%s' "$_CLIENTS" | tr ' ' '|')
+
+# `(^|[^A-Za-z0-9_.-])` deliberately excludes a preceding `-`, so `ro-mysql` does NOT read as
+# `mysql`; `/` and whitespace do count, so `/opt/homebrew/bin/mysql` does. The RIGHT boundary
+# excludes `.` so a filename (`references/mysql.md`, `mysql.sock`) is not a client: 136 denials
+# in 30 days were `sed -n`/`grep` on the debug skill's own reference doc. One grep decides it;
+# the per-client loop only runs to name the hit for the message.
+# LIMIT: a text scan cannot follow a name built from expansions (`my$x`, `${M}sql`, `for x in …`,
+# `set --`); the settings.json deny rules and ro-mysql's own guards are the backstop.
+if printf '%s' "$_scan" | grep -Eq "(^|[^A-Za-z0-9_.-])($_cli)(\$|[^A-Za-z0-9_.-])"; then
+ for _c in $_CLIENTS; do
+  if printf '%s' "$_scan" | grep -Eq "(^|[^A-Za-z0-9_.-])$_c(\$|[^A-Za-z0-9_.-])"; then
+    deny "Denied: the raw \`$_c\` client name appears in this command (denied on the name, not on parsing). $_ROUTE
+A name that is only CONTENT (a script body, a commit message) goes in a file via the Write tool."
+  fi
+ done
+fi
+
+# One grep over the token list, then name the hit. Case-insensitive, like the disk: `MYSQL -e …`
+# and /opt/homebrew/bin/MySQL run the client. The name scan above stays case-sensitive, since
+# "MySQL" is ordinary prose in a commit message or PR title; these checks see only unquoted words.
+_hit=$(printf '%s\n' "$tokens" | grep -ixE "$_cli" | head -1)
+if [ -n "$_hit" ]; then
+  _c="$_hit"
+  deny "Denied: the raw \`$_c\` client, which has no read-only session, one-statement or write-verb check. $_ROUTE
+A dump or an admin verb is the user's to run, not something to route around."
+fi
+# `command <client>` reports `command` to cmd-tokens (deliberately — `command -v foo` is
+# inspection, not invocation), so cover the invoking form explicitly.
+if printf '%s' "$bare" | grep -Eiq "(^|[;&|[:space:]])(command|builtin)[[:space:]]+($_cli)([[:space:]]|\$)"; then
+  deny "Denied: a raw MySQL client invoked via \`command\`. $_ROUTE"
+fi
+# A path resolved at runtime — `$(command -v mysql) -e …` — leaves nothing static to match on,
+# so key off the client name inside the substitution. ANCHORED to command position: matching it
+# anywhere denied `echo "$(command -v mysql)"` and `[ -x "$(command -v mysql)" ]`, which are
+# inspection, and the deny message explicitly promises those are fine.
+# The anchor tolerates a transparent wrapper — `eval $(command -v mysql) -e …` was the last
+# surviving spelling once the tokenizer was fixed, because `eval ` defeated a bare anchor.
+# The wrapper list is lib/cmd-tokens' WRAPPERS, read here rather than copied: two hand-kept
+# copies diverged by four entries one day after the _CLIENTS drift opened a live bypass.
+case $cmd in *'$('*|*'`'*)
+  _wrap=''
+  while IFS= read -r _l; do
+    case $_l in *'WRAPPERS = "'*) _wrap=${_l#*\"}; _wrap=${_wrap%%\"*}; break ;; esac
+  done < "$HOOK_LIB/cmd-tokens"
+  [ -n "$_wrap" ] || deny "bash-guards: hooks/lib/cmd-tokens has no WRAPPERS list, so the runtime-path guard cannot run. Restore it: git -C ~/.agents checkout -- hooks/lib"
+  if printf '%s' "$cmd" | grep -Eiq "(^|[;&|]|&&|\|\|)[[:space:]]*(($_wrap)[[:space:]]+)*(\\\$\\(|\`)[^)\`]*(command[[:space:]]+-v|which|type[[:space:]]+-p)[[:space:]]+($_cli)[^)\`]*(\\)|\`)"; then
+    deny "Denied: a MySQL client path resolved at runtime, then executed. $_ROUTE
+\`command -v <name>\` alone, to check it exists, is fine."
+  fi ;;
+esac
+
+# ---- py-driver: no MySQL driver straight from a script ------------------------------------
+# ro-mysql is only a guard rail if it is the ONLY path to the DB. A permission rule
+# matches a command prefix and cannot see "pymysql" inside python3 -c '...', so the
+# content check has to live here — and unlike CLAUDE.md prose, a hook reaches subagents.
+# The driver name must appear as a CONNECTION, not merely as a word. Matching the bare name
+# denied an analysis script that only held "pymysql" inside a regex literal (2026-08-25);
+# a false deny here costs a full round-trip and trains you to route around the guard.
+if printf '%s' "$bare" | grep -Eq '(^|[;&|[:space:]])(python3?|uv)([[:space:]]|$)' \
+   && printf '%s' "$cmd" | grep -Eqi '(import|from)[[:space:]]+(pymysql|MySQLdb|mysql\.connector)|(pymysql|MySQLdb|mysql\.connector)\.connect|create_engine\([^)]*mysql|mysql\+(mysqldb|pymysql)://'; then
+  deny "Refusing a direct MySQL driver connection. CLAUDE.md: prod MySQL goes through ro-mysql, and a pymysql/python one-liner is not a workaround — it bypasses the read-only session, the single-statement check and the write-verb guard in one step. The login-path credential is NOT read-only (it holds full DML/DDL on a writable primary), so the wrapper is the only thing standing between this and a prod write. $_ROUTE"
+fi
+
+# ---- commit-trailers ------------------------------------------------------------
+# `git -C <dir> commit` counts too, including the quoted `git -C "$WT"` form CLAUDE.md mandates
+# for worktrees (the bare view keeps the masked argument in place). A -F/--file path is resolved
+# against the -C dir; an unresolvable one is ALLOWED, since scanning the command text for
+# trailers that live in the file was the false-deny path.
+if printf '%s' "$bare" | grep -Eq '(^|[;&|[:space:]])git[[:space:]]+(-C[[:space:]]+[^[:space:]]+[[:space:]]+)?commit([[:space:]]|$)' \
+   && ! printf '%s' "$bare" | grep -q -- '--no-edit'; then
+  msg="$cmd"
+  cdir=$(printf '%s' "$cmd" | sed -nE "s/.*git[[:space:]]+-C[[:space:]]+['\"]?([^'\"[:space:]]+).*/\1/p")
+  mfile=$(printf '%s' "$cmd" | sed -nE 's/.*(-F[[:space:]]+|--file[= ])([^[:space:]]+).*/\2/p')
+  mfile=$(printf '%s' "$mfile" | tr -d "\"'")
+  if [ -n "$mfile" ]; then
+    case "$mfile" in /*|~*) ;; *) [ -n "$cdir" ] && mfile="$cdir/$mfile" ;; esac
+    [ -f "$mfile" ] && msg="$msg
+$(cat "$mfile")" || msg=""
+  fi
+  if [ -n "$msg" ] && printf '%s' "$cmd" | grep -Eq -- '(-m|-F|--file)([[:space:]]|=)'; then
+    # Claude-Session is no longer required (2026-09-27): local CLI sessions have no claude.ai
+    # session URL, so the only way to satisfy it was a bare id nobody else can resolve.
+    if ! printf '%s' "$msg" | grep -qi 'Co-authored-by:'; then
+      deny "Commit message is missing the Co-authored-by trailer. Append it, then re-run (history can't be rewritten once pushed):
+Co-authored-by: Claude <noreply@anthropic.com>"
+    fi
+  fi
+fi
+
+# ---- amend-pushed ---------------------------------------------------------------
+# CLAUDE.md: once pushed, never rewrite history. Unpushed amends stay allowed.
+case $_flat in *--amend*)
+  _amends=$(printf '%s' "$cmd" | awk -v AMENDMODE=1 "$_KC_AWK" 2>/dev/null) \
+    || ask "Cannot inspect this amend command. Split it into one literal git command per call."
+  _adir=$cwd; _aguess=0
+  while IFS=$'\t' read -r _event _path; do
+    case $_event in
+      T)
+        if _next=$(_cmd_repo_abs "$_path" "$_adir"); then
+          _adir=$_next; case $_path in /*|'~'*) _aguess=0 ;; esac
+        else _aguess=1; fi ;;
+      B) gdir=$_adir; _gguess=$_aguess ;;
+      G) if _next=$(_cmd_repo_abs "$_path" "$gdir"); then gdir=$_next; case $_path in /*|'~'*) _gguess=0 ;; esac; else _gguess=1; fi ;;
+      U) _gguess=1 ;;
+      H*) ask "Cannot inspect this amend command. Split it into one literal git command per call." ;;
+      A)
+        [ "$_gguess" = 0 ] || ask "Cannot resolve the repository for --amend. Use one literal git -C path per call."
+        ghead=$(git -C "$gdir" rev-parse HEAD 2>/dev/null)
+        gup=$(git -C "$gdir" rev-parse '@{u}' 2>/dev/null)
+        case $(git -C "$gdir" rev-parse --symbolic-full-name '@{u}' 2>/dev/null) in refs/remotes/*) ;; *) gup= ;; esac
+        if [ -n "$ghead" ] && [ "$ghead" = "$gup" ]; then
+          deny "HEAD is already the upstream tip (@{u}) — --amend would rewrite pushed history (CLAUDE.md: Git / PR). Make a NEW commit on top instead."
+        fi ;;
+    esac
+  done <<<"$_amends"
+  ;;
+esac
+
+# drop_heredocs <all>: stdin with heredoc bodies removed — every body when <all> is 1 (bodies are
+# data, not commands), only quoted-delimiter bodies (<<'EOF', <<"EOF", <<\EOF) otherwise, since
+# an unquoted body still expands.
+drop_heredocs() {
+  # (^|[^<]) keeps a here-string (<<<word) from reading as a heredoc whose end never comes. A body fed to
+  # a shell or xargs is code, so <all> keeps it.
+  # An UNQUOTED body expands like a "…" string, so its $( ) and backticks still run: the lines
+  # holding one are kept as a double-quoted string (the body text's " escaped, the substitution's
+  # own text verbatim), which the code view reads as data with code inside, the way bash does
+  # (`cat <<EOF` then `$(git push -f)` was not read). A substitution spanning lines keeps every
+  # line until it closes (CX-3: `$(` / `git reset --hard` / `)`); ub() walks it with a stack of
+  # ( and " so a quoted ) or a nested $( ) does not end it early.
+  awk -v q="'" -v all="$1" '
+    function ub(s,   j, c, o, has) {
+      o = ""; has = (sp > 0 || bt)
+      for (j = 1; j <= length(s); j++) {
+        c = substr(s, j, 1)
+        if (c == "\\") { o = o substr(s, j, 2); j++; continue }
+        if (sp == 0 && !bt) {
+          if (c == "$" && substr(s, j + 1, 1) == "(") { st[++sp] = "P"; o = o "$("; j++; has = 1 }
+          else if (c == "`") { bt = 1; o = o c; has = 1 }
+          else if (c == "\"") o = o "\\\""
+          else o = o c
+        } else if (sp == 0) {
+          if (c == "`") bt = 0
+          o = o c
+        } else if (st[sp] == "S") {
+          if (c == q) sp--
+          o = o c
+        } else if (st[sp] == "D") {
+          if (c == "\"") sp--
+          else if (c == "$" && substr(s, j + 1, 1) == "(") { st[++sp] = "P"; o = o c; c = "("; j++ }
+          o = o c
+        } else {
+          # A shell comment ignores its parentheses until the next body line.
+          if (c == "#" && (j == 1 || substr(s, j - 1, 1) ~ /[ \t;|&()]/)) { o = o substr(s, j); break }
+          if (c == q) st[++sp] = "S"
+          else if (c == "\"") st[++sp] = "D"
+          else if (c == "(") st[++sp] = "P"
+          else if (c == ")") sp--
+          o = o c
+        }
+      }
+      if (!has) return
+      if (!open) { o = "\"" o; open = 1 }
+      if (sp == 0 && !bt) { o = o "\""; open = 0 }
+      print o
+    }
+    skip != "" {
+      t = $0; sub(/^\t+/, "", t)
+      if (t == skip) { if (open) print "\""; skip = ""; open = 0 }
+      else if (uq) ub($0)
+      next
+    }
+    {
+      if (all == 1 && $0 ~ /(^|[;&|( \t])(bash|sh|zsh|ksh|dash|xargs|source|eval)([ \t][^<]*)?<</) { print; next }
+      quoted = "(^|[^<])<<-?[ \t]*[\"" q "][A-Za-z_][A-Za-z0-9_]*[\"" q "]|(^|[^<])<<-?[ \t]*\\\\[A-Za-z_][A-Za-z0-9_]*"
+      uq = 0; sp = 0; bt = 0; open = 0
+      if (match($0, quoted) || (all == 1 && (uq = match($0, "(^|[^<])<<-?[ \t]*[A-Za-z_][A-Za-z0-9_]*")))) {
+        skip = substr($0, RSTART, RLENGTH); sub(/^[^<]?<<-?[ \t]*/, "", skip); gsub("[\"" q "\\\\]", "", skip)
+      }
+      print
+    }'
+}
+
+# code_view: set CV_SRC (the command minus heredoc bodies that are data: a body fed to a shell
+# stays) and CV_CODE (the shell code in CV_SRC, one simple command per line). The per-line
+# CMD_BARE leaves a multi-line -m message and every heredoc body readable as commands, so a body
+# holding `git push` and a `[ -f x ]` anywhere read as a force push. Computed once, lazily.
+# _CODE_AWK walks the quote state the way bash does, across lines: '…', $'…', "…" (whose $( ) and
+# backticks are code again), $( ), backticks, # comments at a word start, \ escapes and line
+# continuations. Three greedy seds paired the apostrophe in "don't" or in a comment with a quote
+# lines later and hid the `git push --force` between them (2244590). A quoted word with no space
+# or shell metacharacter prints as itself (`'--force'` is the flag, `-c 'core.hooksPath'=x` the
+# key); any other span prints as Q, keeping a leading `key=` (`'core.hooksPath=/a b'` is
+# `core.hooksPath=Q`). A $( ) or backtick body prints as Q in its command and on lines of its own
+# after the rest (side[]): breaking the line there split `git push "$(x)" --force` in two (6d62a01).
+# A sh -c or eval string is code, scanned again after the rest, when the shell or eval is the
+# command (echo sh -c '…' is data); under env -i every command of the body gets an `env -i `
+# prefix (pfx), so the body's git is still read as git under an empty env. Unbalanced quotes exit
+# 3, and code_view then adds the per-line masked and raw lines, so a scan it cannot follow asks
+# more, never less.
+_CODE_AWK='
+function push(t) {
+  st[++sp] = t; buf[sp] = ""; dep[sp] = 0; cap[sp] = 0
+  if (t == "P" || t == "B") { ob[++cl] = ""; sg[cl] = ""; if (pfx != "") out(pfx) }
+}
+function take(x) { if (sp > 0) buf[sp] = buf[sp] x }
+function out(x) {
+  if (pfx != "" && x ~ /[;&|()]/) gsub(/[;&|()]+/, "&" pfx, x)
+  if (cl) ob[cl] = ob[cl] x; else printf "%s", x
+  sg[cl] = sg[cl] x; if (length(sg[cl]) > 200) sg[cl] = substr(sg[cl], length(sg[cl]) - 100)
+}
+function brk() {
+  if (cl) { if (ob[cl] != "") side[++ns] = ob[cl]; ob[cl] = "" } else printf "\n"
+  sg[cl] = ""; if (pfx != "") out(pfx)
+}
+function pop(   t, r, c0) {
+  t = st[sp]; r = buf[sp]; c0 = cap[sp]; sp--
+  if (sp > 0) buf[sp] = buf[sp] OPEN[t] r SHUT[t]
+  if (t == "P" || t == "B") {
+    if (ob[cl] != "") side[++ns] = ob[cl]
+    cl--
+    if (st[sp] != "D") out("Q")
+    return
+  }
+  if (c0) { if (ne < 50) { extra[++ne] = (t == "D") ? unesc(r) : r; envi[ne] = (c0 == 2) } out("Q"); return }
+  if (t != "A" && r ~ /^[A-Za-z0-9_.,:=+@%^\/~{}$-]*$/) out(r)
+  else if (match(r, /^[A-Za-z0-9_.-]+=/)) out(substr(r, 1, RLENGTH) "Q")
+  else out("Q")
+}
+function unesc(s,   o, k, ch) {
+  o = ""
+  for (k = 1; k <= length(s); k++) {
+    ch = substr(s, k, 1)
+    if (ch == "\\" && substr(s, k + 1, 1) ~ /["\\$`]/) { k++; ch = substr(s, k, 1) }
+    o = o ch
+  }
+  return o
+}
+function opener(   s, n, W, k, w, e, inenv) {
+  if (sg[cl] !~ /(^|[^A-Za-z0-9_.-])(([^ \t]*\/)?(ba|z|k|da)?sh([ \t]+-[A-Za-z]+)*[ \t]+-[A-Za-z]*c[A-Za-z]*|eval)[ \t]+$/) return 0
+  s = sg[cl]; sub(/.*[;&|()]/, "", s)
+  n = split(s, W, /[ \t]+/); e = 0; inenv = 0
+  for (k = 1; k <= n; k++) {
+    w = W[k]
+    if (w == "") continue
+    if (inenv && (w == "-" || w == "--ignore-environment" || w ~ /^-[A-Za-z]*i[A-Za-z]*$/)) e = 1
+    if (w ~ /^-/ || w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue
+    sub(/.*\//, "", w)
+    if (w ~ /^(do|then|else|elif|if|while|until|!|[{]|time|nohup|command|builtin|exec|sudo|doas|nice|env|stdbuf|caffeinate)$/) { inenv = (w == "env"); continue }
+    if (w ~ /^(echo|printf|print|grep|egrep|fgrep|rg)$/) return 0
+    break
+  }
+  return e ? 2 : 1
+}
+function feed(line,   n, i, rest, t, c, d, p, j, pre) {
+  n = length(line); i = 1
+  while (i <= n) {
+    t = st[sp]; rest = substr(line, i)
+    if (t == "S") {
+      j = index(rest, "\047")
+      if (!j) { take(rest); return }
+      take(substr(rest, 1, j - 1)); i += j; pop(); continue
+    }
+    if (t == "A") {
+      if (!match(rest, /[\\\047]/)) { take(rest); return }
+      take(substr(rest, 1, RSTART - 1)); c = substr(rest, RSTART, 1); i += RSTART
+      if (c == "\\") { take(c substr(line, i, 1)); i++; continue }
+      pop(); continue
+    }
+    if (t == "D") {
+      if (!match(rest, /[\\"`$]/)) { take(rest); return }
+      take(substr(rest, 1, RSTART - 1)); c = substr(rest, RSTART, 1); d = substr(rest, RSTART + 1, 1); i += RSTART
+      if (c == "\\") { take(c d); i++; continue }
+      if (c == "\"") { pop(); continue }
+      if (c == "`") { push("B"); continue }
+      if (c == "$" && d == "(") { push("P"); i++; continue }
+      take(c); continue
+    }
+    if (!match(rest, /[\\\047"`$()#]/)) { out(rest); take(rest); return }
+    pre = substr(rest, 1, RSTART - 1); c = substr(rest, RSTART, 1); d = substr(rest, RSTART + 1, 1)
+    p = i + RSTART - 1; i = p + 1
+    out(pre); take(pre)
+    if (c == "\\") {
+      if (d == "") { cont = 1; return }
+      take(c d); i++
+      out(d ~ /[\047"`$()#;&|<> \t]/ ? "_" : d); continue
+    }
+    if (c == "#") {
+      if (p == 1 || substr(line, p - 1, 1) ~ /[ \t;&|()]/) return
+      out(c); take(c); continue
+    }
+    if (c == "\047" || c == "\"") { j = opener(); push(c == "\"" ? "D" : "S"); cap[sp] = j; continue }
+    if (c == "$") {
+      if (d == "\047") { j = opener(); push("A"); cap[sp] = j; i++; continue }
+      if (d == "(") { push("P"); i++; continue }
+      out(c); take(c); continue
+    }
+    if (c == "`") { if (t == "B") pop(); else push("B"); continue }
+    if (c == "(") { if (t == "P") dep[sp]++; out(c); take(c); continue }
+    if (c == ")") {
+      if (t == "P" && dep[sp] == 0) { pop(); continue }
+      if (t == "P") dep[sp]--
+      out(c); take(c); continue
+    }
+  }
+}
+function eol(   t) {
+  t = st[sp]
+  if (t == "C" || t == "P" || t == "B") { if (cont) out(" "); else brk(); cont = 0 }
+  else take("\n")
+}
+BEGIN {
+  sp = 0; st[0] = "C"; ne = 0; cont = 0; cl = 0; sg[0] = ""; ns = 0; pfx = ""
+  OPEN["S"] = "\047"; SHUT["S"] = "\047"; OPEN["A"] = "$\047"; SHUT["A"] = "\047"
+  OPEN["D"] = "\""; SHUT["D"] = "\""; OPEN["P"] = "$("; SHUT["P"] = ")"; OPEN["B"] = "`"; SHUT["B"] = "`"
+}
+{ feed($0); eol() }
+END {
+  for (k = 1; k <= ne && sp == 0; k++) {
+    pfx = ""; brk(); pfx = envi[k] ? "env -i " : ""; if (pfx != "") out(pfx)
+    m = split(extra[k], L, "\n")
+    for (l = 1; l <= m; l++) { feed(L[l]); eol() }
+  }
+  pfx = ""; printf "\n"
+  for (k = 1; k <= ns; k++) print side[k]
+  for (k = cl; k >= 1; k--) if (ob[k] != "") print ob[k]
+  if (sp > 0) exit 3
+}'
+CV_SRC=''; CV_CODE=''; _cv_done=0
+code_view() {
+  [ "$_cv_done" = 0 ] || return 0
+  _cv_done=1
+  CV_SRC=$(printf '%s\n' "$cmd" | drop_heredocs 1)
+  CV_CODE=$(printf '%s\n' "$CV_SRC" | awk "$_CODE_AWK") || CV_CODE="$CV_CODE
+$(cmd_mask "$CV_SRC")
+$CV_SRC"
+  # One simple command per line. & also ends one (`nohup git push --force &`).
+  CV_CODE=$(printf '%s\n' "$CV_CODE" | sed -E 's/(&&|\|\||;|\||&|\(|\)|`|\$\()/\n/g')
+}
+
+# _seg_walk <line>: parse one simple command of CV_CODE. Steps over VAR=x prefixes, keywords
+# (do, then, !, {, …) and wrappers with their options (sudo, env, xargs, nice, timeout, …), so a
+# git after any of them is still git. Sets:
+#   SW_CMD    the command word's basename          SW_SUB   git's subcommand
+#   SW_ARGS   git's arguments after it, space-padded  SW_GOPTS git's global options, space-padded
+#   SW_SET    names assigned by a prefix, env, export/declare/typeset/local/readonly
+#   SW_UNSET  names removed by unset or env -u     SW_ENVI  1 under env -i / env - / --ignore-environment
+_seg_walk() {
+  local w b wrap='' skip=0 n i=0 k su=0 keepenv=0
+  SW_CMD=''; SW_SUB=''; SW_ARGS=' '; SW_GOPTS=' '; SW_SET=' '; SW_UNSET=' '; SW_ENVI=0
+  # Fast path for the common `git <subcommand> …`: the word loop costs ~0.4ms a segment in bash 3.2.
+  if [[ $1 =~ ^[[:space:]]*git[[:space:]]+([a-z][a-z0-9-]*)([[:space:]].*)?$ ]]; then
+    SW_CMD=git; SW_SUB=${BASH_REMATCH[1]}; SW_ARGS="${BASH_REMATCH[2]} "
+    return 0
+  fi
+  read -ra _sw <<<"$1"   # read -a: no glob expansion of the words
+  n=${#_sw[@]}
+  while [ "$i" -lt "$n" ]; do
+    w=${_sw[$i]}; i=$((i + 1))
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    if [ "$skip" = u ]; then skip=0; SW_UNSET="$SW_UNSET$w "; continue; fi
+    case $w in *=*)
+      if [ "$wrap" != xargs ] && [[ $w =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then SW_SET="$SW_SET${w%%=*} "; continue; fi ;;
+    esac
+    case $wrap:$w in
+      env:-|env:-i|env:--ignore-environment) SW_ENVI=1; continue ;;
+      env:-u|env:--unset) skip=u; continue ;;
+      env:-u*) SW_UNSET="$SW_UNSET${w#-u} "; continue ;;
+      env:--unset=*) SW_UNSET="$SW_UNSET${w#--unset=} "; continue ;;
+      env:-C|env:--chdir|env:-S|env:--split-string|env:-P) skip=1; continue ;;
+      env:-[a-zA-Z]*i*) SW_ENVI=1; continue ;;
+      sudo:-E|sudo:--preserve-env) keepenv=1; continue ;;
+      # --preserve-env=LIST keeps only LIST: GIT_CONFIG_* and the agent markers still go (CX-1).
+      sudo:--preserve-env=*) continue ;;
+      sudo:--user|sudo:--group|sudo:--host|sudo:--prompt|sudo:--chdir|sudo:--chroot|sudo:--role|\
+      sudo:--type|sudo:--other-user|sudo:--close-from|sudo:--command-timeout) skip=1; continue ;;
+      sudo:-[!-]*)   # a short cluster: E keeps the env (-nE); an operand letter takes the rest or the next word
+        k=1
+        while [ "$k" -lt "${#w}" ]; do
+          case ${w:$k:1} in
+            E) keepenv=1 ;;
+            [ughpCDrtUT]) [ $((k + 1)) -lt "${#w}" ] || skip=1; break ;;
+          esac
+          k=$((k + 1))
+        done
+        continue ;;
+      doas:-[uC]|nice:-n|exec:-a|caffeinate:-[wt]|stdbuf:-[ioe]) skip=1; continue ;;
+      exec:-c*|exec:-[a-z]*c*) SW_ENVI=1; continue ;;   # exec -c runs the command with an empty env
+      xargs:-[IJLnPEdsRSa]|timeout:-[sk]|timeout:--signal|timeout:--kill-after) skip=1; continue ;;
+      command:-[vV]*) return 0 ;;
+      *:-*) [ -n "$wrap" ] && continue ;;
+      timeout:*) [ "$skip" = d ] || { skip=d; continue; } ;;
+    esac
+    [ "$skip" = d ] && skip=0
+    b=${w##*/}
+    case $b in
+      do|then|else|elif|if|while|until|'!'|'{') wrap=''; continue ;;
+      sudo|doas) wrap=$b; su=1; continue ;;
+      env|nohup|time|command|builtin|exec|nice|xargs|stdbuf|caffeinate) wrap=$b; continue ;;
+      timeout|gtimeout) wrap=timeout; continue ;;
+    esac
+    # A substitution or a variable as the command word (`$(which git) push`, "$GIT" push) is git
+    # when a git subcommand follows git's global options (`--no-pager`, `-C <dir>`); the code view
+    # prints the first as Q. `"$PY" -c x` and `$MAKE -C d all` name no git subcommand (B-7, CX-2).
+    if [[ $w =~ ^(Q|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)$ ]]; then
+      k=$i
+      while [ "$k" -lt "$n" ]; do
+        case ${_sw[$k]} in
+          -C|-c|--git-dir|--work-tree|--namespace|--config-env|--super-prefix) k=$((k + 2)) ;;
+          -*) k=$((k + 1)) ;;
+          *) break ;;
+        esac
+      done
+      case ${_sw[$k]:-} in push|commit|reset|clean|branch|stash|worktree) b=git ;; esac
+    fi
+    SW_CMD=$b
+    break
+  done
+  # sudo resets the environment (sudoers env_reset), dropping the settings env that carries the
+  # agent git layer, exactly as env -i does; -E keeps it. doas keeps only what doas.conf names.
+  [ "$su" = 1 ] && [ "$keepenv" = 0 ] && SW_ENVI=1
+  case $SW_CMD in
+    [Gg][Ii][Tt])
+      SW_CMD=git
+      while [ "$i" -lt "$n" ]; do   # git's global options; -C/-c and friends take an argument
+        w=${_sw[$i]}
+        case $w in
+          -C|-c|--git-dir|--work-tree|--namespace|--config-env|--super-prefix)
+            SW_GOPTS="$SW_GOPTS$w ${_sw[$((i + 1))]:-} "; i=$((i + 2)) ;;
+          -*) SW_GOPTS="$SW_GOPTS$w "; i=$((i + 1)) ;;
+          *) break ;;
+        esac
+      done
+      SW_SUB=${_sw[$i]:-}
+      [ $((i + 1)) -lt "$n" ] && SW_ARGS=" ${_sw[*]:$((i + 1))} " ;;
+    export|declare|typeset|local|readonly)
+      while [ "$i" -lt "$n" ]; do
+        w=${_sw[$i]}; i=$((i + 1))
+        [[ $w =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && SW_SET="$SW_SET${w%%=*} "
+      done ;;
+    unset)
+      while [ "$i" -lt "$n" ]; do
+        w=${_sw[$i]}; i=$((i + 1))
+        case $w in -*) ;; *) SW_UNSET="$SW_UNSET$w " ;; esac
+      done ;;
+  esac
+  return 0
+}
+
+# _git_flags <sub> <args>: set GF to git's own option words in <args>, space-padded, with each
+# option's operand dropped: `-m '--no-verify'` and `-m -n` are messages, `-uno` is untracked=no.
+# A cluster keeps the letters before its operand letter (`-anm x` is `-an`); `--` ends the options.
+# A long option counts as taking an operand when it is a prefix of one (git takes unique
+# prefixes). An option missing here leaves its operand read as a flag: a deny, never an allow.
+_git_flags() {
+  local w f='' i=0 n k c short='' sticky='' long=' '
+  case $1 in
+    commit) short=mFcCt; sticky=uS
+            long=' file author date message reedit-message reuse-message fixup squash template trailer cleanup pathspec-from-file ' ;;
+    push)   short=o; long=' repo receive-pack exec push-option ' ;;
+  esac
+  read -ra _gf <<<"$2"
+  n=${#_gf[@]}
+  while [ "$i" -lt "$n" ]; do
+    w=${_gf[$i]}; i=$((i + 1))
+    case $w in
+      --) break ;;
+      --*=*) f="$f$w " ;;
+      --?*) f="$f$w "; [[ $long == *" ${w#--}"* ]] && i=$((i + 1)) ;;
+      -?*)
+        k=1
+        while [ "$k" -lt "${#w}" ]; do
+          c=${w:$k:1}
+          case $short in *"$c"*) [ $((k + 1)) -lt "${#w}" ] || i=$((i + 1)); break ;; esac
+          case $sticky in *"$c"*) break ;; esac
+          k=$((k + 1))
+        done
+        [ "$k" -gt 1 ] && f="$f${w:0:$k} " ;;
+    esac
+  done
+  GF=" $f"
+}
+
+# ---- hooks-bypass ---------------------------------------------------------------
+# The agent git layer (~/.agents/git-hooks: the push review/test gate, the commit trailer check,
+# and the repo's own hooks it chains to) reaches agent shells through the settings env
+# (GIT_CONFIG_COUNT/KEY_0/VALUE_0=core.hooksPath) and is scoped by CLAUDECODE/AI_AGENT/AGENT_HOST.
+# Each form below switches it off for one command. Only the command TEXT is read: the session env
+# carrying the kit's own GIT_CONFIG_* values is the install, not a bypass.
+# Read through code_view and _seg_walk, one simple command at a time, and only when a name this
+# guard checks appears: a message or PR body that DESCRIBES `-c core.hooksPath=` is a quoted span,
+# and `grep GIT_CONFIG_COUNT= f` or `git log -n 3 commit` set nothing and commit nothing.
+# git takes a unique prefix of a long option: --no-veri and longer are --no-verify for push and
+# commit (--no-v, --no-ve, --no-ver are ambiguous with --no-verbose and git refuses them).
+_hb_why=-
+case $cmd in
+  *[Gg][Ii][Tt]*|*'$'*|*'`'*|*GIT_CONFIG_*|*AGENT_GIT_HOOKS*|*CI_WATCH_ACTIVE*|*CLAUDECODE*|*AI_AGENT*|*AGENT_HOST*)
+    _hb_why=''; code_view ;;
+esac
+_hb_noverify='[[:space:]]--no-veri(f|fy)?[[:space:]]'
+_hb_commit_n='[[:space:]]-[a-zA-Z]*n[a-zA-Z]*[[:space:]]'   # read on _git_flags' GF, operands gone
+_hb_hookspath='(-c|--config-env)[ =][Cc][Oo][Rr][Ee]\.[Hh][Oo][Oo][Kk][Ss][Pp][Aa][Tt][Hh]([= ]|$)'
+_hb_set=' (GIT_CONFIG_(COUNT|KEY_[0-9]+|VALUE_[0-9]+|PARAMETERS)|AGENT_GIT_HOOKS|CI_WATCH_ACTIVE) '
+_hb_markers=' (CLAUDECODE|AI_AGENT|AGENT_HOST) '
+_hb_unset=' (GIT_CONFIG_[A-Z0-9_]*|CLAUDECODE|AI_AGENT|AGENT_HOST) '
+# Each git command walked here is kept (_gc_sub, _gc_args) for destructive-git, so a long command
+# is walked once: 5400 `git status;` segments took 6.8s with two walks, against a 10s timeout.
+_gc_sub=(); _gc_args=()
+if [ -z "$_hb_why" ]; then
+  while IFS= read -r _hb; do
+    case $_hb in *[Gg][Ii][Tt]*|*GIT_*|*AGENT_*|*CI_WATCH_ACTIVE*|*CLAUDECODE*|*AI_AGENT*) ;;
+      *) [[ $_hb =~ (^|[[:space:]])(Q|\$[^[:space:]]*)[[:space:]]+(push|commit|reset|clean|branch|stash|worktree|-)([[:space:]]|$|[-A-Za-z]) ]] || continue ;;
+    esac
+    _seg_walk "$_hb"
+    if [ "$SW_CMD" = git ]; then
+      _gc_n=${#_gc_sub[@]}; _gc_sub[$_gc_n]=$SW_SUB; _gc_args[$_gc_n]=$SW_ARGS
+    fi
+    if [[ $SW_SET =~ $_hb_set ]]; then
+      _hb_why='setting GIT_CONFIG_*, AGENT_GIT_HOOKS or CI_WATCH_ACTIVE in the command replaces or switches off the agent git hooks'
+    elif [[ $SW_SET =~ $_hb_markers ]]; then
+      _hb_why='assigning the agent markers (CLAUDECODE, AI_AGENT, AGENT_HOST) on the command line can hide this shell from the agent git hooks'
+    elif [[ $SW_UNSET =~ $_hb_unset ]]; then
+      _hb_why='unsetting GIT_CONFIG_* or the agent markers (CLAUDECODE, AI_AGENT, AGENT_HOST) hides this shell from the agent git hooks'
+    elif [ "$SW_CMD" != git ]; then
+      continue
+    elif [ "$SW_ENVI" = 1 ]; then
+      _hb_why='`env -i`, `exec -c` or `sudo` (which resets the environment; `sudo -E` keeps it, `--preserve-env=LIST` does not) drops the settings env that injects the agent git hooks'
+    elif [[ $SW_GOPTS =~ $_hb_hookspath ]]; then
+      _hb_why='overriding core.hooksPath on the command line replaces the agent git hooks'
+    elif [ "$SW_SUB" = push ] && [[ $SW_ARGS =~ $_hb_noverify ]] && _git_flags push "$SW_ARGS" \
+        && [[ $GF =~ $_hb_noverify ]]; then
+      _hb_why='`git push --no-verify` skips the pre-push gate'
+    elif [ "$SW_SUB" = commit ] && [[ $SW_ARGS =~ $_hb_noverify || $SW_ARGS =~ [[:space:]]-[a-zA-Z]*n ]] \
+        && _git_flags commit "$SW_ARGS" && [[ $GF =~ $_hb_noverify || $GF =~ $_hb_commit_n ]]; then
+      _hb_why='`git commit -n/--no-verify` skips the commit hooks (the trailer check, the repo'"'"'s own pre-commit)'
+    fi
+    [ -n "$_hb_why" ] && break
+  done <<<"$CV_CODE"
+fi
+case $_hb_why in ''|-) ;; *) deny "AGENT_PUSH_NOW=\"<reason>\" git push ... is the honest path past the review gate (red CI fix, WIP share, infra down); a commit needs only the Co-authored-by trailer.
+Denied: $_hb_why." ;;
+esac
+
+# ---- destructive-git ------------------------------------------------------------
+# CLAUDE.md: stop and ask before force-push, reset --hard, dropping data, deleting branches —
+# "even in auto mode". Auto mode's classifier used to catch these, but an `allow` rule resolves
+# before the classifier ever runs, so allowlisting `git push:*` for the normal loop silently
+# disarmed that guard. The settings.json `ask` rules cover the canonical spellings; this covers
+# the flag ORDER they can't -- `git push origin my-branch --force` matches no prefix pattern.
+# Per simple command, from code_view and _seg_walk: a segment counts only when its command word is
+# git (after VAR=x prefixes, keywords such as do/then, and wrappers such as sudo/xargs/nohup), and
+# only its own arguments after the subcommand are read. Matching words anywhere in the text asked
+# "FORCE push" for a heredoc body that said push in a comment and ran `[ -f x ]` (every hook ask
+# in 8h on 2026-10-03 was such a false positive); reading only a segment's FIRST word then missed
+# `xargs git branch -d` and `do git push --force` (B-2). Flag ORDER still does not matter:
+# `git push origin my-branch --force` and `git -C <path> push --force` both trip.
+# The git commands come from hooks-bypass's walk, whose gate covers every command naming git.
+if [ "${#_gc_sub[@]}" -gt 0 ]; then
+  _dg_k=0
+  while [ "$_dg_k" -lt "${#_gc_sub[@]}" ]; do
+    _dg_sub=${_gc_sub[$_dg_k]}
+    _dg_args=${_gc_args[$_dg_k]}
+    _dg_k=$((_dg_k + 1))
+    read -r _dg_first _ <<<"$_dg_args"   # stash and worktree take their verb first
+    _dg_arg() { [[ $_dg_args =~ [[:space:]]($1)[[:space:]] ]]; }
+    case $_dg_sub in
+      push)
+        _dg_arg '--force|-[a-zA-Z]*f[a-zA-Z]*|--force-with-lease(=[^[:space:]]*)?|--force-if-includes' \
+          && ask "That is a FORCE push. CLAUDE.md: stop and ask before destructive ops, even in auto mode. Force-pushing rewrites published history — anyone who pulled this branch gets a conflicting history, and any CI run in flight is now testing a sha that no longer exists. To fix an already-pushed commit, add a NEW commit on top. Confirm only if rewriting the remote branch is the actual intent."
+        _dg_arg '\+[A-Za-z0-9._/@-]+(:[^[:space:]]*)?' \
+          && ask "That push uses a '+refspec', which force-updates the remote ref exactly like --force, with the same consequence for published history. Confirm only if that is deliberate."
+        # ci-watch and unfinished-work resolve the PR with a bare `gh pr view`, which follows the
+        # branch's upstream. HEAD:<other-branch> without -u leaves that on the old branch and its PR.
+        _dg_arg 'HEAD:[A-Za-z0-9._/-]+' && ! _dg_arg '-u|--set-upstream' \
+          && deny "Pushing HEAD:<branch> without -u leaves this branch tracking its old upstream, so the CI hooks watch the wrong PR.
+Re-run as: git push -u origin HEAD:<branch>" ;;
+      reset)
+        _dg_arg '--hard' \
+          && ask "\`git reset --hard\` discards every uncommitted change in the worktree, with no recovery path. CLAUDE.md requires asking first. If the intent is only to move the branch pointer, \`--soft\`/\`--mixed\` keep the edits." ;;
+      clean)
+        _dg_arg '-[a-zA-Z]*f[a-zA-Z]*|--force' \
+          && ask "\`git clean -f\` permanently deletes untracked files, including scratch and config files that were never added. Run it with \`-n\` first to see the list, or confirm if you already have." ;;
+      branch)
+        _dg_arg '-d|-D|--delete' \
+          && ask "That deletes a branch — one of the destructive ops CLAUDE.md says to confirm first. With -D an unmerged branch's commits go with it." ;;
+      stash)
+        case $_dg_first in drop|clear)
+          ask "That discards stashed work permanently — dropped stash entries are not reachable afterwards. Confirm this is the stash you mean." ;;
+        esac ;;
+      worktree)
+        [ "$_dg_first" = remove ] \
+          && ask "Removing a worktree deletes its working directory, including uncommitted edits and untracked scratch files inside it. Confirm the branch's work is committed and pushed." ;;
+    esac
+  done
+  unset -f _dg_arg
+fi
+
+# ---- bsd-cp-t -------------------------------------------------------------------
+# macOS cp has no -t: it errors on the flag but still copies the other sources onto the last
+# operand, silently overwriting a same-named file there.
+if printf '%s' "$bare" | grep -Eq '(^|[;&|[:space:]])cp[[:space:]]([^;&|]*[[:space:]])?-t([[:space:]]|$)'; then
+  deny "macOS cp has no -t (GNU only): it copies the other operands onto the last one, overwriting it.
+Copy one file per command: cp <src> <dest>"
+fi
+
+# ---- two-dot-diff against a base branch -----------------------------------------
+if printf '%s' "$bare" | grep -Eq '(^|[;&|[:space:]])git[[:space:]]+(diff|log)([[:space:]]|$)'; then
+  # Every ref alternative must END on a non-dot, or `<base>...HEAD` matches by letting the
+  # ref swallow the first dot of the three. The overlay's RELEASE_BRANCH_RE adds local bases.
+  kit_env
+  _bases="origin/[A-Za-z0-9._/-]*[A-Za-z0-9_/-]|master|main${RELEASE_BRANCH_RE:+|$RELEASE_BRANCH_RE}"
+  if printf '%s' "$bare" | grep -Eq "(^|[[:space:]])($_bases)\\.\\.HEAD([[:space:]]|\$)"; then
+    ask "That is a two-dot range against a base branch. On a stale branch two-dot floods the diff with the base's own divergence, so you review the wrong change with no error. Prefer three-dot: <base>...HEAD (or git diff \$(git merge-base <base> HEAD)). Proceed only if you deliberately want the raw two-endpoint comparison."
+  fi
+fi
+
+# ---- inplace-edit ------------------------------------------------------------------
+# CLAUDE.md: edit files with Edit/Write, never a shell in-place rewrite — it bypasses the format
+# and review hooks. A deliberate multi-file sweep opts out with a trailing `# sweep`.
+# Throwaway files are exempt: under /tmp (the scratchpad lives there) and the work root, no format
+# or review hook applies, and 13 of 17 denials in a week hit such files.
+# _ip_exempt: 0 only when every in-place sed/perl is the command word of its simple command and
+# every file it edits is a literal, UNQUOTED, absolute (or ~/) path to an existing regular file
+# whose physical directory is under /tmp or the work root and outside any git work tree. Anything
+# the parse cannot pin down refuses (fail closed): a glob or brace, a $var, a quoted target, a
+# relative path (a `cd` may precede it), targets from xargs/find -exec/stdin, a backtick, an
+# option it does not know. The first version counted "words that are existing files", so one
+# exempt file exempted `src/*.py`, `{a,b}`, `'hooks/x'` and xargs targets beside it (B-4, CX-4).
+# _IP_AWK lexes the command (quotes, escapes, separators) and prints, per in-place command, N and
+# an `F <path>` per file operand, or R to refuse.
+_IP_AWK='
+function endword() {
+  if (inw) { n++; T[n] = cur; Q[n] = wq; D[n] = wd; G[n] = wg }
+  cur = ""; inw = 0; wq = 0; wd = 0; wg = 0
+}
+function endseg() { endword(); if (n) seg(); n = 0 }
+function base(s) { sub(/.*\//, "", s); return s }
+function redir(i,   t, m) {   # 0: not a redirect; -1: refuse; else the words it takes
+  t = T[i]
+  if (Q[i] || t !~ /^[0-9]*(>>?|<|&>>?)/) return 0
+  m = t; sub(/^[0-9]*(&>>?|>>?|<)/, "", m)
+  if (m == "") { m = T[i + 1]; return (m ~ /^(\/dev\/null|&[0-9-])$/ && !Q[i + 1]) ? 2 : -1 }
+  return (m ~ /^(\/dev\/null|&[0-9-])$/) ? 1 : -1
+}
+function file(i) {
+  if (Q[i] || D[i] || G[i] || T[i] !~ /^(\/|~\/)[A-Za-z0-9._\/+@%=,:~-]+$/ || T[i] ~ /(^|\/)\.\.?(\/|$)/) { bad = 1; return }
+  out = out "F " T[i] "\n"; files++
+}
+function seg(   b, i, k, c, t, r, script, inpl, endo, isperl) {
+  b = base(T[1])
+  if (Q[1] || D[1] || (b != "sed" && b != "gsed" && b != "perl")) {
+    for (i = 2; i <= n; i++) {
+      if (Q[i] || (base(T[i]) != "sed" && base(T[i]) != "gsed" && base(T[i]) != "perl")) continue
+      for (k = i + 1; k <= n; k++) if (T[k] ~ /^(-[A-Za-z0-9]*i|--in-place)/) bad = 1
+    }
+    return
+  }
+  isperl = (b == "perl"); script = 0; inpl = 0; endo = 0; files = 0; out = ""
+  for (i = 2; i <= n; i++) {
+    t = T[i]
+    r = redir(i); if (r < 0) { bad = 1; return } if (r > 0) { i += r - 1; continue }
+    if (!endo && t == "--") { endo = 1; continue }
+    if (!endo && !isperl && t ~ /^--/) {
+      if (t ~ /^--in-place/) inpl = 1
+      else if (t == "--expression" || t == "--file") { script = 1; i++ }
+      else if (t ~ /^--(expression|file)=/) script = 1
+      else if (t == "--line-length") i++
+      continue
+    }
+    if (!endo && t ~ /^-./) {
+      for (k = 2; k <= length(t); k++) {
+        c = substr(t, k, 1)
+        if (c == "i" || (c == "I" && !isperl)) { inpl = 1; if (k == length(t) && !isperl && i < n && T[i + 1] == "" && Q[i + 1]) i++; break }
+        if (c == "e" || (c == "E" && isperl) || (c == "f" && !isperl)) { script = 1; if (k == length(t)) i++; break }
+        if (isperl) {
+          if (c == "l" || c == "0") { while (substr(t, k + 1, 1) ~ /[0-9a-fA-Fx]/) k++; continue }
+          if (index("pnaswWXtTcSuU", c)) continue
+          bad = 1; return
+        }
+        if (c == "l") { if (k == length(t)) i++; break }
+      }
+      continue
+    }
+    if (!script) {
+      if (isperl || (!Q[i] && (D[i] || G[i] || t ~ /^[\/~]/))) { bad = 1; return }
+      script = 1; continue
+    }
+    if (isperl) endo = 1
+    file(i); if (bad) return
+  }
+  if (!inpl) return
+  if (!files) { bad = 1; return }
+  print "N"; printf "%s", out
+}
+{ src = src $0 "\n" }
+END {
+  L = length(src); n = 0; inw = 0
+  for (j = 1; j <= L; j++) {
+    c = substr(src, j, 1)
+    if (c == "\\") {
+      if (substr(src, j + 1, 1) == "\n") { j++; continue }
+      cur = cur substr(src, j + 1, 1); inw = 1; wq = 1; j++; continue
+    }
+    if (c == q) {
+      k = index(substr(src, j + 1), q); if (!k) { bad = 1; break }
+      cur = cur substr(src, j + 1, k - 1); inw = 1; wq = 1; j += k; continue
+    }
+    if (c == "\"") {
+      inw = 1; wq = 1
+      for (j++; j <= L && substr(src, j, 1) != "\""; j++) {
+        c = substr(src, j, 1)
+        if (c == "\\") { j++; c = substr(src, j, 1) } else if (c == "$") wd = 1
+        cur = cur c
+      }
+      if (j > L) { bad = 1; break }
+      continue
+    }
+    if (c == "#" && !inw) { while (j <= L && substr(src, j, 1) != "\n") j++; endseg(); continue }
+    if (c == " " || c == "\t") { endword(); continue }
+    if (c == "&" && (substr(src, j - 1, 1) ~ /[<>]/ || substr(src, j + 1, 1) == ">")) { cur = cur c; inw = 1; continue }
+    if (index(";&|()\n", c)) { endseg(); continue }
+    if (c == "$") wd = 1
+    if (index("*?[]{}", c)) wg = 1
+    cur = cur c; inw = 1
+  }
+  if (!bad) endseg()
+  if (bad) print "R"
+}'
+_ip_under() {   # <physical dir>
+  local p=$1/ r
+  case $p in */worktrees/*) return 1 ;; /private/tmp/*|/tmp/*) return 0 ;; esac
+  for r in "${_ip_roots[@]}"; do case $p in "$r"/*) return 0 ;; esac; done
+  return 1
+}
+_ip_exempt() {
+  local out line p d r seen=0
+  case $cmd in *'`'*) return 1 ;; esac
+  out=$(printf '%s\n' "$cmd" | drop_heredocs 1 | awk -v q="'" "$_IP_AWK") || return 1
+  kit_env
+  _ip_roots=(/nonexistent)   # never empty: "${a[@]}" of an empty array fails under set -u in bash 3.2
+  p=${AGENT_WORK_ROOT:-}; p=${p/#\~/$HOME}
+  for r in "$HOME/agent-work" "$HOME/claude-scratch" "$p"; do
+    [ -n "$r" ] && r=$(cd -P -- "$r" 2>/dev/null && pwd -P) && _ip_roots+=("$r")
+  done
+  while IFS= read -r line; do
+    case $line in N) seen=1; continue ;; 'F '/*|'F ~/'*) p=${line#F } ;; *) return 1 ;; esac
+    case $p in '~/'*) p=$HOME/${p#'~/'} ;; esac
+    [ -f "$p" ] && [ ! -L "$p" ] || return 1
+    d=$(cd -P -- "${p%/*}/" 2>/dev/null && pwd -P) || return 1
+    _ip_under "$d" || return 1
+    # A clone or worktree under /tmp or the work root is code (B-5).
+    git -C "$d" rev-parse --is-inside-work-tree >/dev/null 2>&1 && return 1
+  done <<< "$out"
+  [ "$seen" = 1 ]
+}
+if ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*sweep([[:space:]]|$)'; then
+  # sed/perl in COMMAND position (line start, after ;&|( or a prefix like xargs/-exec/sudo, any path),
+  # then any word run, then -i as its own short-switch cluster: `sed -Ei`, `sed -e x -i`, `-i''`, `-ibak`,
+  # `perl -pi`. sed has no other -i* switch; perl's -I<dir> and -M<mod> are others, so only [pnlaw0-9]
+  # may precede its i.
+  _pos='(^|[;&|(]|(^|[[:space:]])(xargs|-exec|sudo|command|env|time|nice))[[:space:]]*([^;&|[:space:]]*/)?'
+  _words='([[:space:]]+[^;&|[:space:]]+)*[[:space:]]+'
+  # From the raw command: $bare masks a quoted heredoc delimiter to Q, which hides where its body ends.
+  _code=$(printf '%s\n' "$cmd" | drop_heredocs 1 | sed -E -e "s/'[^']*'/Q/g" -e 's/"[^"]*"/Q/g')
+  _ip_sed="${_pos}g?sed${_words}(-[EnrsuzlE]*i|--in-place)"
+  _ip_perl="${_pos}perl${_words}-[pnlaw0-9]*i([^A-Za-z]|e|\$)"
+  if printf '%s' "$_code" | grep -Eq "$_ip_sed" || printf '%s' "$_code" | grep -Eq "$_ip_perl"; then
+    _ip_exempt || deny "In-place sed/perl rewrite refused: edit the file with Edit/Write (CLAUDE.md: Tooling). For a deliberate multi-file sweep, append \`# sweep\` to the command."
+  fi
+fi
+
+# ---- zsh-modifier ------------------------------------------------------------------
+# The Bash tool runs zsh, where \$name:r / :h / :t / :e / :s… are history modifiers: a refspec
+# written "\$b:refs/heads/x" silently became "<b minus extension>efs/heads/x" and every fetch
+# failed. What zsh never expands is dropped before matching: quoted-heredoc bodies, single-quoted
+# spans and \$ escapes. Comments are not: a # inside double quotes still expands, and telling them
+# apart needs a parser; a false deny here costs one pair of braces.
+_unquoted=$(printf '%s\n' "$cmd" | drop_heredocs 0 | sed -E -e "s/'[^']*'//g" -e 's/\\\$//g')
+_zmod=$(printf '%s' "$_unquoted" | grep -Eo '\$[A-Za-z_][A-Za-z0-9_]*:[hrtelqQuxaAPsgc&]' | head -1)
+if [ -n "$_zmod" ]; then
+  _zname=${_zmod%%:*}
+  deny "zsh reads \`${_zmod}\` as a history modifier on ${_zname}, not a literal colon. Brace it: \`\${${_zname#\$}}:${_zmod##*:}…\`."
+fi
+
+# ---- context-dumps: uncapped file reads into the model's context ------------------
+# Measured over 12 sessions: Bash was 87% of all tool-result context and cat/sed/head/tail
+# were 50% of that (383 calls, 1.15M chars); the Read tool did the same job in 34 calls /
+# 200K chars, because it paginates and the harness dedupes a re-read. Auto mode's system
+# prompt actively asks for cat/sed over Read, so this is the only place that can push back.
+# DENY, not ask: the model retries with a bounded form on its own, where an `ask` would put
+# the cost on the user.
+#
+# Two things this deliberately does NOT do, both learned the hard way:
+#   * It does not estimate emitted bytes by prorating over `wc -l`. That divided by zero on a
+#     file with no newline (a 5MB single-line JSON read as "0 lines" and was allowed) and
+#     false-denied a file with one very long line. A span can emit at most the whole file, so
+#     a plain size gate is both simpler and exact enough.
+#   * It does not parse the shell. It works per segment, and a segment whose stdout is piped
+#     into a bounding consumer or redirected to a file is skipped.
+BYTE_CAP=25000     # a file at or under this is cheap enough to dump whole
+LINE_CAP=300       # a span wider than this, against a file bigger than BYTE_CAP, is not
+
+# Tools whose stdout genuinely bounds what reaches context, plus the documented escape hatch.
+_BOUNDING='head|tail|wc|grep|rg|jq|awk|sed|sort|uniq|cut|python3?|shasum|md5sum|column|nl|diff|base64|xxd|od|openssl|node|yq|xargs|tr'
+_ESCAPE='cat|tee|less|more|pbcopy'   # `| cat` is promised in the deny message as the opt-out
+
+# Split on `;`, `&&`, `||` — but NOT on a bare `|`: a pipe is the same output chain and is
+# exactly what caps a dump. (BSD sed does emit a real newline for `\n` here; verified.)
+segments_of() { printf '%s' "$1" | sed -E 's/(&&|\|\||;)/\n/g'; }
+
+# 0 = this segment's stdout never reaches context. Named for what it means, not for BYTE_CAP.
+seg_stdout_hidden() {
+  local s; s=$(cmd_mask "$1")
+  printf '%s' "$s" | grep -Eq "\|[[:space:]]*($_BOUNDING|$_ESCAPE)([[:space:]]|\$)" && return 0
+  # `2>`/`2>>` are not stdout, and `>&2` still lands in the tool result — neither exempts.
+  printf '%s' "$s" | sed -E -e 's/(^|[[:space:]])2>>?[^[:space:]]*//g' -e 's/[0-9]?>&2//g' \
+    | grep -q '>' && return 0
+  return 1
+}
+
+# A { …; } or ( … ) group whose stdout goes to a file or a bounding consumer: segments_of splits
+# INSIDE it, so `{ sed -n '5,$p' f; echo; } > out` lost the group's redirect and read as a dump
+# (retro 2026-W40:9). Its body becomes `:`, innermost group first, so nesting resolves outward.
+# Not $( … ), <( … ) or ${ … }; `2>` and `>&2` are not stdout redirects (as seg_stdout_hidden).
+# An inner >&2, /dev/stderr, /dev/tty or /dev/fd/2 sends output past the group's redirect into the
+# tool result (`{ cat big >&2; } > f`, CX-6): such a command keeps every group as it is.
+drop_redirected_groups() {
+  local s=$1 prev='' out
+  case $s in *'}'*|*')'*) ;; *) printf '%s' "$s"; return ;; esac
+  [[ $s =~ \>\&[[:space:]]*2([^0-9]|$)|/dev/(stderr|tty|fd/2) ]] && { printf '%s' "$s"; return; }
+  out="[[:space:]]*(1?>>?[[:space:]]*[^&[:space:]]|[|][[:space:]]*($_BOUNDING|$_ESCAPE)([[:space:]]|\$))"
+  while [ "$s" != "$prev" ]; do
+    prev=$s
+    s=$(printf '%s\n' "$s" | sed -E -e ':a' -e '$!N' -e '$!ba' \
+      -e "s/(^|[^\$<>])[{][^{}]*[}]($out)/\\1:\\2/g" -e "s/(^|[^\$<>])[(][^()]*[)]($out)/\\1:\\2/g") || { printf '%s' "$prev"; return 0; }
+  done
+  printf '%s' "$s"
+}
+
+# Quote CHARACTERS removed but content kept; ~ / $HOME expanded, which `[ -f ]` never does.
+# Grouping chars become separators: in `(cat big.md)` the path keeps a trailing `)`.
+paths_of() {
+  printf '%s' "$1" | tr -d "\"'" | tr '(){}' '    ' \
+    | sed -e 's/[;&|][;&|]*/ /g' -e "s|[~]/|$HOME/|g" -e "s|\$HOME/|$HOME/|g" -e 's|\${HOME}/|'"$HOME"'/|g'
+}
+# Digits only AND small enough for bash arithmetic: `head -n 18446744073709551617` is all
+# digits but `[ "$n" -gt … ]` dies on it with "integer expression expected", and a failed test
+# falls through to allow — an unbounded read reading as a bounded one.
+is_num() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ ${#1} -le 18 ]; }
+
+# deny() exits, so each check denies where it finds the problem.
+deny_dump() {
+  deny "That emits ~$2 into context ($1). Bash file dumps were half of this setup's context spend and, unlike the Read tool, they neither paginate nor dedupe a re-read.
+
+Use instead:
+  * Read(file_path=…, offset=…, limit=…) — to read a file, even a long one
+  * Grep(pattern=…, path=…, -n, -C 2)    — to find something inside it
+  * a bounded shell form: | head -c 4000, | head -50, | grep -n <pat>
+
+If you genuinely need the whole span, append \`| cat\` to say so deliberately."
+}
+
+guard_context_dumps() {
+  local body seg segbare segtok f fsz p w sz span a b n plus tool width got
+  # Each segment below costs ~10 forks, and every heredoc line used to be a segment: a 30KB
+  # heredoc took 26s against the 10s timeout, which fails open. Bodies are data (lib/
+  # strip-heredocs keeps one fed to a shell); if awk fails, inspect the raw command.
+  body=$(printf '%s\n' "$cmd" | awk -f "$HOOK_LIB/strip-heredocs" 2>/dev/null) || body="$cmd"
+  [ -n "$body" ] || body="$cmd"
+  body=$(drop_redirected_groups "$body")
+  # Every form measured below needs one of these names; without one there is nothing to cap.
+  printf '%s' "$body" | grep -Eq '(^|[^A-Za-z0-9_.-])(cat|head|tail|sed)([^A-Za-z0-9_-]|$)' || return 0
+  while IFS= read -r seg; do
+    [ -n "$seg" ] || continue
+    # segments_of splits the RAW command, so a `;`/`&&` inside a quoted string (a heredoc
+    # body, an awk program) manufactures phantom segments with unbalanced quotes that
+    # cmd_mask cannot pair, and those false-denied.
+    [ $(( $(printf '%s' "$seg" | tr -cd "'" | wc -c) % 2 )) -eq 0 ] || continue
+    [ $(( $(printf '%s' "$seg" | tr -cd '"' | wc -c) % 2 )) -eq 0 ] || continue
+    seg_stdout_hidden "$seg" && continue
+
+    segbare=$(cmd_mask "$seg")
+    segtok=$(awk -f "$HOOK_LIB/cmd-tokens" <<<"$segbare")
+
+    # First readable non-flag path named in THIS segment. Scoped per segment so a small file
+    # named elsewhere cannot stand in for the one being dumped.
+    f=''; fsz=0
+    set -f
+    for p in $(paths_of "$seg"); do
+      case "$p" in -*|cat|sed|head|tail|*'*'*|*'?'*) continue;; esac
+      # -r as well as -f: `wc -c < "$p"` on an unreadable file fails in the SHELL, before wc
+      # runs, so its 2>/dev/null cannot suppress the message and it leaks to the hook's stderr.
+      { [ -f "$p" ] && [ -r "$p" ]; } || continue
+      sz=$(wc -c < "$p" 2>/dev/null | tr -d ' ')
+      is_num "$sz" || continue
+      # LARGEST, not first, or `head -n 5 small.txt big.log` is judged by small.txt.
+      if [ "$sz" -gt "$fsz" ]; then f="$p"; fsz=$sz; fi
+    done
+    set +f
+
+    # cat FILE… — every large file named in this segment.
+    if cmd_invokes cat "$segtok"; then
+      set -f
+      for w in $(paths_of "$seg"); do
+        case "$w" in -*|cat|*'*'*|*'?'*) continue;; esac
+        { [ -f "$w" ] && [ -r "$w" ]; } || continue
+        sz=$(wc -c < "$w" 2>/dev/null | tr -d ' ')
+        if is_num "$sz" && [ "$sz" -gt "$BYTE_CAP" ]; then
+          set +f; deny_dump "$w" "${sz} bytes"
+        fi
+      done
+      set +f
+    fi
+
+    # Every span form wants one number: bytes this would actually emit. Measure it the same
+    # way for all three rather than inferring it: counting the lines that fit in the budget
+    # FROM THE FRONT of the file cannot judge a span starting anywhere (`sed -n '13001,13500p'`
+    # over short-lines-then-fat-lines emits 50MB). No eval: each command is built from an
+    # is_num'd integer and a quoted "$f", and `| head -c` bounds what the measurement reads.
+    [ -n "$f" ] || f=''
+    if [ -n "$f" ]; then
+      # A span can emit at most the whole file, so a small file needs no further thought.
+      [ "$fsz" -le "$BYTE_CAP" ] && continue
+    fi
+
+    # $1 = the bounded command, already fully quoted by the caller. Empty when unmeasurable.
+    emitted() { "$@" 2>/dev/null | head -c $((BYTE_CAP + 1)) | wc -c | tr -d ' '; }
+
+    for tool in head tail; do
+      cmd_invokes "$tool" "$segtok" || continue
+      n=$(printf '%s' "$segbare" | sed -nE 's/.*(^|[[:space:]])-c[[:space:]]*([0-9]+)([[:space:]]|$).*/\2/p' | head -1)
+      is_num "$n" && [ "$n" -gt "$BYTE_CAP" ] && deny_dump "that $tool -c" "${n} bytes"
+      n=$(printf '%s' "$segbare" | sed -nE 's/.*(^|[[:space:]])-(n[[:space:]]*)?(\+?[0-9]+)([[:space:]]|$).*/\3/p' | head -1)
+      plus=''; case "$n" in +*) plus='+'; n=${n#+};; esac
+      [ -n "$n" ] || continue
+      # `tail -n +N` runs to EOF; a count too large to be an integer is likewise unbounded.
+      [ -n "$plus" ] && deny_dump "that $tool" "line ${n} to EOF"
+      is_num "$n" || deny_dump "that $tool" "an unbounded line count"
+      # Bound the work before measuring. `tail -n <huge>` scans backward over the whole file
+      # (2.3s on 1GB, against this hook's 10s timeout), and nobody legitimately reads 100k
+      # lines into context anyway.
+      [ "$n" -gt 100000 ] && deny_dump "that $tool" "${n} lines"
+      got=''
+      [ -n "$f" ] && got=$(emitted "$tool" -n "$n" "$f")
+      if is_num "$got"; then
+        [ "$got" -gt "$BYTE_CAP" ] && deny_dump "that $tool" "${got}+ bytes"
+      else
+        # No readable file named, or the measurement failed — fall back to width alone rather
+        # than reading an empty result as "0 bytes, fine".
+        [ "$n" -gt "$LINE_CAP" ] && deny_dump "that $tool" "${n} lines"
+      fi
+    done
+
+    # sed -n 'A,Bp' and sed -n 'A,$p'.
+    if cmd_invokes sed "$segtok"; then
+      span=$(printf '%s' "$seg" | sed -nE "s/.*-n[[:space:]]*'?([0-9]+),([0-9]+|\\\$)p.*/\1 \2/p" | head -1)
+      if [ -n "$span" ]; then
+        a=${span%% *}; b=${span##* }
+        if is_num "$a"; then
+          [ "$b" = '$' ] && deny_dump 'that sed range' "line ${a} to EOF"
+          if is_num "$b" && [ "$b" -ge "$a" ]; then
+            width=$((b - a + 1))
+            [ "$width" -gt 100000 ] && deny_dump 'that sed range' "${width} lines"
+            got=''
+            [ -n "$f" ] && got=$(emitted sed -n "${a},${b}p" "$f")
+            if is_num "$got"; then
+              [ "$got" -gt "$BYTE_CAP" ] && deny_dump 'that sed range' "${got}+ bytes"
+            else
+              [ "$width" -gt "$LINE_CAP" ] && deny_dump 'that sed range' "${width} lines"
+            fi
+          fi
+        fi
+      fi
+    fi
+  done <<< "$(segments_of "$body")"
+}
+guard_context_dumps
+
+exit 0

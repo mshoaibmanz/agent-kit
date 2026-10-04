@@ -1,0 +1,11 @@
+#!/bin/bash
+# Credentials enter only the server's environment, never rendered config or argv.
+set +x
+set -eu
+SENTRY_ACCESS_TOKEN=$(/usr/bin/security find-generic-password -s agent-kit/mcp/sentry -a sentry -w 2>/dev/null) || {
+  echo 'Could not access the Sentry Keychain item (missing or denied). Check access in your trusted terminal before importing or rotating a credential.' >&2
+  exit 1
+}
+[ -n "$SENTRY_ACCESS_TOKEN" ] || exit 1
+export SENTRY_ACCESS_TOKEN
+exec npx -y @sentry/mcp-server@0.37.0 "$@"

@@ -1,10 +1,10 @@
 {
-  "name": "claude-kit",
+  "name": "agent-kit",
   "owner": {
     "name": "Shoaib Manzoor"
   },
   "metadata": {
-    "description": "A Claude Code setup split into pick-and-choose plugins: guard rails, review, CI, prod-data safety, workflow commands and skills. Read README.md's matrix before installing.",
+    "description": "Shared rules, selected skills, configurable review roles and hooks for Claude, Codex and Cursor. Install only the components you choose.",
     "version": "1.0.0"
   },
   "plugins": [
@@ -26,12 +26,12 @@
     {
       "name": "auto-review",
       "source": "./plugins/auto-review",
-      "description": "Tiered review at Stop, sized by the delta since the LAST completed review. Under 40 lines: a self-check. Under 150: one reviewer agent. Above: a parallel bugs + code-quality audit (with the thermos plugin installed; one deep reviewer without it). Every agent round is followed by a critic that issues typed, evidence-bearing verdicts before anything is fixed. Ships the reviewer, thermo-bugs, thermo-quality, critic, adversary and worker agents and their rubrics."
+      "description": "Review at git push with reproduce-first fixes, role-selected providers and a bounded review budget. Explicit installation enables blocking review hooks."
     },
     {
       "name": "session-context",
       "source": "./plugins/session-context",
-      "description": "Injects per-repo framing at SessionStart: pointers to your ~/.claude/local/<repo>-*.md docs, the repo's code-invariants TL;DR, CONTEXT-MAP navigation, the test-runner line, a prod-data line for repos listed in ~/.claude/local/prod-data-repos, a handoff for the branch, and one-line warnings. Hard-caps its payload. Writes a one-screen session digest at SessionEnd. Ships claude-gc (housekeeping for ~/.claude state and stale worktrees)."
+      "description": "Project and item context, handoffs, a retro inbox and safe housekeeping. Per-user repository docs remain in your overlay."
     },
     {
       "name": "python-hygiene",

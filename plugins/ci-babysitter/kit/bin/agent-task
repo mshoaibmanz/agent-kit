@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""agent-task: projects and work items under the work root (kit.env AGENT_WORK_ROOT, ~/agent-work).
+
+Layout: projects/<p>/{PROJECT.md, INDEX.md, knowledge/, scripts/, data/, items/<TICKET or slug>/
+{HANDOFF.md, task.json, briefs/, out/}}. No worktrees under the work root: they live in
+<repo>/.claude/worktrees/. A legacy tasks/<name>/ folder is a project of one until migrated.
+
+  agent-task bind <project>[/<item>] | <TICKET> | <legacy folder> [desc words] [--session id]
+  agent-task resolve "<text>" [--branch b] [--paths f ...] [--repo r] [--cwd d]
+  agent-task where --path [--session id]        exit 1 when the session is unbound
+  agent-task ls [--paths]
+  agent-task index <project>
+  agent-task brief <project>/<item> [--name task]
+  agent-task harvest <project>/<item>
+  agent-task retro "<note>" | --stdin [--source model|user|auto] [--tag t] [--session id]
+  agent-task retro --pending                    one `<id> <line>` per unprocessed line
+  agent-task retro --mark <id> ...              mark those lines (ids from --pending) processed
+  agent-task migrate --plan
+  agent-task slice [--session id]               the injected context of a bound session
+  agent-task session-start --session id --source startup|resume|clear|compact [--repo r] [--branch b] [--cap n]
+                                (the OUT DIR's repo: --repo, else CLAUDE_PROJECT_DIR's, else the cwd's)
+  agent-task nudge --session id --ctx n --at n [--cwd d]   the context-watch handoff text
+
+--session defaults to AGENT_SESSION_ID; native Codex prefers CODEX_THREAD_ID over an inherited Claude session.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "hooks", "lib"))
+import agent_task as at  # noqa: E402
+
+
+def die(msg: str) -> None:
+    sys.stderr.write(f"agent-task: {msg}\n")
+    sys.exit(2)
+
+
+from session import resolve as session_id  # noqa: E402
+
+
+def need_sid(sid: str) -> str:
+    sid = session_id(sid)
+    if not sid:
+        die("no session: pass --session <id> or set AGENT_SESSION_ID, CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID")
+    return sid
+
+
+def cmd_bind(a: argparse.Namespace) -> int:
+    sid = need_sid(a.session)
+    if not a.args:
+        die("usage: agent-task bind <project>[/<item>] | <TICKET> [desc words]")
+    target, desc = a.args[0], at.slug(" ".join(a.args[1:]))
+    m = re.match(r"^([A-Za-z][A-Za-z0-9]*-[0-9]+)-(.+)$", target)
+    if m and "/" not in target and not at.find_legacy(target):
+        target, desc = m.group(1).upper(), at.slug(f"{m.group(2)} {desc}")
+    b = at.bind(sid, target, desc=desc, branch=a.branch, repo=a.repo)
+    print(f"Bound session {sid[:8]} to {at.where_label(b)} ({b.folder}). Tab: {b.label}.")
+    print(at.slice_text(b))
+    return 0
+
+
+def cmd_resolve(a: argparse.Namespace) -> int:
+    paths = a.paths if a.paths else (at.changed_paths(a.cwd, a.branch) if a.cwd else [])
+    r = at.resolve(" ".join(a.args), branch=a.branch, paths=paths, repo=a.repo)
+    print(json.dumps({"outcome": r.outcome, "ticket": r.ticket, "candidates": [{"project": p.name, "legacy": p.legacy, "score": round(s, 1)} for p, s in r.candidates]}))
+    return 0
+
+
+def cmd_where(a: argparse.Namespace) -> int:
+    b = at.bound(need_sid(a.session))
+    if not b:
+        if not a.path:
+            print("unbound")
+        return 1
+    print(b.folder if a.path else f"{at.where_label(b)}\t{b.folder}")
+    return 0
+
+
+def cmd_ls(a: argparse.Namespace) -> int:
+    for p in at.projects():
+        if p.legacy:
+            print(f"tasks/{p.name}  (legacy){'  [handoff]' if (p.path / 'HANDOFF.md').is_file() else ''}")
+            continue
+        items = p.items()
+        live = sum(1 for d in items if at._item_status(d) not in at.DONE_STATUSES)
+        line = f"{p.name}  status={p.meta.get('status', '?')}  items={len(items)} open={live}"
+        if a.paths:
+            line += f"  paths={','.join(p.listing('paths')) or '-'}  terms={','.join(p.listing('terms')) or '-'}"
+        print(line)
+    return 0
+
+
+def cmd_index(a: argparse.Namespace) -> int:
+    if not a.args:
+        die("usage: agent-task index <project>")
+    f = at.index(a.args[0])
+    if not f:
+        die(f"no project {a.args[0]}")
+    print(f)
+    return 0
+
+
+def split_target(t: str) -> tuple[at.Project, str]:
+    name, _, item = t.partition("/")
+    pdir = at.project_dir(name)
+    if pdir:
+        return at.parse_project(pdir), item
+    leg = at.find_legacy(name)
+    if leg:
+        return at.legacy_project(leg), ""
+    die(f"no project {name}")
+    raise SystemExit
+
+
+def cmd_brief(a: argparse.Namespace) -> int:
+    if not a.args:
+        die("usage: agent-task brief <project>/<item> [--name task]")
+    p, item = split_target(a.args[0])
+    b = at.Binding(p, item)
+    if item and not p.legacy:
+        at.ensure_item(p, item)
+    name = at.slug(a.name or "task")
+    f = b.folder / "briefs" / f"brief-{name}.md"
+    if f.exists():
+        die(f"{f} exists; pass --name")
+    text = f"""# Brief: {name}
+
+Work folder: {b.folder} (notes go to briefs/notes-{name}.md, evidence to out/)
+Python scripts here or in the scratchpad start with a `# type: ignore` line (no Pyright noise).
+
+## Objective
+
+## Repo and worktree
+Repo: ; worktree in <repo>/.claude/worktrees/<name>; expected branch:
+
+## Test command
+
+## Done criteria
+
+## Hand-back
+At most 400 words: outcome, files changed, tests run, what is left, and `Learnings:` (at most 3
+lines, each tagged mistake, fact, doc or tooling) for `agent-task retro`.
+
+## Project context (injected by agent-task brief)
+{at.slice_text(b)}
+"""
+    at._atomic_write(f, text)
+    if not p.legacy:
+        at.index(p.name)
+    print(f)
+    return 0
+
+
+HARVEST_SKIP = {"worktrees", ".git", "node_modules", "sessions", "__pycache__", ".venv"}
+
+
+def item_files(d: Path) -> list[Path]:
+    """The item's own files: checkouts, dependencies and per-session folders are pruned unread."""
+    out = []
+    for top, dirs, names in os.walk(d):
+        dirs[:] = [x for x in dirs if x not in HARVEST_SKIP]
+        out += [Path(top) / n for n in names]
+    return sorted(out)
+
+
+def cmd_harvest(a: argparse.Namespace) -> int:
+    if not a.args:
+        die("usage: agent-task harvest <project>/<item>")
+    p, item = split_target(a.args[0])
+    b = at.Binding(p, item)
+    d = b.folder
+    files = item_files(d)
+    scripts = [f for f in files if f.suffix in (".py", ".sh", ".sql")]
+    docs = [f for f in files if f.suffix == ".md" and f.name != "HANDOFF.md"]
+    print(f"HARVEST {at.where_label(b)} ({d}). Answer three questions, act on each, then append the summary.")
+    print("1. Domain docs: which facts are true beyond this ticket, about business meaning, flows or decisions, and verified in code? Add them through the docs-rollup worktree (session-review skill, \"Domain-doc learnings\"), then record each in knowledge/ as a one-line `status: in-docs -> <doc link>` entry.")
+    kroot = p.path / "knowledge" if not p.legacy else d
+    print(f"2. Project knowledge: which other findings, decisions, code-map notes and query recipes go to {kroot}/{{findings,decisions,code-map,queries}}.md, each with a source, a last-verified date and a status (project-only or pending-docs)?")
+    print(f"3. Scripts: which of these move to {p.path / 'scripts'}/ with a docstring (git mv is not needed; mv, then fix callers):")
+    for f in scripts[:30]:
+        print(f"   - {f.relative_to(d)}: {at._desc(f) or '(no docstring)'}")
+    if not scripts:
+        print("   (no scripts in the item)")
+    if docs:
+        print("   Item docs to mine for 1 and 2: " + ", ".join(str(f.relative_to(d)) for f in docs[:15]))
+    print(f"Then append to {d / 'HANDOFF.md'} (never overwrite it): `## Summary (harvested {at.today()})` with the PR, what shipped, and where each harvested fact and script went.")
+    print("Last, record at most 3 learnings: agent-task retro \"<mistake|fact|doc|tooling>: <text>\".")
+    if not p.legacy and item:
+        tj = d / "task.json"
+        try:
+            data = json.loads(tj.read_text())
+        except (OSError, ValueError):
+            data = {"item": item}
+        data.update(status="harvested", harvested=at.today())
+        at._atomic_write(tj, json.dumps(data, indent=2) + "\n")
+        at.index(p.name)
+    return 0
+
+
+def cmd_retro(a: argparse.Namespace) -> int:
+    if a.pending:
+        for f, n, line in at.retro_pending():
+            print(f"{at.retro_id(f, n, line)} {line}")
+        return 0
+    if a.mark:
+        if not a.args:
+            die("usage: agent-task retro --mark <id> ... (the ids --pending printed: only the lines you reviewed)")
+        print(f"marked {at.retro_mark(a.args)} lines processed")
+        return 0
+    if a.stdin:
+        a.args = [sys.stdin.read()]
+    if not a.args or not "".join(a.args).strip():
+        die('usage: agent-task retro "<note>" | --stdin')
+    source = a.source or "model"
+    if source not in ("model", "user", "auto"):
+        die("--source is model, user or auto")
+    sid = session_id(a.session)
+    b = at.bound(sid) if sid else None
+    print(at.record_retro(" ".join(a.args), source=source, tag=a.tag, session=sid, where=at.where_label(b)))
+    return 0
+
+
+def cmd_migrate(a: argparse.Namespace) -> int:
+    if not a.plan:
+        die("only `migrate --plan` exists: moving folders is the user's call")
+    legacy = [p for p in at.projects() if p.legacy]
+    toks: dict[str, set[str]] = {}
+    generic = {"ticket", "doc", "docs", "repo", "api", "team", "express", "kickoff", "handoff", "index", "plan", "review"}
+    for p in legacy:
+        # The folder name and the files' titles only: INDEX.md bodies share template text.
+        text = p.meta.get("terms", "")
+        for name in ("INDEX.md", "HANDOFF.md"):
+            f = p.path / name
+            if f.is_file():
+                text += " " + " ".join(x for x in f.read_text(errors="replace").split("\n")[:3] if x.startswith("# "))
+        toks[p.name] = {w[:5] for w in at.words(text) - generic}
+    parent = {n: n for n in toks}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    names = sorted(toks)
+    for i, x in enumerate(names):
+        for y in names[i + 1 :]:
+            small = min(len(toks[x]), len(toks[y]))
+            if small and len(toks[x] & toks[y]) / small >= 0.3:
+                parent[find(y)] = find(x)
+    groups: dict[str, list[str]] = {}
+    for n in names:
+        groups.setdefault(find(n), []).append(n)
+    print("# Proposed grouping (nothing is moved; confirm, then move by hand or ask for a migration)")
+    for members in sorted(groups.values(), key=lambda m: (-len(m), m)):
+        common = Counter(w for m in members for w in toks[m]).most_common(2)
+        label = "-".join(w for w, _ in common) if len(members) > 1 else at.slug(members[0])
+        print(f"- {label}: {', '.join(members)}" + ("  (project of one)" if len(members) == 1 else ""))
+    print("Per folder: projects/<p>/items/<TICKET>/ gets HANDOFF.md, briefs/, out/; reusable scripts and data go to projects/<p>/scripts|data; worktrees/ stay out (move them to <repo>/.claude/worktrees/).")
+    return 0
+
+
+def cmd_slice(a: argparse.Namespace) -> int:
+    b = at.bound(need_sid(a.session))
+    if not b:
+        return 1
+    print(at.slice_text(b, cap=at.SLICE_CAP - 1))
+    return 0
+
+
+def cmd_session_start(a: argparse.Namespace) -> int:
+    """SessionStart (session-context): the slice of a bound session, inheriting the tab's binding
+    on /clear; else the path the per-session folder gets on first write (never created here).
+    startup and resume point the tab's binding at this session's (an unbound one blanks it)."""
+    sid = need_sid(a.session)
+    b = at.bound(sid)
+    cap = min(at.SLICE_CAP, max(a.cap, 1500)) if a.cap else at.SLICE_CAP
+    if a.source == "compact":
+        print(at.compact_text(sid, a.cwd or os.getcwd(), a.repo, a.branch, cap))
+        return 0
+    how = ""
+    if a.source in ("startup", "resume"):
+        at.set_tab(sid, b)
+    if not b and a.source == "clear":
+        b = at.tab_binding()
+        if b:
+            at.write_binding(sid, b, inherited=True)
+            how = f"Kept this tab's binding to {at.where_label(b)} across /clear; a prompt naming another ticket rebinds."
+    if b:
+        print(at.slice_text(b, how, cap=cap))
+        return 0
+    print(at.unbound_text(at.handoff_folder(sid, a.cwd or os.getcwd(), a.repo)[1], a.branch))
+    return 0
+
+
+def cmd_nudge(a: argparse.Namespace) -> int:
+    """hooks/context-watch: the text of the handoff nudge at the context threshold."""
+    print(at.nudge_text(need_sid(a.session), a.ctx, a.at, a.cwd or os.getcwd()))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="agent-task", add_help=False)
+    ap.add_argument("sub", nargs="?")
+    ap.add_argument("args", nargs="*")
+    ap.add_argument("--session", default="")
+    ap.add_argument("--branch", default="")
+    ap.add_argument("--repo", default="")
+    ap.add_argument("--cwd", default="")
+    ap.add_argument("--paths", nargs="*", default=None)
+    ap.add_argument("--path", action="store_true")
+    ap.add_argument("--name", default="")
+    ap.add_argument("--source", default="")
+    ap.add_argument("--tag", default="")
+    ap.add_argument("--cap", type=int, default=0)
+    ap.add_argument("--ctx", type=int, default=0)
+    ap.add_argument("--at", type=int, default=600000)
+    ap.add_argument("--pending", action="store_true")
+    ap.add_argument("--mark", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--plan", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_intermixed_args()
+    if a.sub == "ls" and a.paths is not None:
+        a.paths = True
+    cmds ={"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge}
+    if a.help or a.sub not in cmds:
+        print(__doc__)
+        return 0 if a.help or not a.sub else 2
+    return cmds[a.sub](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,134 @@
+# The agent push gate, run by the git pre-push hook (~/.agents/git-hooks/agent/pre-push). It is the
+# one authority for an agent's push; the PreToolUse(Bash) pre-push-gate it replaces matched the
+# command text, so `git -C <wt> push` (the form CLAUDE.md prescribes, 56 of 178 pushes in the week
+# to 2026-10-03) skipped every check. Sourced; defines functions only. In order:
+#   force     a remote ref the local sha does not descend from        -> refuse, no override
+#   review    the pushed branch's unreviewed code, from its review record
+#             ($(git rev-parse --git-common-dir)/agent-review/<branch>.json, lib/review-state
+#             rv_push_decide): under ~40 lines allowed with a self-check line, else refused with
+#             the review instruction; past the branch's 3 rounds allowed with a warning
+#   sprawl    a ticket that already has 3+ commits on the branch, no PR -> refuse
+#   tests     no local test run recorded this session or worktree      -> refuse
+# AGENT_PUSH_NOW="<reason>" skips review, sprawl and tests (CI-only check, WIP share, infra down);
+# an empty reason is refused. It is the only override: a `# push-now` shell comment never reaches git.
+# Output goes to stderr, which the agent's tool result shows. Exit status is the decision.
+
+. "${BASH_SOURCE[0]%/*}/state" || return 1
+. "${BASH_SOURCE[0]%/*}/test-run" || return 1
+. "${BASH_SOURCE[0]%/*}/review-state" || return 1
+
+PG_ZERO=0000000000000000000000000000000000000000
+
+pg_refuse() { printf 'agent pre-push: REFUSED. %s\n' "$1" >&2; exit 1; }
+pg_note() { printf 'agent pre-push: %s\n' "$1" >&2; }
+
+# pg_agent: this git runs in an agent's shell. A human's push runs only the repo's own hooks.
+pg_agent() { [ -n "${AI_AGENT:-}${CLAUDECODE:-}${AGENT_HOST:-}" ]; }
+
+# pg_network_url <url>: a remote off this machine. Scratch and test repos push to a local bare
+# repo; gating those would refuse every hook suite's own fixture push.
+pg_network_url() {
+  case $1 in
+    ''|file://*|/*|.*) return 1 ;;
+    *://*|*@*:*) return 0 ;;
+  esac
+  return 1
+}
+
+# pg_enforced <url>: agent shell, not the ci-watch repair agent, not switched off, and a network
+# remote (AGENT_GIT_HOOKS_ENFORCE=1 forces it for the layer's own tests).
+pg_enforced() {
+  [ "${AGENT_GIT_HOOKS:-}" != off ] || return 1
+  pg_agent || return 1
+  [ -z "${CI_WATCH_ACTIVE:-}" ] || return 1
+  [ "${AGENT_GIT_HOOKS_ENFORCE:-}" = 1 ] && return 0
+  pg_network_url "$1"
+}
+
+# pg_sid: the agent session (Claude exports CLAUDE_CODE_SESSION_ID; a subagent shares its parent's).
+pg_sid() { local sid; sid=$(agent_session_id) || return 1; [ -n "$sid" ] || [ "${AGENT_HOST:-claude}" = claude ] || return 1; printf '%s\n' "${sid:-nosession}"; }
+
+# pg_push_now: 0 when AGENT_PUSH_NOW carries a reason; refuses an empty one; 1 when unset.
+pg_push_now() {
+  [ -n "${AGENT_PUSH_NOW+x}" ] || return 1
+  case ${AGENT_PUSH_NOW//[[:space:]]/} in
+    '') pg_refuse "AGENT_PUSH_NOW is set but empty. Give the reason: AGENT_PUSH_NOW=\"red CI fix, reviewed in round 2\" git push ..." ;;
+  esac
+  pg_note "AGENT_PUSH_NOW: ${AGENT_PUSH_NOW} (review, sprawl and test checks skipped)"
+  return 0
+}
+
+# pg_check <remote> <url> <refs>: the agent checks for one push. <refs> is pre-push's stdin.
+pg_check() {
+  local remote=$1 url=$2 refs=$3 lref lsha rref rsha files='' top sid now=1
+  local override tprefix shipped adding branch ctx='' pbr='' plsha='' prsha=''
+  pg_enforced "$url" || return 0
+  while read -r lref lsha rref rsha; do
+    [ -n "$lsha" ] || continue
+    [ "$lsha" != "$PG_ZERO" ] || continue   # a deletion publishes nothing
+    if [ -z "$pbr" ]; then
+      case $rref in refs/heads/*) pbr=${rref#refs/heads/}; plsha=$lsha; [ "$rsha" = "$PG_ZERO" ] || prsha=$rsha ;; esac
+    fi
+    if [ "$rsha" != "$PG_ZERO" ]; then
+      git cat-file -e "$rsha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$rsha" "$lsha" 2>/dev/null \
+        || pg_refuse "$rref on $remote is not an ancestor of what you are pushing (force-push or a stale branch). Never force-push: git fetch, merge origin/${rref#refs/heads/}, then push."
+      files="$files$(git diff --name-only "$rsha" "$lsha" 2>/dev/null)$_RV_NL"
+    else
+      files="$files$(git log --name-only --pretty=format: "$lsha" --not --remotes 2>/dev/null)$_RV_NL"
+    fi
+  done <<<"$refs"
+  top=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  [ -n "$top" ] || return 0
+  files="$files$(git diff HEAD --name-only 2>/dev/null)"
+  local f has_code=0
+  while IFS= read -r f; do rv_is_code "$f" && { has_code=1; break; }; done <<<"$files"
+  [ "$has_code" = 1 ] || return 0
+
+  sid=$(pg_sid) || pg_refuse "Cannot identify this native session; restore session propagation before pushing."
+  # AGENT_PUSH_NOW skips the review, but the branch keeps its anchor: the next push sizes this one.
+  pg_push_now && { now=0; [ -z "$pbr" ] || rv_push_anchor "$top" "$pbr" "$prsha" "$plsha"; }
+  override="to push anyway (CI-only check, WIP share): AGENT_PUSH_NOW=\"<reason>\" git push ..."
+  if [ "$now" = 1 ]; then
+    # Push AFTER the review: once pushed, every later fix is its own commit (audit 2026-09-05: 137
+    # of 208 commits came after a push had closed the amend door). Sized, not binary: denying any
+    # unreviewed edit drew 92 denials in two weeks, half answered by the override. Keyed on the
+    # branch, not the session: the record outlives a session, so the budget holds until merge.
+    RV_KIND=none
+    if [ -n "$pbr" ]; then
+      if [ "$plsha" = "$(git rev-parse -q --verify HEAD 2>/dev/null)" ]; then
+        rv_snapshot "$top" || RV_TREE=''
+      else
+        RV_ROOT=$top; RV_HEAD=$plsha; RV_TREE=$(git rev-parse -q --verify "$plsha^{tree}" 2>/dev/null)
+      fi
+      [ -z "$RV_TREE" ] || rv_push_decide "$sid" "$top" "$pbr" "$prsha"
+      case $RV_KIND in
+        unavailable) pg_refuse "$RV_TEXT" ;;
+        agents) pg_refuse "~$RV_DELTA unreviewed lines on $pbr ($override). This refusal is the review trigger:
+$RV_TEXT
+Then push." ;;
+        wait) pg_refuse "~$RV_DELTA unreviewed lines on $pbr ($override), and $RV_TEXT" ;;
+        self|budget) ctx=$RV_TEXT ;;
+      esac
+    fi
+
+    # Count what this ticket already shipped on the branch: a push per review round is each
+    # legitimate while the total grows (one ticket reached 8 commits for 4 instructions). Skipped
+    # once a PR is open, when amend is forbidden and every push adds a commit by design.
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    tprefix=$(git log -1 --format=%s 2>/dev/null | grep -oE '^[A-Z]+-[0-9]+' || true)
+    pr_open "$branch" && tprefix=''
+    if [ -n "$tprefix" ]; then
+      shipped=$(git log --format=%s -n 50 '@{u}' 2>/dev/null | grep -c "^${tprefix}:" || true)
+      adding=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || true)
+      case "$shipped" in ''|*[!0-9]*) shipped=0 ;; esac
+      case "$adding" in ''|*[!0-9]*) adding=0 ;; esac
+      [ "$shipped" -lt 3 ] || [ "$adding" -lt 1 ] || pg_refuse "$tprefix already has $shipped commits on this branch and this push adds $adding (if it must ship now, red CI or someone waiting: AGENT_PUSH_NOW=\"<reason>\" git push ...).
+Otherwise hold until the review cycle ends, keep follow-ups uncommitted, then commit once and push once."
+    fi
+
+    # After the review gate: a tested-but-unreviewed push is the case that produces the sprawl.
+    tr_ran "$sid" "$top" || pg_refuse "no local test run is recorded for this session or worktree. CLAUDE.md: run a representative local test subset before pushing. If test infra is down: AGENT_PUSH_NOW=\"untested: <why>\" git push ..., then watch CI to a verdict in this session."
+  fi
+  [ -z "$ctx" ] || pg_note "$ctx"
+  return 0
+}

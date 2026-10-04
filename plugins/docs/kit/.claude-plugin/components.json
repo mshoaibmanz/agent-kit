@@ -1,0 +1,58 @@
+{
+  "hook_plugins": {
+    "guard-rails": [
+      "bash-guards",
+      "comment-guard",
+      "commit-cohesion",
+      "edit-guard"
+    ],
+    "prod-data": [
+      "bash-guards",
+      "prod-data-nudge"
+    ],
+    "ci-babysitter": [
+      "ci-watch-on-push",
+      "pre-push-gate",
+      "test-exec-gate",
+      "tests-ran-mark",
+      "unfinished-work"
+    ],
+    "auto-review": [
+      "pre-push-gate",
+      "review-agent-mark",
+      "review-mark-changes",
+      "review-trigger"
+    ],
+    "session-context": [
+      "context-watch",
+      "pre-compact",
+      "project-bind",
+      "read-streak",
+      "retro-extract",
+      "session-context",
+      "worktree-hint"
+    ],
+    "python-hygiene": [
+      "python-format"
+    ],
+    "terminal-signals": [
+      "notify-attn",
+      "stop-chime",
+      "tab-signal"
+    ]
+  },
+  "skill_plugins": {
+    "prod-data": [
+      "debug"
+    ],
+    "python-hygiene": [
+      "conventions"
+    ],
+    "docs": [
+      "process-doc"
+    ],
+    "qa-e2e": [
+      "qa-e2e"
+    ]
+  }
+}

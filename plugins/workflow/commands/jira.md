@@ -1,15 +1,15 @@
 ---
-description: Jira module — find/create a ticket, link a PR, transition, sprint, assign — driven by per-user preferences recorded on first run. The full ticket→PR→merge-ready flow is /kickoff; if the arguments describe work to BUILD rather than a ticket operation, follow the /kickoff command instead.
+description: Jira module — find/create a ticket, link a PR, transition, sprint, assign — driven by per-user preferences recorded on first run. The full ticket→PR→merge-ready flow is /kickoff; if the arguments describe work to BUILD rather than a ticket operation, follow "${CLAUDE_PLUGIN_ROOT}/kit/commands/kickoff.md" instead.
 ---
 
 Jira operations only. All identity and project specifics come from the prefs file — nothing
 personal is hardcoded here. If `$ARGUMENTS` describes a bug or feature to implement (not
 "create a ticket for…", "move ABC-123 to review", "link this PR"), stop and run
-`${CLAUDE_PLUGIN_ROOT}/commands/kickoff.md` with the same arguments — this file is its phase 1.
+`"${CLAUDE_PLUGIN_ROOT}/kit/commands/kickoff.md"` with the same arguments — this file is its phase 1.
 
 ## Preferences (read FIRST, record if missing)
 
-Read `~/.claude/local/jira-prefs.md`. If it exists and has every key you need this run, use
+Read `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/jira-prefs.md`. If it exists and has every key you need this run, use
 it. Otherwise, fill the gaps ONCE and write the file:
 
 1. **Self-discover — never ask for what you can look up:**
@@ -22,7 +22,7 @@ it. Otherwise, fill the gaps ONCE and write the file:
      `gh pr list --state merged --json baseRefName` — where PRs actually land)
    - `pr_labels` — labels to apply to every PR (may be empty)
    - `board_id` — optional; skip unless sprint operations need it
-3. **Write** `~/.claude/local/jira-prefs.md` as plain `key: value` lines with a one-line
+3. **Write** `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/jira-prefs.md` as plain `key: value` lines with a one-line
    header saying the file is consumed by /jira and /kickoff and can be deleted to re-run
    setup; keep any `## <KEY> notes` sections below them. Confirm the recorded values to the
    user in one line.

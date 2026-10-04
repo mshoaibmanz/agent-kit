@@ -1,9 +1,9 @@
 {
   "name": "guard-rails",
   "description": "Safety rails on Bash. DENIES: uncapped file dumps into context (points at Read/Grep), a re-dump of a file already in context, git commits missing the Claude trailers, --amend on pushed history, a second unpushed commit on a branch. ASKS before: force-push, reset --hard, git clean -f, branch delete, stash drop, worktree remove, two-dot diffs against a base. Nudges on comment-heavy edits. Silent on everything else.",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "license": "MIT",
   "author": {
     "name": "Shoaib Manzoor"
-  },
-  "license": "MIT"
+  }
 }

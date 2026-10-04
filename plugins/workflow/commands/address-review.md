@@ -23,12 +23,12 @@ Take the **union** of whatever these turn up. Absent sources are silently skippe
 **A · Working tree** — the primary source.
 - `git diff --no-color` (tracked, unstaged), `git diff --no-color --cached` (staged)
 - `git status --porcelain`, then read untracked files for notes
-- Clean tree → fall back to the branch diff: `git merge-base HEAD <base>` (the release base if branched from one, per `~/.claude/local/<repo>-rules.md` "Branches and deploys", else the default branch) → `git diff --no-color <base>...HEAD`
+- Clean tree → fall back to the branch diff: `git merge-base HEAD <base>` (the release base if branched from one, per `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/<repo>-rules.md` "Branches and deploys", else the default branch) → `git diff --no-color <base>...HEAD`
 
 **B · A pr-study export** — when `$ARGUMENTS` carries `notes:<file>`, or `.claude/pr-study/*/notes.md` exists, or the user pasted the export into the conversation. One note per line, `#` and blank lines ignored:
 
 ```
-src/billing/services/invoice.py:118 — u3 — bulk-fetch here, this is N+1
+src/services/handover.py:118 — u3 — bulk-fetch here, this is N+1
 u3 — why not reuse the existing guard instead of a second one?
 ```
 
@@ -83,6 +83,7 @@ Sources B and C are notes by construction — no classification needed.
 - List anything ambiguous you're skipping.
 - If any note is unclear, or needs a judgment call the note doesn't settle, **ask** — don't guess at directional intent. Run from `/kickoff`, don't ask: make the call and name it in the report.
 - Otherwise proceed: make each change **at that location**, then delete the note comment (and its line, if the line existed only for the note). Notes from sources B and C have nothing to strip. Keep each change minimal and local — this is cleanup of your own tweaks, not a refactor pass. Honor all repo CLAUDE.md rules (match existing style, jsql, etc.).
+- A note that is a review finding (a bot or reviewer comment on the PR, a review agent's report) follows `"${CLAUDE_PLUGIN_ROOT}/kit/skills/review-rubric/references/fix-policy.md"`: fix it when it is confirmed or small, make a larger one a ranked option, and give every one you dismiss its reason class.
 
 ## 4. Report
 

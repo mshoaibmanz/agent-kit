@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# codex-review was renamed to agent-run on 2026-10-03 (roles.toml: the cross-model reviewer is the
+# role review-cross). Not an alias: sessions started before the rename may still run this path from
+# their context, so it says what to run instead and records nothing. Delete after 2026-10-17.
+printf 'codex-review: renamed. Run instead, through Bash with run_in_background: true:\n  %s/.agents/bin/agent-run review-cross %s\nNothing run or recorded.\n' \
+  "$HOME" "$(printf '%q ' "$@")" >&2
+exit 2

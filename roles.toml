@@ -1,0 +1,83 @@
+# Model and effort per role: the one hand-edited source for every host.
+#
+# `agent-kit render --host claude` applies it:
+#   - agents/<role>.md -> ~/.claude/agents/<role>.md with `model:` and `effort:` from here, for each
+#     role whose provider is the host's (anthropic on Claude). A role on the other provider renders
+#     no agent file: it runs through `bin/agent-run <role> <worktree>` (Bash), which calls that
+#     provider's CLI with the same agent body as its prompt.
+#   - [roles.main] -> settings.json `model`, `effortLevel` and `modelSettings` ([hosts.claude]).
+#   - [review] -> state/rendered/roles-claude.sh, the rounds lib/review-state asks for at push.
+#   The Codex host (phase 20) renders openai roles to ~/.codex/agents/<role>.toml from the same
+#   bodies; [hosts.codex] is its seam. agent-run runs REVIEW roles only (a role with a prefix): on a
+#   host whose provider is not a non-review role's (worker on Codex), that role has no runner yet.
+#
+# model = "<provider>:<model>". "anthropic:inherit" is the parent session's model (no `model:` line).
+# effort uses the provider's own scale, which render validates:
+#   anthropic: low medium high xhigh max      openai: minimal low medium high xhigh
+# prefix: the id prefix of a review role's findings (B-1, CX-2). TALLY lines and review_precision
+#   attribute by it: keep it when a role is renamed or moved to another model.
+# fallback: the role that takes a run role's place when its provider CLI is missing or fails.
+# timeout: seconds agent-run gives a run role (default 900).
+#
+# Turning Codex off: set review-cross's model to an anthropic one (round 1 is then two Agent spawns),
+# or replace it in the [review] lists with thermo-bugs: round1 and later must each name a
+# correctness reviewer (a role not in once), which render checks.
+#
+# Every role but main needs agents/<role>.md, its prompt on every host; render checks that too.
+
+[roles.main]
+model = "anthropic:opus[1m]"
+effort = "high"
+
+[roles.worker]
+model = "anthropic:opus"
+effort = "high"
+
+[roles.scout]
+model = "anthropic:sonnet"
+effort = "medium"
+
+[roles.adversary]
+model = "anthropic:fable"
+effort = "high"
+
+[roles.reviewer]
+model = "anthropic:opus"
+effort = "high"
+prefix = "R"
+
+[roles.thermo-bugs]
+model = "anthropic:inherit"
+effort = "high"
+prefix = "B"
+
+[roles.thermo-quality]
+model = "anthropic:opus"
+effort = "high"
+prefix = "Q"
+
+[roles.review-cross]
+model = "openai:gpt-6.1-sol"
+effort = "high"
+prefix = "CX"
+fallback = "thermo-bugs"
+timeout = 900
+
+[review]
+round1 = ["thermo-bugs", "review-cross"]
+later = ["review-cross"]
+once = ["thermo-quality"]
+sensitive_adds = ["thermo-bugs"]
+
+[hosts.claude]
+provider = "anthropic"
+# Claude Code keeps an effort per model id; render sets each of these to main's effort.
+effort_models = ["claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5"]
+
+[hosts.codex]
+provider = "openai"
+native_agents = false
+
+[hosts.cursor]
+provider = "openai"
+native_agents = false

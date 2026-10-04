@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/tab-signal\" busy",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tab-signal\" busy",
             "timeout": 5
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/stop-chime\"",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/stop-chime\"",
             "timeout": 5,
             "async": true
           }
@@ -28,12 +28,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/tab-signal\" attn",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tab-signal\" attn",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/notify-attn\"",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/notify-attn\"",
             "timeout": 5,
             "async": true
           }
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/tab-signal\" start",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tab-signal\" start",
             "timeout": 5
           }
         ]
@@ -56,7 +56,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/tab-signal\" start",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tab-signal\" start",
             "timeout": 5
           }
         ]
@@ -66,7 +66,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/tab-signal\" start",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tab-signal\" start",
             "timeout": 5
           }
         ]
@@ -76,7 +76,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/tab-signal\" start",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tab-signal\" start",
             "timeout": 5
           }
         ]

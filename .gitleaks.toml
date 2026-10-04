@@ -2,7 +2,7 @@
 # the tree AND the git history, in CI and in the pre-push hook. The generic rules below catch what a
 # company config tends to leak; the company's own names are checked from a denylist that is never
 # committed (LEAK_TERMS, see scripts/scan.sh). Every allowlist entry says why it is safe.
-title = "claude-kit public scan"
+title = "agent-kit public scan"
 
 [extend]
 # gitleaks' built-in token and key rules (cloud keys, GitHub/Slack/Atlassian tokens, private keys).
@@ -28,8 +28,14 @@ regex = '''\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b
   regexes = [
     '''^noreply@anthropic\.com$''',
     '''@users\.noreply\.github\.com$''',
-    '''@example\.(?:com|org|net)$''',
+    '''@example\.(?:com|org|net|invalid)$''',
   ]
+
+  [[rules.allowlists]]
+  description = "GitHub SSH remote URL syntax in the synthetic Git dispatcher fixture"
+  paths = ['''^hooks/tests/git-hooks\.test\.sh$''']
+  regexTarget = "match"
+  regexes = ['''^git@github\.com$''']
 
 [[rules]]
 id = "atlassian-site"
@@ -40,6 +46,12 @@ regex = '''(?i)\b[a-z0-9][a-z0-9-]*\.atlassian\.net\b'''
 id = "uuid"
 description = "A UUID: a cloud id, account id, tenant or record id"
 regex = '''(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b'''
+
+  [[rules.allowlists]]
+  description = "Synthetic session IDs with fixed zero tails in resolver and hook fixtures"
+  paths = ['''^hooks/tests/(?:agent-task\.test\.py|hooktest\.sh)$''']
+  regexTarget = "match"
+  regexes = ['''(?i)^[0-9a-f]{8}-(?:aaaa|bbbb|0000)-4000-8000-000000000000$''']
 
 [[rules]]
 id = "tracking-or-order-id"
@@ -67,6 +79,17 @@ secretGroup = 1
   paths = ['''^tests/run-tests\.sh$''']
   regexTarget = "secret"
   regexes = ['''^(?:kit-jobs|env-jobs|flag-jobs)$''']
+
+  [[rules.allowlists]]
+  description = "Local work-project folder names in synthetic task resolver tests"
+  paths = ['''^hooks/tests/agent-task\.test\.py$''']
+  regexTarget = "secret"
+  regexes = ['^(?:cbtest|repack)$']
+  [[rules.allowlists]]
+  description = "A fake jobs project used by the injected bq executable fixture"
+  paths = ['''^hooks/tests/hooktest\.sh$''']
+  regexTarget = "secret"
+  regexes = ['^proj-1$']
 
 [[rules]]
 id = "internal-hostname"

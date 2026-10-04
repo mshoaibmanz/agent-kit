@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Task folders: one per ticket, $TD_TASKS/<TICKET>-<short-desc>/, shared by every session that
+# works the ticket so a later session reuses its scripts, data and handoff. Sourced (functions and
+# constants only) by session-context (SessionStart) and bin/claude-task.
+#
+# A session's task is, in order: its binding ($TD_BIND/<sid8>, written by `claude-task bind`),
+# else the ticket in its branch. A release/base branch (CORE-118-REL, CORE-118-REL-TEST, master)
+# names no task: a session there works whatever the user asks, so it binds explicitly.
+# Bindings are keyed by the first 8 characters of the session id, the part folder names carry.
+
+TD_ROOT="${CLAUDE_OUT_ROOT:-$HOME/claude-scratch}"
+TD_TASKS="$TD_ROOT/tasks"
+TD_BIND="${CLAUDE_STATE_DIR:-$HOME/.claude/state}/task-bindings"
+
+# td_slug <words...>: lower-case, [a-z0-9-], at most 40 characters.
+td_slug() {
+  printf '%s' "$*" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40 | sed -E 's/-+$//'
+}
+
+# td_split <name>: sets TD_TICKET (upper-cased) and TD_DESC from "<TICKET>[-<desc>]"; returns 1
+# when <name> does not start with a ticket.
+td_split() {
+  TD_TICKET='' TD_DESC=''
+  [[ $1 =~ ^([A-Za-z][A-Za-z0-9]*-[0-9]+)(-(.+))?$ ]] || return 1
+  TD_TICKET=$(printf '%s' "${BASH_REMATCH[1]}" | tr 'a-z' 'A-Z')
+  TD_DESC=$(td_slug "${BASH_REMATCH[3]}")
+  return 0
+}
+
+# td_branch_ticket <branch>: TD_TICKET/TD_DESC from a work branch; returns 1 for a release branch.
+td_branch_ticket() {
+  local b=${1#worktree-}
+  td_split "$b" || return 1
+  [[ $TD_DESC =~ ^rel(-|$) ]] && { TD_TICKET='' TD_DESC=''; return 1; }
+  return 0
+}
+
+# td_find <TICKET or folder name>: the task folder, matched on the ticket prefix.
+td_find() {
+  local d
+  for d in "$TD_TASKS/$1" "$TD_TASKS/$1"-*; do
+    [ -d "$d" ] && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
+# td_create <TICKET or name> [desc]: make the folder and its INDEX.md; prints the path.
+td_create() {
+  local dir="$TD_TASKS/$1${2:+-$2}"
+  mkdir -p "$dir/scripts" "$dir/data" "$dir/out" "$dir/briefs" || return 1
+  [ -f "$dir/INDEX.md" ] || cat > "$dir/INDEX.md" <<EOF
+# ${1}${2:+ — $2}
+
+Shared by every session on this task. Read this first and reuse before rewriting. Add one line for
+anything you leave here: what it is, how to run it, what it proved.
+
+- \`HANDOFF.md\`: current state and next steps (the handoff skill writes it).
+
+## scripts/
+
+## data/
+Staging or synthetic data only: no production PII, tokens or secrets.
+
+## out/
+Docs, reports and screenshots for the user.
+
+## briefs/
+Worker briefs and notes.
+
+## worktrees/
+Temporary worktrees (merges, bisects, isolated test runs): name, branch, purpose.
+EOF
+  printf '%s\n' "$dir"
+}
+
+td_bound() { local f="$TD_BIND/${1:0:8}"; [ -s "$f" ] && head -1 "$f"; }
+
+td_bind() { mkdir -p "$TD_BIND" && printf '%s\n' "$2" > "$TD_BIND/${1:0:8}"; }
+
+# td_resolve <sid> <branch>: the session's task folder, created from the branch on first use;
+# prints nothing when the session has no task.
+td_resolve() {
+  local key dir
+  key=$(td_bound "$1")
+  if [ -n "$key" ]; then
+    dir=$(td_find "$key") || { td_split "$key"; dir=$(td_create "${TD_TICKET:-$key}" "$TD_DESC"); }
+  elif td_branch_ticket "$2"; then
+    dir=$(td_find "$TD_TICKET") || dir=$(td_create "$TD_TICKET" "$TD_DESC")
+  fi
+  [ -n "$dir" ] && printf '%s\n' "$dir"
+}
+
+# td_session_dir <sid> <repo>: the per-session folder of a session with no task.
+td_session_dir() {
+  local d
+  d=$(ls -d "$TD_ROOT/$2"/*-"${1:0:8}" 2>/dev/null | head -1)
+  printf '%s\n' "${d:-$TD_ROOT/$2/$(date '+%Y-%m-%d-%H%M')-${1:0:8}}"
+}

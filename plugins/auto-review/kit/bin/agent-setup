@@ -1,0 +1,1130 @@
+#!/usr/bin/env python3
+"""Preview, install, inspect and roll back selected agent-kit components."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from typing import Any
+from urllib.parse import parse_qsl, urlsplit
+
+
+sys.dont_write_bytecode = True
+SOURCE = Path(__file__).resolve().parent.parent
+COMPONENTS = {'rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands'}
+BLOCKING = {'bash-guards', 'test-exec-gate', 'pre-push-gate', 'edit-guard',
+            'commit-cohesion', 'context-guard', 'review-trigger', 'unfinished-work',
+            'context-watch', 'read-streak', 'pre-compact', 'project-bind', 'ci-watch-on-push'}
+SECRET_NAMES = {'auth.json', 'credentials.json', 'kit.env', 'settings.local.json', '.env'}
+TEXT_BEGIN = '<!-- BEGIN agent-kit setup -->'
+TEXT_END = '<!-- END agent-kit setup -->'
+TOML_BEGIN = '# BEGIN agent-kit setup'
+TOML_END = '# END agent-kit setup'
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def output(value: Any) -> None:
+    sys.stdout.write(json.dumps(value, indent=2) + '\n')
+
+
+def atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def load_json(path: Path, default: Any = None) -> Any:
+    if path.is_symlink():
+        raise ValueError(f'Reconcile the existing configuration link first: {path}')
+    text = path.read_text().strip() if path.exists() else ''
+    return json.loads(text) if text else default
+
+
+def safe_catalog(path: Path) -> dict[str, Any]:
+    catalog = json.loads(path.read_text())
+    if not isinstance(catalog, dict) or not isinstance(catalog.get('mcpServers', {}), dict):
+        raise ValueError('MCP catalog must map server names to objects')
+    sys.path.insert(0, str(SOURCE / 'bin/lib'))
+    from hosts import normalize_transport
+    servers = {}
+    for name, spec in catalog.get('mcpServers', {}).items():
+        if not re.fullmatch(r'[a-zA-Z0-9_-]+', name) or not isinstance(spec, dict):
+            raise ValueError('MCP catalog has an invalid server descriptor')
+        if set(spec) - {'command', 'args', 'url', 'type', 'description'}:
+            raise ValueError(f'MCP {name}: use native OAuth or a runtime wrapper, not inline secrets')
+        normalized = normalize_transport(spec)
+        query_names = {re.sub(r'[-_]', '', key).casefold()
+                       for key, _ in parse_qsl(urlsplit(normalized.get('url', '')).query)}
+        credential_query = query_names & {'apikey', 'key', 'accesskey', 'authkey', 'accesstoken',
+                                          'authtoken', 'token', 'password', 'secret', 'authorization'}
+        arguments = normalized.get('args', [])
+        credential_argument = isinstance(arguments, list) and any(
+            isinstance(argument, str) and re.match(r'^--(?:key|apikey|api[-_]key)(?:=|$)', argument, re.I)
+            for argument in arguments)
+        if credential_query or credential_argument or re.search(
+                r'(?:token|password|secret|api[-_]key|authorization|bearer|://[^/]+@)',
+                json.dumps(normalized), re.I):
+            raise ValueError(f'MCP {name}: common inline credential patterns are refused; use a runtime wrapper')
+        if 'args' in normalized and ('command' not in normalized or not isinstance(normalized['args'], list)
+                                    or not all(isinstance(value, str) for value in normalized['args'])):
+            raise ValueError('MCP args must be strings on a command transport')
+        servers[name] = normalized
+    return {'mcpServers': servers}
+
+
+def toml_text(data: dict[str, Any]) -> str:
+    lines = []
+    def table(mapping: dict[str, Any], prefix: str = '') -> None:
+        if prefix and (not mapping or any(not isinstance(value, dict) for value in mapping.values())):
+            lines.append('[' + prefix + ']')
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                continue
+            rendered = str(value).lower() if isinstance(value, bool) else json.dumps(value)
+            lines.append(json.dumps(key) + ' = ' + rendered)
+        lines.append('')
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                table(value, prefix + '.' + json.dumps(key) if prefix else json.dumps(key))
+    table(data)
+    return '\n'.join(lines) + '\n'
+
+
+@dataclass
+class Change:
+    kind: str
+    target: Path
+    wanted: Any
+    mode: int = 0o644
+
+
+def managed_block(text: str, begin: str, end: str) -> tuple[str, str]:
+    if text.count(begin) != text.count(end) or text.count(begin) > 1:
+        raise ValueError('Malformed or repeated managed configuration markers')
+    if begin not in text:
+        return text, ''
+    first = text.index(begin)
+    last = text.index(end, first) + len(end)
+    return text[:first] + text[last:], text[first:last]
+
+
+def selected_registry(source: Path, components: set[str], blocking: bool) -> list[dict]:
+    if 'hooks' not in components:
+        return []
+    rows = json.loads((source / 'hooks/registry.json').read_text())
+    return [row for row in rows if blocking or Path(row['command'].split()[0]).name not in BLOCKING]
+
+
+def role_overrides(path: Path, models: list[str], efforts: list[str]) -> None:
+    if not models and not efforts:
+        return
+    roles = tomllib.loads(path.read_text())
+    for flag, values in [('model', models), ('effort', efforts)]:
+        for setting in values:
+            name, separator, value = setting.partition('=')
+            if not separator or name not in roles.get('roles', {}) or not value:
+                raise ValueError(f'Expected existing-role=value for --role-{flag}')
+            roles['roles'][name][flag] = value
+    path.write_text(toml_text(roles))
+
+
+def kit_api(source: Path) -> Any:
+    os.environ['AGENT_KIT_DIR'] = str(source)
+    loader = importlib.machinery.SourceFileLoader('agent_setup_kit', str(source / 'bin/agent-kit'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def host_target(args: argparse.Namespace, host: str, home: Path) -> Path:
+    if args.host_root:
+        if len(args.hosts) != 1:
+            raise ValueError('--host-root requires exactly one host')
+        return Path(args.host_root).expanduser().absolute()
+    scoped = getattr(args, 'host_roots', {}).get(host)
+    if scoped:
+        return Path(scoped).expanduser().absolute()
+    variable = {'claude': 'CLAUDE_CONFIG_DIR', 'codex': 'CODEX_HOME'}.get(host)
+    return Path(os.environ[variable]).expanduser().absolute() if variable and os.environ.get(variable) else home / ('.' + host)
+
+
+def resolve_values(value: Any, view: Path, root: Path, host_view: Path, target: Path) -> Any:
+    if isinstance(value, dict):
+        return {key: resolve_values(item, view, root, host_view, target) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_values(item, view, root, host_view, target) for item in value]
+    if isinstance(value, str):
+        return value.replace(str(view), str(root)).replace(str(host_view), str(target)).replace('{{AGENT_KIT_DIR}}', str(root))
+    return value
+
+
+def resolve_hooks(document: dict, view: Path, root: Path, host_view: Path, target: Path) -> dict:
+    def walk(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: shlex.join([resolve_values(word, view, root, host_view, target) for word in shlex.split(item)]) if key == 'command' and isinstance(item, str) else walk(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        return resolve_values(value, view, root, host_view, target)
+    return walk(document)
+
+
+def resolve_toml(text: str, view: Path, root: Path, host_view: Path, target: Path) -> str:
+    blocks = []
+    for begin, end in [('# BEGIN agent-kit shell', '# END agent-kit shell'), ('# BEGIN agent-kit managed', '# END agent-kit managed')]:
+        _, block = managed_block(text, begin, end)
+        if block:
+            values = tomllib.loads(block)
+            blocks.append(begin + '\n' + toml_text(resolve_values(values, view, root, host_view, target)) + end)
+    return '\n'.join(blocks) if blocks else toml_text(resolve_values(tomllib.loads(text), view, root, host_view, target))
+
+
+def validate_toml_boundary(text: str) -> None:
+    if TOML_END not in text:
+        return
+    for line in text.split(TOML_END, 1)[1].splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if stripped.startswith('['):
+            return
+        raise ValueError('TOML scalar keys after the managed END retain its table context; move them before the block or add an explicit table header')
+
+
+def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) -> list[Change]:
+    root = Path(args.root_dir).expanduser().absolute()
+    target = host_target(args, host, home)
+    components = set(args.components)
+    changes = []
+    if 'hooks' in components and args.blocking_hooks:
+        components.add('roles')
+    if host == 'claude':
+        api = kit_api(view)
+        if 'rules' in components:
+            text = '@' + str(root / 'rules/AGENTS.md') + '\n@' + str(root / 'rules/hosts/claude.md') + '\n'
+            changes.append(Change('text', target / 'CLAUDE.md', text))
+        if 'roles' in components:
+            roles = api.load_roles()
+            for name, text in api.expected_agents(roles, 'claude').items():
+                changes.append(Change('file', target / 'agents' / name, text.replace('{{AGENT_KIT_DIR}}', str(root)).encode()))
+            for provider in ('claude', 'codex', 'cursor'):
+                changes.append(Change('file', root / 'state/rendered' / ('roles-' + provider + '.sh'),
+                                      api.roles_sh(roles, provider).replace(str(view), str(root)).encode()))
+        if 'hooks' in components:
+            registry = json.loads((view / 'hooks/registry.json').read_text())
+            for row in registry:
+                parts = shlex.split(row['command'])
+                row['command'] = shlex.join([str(root / 'hooks' / Path(parts[0]).name), *parts[1:]])
+            changes.append(Change('hooks', target / 'settings.json', api.render_hooks(registry, 'claude'), 0o600))
+            shell = {'AI_AGENT': 'claude', 'AGENT_HOST': 'claude',
+                     'KIT_ENV': str(root / 'local/setup-paths.env'), 'AGENT_KIT_DIR': str(root),
+                     'CLAUDE_CONFIG_DIR': str(target),
+                     'AGENT_GIT_HOOKS': 'on' if args.blocking_hooks else 'off'}
+            if args.blocking_hooks:
+                shell.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='core.hooksPath',
+                             GIT_CONFIG_VALUE_0=str(root / 'git-hooks'))
+            changes.append(Change('environment', target / 'settings.json', shell, 0o600))
+        if 'mcp' in components:
+            servers = safe_catalog(view / 'mcp/servers.json')['mcpServers']
+            servers = {name: {**spec, 'type': 'stdio' if 'command' in spec else 'http'}
+                       for name, spec in servers.items()}
+            changes.append(Change('servers', target / 'mcp.json', servers, 0o600))
+    else:
+        selected = [name for name in ('hooks', 'rules', 'roles', 'mcp') if name in components]
+        if selected:
+            with tempfile.TemporaryDirectory(prefix='agent-kit-host-view-') as folder:
+                host_view = Path(folder)
+                env = dict(os.environ, AGENT_KIT_DIR=str(view), AGENT_KIT_HOST_ROOT=str(host_view))
+                env['AGENT_GIT_HOOKS'] = 'on' if args.blocking_hooks else 'off'
+                result = subprocess.run([sys.executable, str(view / 'bin/agent-kit'), 'render', '--host', host,
+                                         '--components', *selected], capture_output=True, env=env, timeout=30)
+                if result.returncode:
+                    raise ValueError(f'{host} renderer refused the selected component plan')
+                for path in sorted(host_view.rglob('*')):
+                    if not path.is_file():
+                        continue
+                    relative = path.relative_to(host_view)
+                    text = path.read_text()
+                    if path.name == 'hooks.json':
+                        document = resolve_hooks(json.loads(text), view, root, host_view, target)
+                        changes.append(Change('cursor-hooks' if host == 'cursor' else 'hooks',
+                                              target / relative, document.get('hooks', {}), 0o600))
+                    elif path.name == 'config.toml':
+                        text = resolve_toml(text, view, root, host_view, target)
+                        previous = prior_record(root, target / relative, 'toml').get('owned', '')
+                        if previous.startswith(TOML_BEGIN):
+                            previous = previous[len(TOML_BEGIN):].removesuffix(TOML_END).strip()
+                        combined = previous
+                        for component, begin, end in [('hooks', '# BEGIN agent-kit shell', '# END agent-kit shell'),
+                                                      ('mcp', '# BEGIN agent-kit managed', '# END agent-kit managed')]:
+                            if component in components:
+                                combined, old = managed_block(combined, begin, end)
+                                outside, wanted = managed_block(text, begin, end)
+                                combined = combined.rstrip() + '\n' + wanted + '\n'
+                        if combined.strip():
+                            changes.append(Change('toml', target / relative, combined.strip(), 0o600))
+                    elif path.name == 'mcp.json':
+                        servers = resolve_values(json.loads(text), view, root, host_view, target).get('mcpServers', {})
+                        changes.append(Change('servers', target / relative, servers, 0o600))
+                    elif path.name.endswith('.md') or path.name.endswith('.mdc'):
+                        text = resolve_values(text, view, root, host_view, target)
+                        text = re.sub(r'<!-- BEGIN agent-kit managed -->\n?|<!-- END agent-kit managed -->', '', text).strip() + '\n'
+                        rule_target = Path(args.project_root).expanduser().absolute() / '.cursor' if host == 'cursor' and args.project_root else target
+                        changes.append(Change('file' if path.suffix == '.mdc' else 'text', rule_target / relative, text.encode() if path.suffix == '.mdc' else text))
+                    else:
+                        text = toml_text(resolve_values(tomllib.loads(text), view, root, host_view, target)) if path.suffix == '.toml' else resolve_values(text, view, root, host_view, target)
+                        changes.append(Change('file', target / relative, text.encode()))
+    if 'skills' in components:
+        names = args.skills if args.skills is not None else [path.name for path in sorted((view / 'skills').iterdir()) if path.is_dir()]
+        for name in names:
+            if not (view / 'skills' / name / 'SKILL.md').is_file():
+                raise ValueError(f'Unknown selected skill: {name}')
+            changes.append(Change('link', target / 'skills' / name, str(root / 'skills' / name)))
+    if host == 'claude' and 'commands' in components:
+        for command in sorted((view / 'commands').glob('*.md')):
+            text = command.read_text()
+            prefix = '\nRun this export in the same shell invocation as each command below:\n\n```sh\nexport AGENT_KIT_DIR=' + shlex.quote(str(root)) + '\n```\n\n'
+            if text.startswith('---\n'):
+                end = text.index('\n---', 4) + 4
+                text = text[:end] + prefix + text[end:]
+            else:
+                text = prefix + text
+            changes.append(Change('file', target / 'commands' / command.name, text.encode()))
+    if host == 'claude' and 'hooks' in components:
+        changes.append(Change('link', target / 'bin', str(root / 'bin')))
+    for change in changes:
+        if change.kind not in ('hooks', 'cursor-hooks'):
+            continue
+        prefix = shlex.join(['env', 'KIT_ENV=' + str(root / 'local/setup-paths.env'),
+                             'AGENT_GIT_HOOKS=' + ('on' if args.blocking_hooks else 'off'),
+                             'AGENT_KIT_DIR=' + str(root),
+                             'CLAUDE_CONFIG_DIR=' + str(target) if host == 'claude' else 'AGENT_HOST=' + host,
+                             'CLAUDE_BIN=' + args.claude_bin, 'CODEX_BIN=' + args.codex_bin])
+        for groups in change.wanted.values():
+            for group in groups:
+                if change.kind == 'cursor-hooks' and 'command' in group:
+                    group['command'] = prefix + ' ' + group['command']
+                for hook in group.get('hooks', []):
+                    if hook.get('type') == 'command':
+                        hook['command'] = prefix + ' ' + hook['command']
+    return changes
+
+
+def copy_source_code(source: str | Path, destination: str | Path) -> str:
+    shutil.copyfile(source, destination)
+    source_mode = Path(source).stat().st_mode & 0o777
+    os.chmod(destination, (0o755 if os.access(source, os.X_OK) else 0o644) & (source_mode | 0o600))
+    return str(destination)
+
+
+def installation_view(args: argparse.Namespace, view: Path) -> None:
+    source = Path(args.source).expanduser().resolve()
+    for name in ('bin', 'hooks', 'git-hooks', 'agents', 'commands', 'rules', 'hosts', 'skills', 'references'):
+        path = source / name
+        if path.is_dir():
+            shutil.copytree(path, view / name, copy_function=copy_source_code, ignore=shutil.ignore_patterns('local', 'state', '.git', '__pycache__', '*.env', *SECRET_NAMES))
+    for name in ('roles.toml', 'kit.env.example'):
+        copy_source_code(source / name, view / name)
+    copy_source_code(source / 'hooks/lib/state', view / 'hooks/lib/state')
+    matrix = source / '.claude-plugin/components.json'
+    if matrix.is_file():
+        (view / '.claude-plugin').mkdir()
+        copy_source_code(matrix, view / '.claude-plugin/components.json')
+    registry = selected_registry(view, set(args.components), args.blocking_hooks)
+    (view / 'hooks/registry.json').write_text(json.dumps(registry, indent=2) + '\n')
+    role_overrides(view / 'roles.toml', args.role_model, args.role_effort)
+    kit_api(view).load_roles()
+    if 'mcp' in args.components:
+        catalog = safe_catalog(Path(args.mcp_catalog).expanduser() if args.mcp_catalog else source / 'mcp/servers.json')
+        (view / 'mcp').mkdir()
+        (view / 'mcp/servers.json').write_text(json.dumps(catalog, indent=2) + '\n')
+
+
+def plan(args: argparse.Namespace, view: Path) -> list[Change]:
+    installation_view(args, view)
+    root = Path(args.root_dir).expanduser().absolute()
+    home = Path.home()
+    changes = []
+    for path in sorted(view.rglob('*')):
+        if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
+            continue
+        if path.is_file():
+            relative = path.relative_to(view)
+            if relative.parts[0] == 'skills':
+                selected_skill = 'skills' in args.components and (args.skills is None or relative.parts[1] in args.skills)
+                reference_asset = relative.parts[1] == 'review-rubric' and path.name != 'SKILL.md'
+                if not selected_skill and not reference_asset:
+                    continue
+            if relative == Path('hooks/registry.json'):
+                current = root / relative
+                owned = prior_record(root, current, 'file')
+                content = current.read_bytes() if 'hooks' not in args.components and current.is_file() and digest(current.read_bytes()) == owned.get('hash') else path.read_bytes()
+                changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
+                continue
+            if relative.parts[0] == 'bin' and path.name in ('ro-mysql', 'bqro') and 'data-wrappers' not in args.components:
+                continue
+            content = path.read_bytes()
+            if relative.parts[0] == 'skills' and path.name == 'SKILL.md':
+                content = content.replace(b'```sh\n', ('```sh\nexport AGENT_KIT_DIR=' + shlex.quote(str(root)) + '\n').encode())
+            changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
+    if any('\n' in value or '\r' in value for value in [*args.repo_roots, args.work_root]):
+        raise ValueError('Repository and work roots must fit on one line')
+    overlay = 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
+    if args.work_root:
+        overlay += 'AGENT_WORK_ROOT=' + args.work_root + '\n'
+    if args.github_owner:
+        overlay += 'CODE_SEARCH_GH_OWNER=' + args.github_owner + '\n'
+    if args.zoekt_url:
+        overlay += 'CODE_SEARCH_ZOEKT_URL=' + args.zoekt_url + '\n'
+    changes.append(Change('file', root / 'local/setup-paths.env', overlay.encode(), 0o600))
+    providers = {host: getattr(args, host + '_bin') for host in ('claude', 'codex', 'cursor')}
+    changes.append(Change('file', root / 'local/provider-paths.json', (json.dumps(providers, indent=2) + '\n').encode(), 0o600))
+    api = kit_api(view)
+    roles = api.load_roles()
+    for host in ('claude', 'codex', 'cursor'):
+        changes.append(Change('file', root / 'state/rendered' / ('roles-' + host + '.sh'), api.roles_sh(roles, host).replace(str(view), str(root)).encode()))
+    for host in args.hosts:
+        changes.extend(host_changes(args, view, host, home))
+    previous = load_json(root / '.install-state/current.json', {})
+    for record in previous.get('managed', {}).values():
+        target = Path(record['target'])
+        if record['kind'] == 'file' and root in target.parents and ('__pycache__' in target.relative_to(root).parts or target.suffix in ('.pyc', '.pyo')):
+            changes.append(Change('remove', target, record['hash']))
+    if 'skills' in args.components:
+        selected = set(args.skills if args.skills is not None else [path.name for path in (view / 'skills').iterdir() if path.is_dir()])
+        previous = load_json(root / '.install-state/current.json', {})
+        for record in previous.get('managed', {}).values():
+            target = Path(record['target'])
+            retired = False
+            if record['kind'] == 'file' and root / 'skills' in target.parents:
+                skill = target.relative_to(root / 'skills').parts[0]
+                retired = skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md')
+            if record['kind'] == 'link':
+                link = Path(record.get('link', ''))
+                retired = link.parent == root / 'skills' and link.name not in selected
+            if retired:
+                changes.append(Change('remove', target, record['hash']))
+    unique = {}
+    for change in changes:
+        identity = (change.kind, str(change.target))
+        if identity in unique and unique[identity] != change:
+            raise ValueError(f'Two selected components conflict: {change.target}')
+        unique[identity] = change
+    return list(unique.values())
+
+
+def prior_record(root: Path, target: Path, kind: str | None = None) -> dict:
+    previous = load_json(root / '.install-state/current.json', {})
+    return previous.get('managed', {}).get((kind + ':' if kind else '') + str(target),
+                                         previous.get('managed', {}).get(str(target), {}))
+
+
+def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
+    target = change.target
+    prior = prior_record(Path(args.root_dir).expanduser().absolute(), target, change.kind)
+    record = {'kind': change.kind, 'target': str(target), 'mode': change.mode}
+    present = target.exists() or target.is_symlink()
+    if change.kind in ('file', 'link', 'remove'):
+        record['before_type'] = 'link' if target.is_symlink() else 'file' if target.is_file() else 'directory' if target.is_dir() else 'absent'
+        if change.kind == 'remove':
+            current = file_digest(target)
+            if present and current != change.wanted and args.collision != 'backup':
+                raise ValueError(f'Changed managed content is preserved; use --collision backup to save it before retiring: {target}')
+            record.update(hash=None, present=present, before_hash=current, noop=not present)
+            return record
+        if change.kind == 'file' and target.suffix == '.mdc' and not prior:
+            legacy = prior_record(Path(args.root_dir).expanduser().absolute(), target, 'text')
+            if legacy and target.is_file() and not target.is_symlink():
+                if target.read_text() in (legacy.get('owned', ''), legacy.get('owned', '') + '\n') or args.collision == 'backup':
+                    prior = {'hash': digest(target.read_bytes())}
+                    record['retired_identity'] = 'text:' + str(target)
+        if change.kind == 'link':
+            wanted_hash = digest(change.wanted.encode())
+            current_hash = digest(os.readlink(target).encode()) if target.is_symlink() else None
+            record['link'] = change.wanted
+        else:
+            wanted_hash = digest(change.wanted)
+            current_hash = digest(target.read_bytes()) if target.is_file() and not target.is_symlink() else None
+        if current_hash == wanted_hash:
+            record.update(hash=wanted_hash, present=present, before_hash=current_hash, noop=True)
+            return record
+        if present and (not prior or current_hash is None or current_hash != prior.get('hash')) and args.collision != 'backup':
+            raise ValueError(f'Existing user content is preserved; select --collision backup or another destination: {target}')
+        record.update(hash=wanted_hash, present=present, before_hash=current_hash)
+        return record
+    if target.is_symlink():
+        raise ValueError(f'Existing user configuration link is preserved: {target}')
+    if change.kind == 'hooks' and target.name == 'hooks.json':
+        config = target.parent / 'config.toml'
+        if config.is_file():
+            inline = tomllib.loads(config.read_text()).get('hooks', {})
+            if set(inline) - {'state'}:
+                raise ValueError('Existing inline Codex event hooks are preserved; choose one event-definition source before installing hooks.json')
+    if change.kind in ('hooks', 'cursor-hooks', 'servers', 'environment'):
+        document = load_json(target, {})
+        field = 'env' if change.kind == 'environment' else 'mcpServers' if change.kind == 'servers' else 'hooks'
+        if change.kind == 'cursor-hooks' and document.get('version', 1) != 1:
+            raise ValueError(f'Existing Cursor hook version is preserved: {target}')
+        current = document.get(field, {})
+        wanted = change.wanted
+        previous = prior.get('owned', {})
+        if change.kind in ('servers', 'environment'):
+            for name, old in previous.items():
+                if name in current and current[name] != old:
+                    raise ValueError(f'User edited a previously managed entry; it is preserved: {target}')
+            for name, server in wanted.items():
+                if name in current and current[name] not in (server, previous.get(name)):
+                    raise ValueError(f'Existing MCP server {name} is preserved: {target}')
+            updated = {name: server for name, server in current.items() if name not in previous}
+            updated.update(wanted)
+        else:
+            updated = dict(current)
+            for event in set(previous) | set(wanted):
+                kept = [entry for entry in current.get(event, []) if entry not in previous.get(event, [])]
+                for entry in wanted.get(event, []):
+                    if entry not in kept:
+                        kept.append(entry)
+                if kept:
+                    updated[event] = kept
+                else:
+                    updated.pop(event, None)
+        record['cas_names'] = sorted(set(previous) | set(wanted))
+        record['cas_before_digest'] = digest(json.dumps({name: current[name] for name in record['cas_names'] if name in current}, sort_keys=True).encode())
+        record.update(owned=wanted, previous={name: current[name] for name in previous if name in current} if change.kind in ('servers', 'environment') else previous,
+                      existed=present, noop=updated == current)
+        record['before_document_hash'] = digest(target.read_bytes()) if present else None
+        if change.kind == 'cursor-hooks':
+            record['previous_version'] = document.get('version')
+        return record
+    if change.kind in ('text', 'toml'):
+        original = target.read_text() if present else ''
+        if change.kind == 'toml':
+            validate_toml_boundary(original)
+        begin, end = (TEXT_BEGIN, TEXT_END) if change.kind == 'text' else (TOML_BEGIN, TOML_END)
+        outside, old = managed_block(original, begin, end)
+        wanted = begin + '\n' + change.wanted.rstrip() + '\n' + end
+        if old == wanted:
+            record.update(owned=wanted, previous=old, existed=present, noop=True)
+            return record
+        if old and old != prior.get('owned'):
+            raise ValueError(f'User edited the managed block; it is preserved: {target}')
+        if change.kind == 'toml':
+            new_tables = tomllib.loads(change.wanted)
+            existing = tomllib.loads(outside)
+            if set(new_tables.get('mcp_servers', {})) & set(existing.get('mcp_servers', {})):
+                raise ValueError(f'Existing native MCP names are preserved: {target}')
+            tomllib.loads(outside + '\n' + wanted)
+        record.update(owned=wanted, previous=old, existed=present)
+        record['before_document_hash'] = digest(target.read_bytes()) if present else None
+        return record
+    raise ValueError(f'Unknown change kind: {change.kind}')
+
+
+def file_digest(target: Path) -> str | None:
+    return digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
+
+
+def validate_planned_change(change: Change, record: dict) -> None:
+    target = change.target
+    if change.kind in ('file', 'link', 'remove'):
+        present = target.exists() or target.is_symlink()
+        actual_type = 'link' if target.is_symlink() else 'file' if target.is_file() else 'directory' if target.is_dir() else 'absent'
+        if present != record['present'] or actual_type != record.get('before_type', actual_type) or file_digest(target) != record.get('before_hash'):
+            raise ValueError(f'File changed after preflight; user content is preserved: {target}')
+    elif change.kind in ('servers', 'environment', 'hooks', 'cursor-hooks'):
+        document = load_json(target, {})
+        field = 'env' if change.kind == 'environment' else 'mcpServers' if change.kind == 'servers' else 'hooks'
+        current = document.get(field, {})
+        selected = {name: current[name] for name in record['cas_names'] if name in current}
+        if digest(json.dumps(selected, sort_keys=True).encode()) != record['cas_before_digest']:
+            raise ValueError(f'Configuration changed after preflight; user entries are preserved: {target}')
+        if change.kind == 'cursor-hooks' and document.get('version') != record['previous_version']:
+            raise ValueError(f'Cursor hook version changed after preflight: {target}')
+    else:
+        begin, end = (TEXT_BEGIN, TEXT_END) if change.kind == 'text' else (TOML_BEGIN, TOML_END)
+        text = target.read_text() if target.exists() else ''
+        if change.kind == 'toml':
+            validate_toml_boundary(text)
+        _, block = managed_block(text, begin, end)
+        if block != record['previous']:
+            raise ValueError(f'Configuration changed after preflight; user content is preserved: {target}')
+
+
+def apply_change(change: Change, record: dict, journal: Path, number: int) -> None:
+    target = change.target
+    validate_planned_change(change, record)
+    record['before_document_hash'] = digest(target.read_bytes()) if target.is_file() and not target.is_symlink() else None
+    record['mutation_started'] = True
+    journal_file = journal / 'journal.json'
+    if journal_file.exists():
+        pending = load_json(journal_file, {})
+        pending['records'][number] = record
+        atomic(journal_file, (json.dumps(pending, indent=2) + '\n').encode())
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if change.kind in ('file', 'link', 'remove'):
+        if record['present']:
+            backup = journal / 'backups' / str(number)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(target, backup)
+        if change.kind == 'link':
+            target.symlink_to(change.wanted, target_is_directory=True)
+        elif change.kind != 'remove':
+            atomic(target, change.wanted, change.mode)
+    elif change.kind in ('hooks', 'cursor-hooks', 'servers', 'environment'):
+        document = load_json(target, {})
+        field = 'env' if change.kind == 'environment' else 'mcpServers' if change.kind == 'servers' else 'hooks'
+        if change.kind == 'cursor-hooks':
+            document['version'] = 1
+        current = document.get(field, {})
+        if change.kind in ('servers', 'environment'):
+            document[field] = {**{name: server for name, server in current.items() if name not in record['previous']}, **change.wanted}
+        else:
+            updated = dict(current)
+            for event in set(record['previous']) | set(change.wanted):
+                entries = [entry for entry in current.get(event, []) if entry not in record['previous'].get(event, [])]
+                entries.extend(entry for entry in change.wanted.get(event, []) if entry not in entries)
+                if entries:
+                    updated[event] = entries
+                else:
+                    updated.pop(event, None)
+            document[field] = updated
+        atomic(target, (json.dumps(document, indent=2) + '\n').encode(), 0o600)
+    else:
+        begin, end = (TEXT_BEGIN, TEXT_END) if change.kind == 'text' else (TOML_BEGIN, TOML_END)
+        original = target.read_text() if target.exists() else ''
+        outside, old = managed_block(original, begin, end)
+        if old != record['previous']:
+            raise ValueError(f'Configuration changed during installation: {target}')
+        atomic(target, (outside.rstrip() + '\n\n' + record['owned'] + '\n').lstrip().encode(), change.mode)
+
+
+def rollback_preflight(record: dict) -> bool:
+    """Return true for the before-state; otherwise validate without changing any file."""
+    target = Path(record['target'])
+    kind = record['kind']
+    if record.get('status') != 'completed' and not record.get('mutation_started'):
+        return True
+    if kind in ('file', 'link', 'remove'):
+        current = file_digest(target)
+        backup = Path(record['backup']) if record.get('backup') else None
+        if kind == 'remove' and (target.exists() or target.is_symlink()) and current != record.get('before_hash'):
+            raise ValueError(f'Recreated deselected skill is preserved: {target}')
+        if current == record.get('before_hash') and not (backup and (backup.exists() or backup.is_symlink())):
+            return True
+        if current is None and backup and (backup.exists() or backup.is_symlink()):
+            return False
+        if current != record['hash']:
+            raise ValueError(f'Changed installed file is preserved during rollback: {target}')
+        return False
+    if kind in ('servers', 'environment', 'hooks', 'cursor-hooks'):
+        document = load_json(target, {})
+        field = 'env' if kind == 'environment' else 'mcpServers' if kind == 'servers' else 'hooks'
+        current = document.get(field, {})
+        names = record.get('cas_names', sorted(set(record['previous']) | set(record['owned'])))
+        selected = {name: current[name] for name in names if name in current}
+        if digest(json.dumps(selected, sort_keys=True).encode()) == record.get('cas_before_digest'):
+            return True
+        if kind in ('servers', 'environment'):
+            for name, value in record['owned'].items():
+                if name not in current or current[name] != value:
+                    raise ValueError(f'Changed managed entry is preserved during rollback: {target}')
+            for name in set(record['previous']) - set(record['owned']):
+                if name in current:
+                    raise ValueError(f'Recreated entry is preserved during rollback: {target}')
+        else:
+            for event, groups in record['owned'].items():
+                if any(group not in current.get(event, []) for group in groups):
+                    raise ValueError(f'Changed managed hook is preserved during rollback: {target}')
+        return False
+    begin, end = (TEXT_BEGIN, TEXT_END) if kind == 'text' else (TOML_BEGIN, TOML_END)
+    _, current = managed_block(target.read_text() if target.exists() else '', begin, end)
+    if current == record['previous']:
+        return True
+    if current != record['owned']:
+        raise ValueError(f'Changed rule/config block is preserved during rollback: {target}')
+    return False
+
+
+def rollback_record(record: dict) -> None:
+    if rollback_preflight(record):
+        return
+    target = Path(record['target'])
+    kind = record['kind']
+    if kind not in ('file', 'link', 'remove') and record.get('status') != 'completed':
+        actual = digest(target.read_bytes()) if target.exists() else None
+        if actual == record.get('before_document_hash'):
+            return
+    if kind in ('file', 'link', 'remove'):
+        current = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
+        if current is None:
+            if target.exists() or target.is_symlink():
+                raise ValueError(f'Recreated user content is preserved: {target}')
+            if record.get('backup') and (Path(record['backup']).exists() or Path(record['backup']).is_symlink()):
+                os.replace(record['backup'], target)
+            return
+        if current == record.get('before_hash') and record.get('backup') and not (Path(record['backup']).exists() or Path(record['backup']).is_symlink()):
+            return
+        if current != record['hash']:
+            raise ValueError(f'Changed installed file is preserved during rollback: {target}')
+        target.unlink()
+        if record.get('backup'):
+            os.replace(record['backup'], target)
+    elif kind in ('hooks', 'cursor-hooks', 'servers', 'environment'):
+        document = load_json(target, {})
+        field = 'env' if kind == 'environment' else 'mcpServers' if kind == 'servers' else 'hooks'
+        if kind == 'cursor-hooks':
+            if record['previous_version'] is None:
+                document.pop('version', None)
+            else:
+                document['version'] = record['previous_version']
+        current = document.get(field, {})
+        if kind in ('servers', 'environment'):
+            for name, server in record['owned'].items():
+                if current.get(name) != server:
+                    raise ValueError(f'Changed MCP entry is preserved during rollback: {target}')
+                if name in record['previous']:
+                    current[name] = record['previous'][name]
+                else:
+                    current.pop(name, None)
+            for name, server in record['previous'].items():
+                if name not in record['owned']:
+                    if name in current:
+                        raise ValueError(f'Recreated entry is preserved during rollback: {target}')
+                    current[name] = server
+        else:
+            for event, owned in record['owned'].items():
+                current[event] = [entry for entry in current.get(event, []) if entry not in owned]
+            for event, previous in record['previous'].items():
+                current.setdefault(event, []).extend(entry for entry in previous if entry not in current.get(event, []))
+            current = {event: entries for event, entries in current.items() if entries}
+        if current:
+            document[field] = current
+        else:
+            document.pop(field, None)
+        if document or record['existed']:
+            atomic(target, (json.dumps(document, indent=2) + '\n').encode(), 0o600)
+        else:
+            target.unlink()
+    else:
+        begin, end = (TEXT_BEGIN, TEXT_END) if kind == 'text' else (TOML_BEGIN, TOML_END)
+        outside, current = managed_block(target.read_text(), begin, end)
+        if current != record['owned']:
+            raise ValueError(f'Changed rule/config block is preserved during rollback: {target}')
+        restored = outside.rstrip() + ('\n\n' + record['previous'] if record['previous'] else '')
+        if restored or record['existed']:
+            atomic(target, (restored + '\n').encode(), record['mode'])
+        else:
+            target.unlink()
+
+
+def dependencies(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
+    needs_hooks = 'hooks' in args.components
+    required = {'git': 'shared kit', **({'jq': 'hooks'} if needs_hooks else {})}
+    optional = {}
+    if 'skills' in args.components:
+        names = args.skills if args.skills is not None else [path.name for path in (Path(args.source) / 'skills').iterdir() if path.is_dir()]
+        if 'code-search' in names:
+            optional.update({'rg': 'local code search', 'gh': 'GitHub code search', 'jq': 'code-search root listing'})
+    for host in args.hosts:
+        command = getattr(args, host + '_bin')
+        (required if needs_hooks else optional)[command] = host
+    if 'commands' in args.components:
+        optional.update({'gh': 'workflow PR/CI commands; Jira commands also require an authorized connector'})
+    if 'data-wrappers' in args.components:
+        optional.update({'mysql': 'MySQL read wrapper', 'bq': 'BigQuery read wrapper'})
+    return {name: {'available': bool(shutil.which(name)), 'required_for_install': name in required,
+                   'used_by': required.get(name, optional.get(name))} for name in required | optional}
+
+
+def role_plan(args: argparse.Namespace, view: Path) -> dict[str, Any]:
+    if not ('roles' in args.components or ('hooks' in args.components and args.blocking_hooks)):
+        return {}
+    roles = kit_api(view).load_roles()
+    routes = {}
+    for host in args.hosts:
+        rows = []
+        for name, role in roles.roles.items():
+            invocation = 'session' if name == 'main' else roles.invoke(role, host)
+            command = args.claude_bin if role.provider == 'anthropic' else args.codex_bin
+            unavailable = invocation == 'run' and not role.prefix
+            rows.append({'role': name, 'provider': role.provider, 'model': role.model,
+                         'effort': role.effort, 'invoke': invocation, 'fallback': role.fallback,
+                         'provider_cli': command, 'cli_available': bool(shutil.which(command)),
+                         'required_for_review_run': invocation == 'run' and bool(role.prefix),
+                         'login': 'not checked', 'availability': 'unavailable through agent-run: no review prefix; host native named role support is not enabled' if unavailable else 'configured'})
+        routes[host] = rows
+    return routes
+
+
+def capabilities(args: argparse.Namespace) -> dict[str, str]:
+    if 'hooks' not in args.components:
+        return {host: 'hooks unselected' for host in args.hosts}
+    if args.hook_runtime != 'local':
+        raise ValueError('Command hooks require a supported local host runtime; choose rules or skills for cloud runs')
+    result = {}
+    for host in args.hosts:
+        command = getattr(args, host + '_bin')
+        if not shutil.which(command):
+            result[host] = 'provider CLI missing'
+            continue
+        if host == 'codex':
+            probe = subprocess.run([command, 'features', 'list'], capture_output=True, text=True, timeout=10)
+            match = re.search(r'^hooks\s+.*?\s+(true|false)\s*$', probe.stdout, re.M)
+            result[host] = 'supported' if probe.returncode == 0 and match and match.group(1) == 'true' else 'hooks present but disabled: explicitly enable the feature in Codex first' if match else 'hooks unsupported or capability unknown'
+        elif host == 'cursor':
+            result[host] = 'supported' if host in args.confirm_hook_support else 'requires explicit confirmation of native hooks support'
+        else:
+            result[host] = 'supported'
+    return result
+
+
+def plugin_conflicts(args: argparse.Namespace) -> list[str]:
+    if 'hooks' not in args.components or 'claude' not in args.hosts:
+        return []
+    source = Path(args.source).expanduser()
+    matrix = source / '.claude-plugin/components.json'
+    if not matrix.is_file():
+        return []
+    target = host_target(args, 'claude', Path.home())
+    enabled = load_json(target / 'settings.json', {}).get('enabledPlugins', {})
+    selected = {Path(shlex.split(row['command'])[0]).name for row in selected_registry(source, set(args.components), args.blocking_hooks)}
+    definitions = json.loads(matrix.read_text())['hook_plugins']
+    return sorted(name for name, active in enabled.items() if active and selected & set(definitions.get(name.split('@', 1)[0], [])))
+
+
+def setup(args: argparse.Namespace) -> int:
+    root = Path(args.root_dir).expanduser().absolute()
+    source = Path(args.source).expanduser().resolve()
+    if args.github_owner and not re.fullmatch(r'[A-Za-z0-9_.-]+', args.github_owner):
+        raise ValueError('--github-owner must be a GitHub organization or user name')
+    if args.zoekt_url and (not args.zoekt_url.startswith('https://') or
+                          re.search(r'[\r\n]|://[^/]+@|token|password|secret|api[-_]key', args.zoekt_url, re.I)):
+        raise ValueError('--zoekt-url must be an HTTPS endpoint without inline authentication')
+    resolved_root = root.resolve()
+    if resolved_root == source or source in resolved_root.parents or (root.exists() and root.samefile(source)):
+        raise ValueError('Install destination must be separate from the source checkout')
+    pending = load_json(root / '.install-state/pending.json', {})
+    current = load_json(root / '.install-state/current.json', {})
+    if pending and pending.get('id') == current.get('id'):
+        (root / '.install-state/pending.json').unlink()
+    elif pending:
+        raise ValueError('An interrupted installation requires recovery first: rollback ' + pending['id'])
+    with tempfile.TemporaryDirectory(prefix='agent-kit-install-view-') as folder:
+        view = Path(folder) / 'kit source'
+        view.mkdir()
+        changes = plan(args, view)
+        all_records = [(change, record) for change in changes if (record := prepare_change(change, args)) is not None]
+        prepared = [(change, record) for change, record in all_records if not record.get('noop')]
+        deps = dependencies(args)
+        routes = role_plan(args, view)
+        for rows in routes.values():
+            for row in rows:
+                if row['required_for_review_run']:
+                    deps.setdefault(row['provider_cli'], {'available': row['cli_available'], 'required_for_install': False, 'required_for_role_execution': True, 'used_by': row['role'], 'login': 'not checked'})
+        support = capabilities(args)
+        duplicates = plugin_conflicts(args)
+        output({'mode': 'apply' if args.apply else 'preview', 'hosts': args.hosts,
+                'components': args.components, 'blocking_hooks': args.blocking_hooks, 'role_routing': routes,
+                'component_dependencies': ['roles and review references for blocking hooks'] if 'hooks' in args.components and args.blocking_hooks else [],
+                'root': str(root), 'source_checkout': str(source), 'host_targets': {host: str(host_target(args, host, Path.home())) for host in args.hosts}, 'changes': len(prepared), 'dependencies': deps, 'capabilities': support,
+                'conflicting_plugins': duplicates,
+                'paths': [{'kind': change.kind, 'path': str(change.target)} for change, record in prepared],
+                'shell_activation': 'export PATH=' + shlex.quote(str(root / 'bin')) + ':"$PATH"' if 'data-wrappers' in args.components else None,
+                'auth': 'Reuse each provider login; no auth files are read or copied.',
+                'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
+                'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'})
+        if not args.apply:
+            return 0
+        if duplicates:
+            raise ValueError('Disable the overlapping plugin hook component in Claude first, or leave hooks unselected: ' + ', '.join(duplicates))
+        if any(not data['available'] and data['required_for_install'] for data in deps.values()):
+            raise ValueError('Install dependencies are missing; preview lists each required command')
+        if 'hooks' in args.components and any(value != 'supported' for value in support.values()):
+            raise ValueError('Selected host hooks are unsupported or unverified; preview lists the correction')
+        identifier = time.strftime('%Y%m%dT%H%M%S') + '-' + str(os.getpid())
+        journal = root / '.install-state' / identifier
+        journal.mkdir(parents=True, exist_ok=False)
+        previous = load_json(root / '.install-state/current.json', {})
+        records = []
+        atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+        atomic(root / '.install-state/pending.json', (json.dumps({'id': identifier, 'previous_id': previous.get('id')}) + '\n').encode())
+        try:
+            for number, (change, record) in enumerate(prepared):
+                if record['kind'] in ('file', 'link', 'remove') and record['present']:
+                    record['backup'] = str(journal / 'backups' / str(number))
+                records.append(record)
+                atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+                apply_change(change, record, journal, number)
+                record['status'] = 'completed'
+                atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+            managed = dict(previous.get('managed', {}))
+            for change, record in all_records:
+                if record['kind'] == 'remove':
+                    managed.pop('file:' + record['target'], None)
+                    managed.pop('link:' + record['target'], None)
+                else:
+                    if record.get('retired_identity'):
+                        managed.pop(record['retired_identity'], None)
+                    managed[record['kind'] + ':' + record['target']] = record
+            configuration = {key: getattr(args, key) for key in ('repo_roots', 'work_root', 'role_model', 'role_effort',
+                             'claude_bin', 'codex_bin', 'cursor_bin', 'hosts', 'components', 'host_root', 'project_root', 'skills',
+                             'github_owner', 'zoekt_url')}
+            configuration['source_checkout'] = str(source)
+            configuration['blocking_hooks'] = args.blocking_hooks
+            configuration['host_roots'] = dict(getattr(args, 'host_roots', {}))
+            if args.host_root:
+                configuration['host_roots'][args.hosts[0]] = str(host_target(args, args.hosts[0], Path.home()))
+            configuration['project_roots'] = dict(getattr(args, 'project_roots', {}))
+            if args.project_root and 'cursor' in args.hosts:
+                configuration['project_roots']['cursor'] = args.project_root
+            atomic(root / '.install-state/current.json', (json.dumps({'id': identifier, 'managed': managed,
+                   'configuration': configuration}, indent=2) + '\n').encode())
+            (root / '.install-state/pending.json').unlink(missing_ok=True)
+        except BaseException as original:
+            failures = []
+            for record in reversed(records):
+                try:
+                    rollback_record(record)
+                except (ValueError, OSError) as error:
+                    failures.append(str(error))
+            if failures:
+                original.add_note('Some rollback records need explicit recovery: ' + '; '.join(failures))
+            else:
+                if previous:
+                    atomic(root / '.install-state/current.json', (json.dumps(previous, indent=2) + '\n').encode())
+                else:
+                    (root / '.install-state/current.json').unlink(missing_ok=True)
+                (root / '.install-state/pending.json').unlink(missing_ok=True)
+            raise
+        output({'installed': len(records), 'journal': identifier,
+                'rollback': shlex.join([sys.executable, str(source / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])})
+        return 0
+
+
+def rollback(args: argparse.Namespace) -> int:
+    root = Path(args.root_dir).expanduser().absolute()
+    current = load_json(root / '.install-state/current.json', {})
+    pending = load_json(root / '.install-state/pending.json', {})
+    journal = load_json(root / '.install-state' / args.journal / 'journal.json', {})
+    interrupted = pending.get('id') == args.journal and journal.get('previous', {}).get('id') == current.get('id')
+    if (pending and pending.get('id') != args.journal) or (current.get('id') != args.journal and not interrupted):
+        raise ValueError('Rollback must target the most recent or pending installation journal')
+    if not journal:
+        raise ValueError('Installation journal is missing')
+    progress_file = root / '.install-state' / args.journal / 'rollback-state.json'
+    progress = load_json(progress_file, {'completed': []})
+    records = journal['records']
+    for number, record in enumerate(records):
+        if number not in progress['completed']:
+            rollback_preflight(record)
+    for number in reversed(range(len(records))):
+        if number in progress['completed']:
+            continue
+        progress['running'] = number
+        atomic(progress_file, (json.dumps(progress, indent=2) + '\n').encode())
+        rollback_record(records[number])
+        progress['completed'].append(number)
+        progress.pop('running', None)
+        atomic(progress_file, (json.dumps(progress, indent=2) + '\n').encode())
+    atomic(root / '.install-state/current.json', (json.dumps(journal['previous'], indent=2) + '\n').encode())
+    if pending.get('id') == args.journal:
+        (root / '.install-state/pending.json').unlink(missing_ok=True)
+    output({'rolled_back': args.journal, 'changes': len(journal['records'])})
+    return 0
+
+
+def doctor(args: argparse.Namespace) -> int:
+    root = Path(args.root_dir).expanduser().absolute()
+    state = load_json(root / '.install-state/current.json', {})
+    drift = []
+    for identity, record in state.get('managed', {}).items():
+        target = Path(record['target'])
+        if record['kind'] in ('file', 'link', 'remove'):
+            actual = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
+            if actual != record['hash']:
+                drift.append(str(target))
+        elif record['kind'] in ('text', 'toml'):
+            if not target.exists() or record['owned'] not in target.read_text():
+                drift.append(str(target))
+        else:
+            document = load_json(target, {})
+            field = 'env' if record['kind'] == 'environment' else 'mcpServers' if record['kind'] == 'servers' else 'hooks'
+            current = document.get(field, {})
+            for key, value in record['owned'].items():
+                if record['kind'] in ('hooks', 'cursor-hooks'):
+                    mismatch = any(entry not in current.get(key, []) for entry in value)
+                else:
+                    mismatch = current.get(key) != value
+                if mismatch:
+                    drift.append(str(target))
+                    break
+    output({'wrappers': [str(root / 'bin' / name) for name in ('ro-mysql', 'bqro') if (root / 'bin' / name).is_file()], 'installed': bool(state), 'root': str(root), 'drift': drift,
+            'dependencies': dependencies(args),
+            'native_auth': {host: (Path.home() / ('.' + host)).exists() for host in args.hosts}})
+    return 1 if drift else 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description='Choose components, preview changes, apply and roll back agent-kit.')
+    result.add_argument('action', choices=('setup', 'doctor', 'rollback'), nargs='?', default='setup')
+    result.add_argument('journal', nargs='?')
+    result.add_argument('--source', help='Source checkout; installed setup inherits its recorded original checkout')
+    result.add_argument('--root-dir', default=os.environ.get('AGENT_KIT_DIR', str(Path.home() / '.local/share/agent-kit')))
+    result.add_argument('--hosts', nargs='+', choices=('claude', 'codex', 'cursor'))
+    result.add_argument('--components', nargs='+', choices=sorted(COMPONENTS))
+    result.add_argument('--skills', nargs='*', help='Names, all for every bundled skill, or no values for none')
+    result.add_argument('--repo-roots', nargs='*', help='Parent directories for local clones; no values clears saved roots')
+    result.add_argument('--work-root')
+    result.add_argument('--github-owner', help='Default GitHub organization or owner for scoped code search')
+    result.add_argument('--zoekt-url', help='Optional configured Zoekt backend')
+    result.add_argument('--host-root')
+    result.add_argument('--project-root', help='Project directory for active Cursor project rules')
+    result.add_argument('--claude-bin')
+    result.add_argument('--codex-bin')
+    result.add_argument('--cursor-bin')
+    result.add_argument('--role-model', action='append', default=[])
+    result.add_argument('--role-effort', action='append', default=[])
+    result.add_argument('--mcp-catalog')
+    result.add_argument('--blocking-hooks', action='store_true', help='Explicitly enable selected blocking guards/review gates.')
+    result.add_argument('--hook-runtime', choices=('local', 'cloud', 'unsupported'), default='local')
+    result.add_argument('--confirm-hook-support', nargs='+', choices=('cursor',), default=[],
+                        help='Confirm native Cursor hook support after checking the installed host.')
+    result.add_argument('--collision', choices=('refuse', 'backup'), default='refuse')
+    result.add_argument('--interactive', action='store_true')
+    result.add_argument('--apply', action='store_true')
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.interactive and args.action == 'setup':
+        if not sys.stdin.isatty():
+            raise ValueError('--interactive needs a terminal; use explicit flags in scripts')
+        entered = input('Kit root [' + args.root_dir + ']: ').strip()
+        if entered:
+            args.root_dir = entered
+    saved = load_json(Path(args.root_dir).expanduser() / '.install-state/current.json', {}).get('configuration', {})
+    if args.source is None:
+        selected_root = Path(args.root_dir).expanduser()
+        installed = selected_root.exists() and selected_root.samefile(SOURCE)
+        if args.action == 'setup' and installed:
+            origin = saved.get('source_checkout')
+            if not isinstance(origin, str) or not origin or not Path(origin).is_dir():
+                raise ValueError('Original source checkout is unavailable; pass --source /path/to/checkout. Doctor and rollback remain available without it.')
+            args.source = origin
+        else:
+            args.source = str(SOURCE)
+    defaults = {'repo_roots': [], 'work_root': str(Path.home() / 'agent-work'),
+                'hosts': ['claude'], 'components': ['rules', 'skills'], 'claude_bin': 'claude',
+                'codex_bin': 'codex', 'cursor_bin': 'cursor', 'skills': None,
+                'github_owner': '', 'zoekt_url': ''}
+    for key, default in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, saved.get(key, default))
+    if args.skills == ['all']:
+        args.skills = None
+    elif args.skills is not None and 'all' in args.skills:
+        raise ValueError('--skills all must be used without individual names')
+    args.host_roots = dict(saved.get('host_roots', {}))
+    if not args.host_roots and saved.get('host_root') and len(saved.get('hosts', [])) == 1:
+        args.host_roots[saved['hosts'][0]] = saved['host_root']
+    args.project_roots = dict(saved.get('project_roots', {}))
+    if not args.project_roots and saved.get('project_root') and 'cursor' in saved.get('hosts', []):
+        args.project_roots['cursor'] = saved['project_root']
+    if args.project_root is None and 'cursor' in args.hosts:
+        args.project_root = args.project_roots.get('cursor')
+    for key in ('role_model', 'role_effort'):
+        values = {value.split('=', 1)[0]: value for value in saved.get(key, [])}
+        values.update({value.split('=', 1)[0]: value for value in getattr(args, key)})
+        setattr(args, key, [value for value in values.values() if value.partition('=')[2]])
+    if args.interactive and args.action == 'setup':
+        entered = input('Hosts [' + ' '.join(args.hosts) + '], choices claude codex cursor: ').strip()
+        if entered:
+            args.hosts = entered.split()
+        entered = input('Components [' + ' '.join(args.components) + '], choices ' + ' '.join(sorted(COMPONENTS)) + ': ').strip()
+        if entered:
+            args.components = entered.split()
+        if set(args.hosts) - {'claude', 'codex', 'cursor'} or set(args.components) - COMPONENTS:
+            raise ValueError('Unknown host or component selection')
+        if 'skills' in args.components:
+            entered = input('Skills [' + ('all bundled' if args.skills is None else ' '.join(args.skills) or 'none') + '], names, all, or none: ').strip()
+            if entered:
+                args.skills = None if entered == 'all' else [] if entered == 'none' else entered.split()
+        entered = input('Local repository parent directories as a JSON array [' + json.dumps(args.repo_roots) + ']; [] means remote-only: ').strip()
+        if entered:
+            roots = json.loads(entered)
+            if not isinstance(roots, list) or not all(isinstance(value, str) for value in roots):
+                raise ValueError('Repository roots must be a JSON array of directory strings')
+            args.repo_roots = roots
+        entered = input('GitHub owner or organization [' + args.github_owner + '], optional when --repo is supplied during search: ').strip()
+        if entered:
+            args.github_owner = entered
+        entered = input('Work root [' + args.work_root + ']; enter "" to leave unset: ').strip()
+        if entered:
+            args.work_root = '' if entered == '""' else entered
+        for host in args.hosts:
+            target = host_target(args, host, Path.home())
+            entered = input(host + ' configuration root [' + str(target) + ']: ').strip()
+            if entered:
+                args.host_roots[host] = entered
+                if len(args.hosts) == 1:
+                    args.host_root = entered
+            key = host + '_bin'
+            entered = input(host + ' CLI [' + getattr(args, key) + ']: ').strip()
+            if entered:
+                setattr(args, key, entered)
+        if 'hooks' in args.components:
+            args.blocking_hooks = input('Enable blocking safety and review hooks? [y/N]: ').strip().lower() == 'y'
+        if 'roles' in args.components or ('hooks' in args.components and args.blocking_hooks):
+            for flag in ('model', 'effort'):
+                entered = input('Role ' + flag + ' overrides, space-separated role=value [keep configured]: ').strip()
+                if entered:
+                    values = {value.split('=', 1)[0]: value for value in getattr(args, 'role_' + flag)}
+                    values.update({value.split('=', 1)[0]: value for value in shlex.split(entered)})
+                    setattr(args, 'role_' + flag, [value for value in values.values() if value.partition('=')[2]])
+        args.apply = False
+        setup(args)
+        if input('Apply this previewed selection? [y/N]: ').strip().lower() != 'y':
+            return 0
+        args.apply = True
+    if args.action == 'setup':
+        return setup(args)
+    if args.action == 'rollback':
+        if not args.journal:
+            raise ValueError('rollback needs the journal id printed by setup')
+        return rollback(args)
+    return doctor(args)
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+        sys.stderr.write('agent-setup: ' + str(error) + '\n')
+        raise SystemExit(2)

@@ -6,18 +6,23 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/bash-guards\" git",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/bash-guards\" git",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/commit-cohesion\"",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/commit-cohesion\"",
             "timeout": 10
-          },
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/context-guard\"",
-            "timeout": 10
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/edit-guard\"",
+            "timeout": 5
           }
         ]
       }
@@ -28,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/comment-guard\"",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/comment-guard\"",
             "timeout": 5
           }
         ]
@@ -38,22 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/commit-cohesion\"",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/context-guard\"",
-            "timeout": 10
-          }
-        ]
-      },
-      {
-        "matcher": "EnterWorktree",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/worktree-hint\"",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/commit-cohesion\"",
             "timeout": 5
           }
         ]
@@ -64,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/commit-cohesion\"",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/commit-cohesion\"",
             "timeout": 5
           }
         ]

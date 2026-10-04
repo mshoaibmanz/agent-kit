@@ -1,0 +1,69 @@
+# The directory a Bash command acts in, for hooks that key on a repo: the payload cwd is where the
+# command STARTED, so `cd <wt> && project-test ...` (the runner has no -C) and `git -C <wt> push` (the
+# form CLAUDE.md prescribes) were checked and recorded under the wrong repo. Sourced; defines
+# functions only. Callers: test-exec-gate, tests-ran-mark, ci-watch-on-push, commit-cohesion.
+
+# cmd_repo <cmd> <cwd> [trigger...]: set CMD_DIR. <cmd> is split into simple commands at && || ; |
+# and newlines (quotes are not parsed). Walking them from <cwd>, each `cd <dir>` moves the
+# directory; the first command matching a trigger ends the walk, and its own `git -C <dir>` (the
+# git a trigger names, never an earlier one: `git -C ~/.claude log && git push` pushes the cwd)
+# is the answer. A trigger is a literal substring, or an ERE after a leading `~`, matched against
+# the command with git's -C/-c options removed, so 'git push' also matches `git -C <wt> push`.
+# With no trigger, or none matching, every cd counts and a `git -C` in the last command wins.
+# A path holding an unexpanded `$var`, or one that is not a directory, is ignored (falls back), as
+# guessing at variables would key on a wrong repo. CMD_GUESS is then 1: CMD_DIR is the start
+# directory standing in for one the command names but this cannot resolve (`git -C "$WT" commit`).
+cmd_repo() {
+  local cmd=$1 dir=$2 seg norm c d t hit last=''
+  local re_cd='^\(?[[:space:]]*cd[[:space:]]+["'\'']?([^"'\''[:space:]]+)["'\'']?[[:space:]]*\)?$'
+  local re_git='^(.*)git(([[:space:]]+-[Cc][[:space:]]+[^[:space:]]+)+)(.*)$'
+  local re_c='-C[[:space:]]+["'\'']?([^"'\''[:space:]]+)["'\'']?'
+  CMD_DIR=$2; CMD_GUESS=0
+  shift 2
+  cmd=${cmd//&&/$'\n'}; cmd=${cmd//||/$'\n'}; cmd=${cmd//;/$'\n'}; cmd=${cmd//|/$'\n'}
+  while IFS= read -r seg; do
+    seg=${seg#"${seg%%[![:space:]]*}"}
+    [ -n "$seg" ] || continue
+    if [[ $seg =~ $re_cd ]]; then
+      if d=$(_cmd_repo_abs "${BASH_REMATCH[1]}" "$dir"); then
+        dir=$d; case ${BASH_REMATCH[1]} in /*|'~'*) CMD_GUESS=0 ;; esac   # an absolute cd is known again
+      else
+        CMD_GUESS=1
+      fi
+      continue
+    fi
+    norm=$seg; c=''
+    if [[ $seg =~ $re_git ]]; then
+      norm="${BASH_REMATCH[1]}git${BASH_REMATCH[4]}"
+      local opts=${BASH_REMATCH[2]}
+      while [[ $opts =~ $re_c ]]; do c=${BASH_REMATCH[1]}; opts=${opts#*"${BASH_REMATCH[0]}"}; done
+    fi
+    last=$c
+    hit=0
+    for t in "$@"; do
+      case $t in
+        '~'*) [[ $norm =~ ${t#\~} ]] && hit=1 ;;
+        *) case $norm in *"$t"*) hit=1 ;; esac ;;
+      esac
+      [ "$hit" = 0 ] || break
+    done
+    if [ "$hit" = 1 ]; then
+      CMD_DIR=$dir
+      [ -z "$c" ] || { if d=$(_cmd_repo_abs "$c" "$dir"); then CMD_DIR=$d; case $c in /*|'~'*) CMD_GUESS=0 ;; esac; else CMD_GUESS=1; fi; }
+      return 0
+    fi
+  done <<<"$cmd"
+  CMD_DIR=$dir
+  [ -z "$last" ] || { if d=$(_cmd_repo_abs "$last" "$dir"); then CMD_DIR=$d; case $last in /*|'~'*) CMD_GUESS=0 ;; esac; else CMD_GUESS=1; fi; }
+  return 0
+}
+
+# _cmd_repo_abs <dir> <base>: print <dir> made absolute (~ and relative to <base>); fails on a
+# `$var` path or a missing directory.
+_cmd_repo_abs() {
+  local d=$1
+  case $d in *'$'*|'') return 1 ;; esac
+  case $d in "~") d=$HOME ;; "~/"*) d="$HOME/${d#\~/}" ;; /*) ;; *) d="$2/$d" ;; esac
+  [ -d "$d" ] || return 1
+  printf '%s\n' "$d"
+}

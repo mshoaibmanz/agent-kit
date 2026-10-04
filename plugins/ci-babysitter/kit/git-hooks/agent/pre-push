@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Agent pre-push: the checks live in ~/.agents/hooks/lib/push-gate (pg_check). Run by ../dispatch in
+# agent shells only. Fails closed: a missing lib refuses the push.
+L="$(cd -P "${0%/*}/../../hooks/lib" 2>/dev/null && pwd)"
+# shellcheck source=/dev/null
+. "$L/push-gate" 2>/dev/null || {
+  printf '%s\n' "agent pre-push: REFUSED. hooks/lib/push-gate (or a lib it reads) is missing. Restore it: git -C ~/.agents checkout -- hooks/lib" >&2
+  exit 1
+}
+pg_check "$1" "$2" "$(cat)"

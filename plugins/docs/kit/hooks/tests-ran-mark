@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# PostToolUse: maintains the markers the test and push gates read (lib/test-run lists them).
+# Registered on BOTH matchers, and branches on tool_name:
+#   Bash                 -> a test command ran: the session/worktree run markers, and the agent's
+#                           lastrun marker plus the scope it covered
+#   Edit|Write|MultiEdit -> a source file changed: the edit markers, which unlock the next run
+# pre-push-gate reads the run markers ("were tests run at all?"); test-exec-gate reads lastrun
+# against the edit markers and the recorded scope to refuse a re-run that cannot tell us
+# anything new. Silent no-op otherwise.
+set -uo pipefail
+
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+hook_lib open cmd-view state test-run cmd-repo review-state
+kit_env 2>/dev/null
+# The work root (kit.env AGENT_WORK_ROOT); ~/claude-scratch is its old name, kept as a link to it.
+_wr=${CLAUDE_OUT_ROOT:-${AGENT_WORK_ROOT:-$HOME/agent-work}}; _wr=${_wr/#\~/$HOME}; _wrt="~${_wr#"$HOME"}"
+hook_read tool='.tool_name // ""' sid='.session_id // "nosession"' cwd='.cwd // ""' \
+  files='(.tool_input.file_paths // [(.tool_input.file_path // "")]) | join("\n")' cmd='.tool_input.command // ""' aid='.agent_id // ""'
+[ -n "$cwd" ] || cwd="$PWD"
+
+# --- edit branch: unlocks the next test run ---
+if [ "$tool" != "Bash" ]; then
+  seen=''
+  while IFS= read -r file; do
+  case "$file" in
+    # Only source edits unlock a re-run; a doc or scratch edit changes no test outcome.
+    *.py|*.pyi|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.go|*.rs|*.java|*.kt|*.sql|*.sh|*.yaml|*.yml|*.toml|*.json) ;;
+    *) continue ;;
+  esac
+  case "$file" in /tmp/*|/private/tmp/*|/var/folders/*) continue ;; esac
+  # A task folder's helper scripts are not the code under test; its worktrees/ are.
+  case "$file" in
+    "$_wr"/tasks/*/worktrees/*|*/claude-scratch/tasks/*/worktrees/*) ;;
+    "$_wr"/*|*/claude-scratch/*) continue ;;
+  esac
+  parent=${file%/*}
+  case "$seen" in *"$parent"$'\n'*) continue ;; esac
+  seen="$seen$parent"$'\n'
+  tr_mark edit "$sid" "$(git -C "$parent" rev-parse --show-toplevel 2>/dev/null)"
+  done <<<"$files"
+  exit 0
+fi
+
+[ -n "$cmd" ] || exit 0
+# `cd <worktree> && project-test ...` ran in the worktree, not the payload cwd (lib/cmd-repo). A write
+# lands after every cd; the run is placed by the runner command below.
+start=$cwd
+cmd_repo "$cmd" "$cwd"; cwd=$CMD_DIR
+
+# A source edit made through Bash — `sed -i`, a heredoc, a redirect — fires no Edit/Write
+# PostToolUse, so it would leave no edit marker and test-exec-gate would refuse the run that
+# edit was made for. Only 2.3% of this setup's source writes take that path (67 of 2,922,
+# measured 2026-09-05) because CLAUDE.md mandates Edit/Write, but auto mode actively pushes
+# toward it, so cover it here rather than relying on the rule holding.
+# Two independent conditions, ANDed — a single regex cannot express this, because in
+# `sed -i '' 's/a/b/' pkg/x.py` the filename is four tokens away from the writer.
+_writes=0
+printf '%s' "$cmd" | grep -Eq "(^|[;&|[:space:]])(sed[[:space:]]+-i|(cat|tee|printf|echo)[^;&|]*>)|>>?[[:space:]]*[^[:space:];&|]*\.(py|ts|tsx|go|rs|sql)|write_text\(|open\([^)]*['\"][wa]|python3?[[:space:]]+-[[:space:]]*<<" && _writes=1
+_src=0
+printf '%s' "$cmd" | grep -Eq "\.(py|pyi|ts|tsx|js|jsx|go|rs|java|kt|sql|sh|ya?ml|toml|json)([[:space:]'\"]|$)" && _src=1
+# Scratch only: NOT a bare */tmp/* — that also matches ~/.claude/tmp, where this hook's own
+# fixtures and markers live, and swallowing those made the detector look dead in testing.
+case "$cmd" in
+  */private/tmp/*|*/var/folders/*|*scratchpad*) _writes=0 ;;
+  *"$_wr"/tasks/*/worktrees/*|*"$_wrt"/tasks/*/worktrees/*|*/claude-scratch/tasks/*/worktrees/*) ;;
+  *"$_wr"/*|*"$_wrt"/*|*/claude-scratch/*) _writes=0 ;;
+esac
+if [ "$_writes" = 1 ] && [ "$_src" = 1 ]; then
+  _top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+  tr_mark edit "$sid" "$_top"
+  # The review gates count it too: 54 Bash-written source edits in the week to 2026-10-03 were
+  # invisible to review-mark-changes. The worktree snapshot (staged, unstaged and untracked code)
+  # is compared with the session's last review there, else its base, and only a changed code file
+  # the command names counts, so another session's unstaged edit in a shared checkout does not.
+  if [ -n "$_top" ] && rv_snapshot "$_top"; then
+    while IFS= read -r _f; do
+      rv_is_code "$_f" || continue
+      case $cmd in *"${_f##*/}"*) rv_mark_edit "$sid" "$_top"; break ;; esac
+    done < <(git -C "$_top" diff --name-only "$(rv_since "$sid" "$_top")" "$RV_TREE" 2>/dev/null)
+  fi
+fi
+
+# A runner merely NAMED in a commit message or PR body must not mark tests as run, or
+# pre-push-gate waves through an untested push. A TEST_REFUSED_CMDS form is not counted —
+# test-exec-gate denies it outright.
+cmd_view "$cmd"
+cmd_tokens
+tr_invoked || exit 0
+
+tr_runner_re _rre
+cmd_repo "$cmd" "$start" "~(^|[[:space:]/])(pytest${_rre:+|$_rre})([[:space:]]|\$)"; cwd=$CMD_DIR
+top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
+tr_mark run "$sid" "$top"
+# The scope accumulates across runs on unchanged code and resets once the code changed since
+# the last run or that run went stale.
+tr_state "$sid" "$aid" "$top"
+tr_record "$(tr_scope "$cmd")"
+find "$TR_DIR" -type f -mtime +1 -delete 2>/dev/null || true
+exit 0

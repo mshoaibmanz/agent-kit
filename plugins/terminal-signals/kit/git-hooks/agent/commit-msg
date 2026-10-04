@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Agent commit-msg: an agent's commit carries the Co-authored-by trailer bash-guards asks for (its
+# PreToolUse check stays as the early warning; this one also sees `git -C`, -F files, editors and
+# commits made by scripts). Run by ../dispatch in agent shells only.
+# Scope (lib/push-gate pg_enforced): repos with a network remote, plus the kit repos ~/.agents and
+# ~/.claude; scratch and test repos commit freely. A merge's generated message is exempt.
+L="$(cd -P "${0%/*}/../../hooks/lib" 2>/dev/null && pwd)"
+. "$L/push-gate" 2>/dev/null || exit 0   # an advisory miss: the PreToolUse warning still runs
+msg=$1
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+gd=$(git rev-parse --absolute-git-dir 2>/dev/null)
+[ ! -f "$gd/MERGE_HEAD" ] || exit 0
+kit=0
+case $top in "$HOME/.agents"|"$HOME/.claude"|"$HOME"/.claude-*) kit=1 ;; esac
+url=''
+if [ "$kit" = 0 ]; then
+  for r in $(git remote 2>/dev/null); do
+    u=$(git remote get-url "$r" 2>/dev/null)
+    pg_network_url "$u" && { url=$u; break; }
+  done
+  [ -n "$url" ] || url=$(git remote get-url origin 2>/dev/null)
+else
+  url=git@kit:local
+fi
+pg_enforced "$url" || exit 0
+grep -qi '^Co-authored-by:' "$msg" 2>/dev/null && exit 0
+printf '%s\n' "agent commit-msg: REFUSED. The message lacks the trailer. Append it and commit again:" \
+  "Co-authored-by: Claude <noreply@anthropic.com>" >&2
+exit 1
