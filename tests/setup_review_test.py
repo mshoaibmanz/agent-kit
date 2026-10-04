@@ -62,7 +62,33 @@ class SetupReviewTests(unittest.TestCase):
         original = b"user-owned roles file\n"
         roles = self.root / "roles.toml"
         roles.write_bytes(original)
-        code = "import importlib.machinery,importlib.util,os,sys;from pathlib import Path;loader=importlib.machinery.SourceFileLoader('setup',sys.argv[1]);spec=importlib.util.spec_from_loader(loader.name,loader);module=importlib.util.module_from_spec(spec);sys.modules['setup']=module;loader.exec_module(module);trigger=Path(sys.argv[2])/'roles.toml';sys.argv=[sys.argv[1],'--source',sys.argv[3],'--root-dir',sys.argv[2],'--host-root',sys.argv[4],'--components','rules','--collision','backup','--apply']\ndef stop(frame,event,arg):\n if trigger.is_file() and trigger.read_bytes()!=b'user-owned roles file\\n':os._exit(77)\n return stop\nsys.settrace(stop);module.main()"
+        code = """
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+loader = importlib.machinery.SourceFileLoader('setup', sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules['setup'] = module
+loader.exec_module(module)
+trigger = Path(sys.argv[2]) / 'roles.toml'
+sys.argv = [sys.argv[1], '--source', sys.argv[3], '--root-dir', sys.argv[2],
+            '--host-root', sys.argv[4], '--components', 'rules',
+            '--collision', 'backup', '--apply']
+
+def stop(frame, event, arg):
+    # Interrupt the real write before its completion is recorded in the journal.
+    if (event == 'return' and frame.f_code is module.atomic.__code__
+            and frame.f_locals['path'] == trigger
+            and trigger.read_bytes() != b'user-owned roles file\\n'):
+        os._exit(77)
+
+sys.setprofile(stop)
+module.main()
+"""
         result = subprocess.run(
             [
                 sys.executable,

@@ -638,8 +638,13 @@ for _d in ("aw/tasks/t/scripts", "aw/tasks/t/worktrees/r", "aw/tasks/t/clone", "
     os.makedirs(os.path.join(FIX, _d), exist_ok=True)
 WR_SCRIPT = _fixture("aw/tasks/t/scripts/x.sh", "a\n")
 WR_WT = _fixture("aw/tasks/t/worktrees/r/a.py", "a = 1\n")
-# The scratchpad lives under /tmp; a dir merely NAMED scratchpad elsewhere is not exempt.
-SCR_DIR = tempfile.mkdtemp(prefix=".bash-guards-scratch-", dir="/private/tmp" if os.path.isdir("/private/tmp") else "/tmp")
+# Test the legacy temporary-path exemption only when the selected test root is there.
+# Otherwise use the configured work root, keeping every fixture in the test workspace.
+SCR_ROOT = os.path.realpath(os.environ.get("TMPDIR") or FIX)
+SCR_IS_SYSTEM_TEMP = SCR_ROOT in ("/tmp", "/private/tmp") or SCR_ROOT.startswith(("/tmp/", "/private/tmp/"))
+if not SCR_IS_SYSTEM_TEMP:
+    SCR_ROOT = os.path.join(FIX, "aw/tasks/t")
+SCR_DIR = tempfile.mkdtemp(prefix=".bash-guards-scratch-", dir=SCR_ROOT)
 atexit.register(shutil.rmtree, SCR_DIR, ignore_errors=True)
 SCR_FILE = os.path.join(SCR_DIR, "x.txt")
 open(SCR_FILE, "w").write("a\n")
@@ -688,7 +693,7 @@ KIT_CASES = [
     (KWR,        "deny",  "sed -i '' 's/a/b/' \"$F\"",        "in-place: an unknown $var target"),
     (KWR,        "deny",  f"sed -i '' 's/a/b/' {SCR_DIR}/missing.txt", "in-place: no existing file named"),
     (KWR,        "deny",  f"ls {SCR_DIR} | xargs sed -i '' 's/a/b/'", "in-place: targets from stdin"),
-    (os.devnull, "allow", f"sed -i '' 's/a/b/' {SCR_FILE}",   "in-place: the scratchpad needs no overlay"),
+    (os.devnull, "allow" if SCR_IS_SYSTEM_TEMP else "deny", f"sed -i '' 's/a/b/' {SCR_FILE}", "in-place: only a legacy temporary path needs no overlay"),
     (os.devnull, "deny",  f"sed -i '' 's/a/b/' {WR_SCRIPT}",  "in-place: without the overlay that dir is not the work root"),
 ]
 
@@ -712,8 +717,8 @@ def decision(cmd, kit=None, timeout=None):
     env = None if kit is None else {**os.environ, "KIT_ENV": kit}
     try:
         r = subprocess.run(
-            [H], input=json.dumps({"tool_input": {"command": cmd}}),
-            capture_output=True, text=True, env=env, timeout=timeout,
+            [H], input=json.dumps({"cwd": FIX, "tool_input": {"command": cmd}}),
+            capture_output=True, text=True, env=env, timeout=timeout, cwd=FIX,
         )
     except subprocess.TimeoutExpired:
         return "TIMEOUT"
