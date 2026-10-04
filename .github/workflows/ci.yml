@@ -16,6 +16,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Hook suites, plugin manifests and copies
+        env:
+          TMPDIR: ${{ github.workspace }}/../agent-kit-test-fixtures
         run: bash tests/run-tests.sh
 
   scan:
@@ -37,9 +39,12 @@ jobs:
           echo "GITLEAKS=$PWD/gitleaks" >> "$GITHUB_ENV"
       - name: Leak scan (tree, history, org denylist, identities, images)
         env:
+          TMPDIR: ${{ github.workspace }}/../agent-kit-test-fixtures
           # Newline-separated EREs naming the org's hosts, projects and repos. A hit prints only the
           # term's line number, so the list never reaches these public logs.
           LEAK_TERMS: ${{ secrets.LEAK_TERMS }}
           # Fork PRs get no secrets; a push without the list is a failure, not a pass.
           REQUIRE_LEAK_TERMS: ${{ github.event_name == 'push' && '1' || '0' }}
-        run: bash scripts/scan.sh
+        run: |
+          mkdir -p "$TMPDIR"
+          bash scripts/scan.sh

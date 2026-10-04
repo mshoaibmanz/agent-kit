@@ -11,8 +11,12 @@
 # repo-based step is skipped, including the dead-worktree transcript prune, which would otherwise
 # read "no live worktree anywhere" and delete every worktree's transcripts.
 set -uo pipefail
-# launchd's PATH is /usr/bin:/bin:/usr/sbin:/sbin, which has no gh.
-PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Preserve caller-selected tools; bare launchd needs the Homebrew runtime first.
+case "$PATH" in
+  ''|/usr/bin:/bin|/usr/bin:/bin:/usr/sbin:/sbin)
+    PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;;
+  *) PATH="$PATH:/opt/homebrew/bin:/usr/local/bin" ;;
+esac
 log() { printf '%s claude-gc: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
 usage() { echo "usage: claude-gc [--prune-worktrees] [--report-file PATH] [--report-sha256 HASH]" >&2; exit 2; }
 src=${BASH_SOURCE[0]}

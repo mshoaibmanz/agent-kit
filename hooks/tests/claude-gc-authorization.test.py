@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -22,7 +23,7 @@ GC = Path(
 class AuthorizationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.scratch = tempfile.TemporaryDirectory(prefix="gc-authorization-")
-        self.addCleanup(self.scratch.cleanup)
+        self.addCleanup(self.cleanup_fixture)
         self.home = Path(self.scratch.name)
         self.overlay = self.home / "synthetic-kit.env"
         self.overlay.write_text('CODE_DIRS=""\n')
@@ -56,6 +57,47 @@ class AuthorizationTests(unittest.TestCase):
         self.digest_supported = (
             "--report-sha256" in help_result.stdout + help_result.stderr
         )
+
+    def cleanup_fixture(self) -> None:
+        for attempt in range(3):
+            try:
+                self.scratch.cleanup()
+                return
+            except OSError as error:
+                # Background Git metadata can appear between traversal and rmdir.
+                if error.errno != errno.ENOTEMPTY or attempt == 2:
+                    raise
+                time.sleep(0.05)
+
+    def path_probe(self, selected: str) -> list[str]:
+        fallback = self.home / "fallback-bin"
+        fallback.mkdir()
+        preferred = self.home / "preferred-bin"
+        preferred.mkdir()
+        for directory in (fallback, preferred):
+            for name in ("git", "python3"):
+                executable = directory / name
+                executable.write_text("#!/bin/sh\nexit 0\n")
+                executable.chmod(0o700)
+        bootstrap, separator, _ = GC.read_text().partition("\nlog() {")
+        self.assertTrue(separator, "GC bootstrap boundary is missing")
+        bootstrap = bootstrap.replace("/opt/homebrew/bin", str(fallback)).replace(
+            "/usr/local/bin", str(fallback)
+        )
+        path = str(preferred) if selected == "preferred" else selected
+        result = subprocess.run(
+            ["/bin/bash", "-c", bootstrap + "\ncommand -v git\ncommand -v python3\n"],
+            env=dict(self.env, PATH=path), capture_output=True, text=True, check=True,
+        )
+        return result.stdout.splitlines()
+
+    def test_custom_path_precedes_homebrew_fallback(self) -> None:
+        expected = self.home / "preferred-bin"
+        self.assertEqual(self.path_probe("preferred"), [str(expected / "git"), str(expected / "python3")])
+
+    def test_launchd_path_keeps_homebrew_runtime_fallback(self) -> None:
+        expected = self.home / "fallback-bin"
+        self.assertEqual(self.path_probe("/usr/bin:/bin:/usr/sbin:/sbin"), [str(expected / "git"), str(expected / "python3")])
 
     def git(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -322,7 +364,8 @@ class AuthorizationTests(unittest.TestCase):
         deadline = time.monotonic() + 10
         while not path.exists() and time.monotonic() < deadline:
             if process.poll() is not None:
-                self.fail("fixture process exited before barrier")
+                stdout, stderr = process.communicate(timeout=5)
+                self.fail(f"fixture process exited before barrier: {stdout!r} {stderr!r}")
             time.sleep(0.02)
         self.assertTrue(path.exists(), "fixture barrier timed out")
 
