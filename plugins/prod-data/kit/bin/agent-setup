@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit(f'agent-setup: needs Python 3.11 or newer (this is {sys.version.split()[0]}). '
+             'Fix: brew install python@3.12 (macOS) or sudo apt-get install python3 (Linux), then rerun with it.')
+
 import argparse
 from dataclasses import dataclass
 import hashlib
@@ -15,7 +21,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import tomllib
@@ -39,7 +44,18 @@ ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'secon
                 'reviewer': 'task-reviewer', 'thermo-bugs': 'bug-reviewer',
                 'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
-from hosts import HOSTS, install_text, keep_host_tables, normalize_transport  # noqa: E402
+from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, fill, install_text, keep_host_tables,  # noqa: E402
+                   normalize_transport, resume_max, without_table)
+from kit_env import kit_env  # noqa: E402
+SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
+MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
+HOST_LINKS = {'claude': 'https://docs.anthropic.com/en/docs/claude-code', 'codex': 'https://developers.openai.com/codex/cli',
+              'cursor': 'https://cursor.com/downloads'}
+REPO_PARENTS = ('Code', 'src', 'dev', 'projects')
+# Preset [kit] keys: the ones setup answers itself, and the overlay keys it writes as they are.
+PRESET_ANSWERS = {'GITHUB_OWNER': 'github_owner', 'CODE_DIRS': 'repo_roots', 'ZOEKT_URL': 'zoekt_url'}
+PRESET_OVERLAY = ('REVIEW_BASE', 'RELEASE_BRANCH_RE', 'BQRO_PROJECT', 'GIT_AUTHOR', 'SUBAGENT_RESUME_MAX')
+INLINE_SECRET = re.compile(r'token|password|passwd|secret|api[-_]?key|bearer|authorization|://[^/\s]+@', re.I)
 
 
 def digest(data: bytes) -> str:
@@ -71,8 +87,15 @@ def load_json(path: Path, default: Any = None) -> Any:
     return json.loads(text) if text else default
 
 
-def safe_catalog(path: Path) -> dict[str, Any]:
+def safe_catalog(path: Path, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The catalog at path, plus extra servers (a preset's) under names it does not already hold."""
     catalog = json.loads(path.read_text())
+    if isinstance(catalog, dict) and isinstance(catalog.get('mcpServers', {}), dict) and extra:
+        catalog = {**catalog, 'mcpServers': {**extra, **catalog.get('mcpServers', {})}}
+    return safe_servers(catalog)
+
+
+def safe_servers(catalog: Any) -> dict[str, Any]:
     if not isinstance(catalog, dict) or not isinstance(catalog.get('mcpServers', {}), dict):
         raise ValueError('MCP catalog must map server names to objects')
     servers = {}
@@ -192,7 +215,8 @@ def resolve_values(value: Any, view: Path, root: Path, host_view: Path, target: 
     if isinstance(value, list):
         return [resolve_values(item, view, root, host_view, target) for item in value]
     if isinstance(value, str):
-        return value.replace(str(view), str(root)).replace(str(host_view), str(target)).replace('{{AGENT_KIT_DIR}}', str(root))
+        # Placeholders were filled at render (hosts.fill) with the view's paths; these map them.
+        return value.replace(str(view), str(root)).replace(str(host_view), str(target))
     return value
 
 
@@ -208,7 +232,7 @@ def resolve_hooks(document: dict, view: Path, root: Path, host_view: Path, targe
 
 def resolve_toml(text: str, view: Path, root: Path, host_view: Path, target: Path) -> str:
     blocks = []
-    for begin, end in [('# BEGIN agent-kit shell', '# END agent-kit shell'), ('# BEGIN agent-kit managed', '# END agent-kit managed')]:
+    for begin, end in [SHELL_MARKERS, MANAGED_MARKERS, (SANDBOX_BEGIN, SANDBOX_END)]:
         _, block = managed_block(text, begin, end)
         if block:
             values = tomllib.loads(block)
@@ -258,7 +282,19 @@ def overlay_text(args: argparse.Namespace) -> str:
         overlay += 'CODE_SEARCH_ZOEKT_URL=' + args.zoekt_url + '\n'
     # Written either way: this layer sits over kit.env, so the saved choice is the one the sandbox gets.
     overlay += 'CODEX_SANDBOX_GCLOUD=' + ('1' if args.codex_gcloud == 'on' else '0') + '\n'
+    # A preset's team defaults; kit.env, read under this layer, cannot override them, so only these.
+    for key, value in getattr(args, 'kit_values', {}).items():
+        overlay += key + '=' + value + '\n'
     return overlay
+
+
+def setup_resume(args: argparse.Namespace) -> int:
+    """SUBAGENT_RESUME_MAX for this install: the preset's, else the user's kit.env, else the default."""
+    root = Path(args.root_dir).expanduser().absolute()
+    raw = getattr(args, 'kit_values', {}).get('SUBAGENT_RESUME_MAX')
+    if raw is None and (root / 'local/kit.env').is_file():
+        raw = kit_env(str(root / 'local/kit.env'))['SUBAGENT_RESUME_MAX']
+    return resume_max(raw or '')
 
 
 def installed_work_root(root: Path) -> Path:
@@ -301,12 +337,20 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
     if host == 'claude':
         api = kit_api(view)
         if 'rules' in components:
-            text = '@' + str(root / 'rules/AGENTS.md') + '\n@' + str(root / 'rules/hosts/claude.md') + '\n'
+            # rules/AGENTS.md is imported as is; the host rules through their filled copy.
+            if '{{' in (view / 'rules/AGENTS.md').read_text():
+                raise ValueError('rules/AGENTS.md is imported unrendered, so it may hold no {{...}} placeholder')
+            host_rules = root / 'state/rendered/claude-host-rules.md'
+            filled = fill((view / 'rules/hosts/claude.md').read_text(), str(root), 'claude', str(target),
+                          'rules/hosts/claude.md', setup_resume(args))
+            changes.append(Change('file', host_rules, filled.encode()))
+            text = '@' + str(root / 'rules/AGENTS.md') + '\n@' + str(host_rules) + '\n'
             changes.append(Change('text', target / 'CLAUDE.md', text))
         if 'roles' in components:
             roles = api.load_roles()
-            for name, text in api.expected_agents(roles, 'claude').items():
-                changes.append(Change('file', target / 'agents' / name, install_text(text, str(root), export=False).encode()))
+            for name, text in api.expected_agents(roles, 'claude', kit=str(root), host_root=str(target),
+                                                  resume=setup_resume(args)).items():
+                changes.append(Change('file', target / 'agents' / name, text.encode()))
             for provider in HOSTS:
                 changes.append(Change('file', root / 'state/rendered' / ('roles-' + provider + '.sh'),
                                       api.roles_sh(roles, provider).replace(str(view), str(root)).encode()))
@@ -367,12 +411,17 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
                             previous = previous[len(TOML_BEGIN):].removesuffix(TOML_END).strip()
                         # Each block from this render when its component is selected, else as installed,
                         # always in this order: a one-component update leaves the file byte-identical.
+                        # The sandbox block has its own gate (Q-12): hooks or mcp, not mcp alone.
                         rest, blocks = previous, []
-                        for component, begin, end in [('hooks', '# BEGIN agent-kit shell', '# END agent-kit shell'),
-                                                      ('mcp', '# BEGIN agent-kit managed', '# END agent-kit managed')]:
+                        for component, (begin, end) in [('hooks', SHELL_MARKERS), ('mcp', MANAGED_MARKERS),
+                                                        ('sandbox', (SANDBOX_BEGIN, SANDBOX_END))]:
                             rest, block = managed_block(rest, begin, end)
-                            if component in components:
+                            if component in components or (component == 'sandbox' and components & SANDBOX_COMPONENTS):
                                 _, block = managed_block(text, begin, end)
+                            elif component == 'mcp' and 'sandbox_workspace_write' in block:
+                                # An install from before the sandbox block kept its roots in this one.
+                                inner = without_table(block[len(begin):-len(end)], 'sandbox_workspace_write')
+                                block = begin + '\n' + inner.strip() + ('\n' if inner.strip() else '') + end
                             blocks.append(block)
                         combined = '\n'.join(part for part in (rest.strip(), *blocks) if part)
                         if combined.strip():
@@ -458,7 +507,8 @@ def installation_view(args: argparse.Namespace, view: Path) -> None:
     role_overrides(view / 'roles.toml', args.role_model, args.role_effort)
     kit_api(view).load_roles()
     if 'mcp' in args.components:
-        catalog = safe_catalog(Path(args.mcp_catalog).expanduser() if args.mcp_catalog else source / 'mcp/servers.json')
+        catalog = safe_catalog(Path(args.mcp_catalog).expanduser() if args.mcp_catalog else source / 'mcp/servers.json',
+                               getattr(args, 'preset_servers', {}))
         (view / 'mcp').mkdir()
         (view / 'mcp/servers.json').write_text(json.dumps(catalog, indent=2) + '\n')
 
@@ -557,6 +607,10 @@ def prior_record(root: Path, target: Path, kind: str | None = None) -> dict:
                                          previous.get('managed', {}).get(str(target), {}))
 
 
+class Collision(ValueError):
+    """A planned file or link where the user has their own content (preflight collects these)."""
+
+
 def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
     target = change.target
     prior = prior_record(Path(args.root_dir).expanduser().absolute(), target, change.kind)
@@ -587,7 +641,7 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
             record.update(hash=wanted_hash, present=present, before_hash=current_hash, noop=True)
             return record
         if present and (not prior or current_hash is None or current_hash != prior.get('hash')) and args.collision != 'backup':
-            raise ValueError(f'Existing user content is preserved; select --collision backup or another destination: {target}')
+            raise Collision(f'Existing user content is preserved; select --collision backup or skip, or another destination: {target}')
         record.update(hash=wanted_hash, present=present, before_hash=current_hash)
         return record
     if target.is_symlink():
@@ -865,9 +919,289 @@ def dependencies(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     if 'commands' in args.components:
         optional.update({'gh': 'workflow PR/CI commands; Jira commands also require an authorized connector'})
     if 'data-wrappers' in args.components:
-        optional.update({'mysql': 'MySQL read wrapper', 'bq': 'BigQuery read wrapper'})
-    return {name: {'available': bool(shutil.which(name)), 'required_for_install': name in required,
-                   'used_by': required.get(name, optional.get(name))} for name in required | optional}
+        optional.update({'mysql': 'MySQL read wrapper', 'bq': 'BigQuery read wrapper', 'gcloud': 'BigQuery read wrapper login'})
+    if 'mcp' in args.components:
+        for name, spec in mcp_servers(args).items():
+            command = Path(str(spec.get('command', ''))).name
+            if command in ('npx', 'node', 'uvx', 'uv'):
+                optional.setdefault(command, 'MCP server ' + name)
+    result = {name: {'available': bool(shutil.which(name)), 'required_for_install': name in required,
+                     'used_by': required.get(name, optional.get(name))} for name in required | optional}
+    for name, data in result.items():
+        if not data['available']:
+            data['install'] = install_hint(name)
+    return result
+
+
+def install_hint(tool: str) -> str:
+    """This OS's install command for tool, from hooks/lib/install-hint (the hooks' one source)."""
+    try:
+        result = subprocess.run(['sh', str(SOURCE / 'hooks/lib/install-hint'), tool], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return f'install {tool} with your package manager'
+
+
+def mcp_servers(args: argparse.Namespace) -> dict[str, Any]:
+    """The servers an mcp install would register (catalog plus preset), {} when it cannot be read."""
+    path = Path(args.mcp_catalog).expanduser() if args.mcp_catalog else Path(args.source) / 'mcp/servers.json'
+    try:
+        return safe_catalog(path, getattr(args, 'preset_servers', {}))['mcpServers']
+    except (OSError, ValueError):
+        return {}
+
+
+def run_quiet(command: list[str], env: dict[str, str] | None = None) -> int | None:
+    """command's exit code, None when it cannot run (missing, or no answer in 10 seconds)."""
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=10, env=env, stdin=subprocess.DEVNULL).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def host_login(host: str, command: str, target: Path) -> tuple[bool | None, str]:
+    """(logged in, how it was checked); None when this host's login cannot be checked locally."""
+    if host == 'claude':
+        if os.environ.get('ANTHROPIC_API_KEY'):
+            return True, 'ANTHROPIC_API_KEY is set'
+        state = target / '.claude.json' if target != Path.home() / '.claude' else Path.home() / '.claude.json'
+        try:
+            account = 'oauthAccount' in json.loads(state.read_text())
+        except (OSError, ValueError):
+            account = False
+        return account, ('signed in' if account else f'not signed in: run `{command}` and log in')
+    if host == 'codex':
+        if not shutil.which(command):
+            return None, f'{command} not on PATH'
+        code = run_quiet([command, 'login', 'status'], dict(os.environ, CODEX_HOME=str(target)))
+        return (code == 0), ('signed in' if code == 0 else f'not signed in: run `{command} login`')
+    if target.is_dir():
+        return True, f'configured ({target} exists)'
+    return None, 'open Cursor once and sign in, then rerun'
+
+
+def secret_store() -> str:
+    """Where the wrappers read credentials: the macOS Keychain, secret-tool, else environment variables."""
+    if Path('/usr/bin/security').exists():
+        return 'keychain'
+    return 'secret-tool' if shutil.which('secret-tool') else 'env'
+
+
+def detect_hosts(args: argparse.Namespace) -> list[str]:
+    """Hosts with their CLI on PATH or a config dir (CLAUDE_CONFIG_DIR and CODEX_HOME honoured)."""
+    found = []
+    for host in HOSTS:
+        command = getattr(args, host + '_bin', None) or host
+        if shutil.which(command) or host_target(argparse.Namespace(host_root=None, hosts=[host]), host, Path.home()).is_dir():
+            found.append(host)
+    return found
+
+
+def detect_cli(host: str) -> str:
+    """The host's CLI name on PATH, including the install locations each host's installer uses."""
+    candidates = {'claude': ['claude', str(Path.home() / '.claude/local/claude')], 'codex': ['codex'],
+                  'cursor': ['cursor', 'cursor-agent']}[host]
+    return next((name for name in candidates if shutil.which(name)), host)
+
+
+def detect_repo_roots() -> list[str]:
+    """~/Code, ~/src, ~/dev and ~/projects when they hold at least one git checkout."""
+    roots = []
+    for name in REPO_PARENTS:
+        parent = Path.home() / name
+        try:
+            if parent.is_dir() and any((child / '.git').exists() for child in parent.iterdir() if child.is_dir()):
+                roots.append(str(parent))
+        except OSError:
+            continue
+    return roots
+
+
+def detect_owner(roots: list[str]) -> tuple[str, str]:
+    """(GitHub owner, where it came from): your only org per `gh api user/orgs`, else the most common
+    owner among the origin remotes of the repos found. Empty when neither answers."""
+    if shutil.which('gh'):
+        try:
+            result = subprocess.run(['gh', 'api', 'user/orgs', '--jq', '.[].login'], capture_output=True, text=True,
+                                    timeout=10, stdin=subprocess.DEVNULL)
+            orgs = result.stdout.split() if result.returncode == 0 else []
+            if len(orgs) == 1:
+                return orgs[0], 'gh api user/orgs'
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    owners: dict[str, int] = {}
+    for root in roots:
+        for child in sorted(Path(root).iterdir())[:200]:
+            config = child / '.git/config'
+            if not config.is_file():
+                continue
+            match = re.search(r'url = (?:git@github\.com:|https://github\.com/)([A-Za-z0-9_.-]+)/', config.read_text(errors='replace'))
+            if match:
+                owners[match.group(1)] = owners.get(match.group(1), 0) + 1
+    if owners:
+        return max(owners, key=lambda name: owners[name]), 'origin remotes'
+    return '', ''
+
+
+def load_preset(spec: str) -> tuple[dict[str, Any], str]:
+    """(validated preset, its sha256). A local path or gh:owner/repo[/path] (default path
+    agent-kit-preset.toml), fetched with the user's own gh login. PresetUnavailable when a gh: fetch
+    fails; ValueError when the preset is invalid or holds an inline secret."""
+    if spec.startswith('gh:'):
+        parts = spec[3:].split('/', 2)
+        if len(parts) < 2 or not all(re.fullmatch(r'[A-Za-z0-9_.-]+', part) for part in parts[:2]):
+            raise ValueError(f'preset {spec}: expected gh:owner/repo[/path]')
+        path = parts[2] if len(parts) == 3 else 'agent-kit-preset.toml'
+        if not shutil.which('gh'):
+            raise PresetUnavailable(f'gh is not installed ({install_hint("gh")})')
+        try:
+            result = subprocess.run(['gh', 'api', '-H', 'Accept: application/vnd.github.raw',
+                                     f'repos/{parts[0]}/{parts[1]}/contents/{path}'], capture_output=True, text=True,
+                                    timeout=20, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise PresetUnavailable(str(error)) from None
+        if result.returncode:
+            reason = (result.stderr.strip().splitlines() or ['gh api failed'])[0]
+            raise PresetUnavailable(f'{reason} (check `gh auth status` and your access to {parts[0]}/{parts[1]})')
+        text = result.stdout
+    else:
+        text = Path(spec).expanduser().read_text()
+    try:
+        preset = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f'preset {spec}: not valid TOML: {error}') from None
+    validate_preset(preset, spec)
+    return preset, digest(text.encode())
+
+
+class PresetUnavailable(Exception):
+    """A gh: preset that could not be fetched: setup continues on its own defaults."""
+
+
+def validate_preset(preset: dict[str, Any], spec: str) -> None:
+    """Refuse unknown tables or keys, wrong types, and anything that looks like an inline secret."""
+    unknown = set(preset) - {'kit', 'mcp', 'hosts', 'roles', 'skills'}
+    if unknown:
+        raise ValueError(f'preset {spec}: unknown table(s) {", ".join(sorted(unknown))}; expected kit, mcp, hosts, roles, skills')
+    kit = preset.get('kit', {})
+    bad = set(kit) - set(PRESET_ANSWERS) - set(PRESET_OVERLAY)
+    if bad:
+        raise ValueError(f'preset {spec}: unknown [kit] key(s) {", ".join(sorted(bad))}')
+    for key, value in kit.items():
+        values = value if key == 'CODE_DIRS' and isinstance(value, list) else [value]
+        if not all(isinstance(item, str) and '\n' not in item for item in values):
+            raise ValueError(f'preset {spec}: [kit] {key} must be a one-line string' + (' or a list of them' if key == 'CODE_DIRS' else ''))
+        if any(INLINE_SECRET.search(item) for item in values):
+            raise ValueError(f'preset {spec}: [kit] {key} looks like an inline secret; presets hold non-secret defaults only')
+    servers = preset.get('mcp', {}).get('servers', {})
+    if set(preset.get('mcp', {})) - {'servers'}:
+        raise ValueError(f'preset {spec}: [mcp] takes only [mcp.servers.<name>] tables')
+    try:
+        safe_servers({'mcpServers': servers})
+    except ValueError as error:
+        raise ValueError(f'preset {spec}: {error}') from None
+    hosts = preset.get('hosts', {}).get('recommended', [])
+    if not isinstance(hosts, list) or set(hosts) - set(HOSTS):
+        raise ValueError(f'preset {spec}: [hosts] recommended must list hosts from {", ".join(HOSTS)}')
+    for name, role in preset.get('roles', {}).items():
+        if not isinstance(role, dict) or set(role) - {'model', 'effort'} or not all(isinstance(v, str) for v in role.values()):
+            raise ValueError(f'preset {spec}: [roles.{name}] takes model and effort strings only')
+    skills = preset.get('skills', {})
+    if set(skills) - {'include', 'exclude'} or not all(isinstance(v, list) and all(isinstance(s, str) for s in v) for v in skills.values()):
+        raise ValueError(f'preset {spec}: [skills] takes include and exclude lists only')
+
+
+def org_access(owner: str, zoekt: str) -> tuple[str, str]:
+    """(section, line) for whether gh can read owner's org, the preset's code-search scope."""
+    if not shutil.which('gh'):
+        return 'Skipped', f'GitHub org check for {owner}: gh is missing. Fix: {install_hint("gh")}'
+    code = run_quiet(['gh', 'api', f'orgs/{owner}', '--silent'])
+    if code == 0:
+        return 'Ready', f'GitHub org {owner}: readable with your gh login'
+    if zoekt:
+        return 'Skipped', f'GitHub org {owner}: gh cannot read it, so code-search uses its Zoekt backend ({zoekt}) for those repos'
+    return 'Needs attention', f'GitHub org {owner}: gh cannot read it; code-search finds only public and local repos. Fix: gh auth refresh -s read:org, or ask an org admin for access'
+
+
+def preflight(args: argparse.Namespace, deps: dict, support: dict, duplicates: list[str], collisions: list[str],
+              notes: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], bool]:
+    """(section, line) rows for the summary, and whether apply is blocked. Each row that needs action
+    ends in its fix for this OS."""
+    rows = [('Ready', f'python {sys.version.split()[0]}')]
+    blocked = False
+    if not args.hosts:
+        recommended = getattr(args, 'recommended_hosts', [])
+        rows.append(('Skipped', 'hosts: none detected or selected (no claude, codex or cursor CLI or config dir); kit files '
+                     'install now and activate when you install a host'
+                     + (f' (the preset recommends {" ".join(recommended)})' if recommended else '') + ': '
+                     + ', '.join(f'{host} {link}' for host, link in HOST_LINKS.items())))
+    for host in args.hosts:
+        command = getattr(args, host + '_bin')
+        target = host_target(args, host, Path.home())
+        if not shutil.which(command):
+            rows.append(('Needs attention', f'{host}: {command} not on PATH; files install and activate once it is. Fix: {install_hint(host)}'))
+            continue
+        logged, how = host_login(host, command, target)
+        rows.append(('Ready' if logged else 'Needs attention', f'{host}: {command}, {how}'))
+    for name, data in deps.items():
+        if name in args.hosts or name in (getattr(args, host + '_bin') for host in args.hosts):
+            continue
+        if data['available']:
+            rows.append(('Ready', f'{name}: for {data["used_by"]}'))
+        elif data['required_for_install']:
+            rows.append(('Needs attention', f'{name} missing, required for {data["used_by"]} (blocks apply). Fix: {data["install"]}'))
+            blocked = True
+        else:
+            rows.append(('Skipped', f'{data["used_by"]} off: {name} missing. Fix: {data["install"]}'))
+    if shutil.which('gh') and any('gh' == name for name in deps):
+        if run_quiet(['gh', 'auth', 'status']) != 0:
+            rows.append(('Skipped', 'GitHub search and PR flows off: gh is not logged in. Fix: gh auth login'))
+    if 'data-wrappers' in args.components:
+        store = secret_store()
+        rows.append(('Ready' if store != 'env' else 'Skipped', {
+            'keychain': 'credentials: wrappers read the macOS Keychain',
+            'secret-tool': 'credentials: no Keychain here; wrappers read secret-tool (libsecret)',
+            'env': 'credentials: no Keychain or secret-tool; wrappers read env vars (RO_MYSQL_PASSWORD_<ACCOUNT>, '
+                   f'SENTRY_ACCESS_TOKEN). Fix for a store: {install_hint("secret-tool")}'}[store]))
+    if 'mcp' in args.components and not mcp_servers(args):
+        rows.append(('Skipped', 'mcp: no MCP servers configured (add them in mcp/servers.json or a preset)'))
+    for host, state in support.items():
+        if state in ('supported', 'hooks unselected'):
+            continue
+        fix = ('--confirm-hook-support cursor after checking Cursor > Settings > Hooks' if host == 'cursor'
+               else install_hint(getattr(args, host + '_bin')) if state == 'provider CLI missing' else 'enable hooks in the host, or drop the hooks component')
+        rows.append(('Needs attention', f'{host} hooks: {state} (blocks apply). Fix: {fix}'))
+        blocked = True
+    if duplicates:
+        rows.append(('Needs attention', 'plugins with the same hooks are enabled: ' + ', '.join(duplicates)
+                     + ' (blocks apply). Fix: disable them in Claude, or leave hooks unselected'))
+        blocked = True
+    for path in collisions:
+        rows.append(('Needs attention', f'{path} holds your own content (blocks apply). Fix: --collision backup or --collision skip'))
+        blocked = True
+    rows.extend(notes)
+    return rows, blocked
+
+
+def print_summary(rows: list[tuple[str, str]], prepared: list, args: argparse.Namespace, root: Path) -> None:
+    out = [f'agent-setup {"apply" if args.apply else "preview"}: hosts {" ".join(args.hosts) or "none"}; '
+           f'components {" ".join(args.components)}; kit root {root}']
+    for section in ('Ready', 'Needs attention', 'Skipped'):
+        lines = [line for name, line in rows if name == section]
+        if lines:
+            out.append(f'{section}:')
+            out.extend('  ' + line for line in lines)
+    counts: dict[str, int] = {}
+    for change, _ in prepared:
+        counts[change.kind] = counts.get(change.kind, 0) + 1
+    out.append(f'Changes: {len(prepared)}' + (' (' + ', '.join(f'{kind} {n}' for kind, n in sorted(counts.items())) + ')' if counts else ''))
+    if args.verbose:
+        out.extend(f'  {change.kind:12} {change.target}' for change, _ in prepared)
+    elif prepared:
+        out.append('  --verbose lists every path; --json prints the full plan')
+    sys.stdout.write('\n'.join(out) + '\n')
 
 
 def role_plan(args: argparse.Namespace, view: Path) -> dict[str, Any]:
@@ -947,21 +1281,41 @@ def setup(args: argparse.Namespace) -> int:
         view = Path(folder) / 'kit source'
         view.mkdir()
         changes = plan(args, view)
-        all_records = [(change, record) for change in changes if (record := prepare_change(change, args)) is not None]
+        all_records, collisions, skipped = [], [], []
+        for change in changes:
+            try:
+                record = prepare_change(change, args)
+            except Collision:
+                (skipped if args.collision == 'skip' else collisions).append(str(change.target))
+                continue
+            if record is not None:
+                all_records.append((change, record))
         prepared = [(change, record) for change, record in all_records if not record.get('noop')]
         deps = dependencies(args)
         routes = role_plan(args, view)
+        notes = list(getattr(args, 'notes', []))
+        notes.extend(('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped)
+        providers = {'anthropic': 'claude', 'openai': 'codex'}
         for rows in routes.values():
             for row in rows:
-                if row['required_for_review_run']:
+                if not row['required_for_review_run']:
+                    continue
+                if providers.get(row['provider']) in args.hosts or row['cli_available']:
                     deps.setdefault(row['provider_cli'], {'available': row['cli_available'], 'required_for_install': False, 'required_for_role_execution': True, 'used_by': row['role'], 'login': 'not checked'})
+                elif ('Skipped', f'{row["role"]}: {row["provider_cli"]} not selected or installed; review rounds run its fallback {row["fallback"]}') not in notes:
+                    notes.append(('Skipped', f'{row["role"]}: {row["provider_cli"]} not selected or installed; review rounds run its fallback {row["fallback"]}'))
         support = capabilities(args)
         duplicates = plugin_conflicts(args)
-        output({'mode': 'apply' if args.apply else 'preview', 'hosts': args.hosts,
+        summary, blocked = preflight(args, deps, support, duplicates, collisions, notes)
+        args.blocked, args.collided = blocked, bool(collisions)
+        if not args.json:
+            print_summary(summary, prepared, args, root)
+        else:
+            output({'mode': 'apply' if args.apply else 'preview', 'hosts': args.hosts, 'summary': [{'section': section, 'line': line} for section, line in summary],
                 'components': args.components, 'blocking_hooks': args.blocking_hooks, 'role_routing': routes,
                 'component_dependencies': ['roles and review references for blocking hooks'] if 'hooks' in args.components and args.blocking_hooks else [],
                 'root': str(root), 'source_checkout': str(source), 'host_targets': {host: str(host_target(args, host, Path.home())) for host in args.hosts}, 'changes': len(prepared), 'dependencies': deps, 'capabilities': support,
-                'conflicting_plugins': duplicates,
+                'conflicting_plugins': duplicates, 'collisions': collisions, 'skipped_collisions': skipped,
                 'paths': [{'kind': change.kind, 'path': str(change.target)} for change, record in prepared],
                 'shell_activation': 'export PATH=' + shlex.quote(str(root / 'bin')) + ':"$PATH"' if 'data-wrappers' in args.components else None,
                 'auth': 'Reuse each provider login; no auth files are read or copied.',
@@ -969,6 +1323,8 @@ def setup(args: argparse.Namespace) -> int:
                 'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'})
         if not args.apply:
             return 0
+        if collisions:
+            raise ValueError(f'Existing user content is preserved; select --collision backup or skip, or another destination: {", ".join(collisions)}')
         if duplicates:
             raise ValueError('Disable the overlapping plugin hook component in Claude first, or leave hooks unselected: ' + ', '.join(duplicates))
         if any(not data['available'] and data['required_for_install'] for data in deps.values()):
@@ -1003,6 +1359,11 @@ def setup(args: argparse.Namespace) -> int:
             configuration = {key: getattr(args, key) for key in ('repo_roots', 'work_root', 'role_model', 'role_effort',
                              'claude_bin', 'codex_bin', 'cursor_bin', 'hosts', 'components', 'host_root', 'project_root', 'skills',
                              'github_owner', 'zoekt_url', 'codex_gcloud')}
+            # The catalog as an absolute path, so a later update that reselects mcp keeps it.
+            configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
+            if getattr(args, 'preset_record', None):
+                # The preset's values outlive this run: a later update without --preset keeps them.
+                configuration.update(preset=args.preset_record, kit_values=args.kit_values, preset_servers=args.preset_servers)
             configuration['source_checkout'] = str(source)
             configuration['blocking_hooks'] = args.blocking_hooks
             configuration['host_roots'] = dict(getattr(args, 'host_roots', {}))
@@ -1014,8 +1375,9 @@ def setup(args: argparse.Namespace) -> int:
             atomic(root / '.install-state/current.json', (json.dumps({'id': identifier, 'managed': managed,
                    'configuration': configuration}, indent=2) + '\n').encode())
             (root / '.install-state/pending.json').unlink(missing_ok=True)
-            if 'codex' in args.hosts and 'mcp' in args.components:
+            if 'codex' in args.hosts and set(args.components) & SANDBOX_COMPONENTS:
                 installed_work_root(root).mkdir(parents=True, exist_ok=True)
+            (root / '.install-state/answers.json').unlink(missing_ok=True)
         except BaseException as original:
             failures = []
             for record in reversed(records):
@@ -1032,8 +1394,11 @@ def setup(args: argparse.Namespace) -> int:
                     (root / '.install-state/current.json').unlink(missing_ok=True)
                 (root / '.install-state/pending.json').unlink(missing_ok=True)
             raise
-        output({'installed': len(records), 'journal': identifier,
-                'rollback': shlex.join([sys.executable, str(source / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])})
+        undo = shlex.join([sys.executable, str(source / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
+        if args.json:
+            output({'installed': len(records), 'journal': identifier, 'rollback': undo})
+        else:
+            sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n')
         return 0
 
 
@@ -1094,10 +1459,26 @@ def doctor(args: argparse.Namespace) -> int:
                 if mismatch:
                     drift.append(str(target))
                     break
+    deps = dependencies(args)
+    problems = []
+    if not state:
+        problems.append(f'not installed at {root}: run agent-setup --apply (or pass --root-dir)')
+    problems.extend(f'{name} missing, required for {data["used_by"]}. Fix: {data["install"]}'
+                    for name, data in deps.items() if not data['available'] and data['required_for_install'])
+    if drift:
+        problems.append(f'{len(drift)} installed path(s) changed since setup; rerun agent-setup --apply, or --collision backup to keep yours')
+    preset = state.get('configuration', {}).get('preset')
+    if preset and not preset['source'].startswith('gh:') and Path(preset['source']).expanduser().is_file():
+        preset['current'] = 'unchanged' if digest(Path(preset['source']).expanduser().read_bytes()) == preset['sha256'] else 'changed since setup: rerun with --preset to apply it'
+    logins = {}
+    for host in args.hosts:
+        logged, how = host_login(host, getattr(args, host + '_bin'), host_target(args, host, Path.home()))
+        logins[host] = {'logged_in': logged, 'checked': how}
     output({'wrappers': [str(root / 'bin' / name) for name in ('ro-mysql', 'bqro') if (root / 'bin' / name).is_file()], 'installed': bool(state), 'root': str(root), 'drift': drift,
-            'dependencies': dependencies(args),
-            'native_auth': {host: (Path.home() / ('.' + host)).exists() for host in args.hosts}})
-    return 1 if drift else 0
+            'problems': problems, 'preset': preset, 'dependencies': deps, 'native_auth': logins})
+    for problem in problems:
+        print('agent-setup doctor: ' + problem, file=sys.stderr)
+    return 1 if problems else 0
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1123,14 +1504,62 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--role-model', action='append', default=[])
     result.add_argument('--role-effort', action='append', default=[])
     result.add_argument('--mcp-catalog')
-    result.add_argument('--blocking-hooks', action='store_true', help='Explicitly enable selected blocking guards/review gates.')
+    result.add_argument('--blocking-hooks', action=argparse.BooleanOptionalAction, default=None,
+                        help='Enable selected blocking guards/review gates; the saved choice when omitted')
     result.add_argument('--hook-runtime', choices=('local', 'cloud', 'unsupported'), default='local')
     result.add_argument('--confirm-hook-support', nargs='+', choices=('cursor',), default=[],
                         help='Confirm native Cursor hook support after checking the installed host.')
-    result.add_argument('--collision', choices=('refuse', 'backup'), default='refuse')
+    result.add_argument('--collision', choices=('refuse', 'backup', 'skip'), default=None,
+                        help='Where you already have content: refuse (default), backup it, or skip that path')
+    result.add_argument('--preset', help='Team defaults: a TOML path or gh:owner/repo[/path] (default path agent-kit-preset.toml)')
+    result.add_argument('--yes', action='store_true', help='Take every default and detected value; no prompts')
+    result.add_argument('--verbose', action='store_true', help='List every planned path under the summary')
+    result.add_argument('--json', action='store_true', help='Print the full plan as JSON instead of the summary')
     result.add_argument('--interactive', action='store_true')
     result.add_argument('--apply', action='store_true')
     return result
+
+
+def apply_preset(args: argparse.Namespace, saved: dict[str, Any]) -> dict[str, Any]:
+    """Load --preset (or the saved one's values) onto args; return the answers it supplies, which sit
+    under the user's own (flags, saved configuration, prompts)."""
+    args.notes = []
+    args.kit_values = dict(saved.get('kit_values', {}))
+    args.preset_servers = dict(saved.get('preset_servers', {}))
+    args.preset_record = saved.get('preset')
+    if not args.preset:
+        return {}
+    try:
+        preset, sha = load_preset(args.preset)
+    except PresetUnavailable as error:
+        print(f'agent-setup: preset {args.preset} unavailable: {error}; continuing with '
+              f'{"interactive " if args.interactive else ""}defaults', file=sys.stderr)
+        args.notes.append(('Skipped', f'preset {args.preset}: {error}'))
+        return {}
+    kit = preset.get('kit', {})
+    args.kit_values = {key: kit[key] for key in PRESET_OVERLAY if key in kit}
+    args.preset_servers = preset.get('mcp', {}).get('servers', {})
+    source = args.preset if args.preset.startswith('gh:') else str(Path(args.preset).expanduser().absolute())
+    args.preset_record = {'source': source, 'sha256': sha}
+    answers: dict[str, Any] = {field: kit[key] for key, field in PRESET_ANSWERS.items() if key in kit}
+    if isinstance(answers.get('repo_roots'), str):
+        answers['repo_roots'] = [answers['repo_roots']]
+    answers['recommended_hosts'] = preset.get('hosts', {}).get('recommended', [])
+    skills = preset.get('skills', {})
+    if skills.get('include') or skills.get('exclude'):
+        names = skills.get('include') or [path.name for path in sorted((Path(args.source) / 'skills').iterdir()) if path.is_dir()]
+        answers['skills'] = [name for name in names if name not in skills.get('exclude', [])]
+    for flag in ('model', 'effort'):
+        answers['role_' + flag] = [f'{name}={role[flag]}' for name, role in preset.get('roles', {}).items() if flag in role]
+    args.notes.append(('Ready', f'preset {source} (sha256 {sha[:12]})'))
+    if kit.get('GITHUB_OWNER'):
+        args.notes.append(org_access(kit['GITHUB_OWNER'], kit.get('ZOEKT_URL', '')))
+    return answers
+
+
+def ask(prompt: str, args: argparse.Namespace) -> str:
+    """One prompt's answer; empty (the default) under --yes."""
+    return '' if args.yes else input(prompt).strip()
 
 
 def main() -> int:
@@ -1138,10 +1567,13 @@ def main() -> int:
     if args.interactive and args.action == 'setup':
         if not sys.stdin.isatty():
             raise ValueError('--interactive needs a terminal; use explicit flags in scripts')
-        entered = input('Kit root [' + args.root_dir + ']: ').strip()
+        entered = ask('Kit root [' + args.root_dir + ']: ', args)
         if entered:
             args.root_dir = entered
     saved = load_json(Path(args.root_dir).expanduser() / '.install-state/current.json', {}).get('configuration', {})
+    if args.interactive and args.action == 'setup':
+        # The answers of an interactive run that stopped before apply: a rerun starts from them.
+        saved = {**saved, **load_json(Path(args.root_dir).expanduser() / '.install-state/answers.json', {})}
     if args.source is None:
         selected_root = Path(args.root_dir).expanduser()
         installed = selected_root.exists() and selected_root.samefile(SOURCE)
@@ -1152,13 +1584,24 @@ def main() -> int:
             args.source = origin
         else:
             args.source = str(SOURCE)
-    defaults = {'repo_roots': [], 'work_root': str(Path.home() / 'agent-work'),
-                'hosts': ['claude'], 'components': ['rules', 'skills'], 'claude_bin': 'claude',
-                'codex_bin': 'codex', 'cursor_bin': 'cursor', 'skills': None,
-                'github_owner': '', 'zoekt_url': '', 'codex_gcloud': 'off'}
+    preset = apply_preset(args, saved) if args.action == 'setup' else {}
+    guided = args.action == 'setup' and (args.interactive or args.yes or bool(args.preset))
+    detected = detect_hosts(args)
+    # --host-root names one host's root; with no --hosts that host is claude, as before detection.
+    defaults = {'repo_roots': detect_repo_roots() if guided else [], 'work_root': str(Path.home() / 'agent-work'),
+                'hosts': ['claude'] if args.host_root else detected, 'components': ['rules', 'skills'],
+                'claude_bin': detect_cli('claude'), 'codex_bin': detect_cli('codex'), 'cursor_bin': detect_cli('cursor'),
+                'skills': None, 'github_owner': '', 'zoekt_url': '', 'codex_gcloud': 'off', 'blocking_hooks': False,
+                'mcp_catalog': None, 'collision': 'refuse'}
     for key, default in defaults.items():
         if getattr(args, key) is None:
-            setattr(args, key, saved.get(key, default))
+            setattr(args, key, saved.get(key, preset.get(key, default)))
+    args.recommended_hosts = preset.get('recommended_hosts', [])
+    if guided and not args.github_owner and 'github_owner' not in saved:
+        owner, origin = detect_owner(args.repo_roots)
+        if owner:
+            args.github_owner = owner
+            args.notes.append(('Ready', f'GitHub owner {owner} (from {origin})'))
     if args.skills == ['all']:
         args.skills = None
     elif args.skills is not None and 'all' in args.skills:
@@ -1173,63 +1616,32 @@ def main() -> int:
         args.project_root = args.project_roots.get('cursor')
     for key in ('role_model', 'role_effort'):
         values = {}
-        for value in [*saved.get(key, []), *getattr(args, key)]:
+        for value in [*preset.get(key, []), *saved.get(key, []), *getattr(args, key)]:
             name, separator, setting = value.partition('=')
             name = ROLE_ALIASES.get(name, name)
             values[name] = name + separator + setting
         setattr(args, key, [value for value in values.values() if value.partition('=')[2]])
     if args.interactive and args.action == 'setup':
-        entered = input('Hosts [' + ' '.join(args.hosts) + '], choices claude codex cursor: ').strip()
-        if entered:
-            args.hosts = entered.split()
-        entered = input('Components [' + ' '.join(args.components) + '], choices ' + ' '.join(sorted(COMPONENTS)) + ': ').strip()
-        if entered:
-            args.components = entered.split()
-        if set(args.hosts) - set(HOSTS) or set(args.components) - COMPONENTS:
-            raise ValueError('Unknown host or component selection')
-        if 'skills' in args.components:
-            entered = input('Skills [' + ('all bundled' if args.skills is None else ' '.join(args.skills) or 'none') + '], names, all, or none: ').strip()
-            if entered:
-                args.skills = None if entered == 'all' else [] if entered == 'none' else entered.split()
-        entered = input('Local repository parent directories as a JSON array [' + json.dumps(args.repo_roots) + ']; [] means remote-only: ').strip()
-        if entered:
-            roots = json.loads(entered)
-            if not isinstance(roots, list) or not all(isinstance(value, str) for value in roots):
-                raise ValueError('Repository roots must be a JSON array of directory strings')
-            args.repo_roots = roots
-        entered = input('GitHub owner or organization [' + args.github_owner + '], optional when --repo is supplied during search: ').strip()
-        if entered:
-            args.github_owner = entered
-        entered = input('Work root [' + args.work_root + ']; enter "" to leave unset: ').strip()
-        if entered:
-            args.work_root = '' if entered == '""' else entered
-        for host in args.hosts:
-            target = host_target(args, host, Path.home())
-            entered = input(host + ' configuration root [' + str(target) + ']: ').strip()
-            if entered:
-                args.host_roots[host] = entered
-                if len(args.hosts) == 1:
-                    args.host_root = entered
-            key = host + '_bin'
-            entered = input(host + ' CLI [' + getattr(args, key) + ']: ').strip()
-            if entered:
-                setattr(args, key, entered)
-        if 'codex' in args.hosts and 'mcp' in args.components:
-            entered = input("Let Codex's sandbox write gcloud's config dir? It holds credentials; bq needs it [" + args.codex_gcloud + '] (on/off): ').strip()
-            if entered in ('on', 'off'):
-                args.codex_gcloud = entered
-        if 'hooks' in args.components:
-            args.blocking_hooks = input('Enable blocking safety and review hooks? [y/N]: ').strip().lower() == 'y'
-        if 'roles' in args.components or ('hooks' in args.components and args.blocking_hooks):
-            for flag in ('model', 'effort'):
-                entered = input('Role ' + flag + ' overrides, space-separated role=value [keep configured]: ').strip()
-                if entered:
-                    values = {value.split('=', 1)[0]: value for value in getattr(args, 'role_' + flag)}
-                    values.update({value.split('=', 1)[0]: value for value in shlex.split(entered)})
-                    setattr(args, 'role_' + flag, [value for value in values.values() if value.partition('=')[2]])
+        interview(args, detected, preset)
+        root = Path(args.root_dir).expanduser()
+        answers = {key: getattr(args, key) for key in ('hosts', 'components', 'skills', 'repo_roots', 'github_owner', 'work_root',
+                                                         'claude_bin', 'codex_bin', 'cursor_bin', 'codex_gcloud', 'blocking_hooks',
+                                                         'role_model', 'role_effort', 'collision')}
+        answers['host_roots'] = args.host_roots
         args.apply = False
         setup(args)
-        if input('Apply this previewed selection? [y/N]: ').strip().lower() != 'y':
+        if args.collision == 'refuse' and getattr(args, 'collided', False):
+            choice = ask('Some paths hold your own content: [b]ackup and replace, [s]kip them, or [a]bort? [a]: ', args).lower()
+            if choice[:1] in ('b', 's'):
+                args.collision = answers['collision'] = 'backup' if choice[:1] == 'b' else 'skip'
+                setup(args)
+        if args.blocked:
+            # Saved only when the run stops here: the rerun after the fix offers them as defaults.
+            atomic(root / '.install-state/answers.json', (json.dumps(answers, indent=2) + '\n').encode())
+            print('agent-setup: apply is blocked: fix the items under Needs attention, then rerun; '
+                  'your answers are saved as its defaults.', file=sys.stderr)
+            return 2
+        if ask('Apply this previewed selection? [y/N]: ', args).lower() != 'y':
             return 0
         args.apply = True
     if args.action == 'setup':
@@ -1239,6 +1651,73 @@ def main() -> int:
             raise ValueError('rollback needs the journal id printed by setup')
         return rollback(args)
     return doctor(args)
+
+
+def interview(args: argparse.Namespace, detected: list[str], preset: dict[str, Any]) -> None:
+    """The guided questions, each defaulting to the saved, preset or detected answer. A preset's
+    answers are not asked again."""
+    if not detected:
+        print('No agent host detected. Files can install for the hosts you name now; they activate when you install the host:')
+        for host, link in HOST_LINKS.items():
+            print(f'  {host}: {link}')
+    entered = ask('Hosts [' + (' '.join(args.hosts) or 'none') + '] (detected: ' + (' '.join(detected) or 'none')
+                  + '), choices claude codex cursor, or none: ', args)
+    if entered:
+        args.hosts = [] if entered == 'none' else entered.split()
+    entered = ask('Components [' + ' '.join(args.components) + '], choices ' + ' '.join(sorted(COMPONENTS)) + ': ', args)
+    if entered:
+        args.components = entered.split()
+    if set(args.hosts) - set(HOSTS) or set(args.components) - COMPONENTS:
+        raise ValueError('Unknown host or component selection')
+    if 'skills' in args.components and 'skills' not in preset:
+        entered = ask('Skills [' + ('all bundled' if args.skills is None else ' '.join(args.skills) or 'none') + '], names, all, or none: ', args)
+        if entered:
+            args.skills = None if entered == 'all' else [] if entered == 'none' else entered.split()
+    if 'repo_roots' not in preset:
+        entered = ask('Local repository parent directories as a JSON array [' + json.dumps(args.repo_roots) + ']; [] means remote-only: ', args)
+        if entered:
+            roots = json.loads(entered)
+            if not isinstance(roots, list) or not all(isinstance(value, str) for value in roots):
+                raise ValueError('Repository roots must be a JSON array of directory strings')
+            args.repo_roots = roots
+    if 'github_owner' not in preset:
+        entered = ask('GitHub owner or organization [' + args.github_owner + '], optional when --repo is supplied during search: ', args)
+        if entered:
+            args.github_owner = entered
+    entered = ask('Work root [' + args.work_root + ']; enter "" to leave unset: ', args)
+    if entered:
+        args.work_root = '' if entered == '""' else entered
+    for host in args.hosts:
+        target = host_target(args, host, Path.home())
+        entered = ask(host + ' configuration root [' + str(target) + ']: ', args)
+        if entered:
+            args.host_roots[host] = entered
+            if len(args.hosts) == 1:
+                args.host_root = entered
+        key = host + '_bin'
+        entered = ask(host + ' CLI [' + getattr(args, key) + ']: ', args)
+        if entered:
+            setattr(args, key, entered)
+    if 'codex' in args.hosts and set(args.components) & SANDBOX_COMPONENTS:
+        entered = ask("Let Codex's sandbox write gcloud's config dir? It holds credentials; bq needs it [" + args.codex_gcloud + '] (on/off): ', args)
+        if entered in ('on', 'off'):
+            args.codex_gcloud = entered
+    if 'hooks' in args.components:
+        entered = ask('Enable blocking safety and review hooks? [' + ('Y/n' if args.blocking_hooks else 'y/N') + ']: ', args).lower()
+        if entered:
+            args.blocking_hooks = entered == 'y'
+        if 'cursor' in args.hosts and 'cursor' not in args.confirm_hook_support:
+            entered = ask('Cursor hooks: does your Cursor build list Hooks under Settings? Without native hook support '
+                          'the kit installs no Cursor hooks. [y/N]: ', args).lower()
+            if entered == 'y':
+                args.confirm_hook_support = [*args.confirm_hook_support, 'cursor']
+    if 'roles' in args.components or ('hooks' in args.components and args.blocking_hooks):
+        for flag in ('model', 'effort'):
+            entered = ask('Role ' + flag + ' overrides, space-separated role=value [keep configured]: ', args)
+            if entered:
+                values = {value.split('=', 1)[0]: value for value in getattr(args, 'role_' + flag)}
+                values.update({value.split('=', 1)[0]: value for value in shlex.split(entered)})
+                setattr(args, 'role_' + flag, [value for value in values.values() if value.partition('=')[2]])
 
 
 if __name__ == '__main__':

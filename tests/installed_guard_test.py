@@ -207,7 +207,8 @@ class InstalledGuardTests(unittest.TestCase):
                 )
                 if not default_root and not mcp and owned == "hooks":
                     preview = subprocess.run(
-                        ["bash", "-c", command],
+                        # --json: the plan as data; the user who runs the printed command sees the summary.
+                        ["bash", "-c", command + " --json"],
                         env=self.env,
                         cwd=self.project,
                         text=True,

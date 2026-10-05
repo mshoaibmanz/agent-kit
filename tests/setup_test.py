@@ -49,8 +49,9 @@ class SetupTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def run_setup(self, *flags: str, success: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+        # --json: these tests read the plan and the apply result as data, not the summary.
         result = subprocess.run([sys.executable, str(SOURCE / 'bin/agent-setup'), '--source', str(SOURCE),
-                                 '--root-dir', str(self.root), '--host-root', str(self.host), *flags],
+                                 '--root-dir', str(self.root), '--host-root', str(self.host), '--json', *flags],
                                 capture_output=True, text=True, env=env or self.env, timeout=60)
         if success:
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -139,6 +140,25 @@ class SetupTests(unittest.TestCase):
         self.run_setup('--hosts', 'codex', '--components', 'mcp', '--codex-gcloud', 'on', '--apply')
         config = tomllib.loads((self.host / 'config.toml').read_text())
         self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work), str(gcloud)])
+
+    def test_codex_sandbox_has_its_own_block_gated_on_hooks_too(self) -> None:
+        """Q-12: hooks alone name the work root; the sandbox block is its own, and an update without
+        mcp keeps it without a second [sandbox_workspace_write] from an install before the split."""
+        work = self.home / 'work'
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', '--work-root', str(work), '--apply')
+        text = (self.host / 'config.toml').read_text()
+        self.assertEqual(tomllib.loads(text)['sandbox_workspace_write']['writable_roots'], [str(work)], 'Q-12: hooks only')
+        self.assertIn('# BEGIN agent-kit sandbox', text)
+        self.assertTrue(work.is_dir())
+        shutil.rmtree(self.root)
+        shutil.rmtree(self.host)
+        self.run_base_setup('--hosts', 'codex', '--components', 'mcp', '--work-root', str(work), '--apply')
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', '--work-root', str(work), '--apply')
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work)])
+        self.run_setup('--hosts', 'codex', '--components', 'rules', '--apply')
+        self.assertEqual(tomllib.loads((self.host / 'config.toml').read_text()), config, 'rules alone leave config.toml')
+        self.run_setup('doctor')
 
     def test_user_sandbox_table_is_kept_not_duplicated(self) -> None:
         self.host.mkdir()
@@ -319,6 +339,10 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(config['model'], 'user-model')
         self.assertEqual(config['env']['GIT_CONFIG_VALUE_0'], str(self.root / 'git-hooks'))
         self.run_setup('--components', 'hooks', '--apply')
+        config = json.loads((self.host / 'settings.json').read_text())
+        self.assertEqual(config['env']['GIT_CONFIG_VALUE_0'], str(self.root / 'git-hooks'),
+                         '4c: reselecting hooks without the flag keeps the saved blocking choice')
+        self.run_setup('--components', 'hooks', '--no-blocking-hooks', '--apply')
         config = json.loads((self.host / 'settings.json').read_text())
         self.assertNotIn('GIT_CONFIG_VALUE_0', config['env'])
         self.assertEqual(config['env']['AGENT_GIT_HOOKS'], 'off')
@@ -683,7 +707,10 @@ class SetupTests(unittest.TestCase):
                 (self.host / 'mcp.json' if host != 'codex' else self.host / 'config.toml').write_text(
                     json.dumps({'mcpServers': {'user': {'command': 'user-choice'}}}) if host != 'codex' else 'model = "user"\n')
                 flags = ['--hosts', host, '--confirm-hook-support', 'cursor']
-                self.run_setup(*flags, '--components', *everything, '--apply')
+                # 4c: blocking hooks and a custom catalog, given only here, must survive every reselection.
+                catalog = self.home / 'custom catalog.json'
+                catalog.write_text(json.dumps({'mcpServers': {'custom': {'command': 'true'}}}))
+                self.run_setup(*flags, '--components', *everything, '--blocking-hooks', '--mcp-catalog', str(catalog), '--apply')
                 before = self.snapshot()
                 managed = self.state()['managed']
                 for component in everything:

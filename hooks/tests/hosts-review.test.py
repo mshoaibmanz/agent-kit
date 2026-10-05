@@ -378,7 +378,7 @@ class ReviewTests(unittest.TestCase):
         result = self.render("claude")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(path.read_text().startswith("User rule stays.\n"))
-        self.assertIn("rules/hosts/claude.md", path.read_text())
+        self.assertIn("state/rendered/claude-host-rules.md", path.read_text())
 
     def test_B6_multifile_edit_is_one_guard_invocation(self):
         self.assertEqual(self.render().returncode, 0)
@@ -447,7 +447,7 @@ class ReviewTests(unittest.TestCase):
         path.parent.mkdir()
         path.write_text("User rule stays.\n")
         self.assertEqual(self.render("claude").returncode, 0)
-        path.write_text(path.read_text().replace("rules/hosts/claude.md", "rules/hosts/other.md"))
+        path.write_text(path.read_text().replace("state/rendered/claude-host-rules.md", "rules/hosts/other.md"))
         settings = self.root / ".claude/settings.json"
         before = settings.read_text()
         base = self.kit / "hosts/claude/settings.base.json"

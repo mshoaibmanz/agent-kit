@@ -41,3 +41,4 @@ guards need no key. Documented with placeholder values in ~/.claude/kit.env.exam
   CODE_SEARCH_SSO_COOKIE  code-search: the SSO session cookie's name, read from the local Chrome profile
   CODE_SEARCH_GH_OWNER  code-search: default GitHub org or user for gh searches and short repo names
   CODE_SEARCH_CHROME_PROFILE  code-search: the Chrome profile dir that holds the cookie (default Default)
+  SUBAGENT_RESUME_MAX  context tokens past which a subagent is replaced, not resumed (default 300000): setup and agent-kit render it into rules/hosts/claude.md and agent bodies ({{SUBAGENT_RESUME_MAX_K}})

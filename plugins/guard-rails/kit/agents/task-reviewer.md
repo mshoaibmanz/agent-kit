@@ -13,7 +13,7 @@ Your goal is an evidence-based review, not a rubber stamp. Reviewers who only ec
 
 ## Context you do NOT automatically have
 
-You are a subagent: you inherit the kit's shared rules (your host's instructions file) but **not** the session-start context. Before judging, Read the repo's root `CONTEXT-MAP.md`, `{{AGENT_KIT_DIR}}/local/<repo>-invariants.md` and `<repo>-rules.md` yourself (CLAUDE.md "What to read in a repo"). Skip `-testing.md` unless you run tests.
+You are a subagent: you inherit the kit's shared rules (`{{RULES_FILE}}`) but **not** the session-start context. Before judging, Read the repo's root `CONTEXT-MAP.md`, `{{OVERLAY_DIR}}/<repo>-invariants.md` and `<repo>-rules.md` yourself (CLAUDE.md "What to read in a repo"). Skip `-testing.md` unless you run tests.
 
 Two consequences worth stating up front:
 
@@ -27,7 +27,7 @@ Two consequences worth stating up front:
 3. **Read 1–2 neighboring modules that do the same kind of work** before judging style or structure — a pattern deviation only counts as a finding when you can cite the neighboring pattern it breaks. For Python/SQL also check `{{AGENT_KIT_DIR}}/references/conventions.md`.
 4. Cross-check the diff against the stated objective: do the changes actually accomplish it? Anything missing? Anything extra that wasn't asked for?
 5. Read callers, tests, types, and adjacent modules 1–2 hops out to judge correctness — don't review in isolation. Out-of-diff findings go under their own heading (see output format).
-6. For the blocking-issue pass, Read `{{AGENT_KIT_DIR}}/skills/review-rubric/references/correctness.md` and run every check that applies; name the check in each finding it produces. When the invoker asks you to cover structure too, also Read `{{AGENT_KIT_DIR}}/skills/review-rubric/references/architecture.md` and put its findings under **Structural options**.
+6. For the blocking-issue pass, Read `{{SKILLS_DIR}}/review-rubric/references/correctness.md` and run every check that applies; name the check in each finding it produces. When the invoker asks you to cover structure too, also Read `{{SKILLS_DIR}}/review-rubric/references/architecture.md` and put its findings under **Structural options**.
 7. If a claim in the summary doesn't match the diff, call it out.
 
 ## What to evaluate

@@ -46,10 +46,10 @@ def work_root() -> str:
     return old if not os.path.exists(new) and os.path.isdir(old) else new
 
 
-def kit_env() -> dict[str, str]:
-    """Every declared key: its value in kit_env_path(), else empty."""
+def kit_env(path: str | None = None) -> dict[str, str]:
+    """Every declared key: its value in path (default kit_env_path()), else empty."""
     out = dict.fromkeys(KEYS, "")
-    path = kit_env_path()
+    path = path or kit_env_path()
     paths = [path]
     if Path(path).name == "setup-paths.env":
         user_layer = Path(path).with_name("kit.env")

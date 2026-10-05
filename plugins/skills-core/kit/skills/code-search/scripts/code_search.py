@@ -204,8 +204,23 @@ def zoekt_repos(cfg, pattern):
     print(f'[zoekt] {len(repos)} repos')
 
 
+def _install_hint(tool):
+    """The kit's per-OS install command for tool (hooks/lib/install-hint), or a generic line."""
+    kit = os.environ.get('AGENT_KIT_DIR') or str(Path(__file__).resolve().parents[3])
+    try:
+        out = subprocess.run(['sh', os.path.join(kit, 'hooks/lib/install-hint'), tool],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or f'install {tool}'
+    except (OSError, subprocess.TimeoutExpired):
+        return f'install {tool}'
+
+
 def _gh(*args):
-    out = subprocess.run(['gh', *args], capture_output=True, text=True)
+    try:
+        out = subprocess.run(['gh', *args], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise SystemExit(f'[gh] gh is not installed: GitHub search is off (local and Zoekt still work). '
+                         f'Fix: {_install_hint("gh")}, then gh auth login') from None
     if out.returncode != 0:
         raise SystemExit(f'[gh] {" ".join(args[:3])}… failed: {out.stderr.strip()[:500]}')
     return out.stdout

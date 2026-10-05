@@ -128,7 +128,7 @@ ca sync-mcp work 2>/dev/null
 echo "--- check: project-scope MCP servers ---"
 out=$(ca check 2>&1); rc=$?
 check "check names project-scope servers another account lacks" "$out" "^personal: project-scope MCP servers in $REPO that work lacks: bigquery, github\."
-check "...and the fix" "$out" 'Move them to ~/.agents/mcp/servers.json and run `agent-kit render --host claude` \(every account\), or remove them'
+check "...and the fix" "$out" 'Move them to \$AGENT_KIT_DIR/mcp/servers.json and run `agent-kit render --host claude` \(every account\), or remove them'
 [ "$rc" != 0 ] && ok "...and fails" || bad "check passed with a project-scope gap"
 out=$(ca launch "$REPO" 2>"$FH/err"); rc=$?
 check "launch reports the gap on stderr" "$(cat "$FH/err")" "^personal: project-scope MCP servers in $REPO that work lacks"

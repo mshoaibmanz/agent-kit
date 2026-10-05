@@ -389,9 +389,12 @@ rm -f "$M/$SID-cr" "$M/wt-$(crk "$CR")" "$M/wt-$(crk "$T")" "$M/lastrun-$SID" "$
 HC="$T/hooks-cr"; rm -rf "$HC"; cp -RH "$H" "$HC"
 printf '#!/bin/sh\necho "$1" > "%s/ci-watch.arg"\n' "$T" > "$HC/ci-watch.new"; chmod +x "$HC/ci-watch.new"; mv "$HC/ci-watch.new" "$HC/ci-watch"
 rm -f "$T/ci-watch.arg"
-printf '%s' "$(post "git -C \"$CR\" push -u origin HEAD" $SID-cr /)" | env -u CI_WATCH_ACTIVE "$HC/ci-watch-on-push"
+# Its own repo: what the push hook leaves running in the background must not race the review-state
+# cases below on $CR (seen once in CI as a lost "review edit marked").
+CRP="$T/cr-push-repo"; rm -rf "$CRP"; git init -q -b cr "$CRP"
+printf '%s' "$(post "git -C \"$CRP\" push -u origin HEAD" $SID-crp /)" | env -u CI_WATCH_ACTIVE "$HC/ci-watch-on-push"
 n=0; until [ -f "$T/ci-watch.arg" ] || [ "$n" -ge 20 ]; do sleep 0.1; n=$((n+1)); done
-[ "$(cat "$T/ci-watch.arg" 2>/dev/null)" = "$CR" ] && ok "ci-watch-on-push: git -C <wt> push watches <wt>" \
+[ "$(cat "$T/ci-watch.arg" 2>/dev/null)" = "$CRP" ] && ok "ci-watch-on-push: git -C <wt> push watches <wt>" \
   || bad "ci-watch-on-push: git -C <wt> push watches <wt>" "$(cat "$T/ci-watch.arg" 2>/dev/null)"
 rm -rf "$HC" "$T/ci-watch.arg"
 

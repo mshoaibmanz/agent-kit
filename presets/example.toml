@@ -1,0 +1,30 @@
+# agent-kit team preset: non-secret defaults a team shares, so a teammate runs one command:
+#   agent-setup --preset gh:example-org/agent-kit-preset --apply
+# Keep the real preset in a private repository of your organization (agent-setup fetches
+# agent-kit-preset.toml from it with each user's own gh login), never in the public kit.
+# Your own answers (flags, an earlier install, the guided prompts) win over every value here.
+# Secrets never go here: setup refuses anything that looks like a token, password or key.
+
+[kit]
+GITHUB_OWNER = "example-org"                      # code-search's default org; setup checks gh can read it
+CODE_DIRS = ["~/Code"]                            # parent folders of local clones
+ZOEKT_URL = "https://zoekt.example.com"           # optional Zoekt backend, used when gh cannot read a repo
+REVIEW_BASE = "main"                              # the branch review rounds diff against
+RELEASE_BRANCH_RE = "^release/"                   # branches the push gate treats as releases
+BQRO_PROJECT = "example-project"                  # bqro's jobs project
+# GIT_AUTHOR = "Example Bot <bot@example.com>"    # only when the team commits under one author
+# SUBAGENT_RESUME_MAX = "300000"                  # context tokens past which a subagent is not resumed
+
+# MCP servers: a command (often a credential wrapper the kit ships, such as sentry-mcp, which reads
+# the Keychain or secret-tool at start) or a URL with native OAuth. No env, headers or inline keys.
+[mcp.servers.docs]
+url = "https://mcp.example.com/mcp"
+
+[hosts]
+recommended = ["claude", "codex"]                 # shown when none is detected; detection wins
+
+[roles.cross-reviewer]                            # model and effort overrides per role (roles.toml names)
+effort = "high"
+
+[skills]
+exclude = ["process-doc"]                         # or include = [...] for an allowlist

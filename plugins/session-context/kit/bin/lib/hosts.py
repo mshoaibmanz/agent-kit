@@ -14,9 +14,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
+from host import HOSTS  # noqa: E402,F401  (the one host list; hooks/lib needs it standalone)
 from kit_env import kit_env, work_root  # noqa: E402
-
-HOSTS = ("claude", "codex", "cursor")
 
 EVENTS = {
     "PreToolUse": "preToolUse",
@@ -30,6 +29,15 @@ BEGIN = "# BEGIN agent-kit managed"
 END = "# END agent-kit managed"
 SHELL_BEGIN = "# BEGIN agent-kit shell"
 SHELL_END = "# END agent-kit shell"
+# Codex sandbox roots: its own block, rendered with any Codex component, not only with mcp.
+SANDBOX_BEGIN = "# BEGIN agent-kit sandbox"
+SANDBOX_END = "# END agent-kit sandbox"
+# The components whose Codex render writes the sandbox block: both need the work root writable.
+SANDBOX_COMPONENTS = frozenset({"hooks", "mcp"})
+PLACEHOLDER = re.compile(r"\{\{([^{}]*)\}\}")
+SUBAGENT_RESUME_MAX = 300000
+# Each host's global instructions file under its config root, the one the kit's rules reach.
+RULES_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "cursor": "rules/agent-kit.mdc"}
 
 
 def shell_env(kit: Path, host: str) -> dict[str, str]:
@@ -53,7 +61,7 @@ def block(existing: str, managed: str, begin: str = BEGIN, end: str = END) -> st
     new = begin + "\n" + managed.rstrip() + "\n" + end
     if begin in existing:
         start, stop = existing.index(begin), existing.index(end) + len(end)
-        if begin in (BEGIN, SHELL_BEGIN):
+        if begin in (BEGIN, SHELL_BEGIN, SANDBOX_BEGIN):
             for line in existing[stop:].splitlines():
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):
@@ -106,6 +114,12 @@ def keep_host_tables(existing: str, begin: str = BEGIN, end: str = END) -> str:
         + moved
         + ("\n" + tail if tail else "")
     )
+
+
+def without_table(text: str, name: str) -> str:
+    """text without its top-level [name] table (and [name.*] subtables)."""
+    chunks = re.split(r"(?m)^(?=\[)", text)
+    return "".join(chunk for chunk in chunks if not chunk.startswith("[") or _table_name(chunk) != name)
 
 
 def shell_without_owned(existing: str) -> str:
@@ -303,13 +317,73 @@ def sandbox_roots() -> list[str]:
     return roots
 
 
-def install_text(text: str, kit: str, skill: str | None = None, export: bool = True) -> str:
-    """A kit markdown file as installed with its kit at <kit>: {{AGENT_KIT_DIR}} names the kit, each
-    ```sh block first exports AGENT_KIT_DIR (with export), and ${CLAUDE_SKILL_DIR}, which only Claude
-    Code expands, names <kit>/skills/<skill> as one shell word. A kit given as a shell expression
-    (${CLAUDE_PLUGIN_ROOT}/kit) is double-quoted so it still expands."""
+def resume_max(raw: str | None = None) -> int:
+    """SUBAGENT_RESUME_MAX (kit.env, default 300000): context tokens past which a finished subagent
+    is replaced, not resumed. Anything but empty or a positive integer refuses, since rule text
+    carries it."""
+    raw = (kit_env()["SUBAGENT_RESUME_MAX"] if raw is None else raw).strip()
+    if not raw:
+        return SUBAGENT_RESUME_MAX
+    if not raw.isdigit() or int(raw) <= 0:
+        raise SystemExit(f"agent-kit: SUBAGENT_RESUME_MAX={raw!r} is not a positive token count")
+    return int(raw)
+
+
+def rules_file(host: str, host_root: str | None = None) -> str:
+    """The host's global instructions file; ~/.<host> (Claude: $CLAUDE_CONFIG_DIR) when unnamed."""
+    if host_root is None:
+        configured = os.environ.get("CLAUDE_CONFIG_DIR") if host == "claude" else None
+        host_root = configured or f"~/.{host}"
+    return f"{host_root.rstrip('/')}/{RULES_FILES[host]}"
+
+
+def fill(
+    text: str,
+    kit: str,
+    host: str | None = None,
+    host_root: str | None = None,
+    what: str = "text",
+    resume: int | None = None,
+) -> str:
+    """text with every {{NAME}} filled: AGENT_KIT_DIR and KIT_DIR (the kit), SKILLS_DIR, OVERLAY_DIR
+    (<kit>/local), RULES_FILE (the host's instructions file; host text only) and
+    SUBAGENT_RESUME_MAX_K. An unknown one refuses: a literal {{...}} would reach the model as a path
+    it cannot open."""
+    names = {match.group(1) for match in PLACEHOLDER.finditer(text)}
+    if not names:
+        return text
+    values = {"AGENT_KIT_DIR": kit, "KIT_DIR": kit, "SKILLS_DIR": f"{kit}/skills", "OVERLAY_DIR": f"{kit}/local"}
+    if host:
+        values["RULES_FILE"] = rules_file(host, host_root)
+    if "SUBAGENT_RESUME_MAX_K" in names:
+        limit = resume_max() if resume is None else resume
+        values["SUBAGENT_RESUME_MAX_K"] = f"{limit // 1000}" if limit % 1000 == 0 else f"{limit / 1000:g}"
+    bad = sorted("{{" + name + "}}" for name in names - set(values))
+    if bad:
+        known = ", ".join("{{" + name + "}}" for name in (*values, "RULES_FILE", "SUBAGENT_RESUME_MAX_K"))
+        raise SystemExit(
+            f"agent-kit: {what}: unknown placeholder {', '.join(bad)}"
+            + (f" for host {host}" if host else " (host-neutral text)")
+            + f"; known: {', '.join(dict.fromkeys(known.split(', ')))}"
+        )
+    return PLACEHOLDER.sub(lambda match: values[match.group(1)], text)
+
+
+def install_text(
+    text: str,
+    kit: str,
+    skill: str | None = None,
+    export: bool = True,
+    host: str | None = None,
+    host_root: str | None = None,
+    resume: int | None = None,
+) -> str:
+    """A kit markdown file as installed with its kit at <kit>: its {{...}} placeholders filled (fill),
+    each ```sh block first exports AGENT_KIT_DIR (with export), and ${CLAUDE_SKILL_DIR}, which only
+    Claude Code expands, names <kit>/skills/<skill> as one shell word. A kit given as a shell
+    expression (${CLAUDE_PLUGIN_ROOT}/kit) is double-quoted so it still expands."""
     word = f'"{kit}"' if "$" in kit else shlex.quote(kit)
-    text = text.replace("{{AGENT_KIT_DIR}}", kit)
+    text = fill(text, kit, host, host_root, skill or "kit text", resume)
     if export:
         text = text.replace("```sh\n", f"```sh\nexport AGENT_KIT_DIR={word}\n")
     if skill:
@@ -415,7 +489,8 @@ def role_files(api: Any, roles: Any) -> dict[str, str]:
     for name, role in roles.roles.items():
         if name == "main" or role.provider != roles.provider("codex"):
             continue
-        text = (api.AGENT_SRC / f"{name}.md").read_text()
+        text = fill((api.AGENT_SRC / f"{name}.md").read_text(), str(api.KIT), "codex",
+                    os.environ.get("AGENT_KIT_HOST_ROOT"), f"agents/{name}.md")
         end = text.index("\n---\n", 3)
         description = re.search(r"^description:\s*(.+)$", text[:end], re.MULTILINE)
         values = {
@@ -439,7 +514,7 @@ def render(api: Any, args: Any) -> int:
     root = Path(os.environ.get("AGENT_KIT_HOST_ROOT", str(Path.home() / f".{host}")))
     if (
         not args.dry_run
-        and api.KIT.resolve() != (Path.home() / ".agents").resolve()
+        and not api.installed_kit(api.KIT)
         and "AGENT_KIT_HOST_ROOT" not in os.environ
     ):
         raise SystemExit(
@@ -470,10 +545,14 @@ def render(api: Any, args: Any) -> int:
         ownership[state] = wanted_hooks
         plans.append((hook_path, api.dump(merge_hooks(live, previous, wanted_hooks))))
     if "rules" in components:
-        rules = (
+        rules = fill(
             (api.KIT / "rules/AGENTS.md").read_text()
             + "\n"
-            + (api.KIT / f"rules/hosts/{host}.md").read_text()
+            + (api.KIT / f"rules/hosts/{host}.md").read_text(),
+            str(api.KIT),
+            host,
+            str(root),
+            f"rules/AGENTS.md + rules/hosts/{host}.md",
         )
         rules_path = root / ("AGENTS.md" if host == "codex" else "rules/agent-kit.mdc")
         existing_rules = api.read_or_empty(rules_path)
@@ -491,10 +570,11 @@ def render(api: Any, args: Any) -> int:
             )
         )
     servers = safe_servers(api.KIT) if "mcp" in components else {}
-    if host == "codex" and ("mcp" in components or "hooks" in components):
+    if host == "codex" and components & SANDBOX_COMPONENTS:
         config_path = root / "config.toml"
         existing = api.read_or_empty(config_path)
         outside = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END), "", existing, flags=re.DOTALL)
+        outside = re.sub(re.escape(SANDBOX_BEGIN) + r".*?" + re.escape(SANDBOX_END), "", outside, flags=re.DOTALL)
         outside = shell_without_owned(outside)
         config = tomllib.loads(outside)
         if set(config.get("hooks", {})) & set(EVENTS):
@@ -533,17 +613,24 @@ def render(api: Any, args: Any) -> int:
             ownership[shell_key] = values
             new_config = shell_config(new_config, values, versions(shell_key))
         if "mcp" in components:
-            roots = sandbox_roots()
-            if "sandbox_workspace_write" in config:
-                # The user's own table stands; a second one would make the file invalid TOML.
-                print(
-                    "agent-kit: note: your [sandbox_workspace_write] is kept; add these to its "
-                    f"writable_roots for task folders: {json.dumps(roots)}",
-                    file=sys.stderr,
-                )
-                roots = []
-            managed = toml_servers(servers) + toml_sandbox(roots)
-            new_config = block(keep_host_tables(new_config), managed)
+            new_config = block(keep_host_tables(new_config), toml_servers(servers))
+        elif BEGIN in new_config:
+            # A block from before the sandbox had its own: its roots move to the sandbox block.
+            start, stop = new_config.index(BEGIN) + len(BEGIN), new_config.index(END)
+            inner = without_table(new_config[start:stop], "sandbox_workspace_write").rstrip()
+            new_config = new_config[:start] + inner + "\n" + new_config[stop:]
+        roots = sandbox_roots()
+        if "sandbox_workspace_write" in config:
+            # The user's own table stands; a second one would make the file invalid TOML.
+            print(
+                "agent-kit: note: your [sandbox_workspace_write] is kept; add these to its "
+                f"writable_roots for task folders: {json.dumps(roots)}",
+                file=sys.stderr,
+            )
+            roots = []
+        new_config = block(
+            keep_host_tables(new_config, SANDBOX_BEGIN, SANDBOX_END), toml_sandbox(roots), SANDBOX_BEGIN, SANDBOX_END
+        )
         tomllib.loads(new_config)
         plans.append((config_path, new_config))
     if host == "codex" and "roles" in components:

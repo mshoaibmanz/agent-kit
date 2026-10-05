@@ -131,6 +131,7 @@ module.main()
             str(self.root),
             "--components",
             "rules",
+            "--json",
         ]
         custom = self.home / "native codex home"
         result = subprocess.run(
@@ -502,7 +503,8 @@ module.main()
                 process.returncode, 0, b"".join(chunks).decode(errors="replace")[-1000:]
             )
             text = b"".join(chunks).decode(errors="replace")
-            self.assertIn('"mode": "preview"', text)
+            self.assertIn("agent-setup preview:", text)
+            self.assertIn("Ready:", text)
             self.assertIn("example-owner", text)
             self.assertFalse(self.root.exists())
             self.assertFalse(self.host.exists())
@@ -790,7 +792,7 @@ module.main()
         self.run_setup("--components", "rules", "--apply")
         before = self.state()["id"]
         executable = self.root / "bin/agent-setup"
-        base = [sys.executable, str(executable), "--root-dir", str(self.root)]
+        base = [sys.executable, str(executable), "--root-dir", str(self.root), "--json"]
         result = subprocess.run(
             base, env=self.env, capture_output=True, text=True, timeout=60
         )
@@ -850,6 +852,7 @@ module.main()
                 str(alternate / "bin/agent-setup"),
                 "--root-dir",
                 str(self.root),
+                "--json",
             ],
             env=self.env,
             capture_output=True,
@@ -1011,6 +1014,11 @@ module.main()
         self.run_setup("--components", "hooks", "--blocking-hooks", "--apply")
         self.assertTrue(self.state()["configuration"]["blocking_hooks"])
         result = self.run_setup("--components", "hooks")
+        self.assertTrue(
+            json.loads(result.stdout)["blocking_hooks"],
+            "4c: reselecting hooks without the flag keeps the saved choice",
+        )
+        result = self.run_setup("--components", "hooks", "--no-blocking-hooks")
         self.assertFalse(json.loads(result.stdout)["blocking_hooks"])
 
 
