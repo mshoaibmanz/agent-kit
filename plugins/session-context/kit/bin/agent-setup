@@ -256,8 +256,8 @@ def overlay_text(args: argparse.Namespace) -> str:
         overlay += 'CODE_SEARCH_GH_OWNER=' + args.github_owner + '\n'
     if args.zoekt_url:
         overlay += 'CODE_SEARCH_ZOEKT_URL=' + args.zoekt_url + '\n'
-    if args.codex_gcloud == 'on':
-        overlay += 'CODEX_SANDBOX_GCLOUD=1\n'
+    # Written either way: this layer sits over kit.env, so the saved choice is the one the sandbox gets.
+    overlay += 'CODEX_SANDBOX_GCLOUD=' + ('1' if args.codex_gcloud == 'on' else '0') + '\n'
     return overlay
 
 
@@ -365,16 +365,21 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
                         previous = prior_record(root, target / relative, 'toml').get('owned', '')
                         if previous.startswith(TOML_BEGIN):
                             previous = previous[len(TOML_BEGIN):].removesuffix(TOML_END).strip()
-                        combined = previous
+                        # Each block from this render when its component is selected, else as installed,
+                        # always in this order: a one-component update leaves the file byte-identical.
+                        rest, blocks = previous, []
                         for component, begin, end in [('hooks', '# BEGIN agent-kit shell', '# END agent-kit shell'),
                                                       ('mcp', '# BEGIN agent-kit managed', '# END agent-kit managed')]:
+                            rest, block = managed_block(rest, begin, end)
                             if component in components:
-                                combined, old = managed_block(combined, begin, end)
-                                outside, wanted = managed_block(text, begin, end)
-                                combined = combined.rstrip() + '\n' + wanted + '\n'
+                                _, block = managed_block(text, begin, end)
+                            blocks.append(block)
+                        combined = '\n'.join(part for part in (rest.strip(), *blocks) if part)
                         if combined.strip():
                             changes.append(Change('toml', target / relative, combined.strip(), 0o600))
                     elif path.name == 'mcp.json':
+                        if 'mcp' not in components:
+                            continue  # the seeded user servers, not a render: wanted {} would drop the kit's
                         servers = resolve_values(json.loads(text), view, root, host_view, target).get('mcpServers', {})
                         servers = {name: spec for name, spec in servers.items() if name not in seeded}
                         changes.append(Change('servers', target / relative, servers, 0o600))
@@ -515,6 +520,7 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
     (when this plan renders that agents folder), and skill links that are deselected or no longer
     eligible for their host (`hosts:`). A removal refuses changed content unless --collision backup."""
     root = Path(args.root_dir).expanduser().absolute()
+    source = Path(args.source).expanduser().resolve()
     planned = {str(change.target) for change in changes}
     planned_dirs = {change.target.parent for change in changes}
     hosts = {host_target(args, host, home) for host in args.hosts}
@@ -530,7 +536,8 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
             relative = target.relative_to(root)
             if relative.parts[0] in ('local', 'state', '.install-state'):
                 continue
-            retired = not (view / relative).exists()
+            # The source, not the view: the view leaves out an unselected component's files (mcp/servers.json).
+            retired = not (view / relative).exists() and not (source / relative).exists()
             if skills and relative.parts[0] == 'skills':
                 skill = relative.parts[1]
                 retired = retired or (skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md'))

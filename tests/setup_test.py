@@ -611,6 +611,112 @@ class SetupTests(unittest.TestCase):
             self.assertTrue((self.root / 'skills/review-rubric' / name).exists())
         self.assertEqual(list((self.root / 'skills').glob('*/SKILL.md')), [])
 
+    def snapshot(self, *hosts: Path) -> dict[str, str]:
+        """Every file and link under the kit root (install state aside) and the host roots, by content."""
+        files = {}
+        for base in (self.root, *(hosts or [self.host])):
+            for path in sorted(base.rglob('*')):
+                if '.install-state' in path.relative_to(base).parts:
+                    continue
+                if path.is_symlink():
+                    files[str(path)] = 'link:' + os.readlink(path)
+                elif path.is_file():
+                    files[str(path)] = path.read_text(errors='replace')
+        return files
+
+    def test_cursor_rules_or_hooks_update_keeps_installed_mcp(self) -> None:
+        self.host.mkdir()
+        config = self.host / 'mcp.json'
+        config.write_text(json.dumps({'mcpServers': {'user': {'command': 'user-choice'}}}))
+        catalog = self.home / 'catalog.json'
+        catalog.write_text(json.dumps({'mcpServers': {'owned': {'command': 'true'}}}))
+        self.run_setup('--hosts', 'cursor', '--components', 'rules', 'hooks', 'mcp', '--mcp-catalog', str(catalog),
+                       '--confirm-hook-support', 'cursor', '--apply')
+        servers = json.loads(config.read_text())['mcpServers']
+        self.assertEqual(set(servers), {'user', 'owned'})
+        record = self.state()['managed']['servers:' + str(config)]
+        for components in (['rules'], ['hooks']):
+            self.run_setup('--hosts', 'cursor', '--components', *components, '--confirm-hook-support', 'cursor', '--apply')
+            self.assertEqual(json.loads(config.read_text())['mcpServers'], servers, f'R2-CX-1: {components} only')
+            self.assertEqual(self.state()['managed']['servers:' + str(config)], record, f'R2-CX-1: {components} only')
+        self.run_setup('doctor')
+
+    def test_explicit_gcloud_off_overrides_the_user_overlay(self) -> None:
+        gcloud = self.home / '.config/gcloud'
+        gcloud.mkdir(parents=True)
+        work = self.home / 'work'
+        self.run_setup('--hosts', 'codex', '--components', 'rules', 'hooks', 'mcp', '--work-root', str(work),
+                       '--codex-gcloud', 'on', '--apply')
+        config = self.host / 'config.toml'
+        self.assertEqual(tomllib.loads(config.read_text())['sandbox_workspace_write']['writable_roots'], [str(work), str(gcloud)])
+        (self.root / 'local/kit.env').write_text('CODEX_SANDBOX_GCLOUD=1\n')
+        self.run_setup('--hosts', 'codex', '--components', 'mcp', '--codex-gcloud', 'off', '--apply')
+        self.assertEqual(tomllib.loads(config.read_text())['sandbox_workspace_write']['writable_roots'], [str(work)],
+                         'R2-CX-2: an explicit off loses to kit.env')
+        self.assertEqual(self.state()['configuration']['codex_gcloud'], 'off')
+        env = dict(self.env, KIT_ENV=str(self.root / 'local/setup-paths.env'))
+        result = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); from kit_env import kit_env; print(kit_env()["CODEX_SANDBOX_GCLOUD"])',
+                                 str(self.root / 'hooks/lib')], capture_output=True, text=True, env=env, check=True)
+        self.assertEqual(result.stdout.strip(), '0', 'R2-CX-2: hooks resolve the setup choice, not the user layer')
+
+    def test_partial_update_keeps_the_installed_custom_mcp_catalog(self) -> None:
+        catalog = self.home / 'catalog.json'
+        catalog.write_text(json.dumps({'mcpServers': {'custom': {'command': 'true'}}}))
+        self.run_setup('--components', 'rules', 'skills', 'mcp', '--mcp-catalog', str(catalog), '--apply')
+        installed = self.root / 'mcp/servers.json'
+        content = installed.read_text()
+        self.assertIn('custom', content)
+        for components in (['rules'], ['skills']):
+            self.run_setup('--components', *components, '--apply')
+            self.assertEqual(installed.read_text() if installed.is_file() else None, content, f'R2-CX-3: {components} only')
+            self.assertIn('file:' + str(installed), self.state()['managed'])
+        self.run_setup('doctor')
+
+    def test_single_component_updates_leave_every_other_component_alone(self) -> None:
+        """Install every component, then select one at a time: nothing installed may change or lose its record."""
+        everything = ['rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands']
+        for host in ('claude', 'codex', 'cursor'):
+            with self.subTest(host=host):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.host, ignore_errors=True)
+                self.host.mkdir()
+                (self.host / 'mcp.json' if host != 'codex' else self.host / 'config.toml').write_text(
+                    json.dumps({'mcpServers': {'user': {'command': 'user-choice'}}}) if host != 'codex' else 'model = "user"\n')
+                flags = ['--hosts', host, '--confirm-hook-support', 'cursor']
+                self.run_setup(*flags, '--components', *everything, '--apply')
+                before = self.snapshot()
+                managed = self.state()['managed']
+                for component in everything:
+                    self.run_setup(*flags, '--components', component, '--apply')
+                    after = self.snapshot()
+                    changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+                    self.assertEqual(changed, [], f'{host}: selecting only {component}')
+                    current = self.state()['managed']
+                    self.assertEqual(sorted(managed.keys() - current.keys()), [], f'{host}: selecting only {component}')
+                self.run_setup('doctor')
+
+    def test_single_host_updates_leave_the_other_hosts_alone(self) -> None:
+        hosts = {'claude': self.home / 'claude config', 'codex': self.home / 'codex home', 'cursor': self.home / '.cursor'}
+        env = dict(self.env, CLAUDE_CONFIG_DIR=str(hosts['claude']), CODEX_HOME=str(hosts['codex']))
+        everything = ['rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands']
+
+        def setup(*flags: str) -> None:
+            result = subprocess.run([sys.executable, str(SOURCE / 'bin/agent-setup'), '--source', str(SOURCE), '--root-dir', str(self.root),
+                                     *flags, '--confirm-hook-support', 'cursor'], capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        setup('--hosts', *hosts, '--components', *everything, '--apply')
+        before = self.snapshot(*hosts.values())
+        managed = self.state()['managed']
+        for host in hosts:
+            for components in (everything, ['rules']):
+                setup('--hosts', host, '--components', *components, '--apply')
+                after = self.snapshot(*hosts.values())
+                changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+                self.assertEqual(changed, [], f'selecting only {host} with {components}')
+                self.assertEqual(sorted(managed.keys() - self.state()['managed'].keys()), [], f'selecting only {host}')
+        setup('doctor')
+
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(SetupTests)
