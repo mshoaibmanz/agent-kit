@@ -379,7 +379,10 @@ rv_snapshot() {
   mkdir -p "$RV_DIR" 2>/dev/null
   idx=$(mktemp "$RV_DIR/idx.XXXXXX") || return 1
   if [ -f "$gd/index" ]; then
-    cp "$gd/index" "$idx" 2>/dev/null || { rm -f "$idx"; return 1; }
+    # -p: git treats an entry as racily clean only when it is not older than the index file. A
+    # fresh copy's new mtime turns that off, so a same-size edit in the same second reads as
+    # unchanged and the edit is never marked.
+    cp -p "$gd/index" "$idx" 2>/dev/null || { rm -f "$idx"; return 1; }
   else
     rm -f "$idx"
   fi

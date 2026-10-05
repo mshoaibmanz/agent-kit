@@ -16,7 +16,8 @@
 #   two-dot-diff      <base>..HEAD instead of <base>...HEAD            -> ask
 #   inplace-edit      sed -i / perl -i rewriting a file                -> deny
 #   zsh-modifier      unbraced $name:<letter>, eaten as a zsh modifier  -> deny
-#   context-dumps     an uncapped file read into context               -> deny
+#   foreground-poll   an until/while sleep>=5 loop or gh --watch, not in background -> deny
+#   context-dumps    an uncapped file read into context               -> deny
 # macOS bash is 3.2 — no mapfile/readarray/declare -A.
 # Fails CLOSED: without jq, hook-io, cmd-view or cmd-tokens every command-position guard reads
 # an empty token list and allows (verified 2026-08-25: `mysql -e 'DROP TABLE t'` returned allow,
@@ -30,7 +31,7 @@ set -uo pipefail
   exit 0
 }
 hook_lib closed cmd-view cmd-repo
-hook_read cmd='.tool_input.command // ""' cwd='.cwd // ""'
+hook_read cmd='.tool_input.command // ""' cwd='.cwd // ""' bg='.tool_input.run_in_background // false'
 [ -n "$cmd" ] || exit 0
 
 # What is INVOKED, not merely named: CMD_BARE masks quoted spans and drops comments, and
@@ -1527,6 +1528,16 @@ _zmod=$(printf '%s' "$_unquoted" | grep -Eo '\$[A-Za-z_][A-Za-z0-9_]*:[hrtelqQux
 if [ -n "$_zmod" ]; then
   _zname=${_zmod%%:*}
   deny "zsh reads \`${_zmod}\` as a history modifier on ${_zname}, not a literal colon. Brace it: \`\${${_zname#\$}}:${_zmod##*:}…\`."
+fi
+
+# ---- foreground-poll ---------------------------------------------------------------
+# A foreground wait blocks the agent for up to the 600s Bash cap with no output, so it looks hung.
+# Only Claude's Bash has run_in_background; elsewhere a wait has no alternative. Short readiness
+# spins (sleep < 5) and a command marked `# fg-wait` stay allowed.
+if [ "$bg" != true ] && [ "${AGENT_HOST:-claude}" = claude ] \
+   && ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*fg-wait([[:space:]]|$)'; then
+  _poll=$(printf '%s\n' "$cmd" | drop_heredocs 0 | grep -Eo '(until|while)\b.*\bsleep[[:space:]]+([5-9]|[1-9][0-9]+)|\b(gh[[:space:]]+(run[[:space:]]+watch|pr[[:space:]]+checks[^|;&]*--watch))' | head -1)
+  [ -z "$_poll" ] || deny "Append \`# fg-wait\` only for a wait under a minute. Otherwise rerun this with run_in_background: true; you are notified when it exits. Foreground polling blocks this agent with no output for up to 10 minutes."
 fi
 
 # ---- context-dumps: uncapped file reads into the model's context ------------------

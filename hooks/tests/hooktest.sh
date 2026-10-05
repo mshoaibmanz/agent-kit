@@ -361,7 +361,8 @@ rm -f "$M/edit-$SID" "$T/kit-aw.env"; rm -rf "$T/aw"
 
 echo "--- lib/cmd-repo: the repo a command acts in ---"
 CR="$T/cr-repo"; rm -rf "$CR"; git init -q -b cr "$CR"; mkdir -p "$CR/sub"
-printf 'x = 1\n' > "$CR/a.py"; git -C "$CR" add a.py; git -C "$CR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm init
+git -C "$CR" config core.trustctime false   # the racy-git case below must not depend on timing
+printf 'x = 1\n' > "$CR/a.py"; touch -t 202601010000.00 "$CR/a.py"; git -C "$CR" add a.py; git -C "$CR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm init
 crr() { ( . "$H/lib/cmd-repo" && cmd_repo "$@" && printf '%s' "$CMD_DIR" ); }
 crk() { ( . "$H/lib/state" && path_key "$1" ); }
 crcase() { [ "$(crr "${@:3}")" = "$2" ] && ok "cmd-repo: $1" || bad "cmd-repo: $1" "got $(crr "${@:3}")"; }
@@ -402,6 +403,9 @@ echo "--- tests-ran-mark: a Bash-written source edit marks the review ---"
 rvk() { ( . "$H/lib/review-state" 2>/dev/null && "$@" ); }
 rvk rv_clear_edits $SID-rv "$CR"
 printf 'x = 2\n' > "$CR/a.py"
+# Same size as the committed `x = 1` and pinned to the index's own second: git's racy-clean
+# window, which a plain copy of the index closes (the edit then reads as unchanged).
+touch -t 202601010000.00 "$CR/a.py" "$CR/.git/index"
 printf '%s' "$(post "python3 - <<PY
 open(\"a.py\", \"w\").write(\"x = 2\")
 PY" $SID-rv "$CR")" | "$H/tests-ran-mark" >/dev/null

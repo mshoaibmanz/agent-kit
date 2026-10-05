@@ -564,6 +564,16 @@ CASES = [
     ("allow", "sed -n '1,20p' x.py",              "sed read, not in-place"),
     ("allow", "sed -e 's/i/j/' x.py > y.py",      "an i inside the script, not a flag"),
     ("allow", "grep -n 'sed -i' notes.md",        "sed -i named inside a quoted pattern"),
+    # --- foreground-poll ---------------------------------------------------------
+    ("deny",  "until gh run view 1 --json status | grep -q completed; do sleep 20; done", "until + sleep 20 in the foreground"),
+    ("deny",  "while ! test -f done.txt; do sleep 5; done",  "while + sleep 5"),
+    ("deny",  "gh pr checks 1 --watch",                      "gh pr checks --watch"),
+    ("deny",  "gh run watch 123",                            "gh run watch"),
+    ("allow", "until [ -f x ]; do sleep 0.1; done",          "a short readiness spin"),
+    ("allow", "until [ -f x ]; do sleep 1; done",            "sleep under five seconds"),
+    ("allow", "until gh run view 1 | grep -q done; do sleep 30; done # fg-wait", "the fg-wait marker"),
+    ("allow", "gh pr checks 1",                              "a one-shot status read"),
+    ("allow", "cat > w.sh <<'EOF2'\nuntil x; do sleep 30; done\nEOF2", "a loop written into a quoted heredoc"),
     # --- zsh-modifier ------------------------------------------------------------
     ("deny",  'git fetch origin "+refs/heads/$b:refs/remotes/origin/$b"', "refspec eaten by :r"),
     ("deny",  "echo $f:h",                         ":h on an unbraced var"),
@@ -713,11 +723,17 @@ TIMED = [
 ]
 
 
-def decision(cmd, kit=None, timeout=None):
+BG_CASES = [
+    ("allow", "until gh run view 1 | grep -q done; do sleep 30; done", "foreground-poll: a background wait"),
+    ("allow", "gh pr checks 1 --watch",                                "foreground-poll: --watch in the background"),
+]
+
+
+def decision(cmd, kit=None, timeout=None, bg=False):
     env = None if kit is None else {**os.environ, "KIT_ENV": kit}
     try:
         r = subprocess.run(
-            [H], input=json.dumps({"cwd": FIX, "tool_input": {"command": cmd}}),
+            [H], input=json.dumps({"cwd": FIX, "tool_input": {"command": cmd, "run_in_background": bg}}),
             capture_output=True, text=True, env=env, timeout=timeout, cwd=FIX,
         )
     except subprocess.TimeoutExpired:
@@ -757,6 +773,12 @@ def main():
             if got != want:
                 fails += 1
             print(f"{'ok  ' if got == want else 'FAIL'} want={want:<5} got={got:<5} {label}")
+        bg_cases = BG_CASES if want_section in (None, "foreground-poll") else []
+        for want, cmd, label in bg_cases:
+            got = decision(cmd, bg=True)
+            fails += got != want
+            print(f"{'ok  ' if got == want else 'FAIL'} want={want:<5} got={got:<5} {label}")
+        cases += [(None, *c) for c in bg_cases]
         for want, cmd, bound, label in timed:
             start = time.monotonic()
             got = decision(cmd, timeout=bound + 20)
