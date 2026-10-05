@@ -202,6 +202,28 @@ class SetupTests(unittest.TestCase):
         self.assertIn('Sentry', result.stderr)
         self.assertEqual(json.loads(config.read_text())['mcpServers'], {'Sentry': {'command': 'user-choice'}})
 
+    def test_a_preset_server_command_names_the_installed_kit_on_every_host(self) -> None:
+        preset = self.home / 'preset.toml'
+        preset.write_text('[mcp.servers.sentry]\ncommand = "{{KIT_DIR}}/bin/sentry-mcp"\n'
+                          'args = ["--host=sentry.example.com", "--config={{KIT_DIR}}/local/sentry.conf"]\n\n'
+                          '[mcp.servers.wrapped]\ncommand = "{{AGENT_KIT_DIR}}/bin/sentry-mcp"\nargs = ["--root={{KIT_DIR}}"]\n')
+        for host in ('claude', 'codex', 'cursor'):
+            with self.subTest(host=host):
+                self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
+                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--apply')
+                text = (self.host / ('config.toml' if host == 'codex' else 'mcp.json')).read_text()
+                servers = tomllib.loads(text)['mcp_servers'] if host == 'codex' else json.loads(text)['mcpServers']
+                self.assertEqual(servers['sentry']['command'], str(self.root / 'bin/sentry-mcp'))
+                self.assertEqual(servers['sentry']['args'], ['--host=sentry.example.com', f'--config={self.root}/local/sentry.conf'])
+                self.assertEqual((servers['wrapped']['command'], servers['wrapped']['args']),
+                                 (str(self.root / 'bin/sentry-mcp'), [f'--root={self.root}']))
+                self.assertNotIn('{{', text)
+        preset.write_text('[mcp.servers.docs]\ncommand = "{{NOPE}}/bin/server"\n')
+        self.root, self.host = self.home / 'kit refused', self.home / 'host refused'
+        result = self.run_setup('--preset', str(preset), '--hosts', 'claude', '--components', 'mcp', '--apply', success=False)
+        self.assertIn('unknown placeholder {{NOPE}}', result.stderr)
+        self.assertFalse(self.root.exists() or self.host.exists(), 'a refused placeholder wrote nothing')
+
     def test_skill_hosts_rejects_what_would_install_nowhere(self) -> None:
         module = self.module()
         skill = self.home / 'SKILL.md'
@@ -480,12 +502,17 @@ class SetupTests(unittest.TestCase):
 
     def test_the_retired_pre_push_gate_is_not_rendered(self) -> None:
         # The git pre-push hook gates a push (it honors AGENT_PUSH_NOW); the old PreToolUse gate did not.
+        # Its file stays a no-op: a session started before an update still runs it on every Bash call.
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git push origin HEAD'}})
         for flags in (('--blocking-hooks',), ()):
             self.run_setup('--components', 'hooks', *flags, '--apply')
             settings = (self.host / 'settings.json').read_text()
             self.assertIn('bash-guards', settings)
             self.assertNotIn('pre-push-gate', settings, f'rendered with {flags or "default hooks"}')
-            self.assertFalse((self.root / 'hooks/pre-push-gate').exists())
+            stub = self.root / 'hooks/pre-push-gate'
+            self.assertTrue(os.access(stub, os.X_OK), 'the installed stub is executable')
+            result = subprocess.run([str(stub)], input=payload, capture_output=True, text=True, env=self.env, timeout=10)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
 
     def test_blocking_hooks_also_render_required_native_agents(self) -> None:
         self.run_setup('--components', 'hooks', '--blocking-hooks', '--apply')

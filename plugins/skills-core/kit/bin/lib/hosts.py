@@ -316,7 +316,7 @@ def safe_servers(kit: Path) -> dict[str, Any]:
     out = {}
     if not isinstance(servers, dict):
         raise ValueError("MCP catalog must map server names to objects")
-    for name, spec in servers.items():
+    for name, spec in fill_servers(servers, str(kit)).items():
         if not isinstance(spec, dict) or set(spec) - {"command", "args", "url", "env", "type", "description"}:
             raise ValueError("Unsupported MCP transport fields; nothing written")
         spec = normalize_transport(spec)
@@ -418,6 +418,25 @@ def fill(
             + "; known: " + ", ".join("{{" + name + "}}" for name in known)
         )
     return PLACEHOLDER.sub(lambda match: values[match.group(1)], text)
+
+
+def fill_servers(servers: dict[str, Any], kit: str) -> dict[str, Any]:
+    """servers with each command and args filled (fill) for the kit at <kit>: a host starts an MCP
+    command as written, without expanding ~ or a variable, so a preset names a wrapper the kit ships
+    as {{KIT_DIR}}/bin/sentry-mcp."""
+    out = {}
+    for name, spec in servers.items():
+        if isinstance(spec, dict):
+            what = f"MCP server {name}"
+            spec = dict(spec)
+            if isinstance(spec.get("command"), str):
+                spec["command"] = fill(spec["command"], kit, what=what)
+            if isinstance(spec.get("args"), list):
+                spec["args"] = [
+                    fill(arg, kit, what=what) if isinstance(arg, str) else arg for arg in spec["args"]
+                ]
+        out[name] = spec
+    return out
 
 
 def install_text(

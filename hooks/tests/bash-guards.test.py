@@ -630,10 +630,10 @@ def _sections():
     src = open(__file__).read()
     node = next(n for n in ast.parse(src).body
                 if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "CASES")
-    bounds = {}
+    bounds, end = {}, node.end_lineno or node.lineno
     for i, line in enumerate(src.split("\n"), 1):
         st = line.strip()
-        if st.startswith("# --- ") and node.lineno < i < node.end_lineno:
+        if st.startswith("# --- ") and node.lineno < i < end:
             bounds[i] = st.split()[2]
     out, current = {}, None
     for elt, case in zip(node.value.elts, CASES):

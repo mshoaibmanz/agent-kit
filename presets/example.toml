@@ -20,8 +20,14 @@ BQRO_PROJECT = "example-project"                  # bqro's jobs project
 
 # MCP servers: a command (often a credential wrapper the kit ships, such as sentry-mcp, which reads
 # the Keychain or secret-tool at start) or a URL with native OAuth. No env, headers or inline keys.
+# A command or arg names the kit as {{KIT_DIR}}: setup fills each user's own kit root, since hosts
+# expand neither ~ nor variables in an MCP command. Options go in args, as the preset has no env.
 [mcp.servers.docs]
 url = "https://mcp.example.com/mcp"
+
+# [mcp.servers.sentry]
+# command = "{{KIT_DIR}}/bin/sentry-mcp"
+# args = ["--host=sentry.example.com", "--disable-skills=seer"]
 
 [hosts]
 recommended = ["claude", "codex"]                 # shown when none is detected; detection wins

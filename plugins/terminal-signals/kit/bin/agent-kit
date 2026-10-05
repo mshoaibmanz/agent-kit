@@ -773,7 +773,13 @@ def render_settings(
 
 def render_mcp(host: dict[str, Any], dry_run: bool, force: bool) -> int:
     path = host["mcp_path"]
-    rendered = resolve(json.loads(SERVERS.read_text()))
+    catalog = json.loads(SERVERS.read_text())
+    if "{{" in json.dumps(catalog.get("mcpServers", {})):
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+        from hosts import fill_servers
+
+        catalog["mcpServers"] = fill_servers(catalog["mcpServers"], str(KIT))
+    rendered = resolve(catalog)
     new_text = dump(rendered)
     old_text = read_or_empty(path)
     if new_text == old_text:

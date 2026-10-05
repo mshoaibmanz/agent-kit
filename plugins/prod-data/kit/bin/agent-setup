@@ -52,8 +52,8 @@ ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'secon
                 'reviewer': 'task-reviewer', 'thermo-bugs': 'bug-reviewer',
                 'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
-from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root, install_text,  # noqa: E402
-                   keep_host_tables, resume_max, skill_hosts, strip_legacy_sandbox)
+from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root, fill_servers,  # noqa: E402
+                   install_text, keep_host_tables, resume_max, skill_hosts, strip_legacy_sandbox)
 from kit_env import kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
@@ -337,7 +337,7 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                              GIT_CONFIG_VALUE_0=str(root / 'git-hooks'))
             changes.append(Change('environment', target / 'settings.json', shell, 0o600))
         if 'mcp' in components:
-            servers = safe_catalog(view / 'mcp/servers.json')['mcpServers']
+            servers = resolve_values(safe_catalog(view / 'mcp/servers.json')['mcpServers'], view, root, target, target)
             servers = {name: {**spec, 'type': 'stdio' if 'command' in spec else 'http'}
                        for name, spec in servers.items()}
             changes.append(Change('servers', target / 'mcp.json', servers, 0o600))
@@ -481,7 +481,8 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
     if 'mcp' in args.components:
         # A server whose runtime is missing is left out, so no host starts a command that cannot run.
         # Its descriptor stays in the catalog or preset: a rerun after installing the runtime adds it.
-        runnable = {name: spec for name, spec in servers.items()
+        # Kit placeholders fill with the view's paths, which each host's changes map to the root.
+        runnable = {name: spec for name, spec in fill_servers(servers, str(view)).items()
                     if not server_runtime(spec) or shutil.which(spec['command'])}
         (view / 'mcp').mkdir()
         (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': runnable}, indent=2) + '\n')
