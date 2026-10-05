@@ -771,15 +771,20 @@ def render_settings(
     return 1
 
 
-def render_mcp(host: dict[str, Any], dry_run: bool, force: bool) -> int:
-    path = host["mcp_path"]
+def mcp_catalog() -> dict[str, Any]:
+    """The catalog with its kit placeholders ({{KIT_DIR}}) filled for this kit."""
     catalog = json.loads(SERVERS.read_text())
     if "{{" in json.dumps(catalog.get("mcpServers", {})):
         sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
         from hosts import fill_servers
 
         catalog["mcpServers"] = fill_servers(catalog["mcpServers"], str(KIT))
-    rendered = resolve(catalog)
+    return catalog
+
+
+def render_mcp(host: dict[str, Any], dry_run: bool, force: bool) -> int:
+    path = host["mcp_path"]
+    rendered = resolve(mcp_catalog())
     new_text = dump(rendered)
     old_text = read_or_empty(path)
     if new_text == old_text:
@@ -1100,7 +1105,7 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
     for key in extra:
         print(f"settings: live-only key, not in the source (render keeps it): {key}")
     mcp_live = json.loads(host["mcp_path"].read_text()) if host["mcp_path"].exists() else {}
-    mcp_src = resolve(json.loads(SERVERS.read_text()))
+    mcp_src = resolve(mcp_catalog())
     mdiff = sorted(
         n
         for n in set(mcp_src.get("mcpServers", {})) | set(mcp_live.get("mcpServers", {}))

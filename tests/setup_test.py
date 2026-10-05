@@ -224,6 +224,30 @@ class SetupTests(unittest.TestCase):
         self.assertIn('unknown placeholder {{NOPE}}', result.stderr)
         self.assertFalse(self.root.exists() or self.host.exists(), 'a refused placeholder wrote nothing')
 
+    def test_a_later_render_fills_the_installed_catalog_from_the_installed_kit(self) -> None:
+        preset = self.home / 'preset.toml'
+        preset.write_text('[mcp.servers.own-sentry]\ncommand = "{{KIT_DIR}}/bin/sentry-mcp"\n'
+                          'args = ["--config={{KIT_DIR}}/local/sentry.conf"]\n')
+        for host in ('claude', 'codex', 'cursor'):
+            with self.subTest(host=host):
+                self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
+                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--apply')
+                catalog = (self.root / 'mcp/servers.json').read_text()
+                self.assertNotIn('agent-kit-install-view-', catalog, 'the installed catalog names the deleted preview')
+                self.assertEqual(json.loads(catalog)['mcpServers']['own-sentry']['command'], '{{KIT_DIR}}/bin/sentry-mcp')
+                config = self.host / ('config.toml' if host == 'codex' else 'mcp.json')
+                config.unlink()
+                subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'render', '--host', host, '--components', 'mcp'],
+                               capture_output=True, text=True, env=self.env, check=True, timeout=60)
+                text = config.read_text()
+                servers = tomllib.loads(text)['mcp_servers'] if host == 'codex' else json.loads(text)['mcpServers']
+                self.assertEqual((servers['own-sentry']['command'], servers['own-sentry']['args']),
+                                 (str(self.root / 'bin/sentry-mcp'), [f'--config={self.root}/local/sentry.conf']))
+                if host == 'claude':
+                    doctor = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'doctor'], capture_output=True,
+                                            text=True, env=dict(self.env, AGENT_KIT_MCP=str(config)), timeout=60)
+                    self.assertIn('mcp: in sync with the catalog', doctor.stdout)
+
     def test_skill_hosts_rejects_what_would_install_nowhere(self) -> None:
         module = self.module()
         skill = self.home / 'SKILL.md'

@@ -337,7 +337,8 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                              GIT_CONFIG_VALUE_0=str(root / 'git-hooks'))
             changes.append(Change('environment', target / 'settings.json', shell, 0o600))
         if 'mcp' in components:
-            servers = resolve_values(safe_catalog(view / 'mcp/servers.json')['mcpServers'], view, root, target, target)
+            servers = fill_servers(safe_catalog(view / 'mcp/servers.json')['mcpServers'], str(view))
+            servers = resolve_values(servers, view, root, target, target)
             servers = {name: {**spec, 'type': 'stdio' if 'command' in spec else 'http'}
                        for name, spec in servers.items()}
             changes.append(Change('servers', target / 'mcp.json', servers, 0o600))
@@ -481,8 +482,10 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
     if 'mcp' in args.components:
         # A server whose runtime is missing is left out, so no host starts a command that cannot run.
         # Its descriptor stays in the catalog or preset: a rerun after installing the runtime adds it.
-        # Kit placeholders fill with the view's paths, which each host's changes map to the root.
-        runnable = {name: spec for name, spec in fill_servers(servers, str(view)).items()
+        # The catalog keeps its kit placeholders: it is installed as is, and a later render fills them
+        # from the installed kit. Filled with the view here for the runtime check only.
+        filled = fill_servers(servers, str(view))
+        runnable = {name: servers[name] for name, spec in filled.items()
                     if not server_runtime(spec) or shutil.which(spec['command'])}
         (view / 'mcp').mkdir()
         (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': runnable}, indent=2) + '\n')

@@ -584,6 +584,9 @@ CASES = [
     ("deny",  "echo \"'$(gh run watch 1)'\"",                "an apostrophe inside double quotes does not quote"),
     ("allow", 'echo "\\$(gh run watch 1)"',                  "an escaped substitution is literal text"),
     ("deny",  'x="$(gh run watch $(printf 1))"',             "a nested substitution keeps the outer wait"),
+    ("deny",  "while\ntrue; do sleep 20; done",              "a newline right after while"),
+    ("deny",  "until\n! test -f x; do sleep 10; done",       "a newline right after until"),
+    ("allow", "echo while\nsleep 10",                        "the word while as an argument, then a bare sleep"),
     # --- zsh-modifier ------------------------------------------------------------
     ("deny",  'git fetch origin "+refs/heads/$b:refs/remotes/origin/$b"', "refspec eaten by :r"),
     ("deny",  "echo $f:h",                         ":h on an unbraced var"),

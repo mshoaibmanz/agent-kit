@@ -1538,9 +1538,10 @@ if [ "$bg" != true ] && [ "${AGENT_HOST:-claude}" = claude ] \
    && ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*fg-wait([[:space:]]|$)'; then
   # code_view's CV_CODE: quoted data is Q (a search for 'gh run watch' is not a wait), every
   # $( ) and backtick body is code on its own line (so "$(gh run watch 1)" is), escapes and
-  # nesting follow bash. Joined onto one line so a multi-line loop pairs `until` with its sleep.
+  # nesting follow bash. Joined onto one line so a multi-line loop pairs `until` with its sleep;
+  # a line ending in the keyword joins with a space, since `while<newline>cond` is valid bash.
   code_view
-  _ptext=$(printf '%s\n' "$CV_CODE" | tr '\n' ';')
+  _ptext=$(printf '%s\n' "$CV_CODE" | awk '{ printf "%s%s", (NR == 1 ? "" : (p ~ /(^|[;&|({])[[:space:]]*(while|until)[[:space:]]*$/ ? " " : ";")), $0; p = $0 }')
   _poll=$(printf '%s' "$_ptext" | grep -Eo '(^|[;&|({[:space:]])(until|while)[[:space:]].*[;&|[:space:]]sleep[[:space:]]+([5-9]|[1-9][0-9]+)|(^|[;&|([:space:]])gh[[:space:]]+(run[[:space:]]+watch|pr[[:space:]]+checks[^|;&]*--watch)' | head -1)
   [ -z "$_poll" ] || deny "Append \`# fg-wait\` only for a wait under a minute. Otherwise rerun this with run_in_background: true; you are notified when it exits. Foreground polling blocks this agent with no output for up to 10 minutes."
 fi
