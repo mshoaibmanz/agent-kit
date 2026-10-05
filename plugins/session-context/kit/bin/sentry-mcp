@@ -2,20 +2,24 @@
 # Credentials enter only the server's environment, never rendered config or argv.
 set +x
 set -eu
-# The macOS Keychain, else libsecret's secret-tool (Linux), else SENTRY_ACCESS_TOKEN already in the
-# environment (an env-var reference in your shell profile).
+# The macOS Keychain, else libsecret's secret-tool (Linux; ro-mysql's SECRET_TOOL_PATHS, never one
+# from PATH), else SENTRY_ACCESS_TOKEN already in the environment, which is also the fallback when a
+# store has no item.
+store_token= store_fix=
 if [ -x /usr/bin/security ]; then
-  SENTRY_ACCESS_TOKEN=$(/usr/bin/security find-generic-password -s agent-kit/mcp/sentry -a sentry -w 2>/dev/null) || {
-    echo 'Sentry MCP off: could not access the Keychain item agent-kit/mcp/sentry (missing or denied). Fix: security add-generic-password -s agent-kit/mcp/sentry -a sentry -w (in your own terminal)' >&2
-    exit 1
-  }
-elif command -v secret-tool >/dev/null 2>&1; then
-  SENTRY_ACCESS_TOKEN=$(secret-tool lookup service agent-kit/mcp/sentry account sentry 2>/dev/null) || {
-    echo 'Sentry MCP off: no secret-tool item service=agent-kit/mcp/sentry account=sentry. Fix: secret-tool store --label=sentry service agent-kit/mcp/sentry account sentry' >&2
-    exit 1
-  }
-elif [ -z "${SENTRY_ACCESS_TOKEN:-}" ]; then
-  echo 'Sentry MCP off: no Keychain or secret-tool here, and SENTRY_ACCESS_TOKEN is unset. Fix: export it in your shell profile' >&2
+  store_token=$(/usr/bin/security find-generic-password -s agent-kit/mcp/sentry -a sentry -w 2>/dev/null) ||
+    store_fix='could not access the Keychain item agent-kit/mcp/sentry (missing or denied). Fix: security add-generic-password -s agent-kit/mcp/sentry -a sentry -w (in your own terminal)'
+else
+  for secret_tool in /usr/bin/secret-tool /usr/local/bin/secret-tool; do
+    [ -x "$secret_tool" ] || continue
+    store_token=$("$secret_tool" lookup service agent-kit/mcp/sentry account sentry 2>/dev/null) ||
+      store_fix='no secret-tool item service=agent-kit/mcp/sentry account=sentry. Fix: secret-tool store --label=sentry service agent-kit/mcp/sentry account sentry'
+    break
+  done
+fi
+SENTRY_ACCESS_TOKEN=${store_token:-${SENTRY_ACCESS_TOKEN:-}}
+if [ -z "$SENTRY_ACCESS_TOKEN" ]; then
+  echo "Sentry MCP off: ${store_fix:-no Keychain or secret-tool here, and SENTRY_ACCESS_TOKEN is unset. Fix: export it in your shell profile}" >&2
   exit 1
 fi
 [ -n "$SENTRY_ACCESS_TOKEN" ] || exit 1

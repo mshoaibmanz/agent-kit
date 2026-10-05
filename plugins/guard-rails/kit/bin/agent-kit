@@ -87,7 +87,6 @@ REVIEW_LISTS = ("round1", "later", "once", "sensitive_adds")
 # Settings keys [roles.main] renders; settings.base.json may not set them.
 ROLE_SETTINGS = ("model", "effortLevel", "modelSettings")
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]*")
-PLACEHOLDER = re.compile(r"\{\{([^{}]*)\}\}")
 # Claude imports rules/AGENTS.md as is, and this filled copy of rules/hosts/claude.md.
 CLAUDE_HOST_RULES = STATE / "claude-host-rules.md"
 
@@ -181,6 +180,13 @@ class Roles:
         if not spec:
             raise SystemExit(f"agent-kit: {ROLES} has no [hosts.{host}]")
         return spec["provider"]
+
+    def host_for(self, provider: str) -> str:
+        """The first [hosts.X] in roles.toml whose provider is provider: the host whose CLI runs it."""
+        found = next((host for host, spec in self.hosts.items() if spec.get("provider") == provider), None)
+        if found is None:
+            raise SystemExit(f"agent-kit: {ROLES} has no [hosts.*] with provider {provider}")
+        return found
 
     def invoke(self, role: Role, host: str) -> str:
         """agent: the host spawns it natively; run: bin/agent-run calls the other provider's CLI."""
@@ -318,16 +324,15 @@ def role_settings(roles: Roles, host: str) -> dict[str, Any]:
     return out
 
 
-def fill(text: str, host: str, what: str, kit: str | None = None, host_root: str | None = None,
-         resume: int | None = None) -> str:
-    """text with its {{NAME}} placeholders filled for host (bin/lib/hosts.py fill): an unknown one
-    refuses the render."""
-    if not PLACEHOLDER.search(text):
+def fill_for_host(text: str, kit: str | None = None, host: str = "claude", host_root: str | None = None,
+                  what: str = "text", resume: int | None = None) -> str:
+    """hosts.fill with this kit as the default kit: an unknown placeholder refuses the render."""
+    if "{{" not in text:
         return text  # no lib needed: a synthetic kit without bin/lib renders placeholder-free text
     sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from hosts import fill as fill_text
+    from hosts import fill
 
-    return fill_text(text, kit or str(KIT), host, host_root, what, resume)
+    return fill(text, kit or str(KIT), host, host_root, what, resume)
 
 
 def render_agent_text(src: str, role: Role, name: str, host: str = "claude", **where: Any) -> str:
@@ -335,7 +340,7 @@ def render_agent_text(src: str, role: Role, name: str, host: str = "claude", **w
     frontmatter, after `tools:`. where: fill's kit, host_root and resume."""
     if not src.startswith("---\n") or "\n---\n" not in src[3:]:
         raise SystemExit(f"agent-kit: agents/{name}.md has no frontmatter")
-    src = fill(src, host, f"agents/{name}.md", **where)
+    src = fill_for_host(src, host=host, what=f"agents/{name}.md", **where)
     end = src.index("\n---\n", 3)
     fm = [ln for ln in src[4:end].split("\n") if not re.match(r"(model|effort):", ln)]
     pins = ([f"model: {role.model}"] if role.model != "inherit" else []) + [f"effort: {role.effort}"]
@@ -367,7 +372,7 @@ def expected_agents(roles: Roles, host: str, **where: Any) -> dict[str, str]:
         elif roles.invoke(role, host) == "agent":
             out[src.name] = render_agent_text(text, role, name, host, **where)
         else:
-            fill(text, host, f"agents/{name}.md", **where)
+            fill_for_host(text, host=host, what=f"agents/{name}.md", **where)
     if bad:
         raise SystemExit("agent-kit: " + "\n  ".join(bad))
     return out
@@ -803,6 +808,8 @@ def refuse_foreign_kit(dry_run: bool) -> None:
         return
     if (KIT / "rules/hosts/claude.md").exists() and not installed_kit(KIT) and "AGENT_KIT_RULES" not in os.environ:
         raise SystemExit("agent-kit: foreign Claude source requires explicit AGENT_KIT_RULES; nothing written")
+    if (KIT / ".install-state/current.json").is_file() and not dry_run:
+        claude_install_targets()
     if "AGENT_KIT_DIR" in os.environ:
         return
     if installed_kit(KIT):
@@ -813,6 +820,23 @@ def refuse_foreign_kit(dry_run: bool) -> None:
             f"agent-kit: refused: {KIT} is not the installed kit (an agent-setup root), and {', '.join(live)} unset would render it live.\n"
             f"  Set those to temp targets, or AGENT_KIT_DIR={KIT} to render this kit live on purpose."
         )
+
+
+def claude_install_targets() -> None:
+    """An agent-setup install renders Claude into the root it recorded (CLAUDE_CONFIG_DIR or
+    --host-root at setup), not ~/.claude: the targets the environment leaves unset default there."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from hosts import host_root_for
+
+    root = host_root_for(KIT, "claude")
+    if root is None:
+        if any(name not in os.environ for name in (*TARGET_ENV, "AGENT_KIT_RULES")):
+            raise SystemExit("agent-kit: this kit's install has no claude target; rerun agent-setup with "
+                             "--hosts claude, or name the targets (AGENT_KIT_SETTINGS and the rest)")
+        return
+    for name, relative in (("AGENT_KIT_SETTINGS", "settings.json"), ("AGENT_KIT_MCP", "mcp.json"),
+                           ("AGENT_KIT_AGENTS", "agents"), ("AGENT_KIT_RULES", "CLAUDE.md")):
+        os.environ.setdefault(name, str(root / relative))
 
 
 def cmd_render(args: argparse.Namespace) -> int:
@@ -845,16 +869,17 @@ def cmd_render(args: argparse.Namespace) -> int:
     return rc
 
 
-def claude_host_rules(path: Path | None = None) -> str:
+def claude_host_rules(path: Path | None = None, resume: int | None = None) -> str:
     """rules/hosts/claude.md with its placeholders filled: the file CLAUDE.md imports in its place.
     rules/AGENTS.md is imported as is, so a placeholder there would reach the model literally."""
-    if PLACEHOLDER.search(read_or_empty(KIT / "rules/AGENTS.md")):
+    if "{{" in read_or_empty(KIT / "rules/AGENTS.md"):
         raise SystemExit(
             "agent-kit: rules/AGENTS.md: Claude imports it unrendered, so it may hold no {{...}} "
             "placeholder; put host-specific text in rules/hosts/<host>.md"
         )
     host_root = str(path.parent) if path else None
-    return fill((KIT / "rules/hosts/claude.md").read_text(), "claude", "rules/hosts/claude.md", host_root=host_root)
+    return fill_for_host((KIT / "rules/hosts/claude.md").read_text(), host="claude", host_root=host_root,
+                         what="rules/hosts/claude.md", resume=resume)
 
 
 def plan_claude_rules() -> tuple[Path, str, str, str]:
@@ -937,13 +962,14 @@ def agent_body(name: str, host: str) -> str:
     text = (AGENT_SRC / f"{name}.md").read_text()
     if not text.startswith("---\n") or "\n---\n" not in text[3:]:
         raise SystemExit(f"agent-kit: agents/{name}.md has no frontmatter")
-    return fill(text[text.index("\n---\n", 3) + 5 :], host, f"agents/{name}.md")
+    return fill_for_host(text[text.index("\n---\n", 3) + 5 :], host=host, what=f"agents/{name}.md")
 
 
 def cmd_agent_body(args: argparse.Namespace) -> int:
     if not ROLE_NAME.fullmatch(args.role) or not (AGENT_SRC / f"{args.role}.md").is_file():
         raise SystemExit(f"agent-kit: no agents/{args.role}.md")
-    sys.stdout.write(agent_body(args.role, args.host))
+    host = load_roles().host_for(args.provider) if args.provider else args.host
+    sys.stdout.write(agent_body(args.role, host))
     return 0
 
 
@@ -1172,6 +1198,7 @@ def main() -> int:
     b = sub.add_parser("agent-body", help="print a role's agent body with its placeholders filled")
     b.add_argument("role")
     b.add_argument("--host", default="claude")
+    b.add_argument("--provider", help="fill for the host roles.toml gives this provider (overrides --host)")
     b.set_defaults(func=cmd_agent_body)
     ro = sub.add_parser("roles", help="print roles.toml as a host sees it")
     ro.add_argument("--host", default="claude")

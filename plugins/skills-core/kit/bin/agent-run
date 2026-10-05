@@ -14,8 +14,8 @@
 #              --output-format json --tools Read,Grep,Glob,Bash --no-session-persistence
 #                                                             (CLAUDE_BIN names another claude)
 # The prompt is the role's agent body (`agent-kit agent-body`: agents/<role>.md without its
-# frontmatter, placeholders filled for the provider's host, codex for openai and claude for
-# anthropic: the same text the host's own agent of that role reads), then the correctness rubric
+# frontmatter, placeholders filled for the host roles.toml gives the provider: the same text the
+# host's own agent of that role reads), then the correctness rubric
 # (skills/review-rubric/references/correctness.md), then the scope: the whole PR as `git diff --stat`
 # plus its file list, and the delta since --since when given. No diff text: the reviewer inspects it
 # with the git commands the scope names. The answer follows skills/review-rubric/
@@ -164,9 +164,8 @@ prompt=$stem.prompt.md log=$stem.log sout=$stem.stdout raw=$stem.raw.json md=$st
 
 # agent-kit refuses an unknown placeholder, which stops the run here rather than handing the model
 # a literal one.
-case $provider in openai) bhost=codex ;; *) bhost=claude ;; esac
-btext=$(AGENT_KIT_DIR=$KIT "$KIT/bin/agent-kit" agent-body "$role" --host "$bhost") ||
-  die "cannot render agents/$role.md for $bhost (agent-kit agent-body)" 1
+btext=$(AGENT_KIT_DIR=$KIT "$KIT/bin/agent-kit" agent-body "$role" --provider "$provider") ||
+  die "cannot render agents/$role.md for provider $provider (agent-kit agent-body)" 1
 {
   printf '%s\n' "$btext"
   printf '\n<correctness_rubric>\n'

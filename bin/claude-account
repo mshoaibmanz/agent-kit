@@ -25,6 +25,8 @@
 set -uo pipefail
 
 BASE="$HOME/.claude"
+# The kit this script belongs to (its bin/ parent), when the caller's environment does not name one.
+KIT_DIR=${AGENT_KIT_DIR:-$(cd -P "$(dirname "$0")/.." 2>/dev/null && pwd)}
 ROUTES="$BASE/local/accounts"
 MCP="$BASE/mcp.json"
 MARK=".claude-account"
@@ -135,7 +137,7 @@ check_project_mcp() {
       | (.value.mcpServers // {}) | keys[] | "\($a)\t\($d)\t\(.)"' "$JSON" 2>/dev/null)
 "
   done
-  printf '%s' "$rows" | awk -F'\t' -v accts="$(printf '%s ' $names)" '
+  printf '%s' "$rows" | awk -F'\t' -v accts="$(printf '%s ' $names)" -v kit="$KIT_DIR" '
     NF == 3 { has[$1 FS $2 FS $3] = 1; row[++n] = $0 }
     END {
       na = split(accts, A, " ")
@@ -158,7 +160,7 @@ check_project_mcp() {
         split(line[i], g, FS)
         printf "%s: project-scope MCP servers in %s that %s %s: %s.", g[1], g[2], who[line[i]],
           (index(who[line[i]], ",") ? "lack" : "lacks"), g[3]
-        printf " Move them to $AGENT_KIT_DIR/mcp/servers.json and run `agent-kit render --host claude`"
+        printf " Move them to %s/mcp/servers.json and run `agent-kit render --host claude`", kit
         printf " (every account), or remove them: `claude mcp"
         printf " remove -s local <name>` in that dir, as %s\n", g[1]
       }
@@ -252,7 +254,7 @@ sync_mcp() {
   # A server the CLI stores in another form than mcp.json's would be re-added on every launch.
   left=$(mcp_ops "$JSON" 2>/dev/null) && [ -n "$left" ] \
     && echo "claude-account: $name still differs from mcp.json after the sync:" $left \
-      "- write those servers in $AGENT_KIT_DIR/mcp/servers.json as \`claude mcp get <name>\` prints them" >&2
+      "- write those servers in $KIT_DIR/mcp/servers.json as \`claude mcp get <name>\` prints them" >&2
   return 0
 }
 

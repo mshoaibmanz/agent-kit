@@ -70,7 +70,7 @@ SECRET_TOOL_PATHS = ("/usr/bin/secret-tool", "/usr/local/bin/secret-tool")
 
 def secret_store() -> str:
     """Where passwords live: the macOS Keychain, libsecret's secret-tool on Linux, else environment
-    variables RO_MYSQL_PASSWORD_<ACCOUNT> (account upper-cased, non-alphanumerics as _)."""
+    variables (env_name). A store without the item also falls back to the variable."""
     if os.path.exists(SECURITY):
         return "keychain"
     if any(os.path.exists(path) for path in SECRET_TOOL_PATHS):
@@ -83,7 +83,10 @@ def secret_tool() -> str:
 
 
 def env_name(account: str) -> str:
-    return "RO_MYSQL_PASSWORD_" + re.sub(r"[^A-Za-z0-9]", "_", account).upper()
+    """RO_MYSQL_PASSWORD_ plus the account with letters and digits kept and every other byte as _XX
+    (hex): one name per account, so prod-a and prod_a tunnels never share a password."""
+    return "RO_MYSQL_PASSWORD_" + "".join(
+        chr(byte) if chr(byte).isascii() and chr(byte).isalnum() else f"_{byte:02X}" for byte in account.encode())
 LSOF_FAILED = "an unknown process (lsof failed)"
 
 # A leading SELECT/WITH/EXPLAIN does not make a statement a read: MySQL 8 permits
@@ -432,9 +435,14 @@ def multi_port_aliases(tunnels: list[Tunnel]) -> set[str]:
 
 
 def keychain_get(account: str) -> str | None:
+    """The account's password from the store, else from its environment variable."""
+    return store_get(account) or os.environ.get(env_name(account)) or None
+
+
+def store_get(account: str) -> str | None:
     store = secret_store()
     if store == "env":
-        return os.environ.get(env_name(account)) or None
+        return None
     if store == "secret-tool":
         command = [secret_tool(), "lookup", "service", KEYCHAIN_SERVICE, "account", account]
         try:
@@ -648,7 +656,12 @@ def fixed_client() -> str:
     for path in CLIENT_CANDIDATES:
         if os.access(path, os.X_OK):
             return path
-    hint = "brew install mysql-client" if sys.platform == "darwin" else "sudo apt-get install default-mysql-client (or dnf install mysql)"
+    hint_script = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks/lib/install-hint")
+    try:
+        hint = subprocess.run(["sh", hint_script, "mysql"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        hint = ""
+    hint = hint or "install the mysql client with your package manager"
     die(f"no mysql client at {' or '.join(CLIENT_CANDIDATES)}: {hint}")
 
 

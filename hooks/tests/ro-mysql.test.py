@@ -326,6 +326,14 @@ def security_env_ignored() -> bool:
     return got == "pw" and not logged(EVIL_LOG)
 
 
+def store_miss_falls_back_to_env() -> bool:
+    fresh_logs()
+    with open(KEYCHAIN, "w") as f:
+        json.dump({}, f)
+    with environ(**{m.env_name("reader-a"): "from-env"}):
+        return m.keychain_get("reader-a") == "from-env"
+
+
 def refresh_uses_the_query_chain() -> bool:
     tunnels = m.load_tunnels(SSH_CONFIG)
     app = next(t for t in tunnels if t.name == "app")
@@ -624,6 +632,10 @@ checks: dict[str, Callable[[], bool]] = {
     ),
     "...and so does a login-path call, whose user can write": lambda: client_is_fixed({}),
     "RO_MYSQL_SECURITY no longer swaps the Keychain binary": security_env_ignored,
+    "a store without the item falls back to the account's environment variable": store_miss_falls_back_to_env,
+    "two tunnel aliases that differ only in punctuation get two environment names": lambda: len(
+        {m.env_name("reader@db-tunnel-prod-a"), m.env_name("reader@db-tunnel-prod_a"), m.env_name("Reader@db-tunnel-prod-a")}
+    ) == 3,
     "--login-path of another user than the tunnel's annotated one is refused": lambda: refused(
         lambda: plan(["--tunnel=prod", "--login-path=app-ro", *Q], keychain={"reader-b@db-tunnel-prod": "x"})
     ),

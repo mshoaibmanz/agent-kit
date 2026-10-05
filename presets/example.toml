@@ -2,13 +2,16 @@
 #   agent-setup --preset gh:example-org/agent-kit-preset --apply
 # Keep the real preset in a private repository of your organization (agent-setup fetches
 # agent-kit-preset.toml from it with each user's own gh login), never in the public kit.
-# Your own answers (flags, an earlier install, the guided prompts) win over every value here.
-# Secrets never go here: setup refuses anything that looks like a token, password or key.
+# Your own answers (flags, an earlier install's choices, the guided prompts) and your own
+# local/kit.env win over every value here; a changed preset applies on the next run.
+# Secrets never go here: setup refuses token formats (ghp_, sk-, xox*-, AKIA and the like) and
+# credentials in URLs.
 
+# [kit]: overlay keys, the names and meanings in hooks/lib/README. They land in local/preset.env.
 [kit]
-GITHUB_OWNER = "example-org"                      # code-search's default org; setup checks gh can read it
-CODE_DIRS = ["~/Code"]                            # parent folders of local clones
-ZOEKT_URL = "https://zoekt.example.com"           # optional Zoekt backend, used when gh cannot read a repo
+CODE_SEARCH_GH_OWNER = "example-org"              # code-search's default org; setup checks you are a member
+CODE_DIRS_JSON = ["~/Code"]                       # parent folders of local clones
+CODE_SEARCH_ZOEKT_URL = "https://zoekt.example.com"  # optional Zoekt backend, used when gh cannot read a repo
 REVIEW_BASE = "main"                              # the branch review rounds diff against
 RELEASE_BRANCH_RE = "^release/"                   # branches the push gate treats as releases
 BQRO_PROJECT = "example-project"                  # bqro's jobs project

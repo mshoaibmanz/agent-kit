@@ -56,7 +56,8 @@ def kit_env(path: str | None = None) -> dict[str, str]:
         if not user_layer.is_file():
             config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
             user_layer = Path(config) / "local/kit.env"
-        paths = [str(user_layer), path]
+        # A team preset's values sit under the user's own kit.env, which sits under setup's answers.
+        paths = [str(Path(path).with_name("preset.env")), str(user_layer), path]
     # split("\n"), not splitlines(): that also breaks on \x0b, \x85 and others, which bash's read does not.
     for overlay in paths:
         try:

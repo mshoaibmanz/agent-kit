@@ -78,7 +78,7 @@ kit_env() {
   case "$f" in */setup-paths.env)
     user_layer=${f%/*}/kit.env
     [ -f "$user_layer" ] || user_layer=$base/local/kit.env
-    overlays=("$user_layer" "$f") ;;
+    overlays=("${f%/*}/preset.env" "$user_layer" "$f") ;;
   esac
   for k in $KIT_KEYS; do unset "$k"; printf -v "$k" '%s' ''; done
   for overlay in "${overlays[@]}"; do

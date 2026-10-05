@@ -17,6 +17,8 @@ cmd-tokens   awk: the words of a command in command position, one per line; defi
 strip-heredocs  awk: a command with heredoc bodies removed, unless the body is fed to a shell
 
 Overlay: $KIT_ENV, else ${CLAUDE_CONFIG_DIR:-~/.claude}/local/kit.env (KIT_ENV=/dev/null = none).
+An agent-setup install's local/setup-paths.env is read over its layers, later ones winning: the
+team preset's preset.env beside it, then the user's kit.env, then setup-paths.env itself.
 KEY=value lines (a trailing CR dropped), value literal, optionally quoted; parsed, never sourced.
 Only the keys below are read, and the file's value wins: a key it lacks is empty, never taken from
 the environment, and turns its check off, so a hook without an overlay is inert; the prod-data

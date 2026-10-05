@@ -1,4 +1,4 @@
-"""The installer UX matrix: each case runs agent-setup in a fake home whose PATH is a folder of real
+"""The installer UX cases: each one runs agent-setup in a fake home whose PATH is a folder of real
 symlinks (or the fixture host CLIs setup_test uses), then checks the summary line, the exit code and
 that nothing was written outside the fake home. No provider login, network or credential is used."""
 
@@ -71,7 +71,7 @@ class InstallerUxTests(unittest.TestCase):
         self.assertIn('hosts: none detected or selected', result.stdout)
         self.assertIn('https://docs.anthropic.com/en/docs/claude-code', result.stdout)
         self.assertIn('Installed', result.stdout)
-        self.assertFalse((self.home / '.claude').exists(), 'matrix 1: wrote a host config for a host that is not installed')
+        self.assertFalse((self.home / '.claude').exists(), 'wrote a host config for a host that is not installed')
         self.assertTrue((self.root / 'rules/AGENTS.md').is_file())
 
     def test_one_detected_host_is_the_default(self) -> None:
@@ -86,7 +86,7 @@ class InstallerUxTests(unittest.TestCase):
         result = self.setup('--components', 'rules', '--apply')
         self.assertIn('Needs attention:\n  claude: claude, not signed in', result.stdout)
         doctor = json.loads(self.setup('doctor').stdout)
-        self.assertFalse(doctor['native_auth']['claude']['logged_in'], 'matrix 3: doctor checked only the config dir')
+        self.assertFalse(doctor['native_auth']['claude']['logged_in'], 'doctor checked only the config dir')
         (self.home / '.claude.json').write_text(json.dumps({'oauthAccount': {'emailAddress': 'user@example.com'}}))
         self.assertIn('claude: claude, signed in', self.setup('--components', 'rules').stdout)
         self.assertTrue(json.loads(self.setup('doctor').stdout)['native_auth']['claude']['logged_in'])
@@ -94,9 +94,9 @@ class InstallerUxTests(unittest.TestCase):
     def test_missing_jq_blocks_apply_up_front_with_this_os_fix(self) -> None:
         self.host_cli('claude')
         result = self.setup('--components', 'hooks')
-        hint = 'brew install jq' if sys.platform == 'darwin' else 'install'
-        self.assertIn('jq missing, required for hooks (blocks apply). Fix: ', result.stdout)
-        self.assertIn(hint, result.stdout.split('jq missing')[1].splitlines()[0])
+        hint = subprocess.run(['sh', str(SOURCE / 'hooks/lib/install-hint'), 'jq'], capture_output=True, text=True,
+                              env={'PATH': str(self.shim)}, check=True).stdout.strip()
+        self.assertIn(f'jq missing, required for hooks (blocks apply). Fix: {hint}\n', result.stdout)
         self.setup('--components', 'hooks', '--apply', code=2)
         self.assertFalse(self.root.exists())
 
@@ -104,14 +104,28 @@ class InstallerUxTests(unittest.TestCase):
         self.link('jq')
         catalog = self.home / 'catalog.json'
         catalog.write_text(json.dumps({'mcpServers': {'docs': {'command': 'npx', 'args': ['-y', 'example-docs-server']}}}))
+        (self.shim / 'secret-tool').write_text('#!/bin/sh\nexit 0\n')
+        (self.shim / 'secret-tool').chmod(0o755)
         result = self.setup('--components', 'skills', 'mcp', 'data-wrappers', '--skills', 'code-search',
                             '--mcp-catalog', str(catalog), '--hosts', 'claude', '--apply')
         skipped = result.stdout.split('Skipped:')[1]
         for line in ('GitHub code search off: gh missing', 'MCP server docs off: npx missing',
                      'BigQuery read wrapper off: bq missing', 'BigQuery read wrapper login off: gcloud missing'):
             self.assertIn(line, skipped)
-        store = 'macOS Keychain' if Path('/usr/bin/security').exists() else 'secret-tool' if shutil.which('secret-tool') else 'env vars'
-        self.assertIn(store, result.stdout, 'matrix 4f: the summary says where wrappers read credentials')
+        registered = self.home / '.claude/mcp.json'
+        self.assertFalse(registered.exists() and json.loads(registered.read_text()).get('mcpServers'),
+                         'a server whose runtime is missing is not registered')
+        self.assertIn('credentials: ', result.stdout)
+        if sys.platform == 'darwin':
+            self.assertIn('wrappers read the macOS Keychain', result.stdout)
+        elif not any(Path(path).exists() for path in ('/usr/bin/secret-tool', '/usr/local/bin/secret-tool')):
+            self.assertIn('wrappers read env vars', result.stdout, 'a secret-tool on PATH alone is not a store')
+        (self.shim / 'npx').write_text('#!/bin/sh\nexit 0\n')
+        (self.shim / 'npx').chmod(0o755)
+        self.setup('--components', 'skills', 'mcp', 'data-wrappers', '--skills', 'code-search',
+                   '--mcp-catalog', str(catalog), '--hosts', 'claude', '--apply')
+        self.assertIn('docs', json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers'],
+                      'a rerun once the runtime is installed registers it')
 
     def test_empty_mcp_catalog_is_named_not_silent(self) -> None:
         result = self.setup('--components', 'mcp', '--hosts', 'claude')
@@ -122,7 +136,7 @@ class InstallerUxTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(SOURCE / 'skills/code-search/scripts/code_search.py'), 'repos', 'x'],
                                 capture_output=True, text=True, env=environment, timeout=30)
         self.assertNotEqual(result.returncode, 0)
-        self.assertNotIn('Traceback', result.stderr, 'matrix 4a')
+        self.assertNotIn('Traceback', result.stderr)
         self.assertIn('gh is not installed: GitHub search is off', result.stderr)
 
     def test_collision_is_found_in_preflight_and_skip_leaves_it(self) -> None:
@@ -132,7 +146,7 @@ class InstallerUxTests(unittest.TestCase):
         mine.parent.mkdir(parents=True)
         mine.write_text('my own engineer\n')
         result = self.setup('--components', 'roles')
-        self.assertIn(f'{mine} holds your own content (blocks apply)', result.stdout, 'matrix 6b: found in preflight')
+        self.assertIn(f'{mine} holds your own content (blocks apply)', result.stdout, 'found in preflight')
         self.setup('--components', 'roles', '--apply', code=2)
         self.assertFalse(self.root.exists())
         result = self.setup('--components', 'roles', '--collision', 'skip', '--apply')
@@ -142,23 +156,23 @@ class InstallerUxTests(unittest.TestCase):
 
     def test_local_preset_fills_answers_and_is_recorded(self) -> None:
         preset = self.home / 'team preset.toml'
-        preset.write_text('[kit]\nGITHUB_OWNER = "example-org"\nZOEKT_URL = "https://zoekt.example.com"\n'
+        preset.write_text('[kit]\nCODE_SEARCH_GH_OWNER = "example-org"\nCODE_SEARCH_ZOEKT_URL = "https://zoekt.example.com"\n'
                           'BQRO_PROJECT = "example-project"\nREVIEW_BASE = "main"\n\n'
                           '[mcp.servers.docs]\nurl = "https://mcp.example.com/mcp"\n\n[skills]\ninclude = ["conventions"]\n')
         result = self.setup('--preset', str(preset), '--components', 'rules', 'skills', 'mcp', '--hosts', 'claude', '--apply')
         self.assertIn(f'preset {preset} (sha256 ', result.stdout)
         self.assertIn('GitHub org check for example-org: gh is missing', result.stdout)
-        overlay = (self.root / 'local/setup-paths.env').read_text()
+        layer = (self.root / 'local/preset.env').read_text()
         for line in ('CODE_SEARCH_GH_OWNER=example-org', 'CODE_SEARCH_ZOEKT_URL=https://zoekt.example.com',
                      'BQRO_PROJECT=example-project', 'REVIEW_BASE=main'):
-            self.assertIn(line, overlay.splitlines())
+            self.assertIn(line, layer.splitlines())
+        self.assertNotIn('CODE_SEARCH_GH_OWNER', (self.root / 'local/setup-paths.env').read_text())
         self.assertEqual(sorted(path.name for path in (self.home / '.claude/skills').iterdir()), ['conventions'])
         self.assertIn('docs', json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers'])
         doctor = json.loads(self.setup('doctor').stdout)
         self.assertEqual(doctor['preset']['current'], 'unchanged')
         self.setup('--components', 'rules', '--apply')
-        self.assertIn('BQRO_PROJECT=example-project', (self.root / 'local/setup-paths.env').read_text(),
-                      'an update without --preset keeps its values')
+        self.assertEqual(self.effective()['BQRO_PROJECT'], 'example-project', 'an update without --preset keeps its values')
 
     def test_preset_with_an_inline_secret_is_refused_before_any_write(self) -> None:
         preset = self.home / 'bad.toml'
@@ -198,18 +212,109 @@ class InstallerUxTests(unittest.TestCase):
         self.assertNotIn('{{', reviewer)
         self.assertIn(f'{self.root}/skills/review-rubric/references/correctness.md', reviewer)
 
-    def test_unknown_placeholder_is_refused(self) -> None:
-        sys.path.insert(0, str(SOURCE / 'bin/lib'))
-        from hosts import fill
+    def effective(self) -> dict[str, str]:
+        """The overlay as the installed hooks read it (kit_env over its layers), in the fake home."""
+        code = ('import json, sys; sys.path.insert(0, sys.argv[1]); from kit_env import kit_env; '
+                'print(json.dumps(kit_env(sys.argv[2])))')
+        result = subprocess.run([sys.executable, '-c', code, str(SOURCE / 'hooks/lib'), str(self.root / 'local/setup-paths.env')],
+                                capture_output=True, text=True, env={'HOME': str(self.home), 'PATH': str(self.shim)}, check=True)
+        return json.loads(result.stdout)
 
-        self.assertEqual(fill('{{KIT_DIR}} {{OVERLAY_DIR}}', '/kit'), '/kit /kit/local')
-        self.assertEqual(fill('{{RULES_FILE}}', '/kit', 'codex', '/codex'), '/codex/AGENTS.md')
-        with self.assertRaises(SystemExit) as raised:
-            fill('{{NO_SUCH_PATH}}', '/kit', 'claude')
-        self.assertIn('unknown placeholder {{NO_SUCH_PATH}}', str(raised.exception))
-        with self.assertRaises(SystemExit):
-            fill('{{RULES_FILE}}', '/kit')  # host-neutral text cannot name a host's file
+    def test_a_preset_applies_over_an_earlier_install_and_a_changed_one_reapplies(self) -> None:
+        self.setup('--components', 'rules', 'roles', '--hosts', 'claude', '--apply')
+        preset = self.home / 'team.toml'
+        preset.write_text('[kit]\nCODE_SEARCH_GH_OWNER = "a-org"\nCODE_DIRS_JSON = ["~/Code"]\n\n'
+                          '[roles.cross-reviewer]\neffort = "high"\n')
+        self.setup('--preset', str(preset), '--components', 'rules', 'roles', '--hosts', 'claude', '--apply')
+        values = self.effective()
+        self.assertEqual((values['CODE_SEARCH_GH_OWNER'], values['CODE_DIRS_JSON']), ('a-org', '["~/Code"]'))
+        preset.write_text('[kit]\nCODE_SEARCH_GH_OWNER = "b-org"\n\n[roles.cross-reviewer]\neffort = "xhigh"\n')
+        self.setup('--preset', str(preset), '--components', 'rules', 'roles', '--hosts', 'claude', '--apply')
+        self.assertEqual(self.effective()['CODE_SEARCH_GH_OWNER'], 'b-org')
+        self.assertEqual(tomllib.loads((self.root / 'roles.toml').read_text())['roles']['cross-reviewer']['effort'], 'xhigh')
+        self.setup('--github-owner', 'my-org', '--components', 'rules', 'roles', '--hosts', 'claude', '--apply')
+        self.setup('--preset', str(preset), '--components', 'rules', 'roles', '--hosts', 'claude', '--apply')
+        self.assertEqual(self.effective()['CODE_SEARCH_GH_OWNER'], 'my-org', 'your own answer wins over the preset')
 
+    def test_your_kit_env_wins_over_a_preset(self) -> None:
+        (self.root / 'local').mkdir(parents=True)
+        (self.root / 'local/kit.env').write_text('REVIEW_BASE=develop\nGIT_AUTHOR=Me <me@example.com>\n')
+        preset = self.home / 'team.toml'
+        preset.write_text('[kit]\nREVIEW_BASE = "main"\nGIT_AUTHOR = "Team Bot <bot@example.com>"\nBQRO_PROJECT = "team-project"\n')
+        self.setup('--preset', str(preset), '--components', 'rules', '--apply')
+        values = self.effective()
+        self.assertEqual((values['REVIEW_BASE'], values['GIT_AUTHOR'], values['BQRO_PROJECT']),
+                         ('develop', 'Me <me@example.com>', 'team-project'))
+
+    def test_a_preset_root_with_a_tilde_does_not_stop_owner_detection(self) -> None:
+        (self.home / 'Code/repo/.git').mkdir(parents=True)
+        (self.home / 'Code/repo/.git/config').write_text('[remote "origin"]\n\turl = git@github.com:example-org/repo.git\n')
+        preset = self.home / 'team.toml'
+        preset.write_text('[kit]\nCODE_DIRS_JSON = ["~/Code", "~/missing"]\n')
+        result = self.setup('--preset', str(preset), '--components', 'rules')
+        self.assertIn('GitHub owner example-org (from origin remotes)', result.stdout)
+
+    def test_preset_secret_check_matches_token_formats_not_words(self) -> None:
+        preset = self.home / 'team.toml'
+        for text in ('[kit]\nBQRO_PROJECT = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"\n',
+                     '[kit]\nREVIEW_BASE = "sk-ant-api03-abcdefghijklmnop"\n',
+                     '[mcp.servers.x]\nurl = "https://mcp.example.com/mcp/ghp_abcdefghijklmnopqrstuvwxyz0123456789"\n',
+                     '[mcp.servers.x]\ncommand = "npx"\nargs = ["-y", "server", "--pat", "github_pat_11ABCDEFG"]\n',
+                     '[kit]\nSUBAGENT_RESUME_MAX = "abc"\n'):
+            preset.write_text(text)
+            self.setup('--preset', str(preset), '--components', 'rules', code=2)
+        for text in ('[kit]\nCODE_DIRS_JSON = ["~/src/auth-tokens"]\n', '[kit]\nGIT_AUTHOR = "Secretariat Bot <bot@example.com>"\n'):
+            preset.write_text(text)
+            self.setup('--preset', str(preset), '--components', 'rules')
+
+    def test_interactive_yes_takes_every_default_and_applies_without_a_terminal(self) -> None:
+        self.setup('--interactive', '--yes', '--components', 'rules')
+        self.assertTrue((self.root / '.install-state/current.json').is_file())
+
+    def test_an_existing_server_of_the_same_name_is_a_collision_in_the_summary(self) -> None:
+        self.host_cli('claude')
+        (self.home / '.claude').mkdir()
+        (self.home / '.claude/mcp.json').write_text(json.dumps({'mcpServers': {'docs': {'command': 'mine'}}}))
+        catalog = self.home / 'catalog.json'
+        catalog.write_text(json.dumps({'mcpServers': {'docs': {'url': 'https://mcp.example.com/mcp'}}}))
+        flags = ('--hosts', 'claude', '--components', 'mcp', '--mcp-catalog', str(catalog))
+        result = self.setup(*flags)
+        self.assertIn(f'{self.home / ".claude/mcp.json"} holds your own content (blocks apply)', result.stdout)
+        self.assertIn('apply blocked: ', self.setup(*flags, '--apply', code=2).stderr)
+        self.setup(*flags, '--collision', 'skip', '--apply')
+        self.assertEqual(json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers'], {'docs': {'command': 'mine'}})
+        self.setup(*flags, '--collision', 'backup', '--apply')
+        self.assertEqual(json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers']['docs']['type'], 'http')
+
+    def test_a_host_installed_after_a_no_host_install_is_set_up_on_rerun(self) -> None:
+        self.setup('--components', 'rules', '--apply')
+        self.host_cli('claude')
+        self.setup('--apply')
+        self.assertTrue((self.home / '.claude/CLAUDE.md').is_file())
+
+    def test_hosts_are_detected_by_each_cli_name_their_installers_use(self) -> None:
+        self.host_cli('cursor-agent')
+        self.assertEqual(json.loads(self.setup('--json').stdout)['hosts'], ['cursor'])
+
+    def test_installed_kit_renders_codex_into_the_recorded_root(self) -> None:
+        self.host_cli('codex')
+        custom = self.home / 'custom-codex'
+        self.setup('--hosts', 'codex', '--host-root', str(custom), '--components', 'rules', '--apply')
+        (custom / 'AGENTS.md').unlink()
+        environment = {'HOME': str(self.home), 'PATH': str(self.shim), 'TMPDIR': str(self.tmp)}
+        render = [sys.executable, str(self.root / 'bin/agent-kit'), 'render', '--host']
+        subprocess.run([*render, 'codex', '--components', 'rules'], capture_output=True, text=True, env=environment, check=True)
+        self.assertTrue((custom / 'AGENTS.md').is_file())
+        self.assertFalse((self.home / '.codex').exists(), 'rendered into the default root instead')
+        refused = subprocess.run([*render, 'cursor', '--components', 'rules'], capture_output=True, text=True, env=environment)
+        self.assertIn('has no cursor target', refused.stderr)
+
+    def test_agent_body_names_the_rules_file_under_codex_home(self) -> None:
+        environment = {'HOME': str(self.home), 'PATH': str(self.shim), 'CODEX_HOME': str(self.home / 'cx'),
+                       'AGENT_KIT_DIR': str(SOURCE), 'KIT_ENV': '/dev/null'}
+        result = subprocess.run([sys.executable, str(SOURCE / 'bin/agent-kit'), 'agent-body', 'engineer', '--provider', 'openai'],
+                                capture_output=True, text=True, env=environment, check=True)
+        self.assertIn(f'{self.home}/cx/AGENTS.md', result.stdout)
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(InstallerUxTests)

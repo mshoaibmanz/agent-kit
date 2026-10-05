@@ -1,7 +1,6 @@
 #!/bin/sh
-# install-hint <tool>: one line, the command that installs <tool> on this OS. The one source of
-# install advice: agent-setup's summary, hook-io's missing-jq refusal and the code-search helper all
-# print what this prints. POSIX sh and no jq, since it runs when jq is the thing missing.
+# install-hint <tool>: one line, the command that installs <tool> on this OS, the kit's one source of
+# install advice. POSIX sh and no jq, since it runs when jq is the thing missing.
 tool=${1:-}
 [ -n "$tool" ] || { echo "usage: install-hint <tool>" >&2; exit 2; }
 os=$(uname -s 2>/dev/null)
@@ -19,8 +18,6 @@ fi
 # Package names that differ from the command, per manager family.
 case $tool:$pm in
   rg:*) pkg=ripgrep ;;
-  python3:"brew install") pkg=python@3.12 ;;
-  python3:*) pkg=python3 ;;
   npx:"brew install" | node:"brew install") pkg=node ;;
   npx:* | node:*) pkg="nodejs npm" ;;
   mysql:"brew install") pkg=mysql-client ;;
@@ -34,6 +31,11 @@ case $tool in
   claude) echo "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code)"; exit 0 ;;
   codex) echo "npm install -g @openai/codex  (https://developers.openai.com/codex/cli)"; exit 0 ;;
   cursor | cursor-agent) echo "download Cursor from https://cursor.com/downloads"; exit 0 ;;
+  python3)
+    # A distribution's python3 can be older than the 3.11 the kit needs (Ubuntu 22.04, Debian 11).
+    if [ "$os" = Darwin ]; then echo "brew install python@3.12"
+    else echo "uv python install 3.12  (uv: curl -LsSf https://astral.sh/uv/install.sh | sh; your distribution's python3 may be older than 3.11)"; fi
+    exit 0 ;;
   uv | uvx) [ "$os" = Darwin ] && echo "brew install uv" || echo "curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 0 ;;
   gcloud | bq)
     if [ "$os" = Darwin ]; then echo "brew install --cask google-cloud-sdk"

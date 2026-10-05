@@ -6,8 +6,17 @@ from __future__ import annotations
 import sys
 
 if sys.version_info < (3, 11):
+    import os.path
+    import subprocess
+
+    try:
+        _FIX = subprocess.run(['sh', os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'hooks',
+                                                  'lib', 'install-hint'), 'python3'],
+                              capture_output=True, universal_newlines=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        _FIX = ''
     sys.exit(f'agent-setup: needs Python 3.11 or newer (this is {sys.version.split()[0]}). '
-             'Fix: brew install python@3.12 (macOS) or sudo apt-get install python3 (Linux), then rerun with it.')
+             f'Fix: {_FIX or "install Python 3.11 or newer"}, then rerun with it.')
 
 import argparse
 from dataclasses import dataclass
@@ -25,7 +34,6 @@ import tempfile
 import time
 import tomllib
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
 
 
 sys.dont_write_bytecode = True
@@ -44,18 +52,22 @@ ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'secon
                 'reviewer': 'task-reviewer', 'thermo-bugs': 'bug-reviewer',
                 'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
-from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, fill, install_text, keep_host_tables,  # noqa: E402
-                   normalize_transport, resume_max, without_table)
+from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root, install_text,  # noqa: E402
+                   keep_host_tables, resume_max, strip_legacy_sandbox)
 from kit_env import kit_env  # noqa: E402
+from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
+                       detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
+                       server_runtime)
+from preset import Preset, apply_preset, validate_catalog  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
 MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
-HOST_LINKS = {'claude': 'https://docs.anthropic.com/en/docs/claude-code', 'codex': 'https://developers.openai.com/codex/cli',
-              'cursor': 'https://cursor.com/downloads'}
-REPO_PARENTS = ('Code', 'src', 'dev', 'projects')
-# Preset [kit] keys: the ones setup answers itself, and the overlay keys it writes as they are.
-PRESET_ANSWERS = {'GITHUB_OWNER': 'github_owner', 'CODE_DIRS': 'repo_roots', 'ZOEKT_URL': 'zoekt_url'}
-PRESET_OVERLAY = ('REVIEW_BASE', 'RELEASE_BRANCH_RE', 'BQRO_PROJECT', 'GIT_AUTHOR', 'SUBAGENT_RESUME_MAX')
-INLINE_SECRET = re.compile(r'token|password|passwd|secret|api[-_]?key|bearer|authorization|://[^/\s]+@', re.I)
+# The answers a run saves and the next one starts from, with their defaults before detection. A
+# saved value beats a preset only when the user chose it (configuration "answered").
+DEFAULTS: dict[str, Any] = {
+    'hosts': [], 'components': ['rules', 'skills'], 'skills': None, 'repo_roots': [], 'github_owner': '',
+    'zoekt_url': '', 'work_root': str(Path.home() / 'agent-work'), 'claude_bin': 'claude', 'codex_bin': 'codex',
+    'cursor_bin': 'cursor', 'codex_gcloud': 'off', 'blocking_hooks': False, 'mcp_catalog': None}
+SAVED_KEYS = (*DEFAULTS, 'role_model', 'role_effort', 'host_root', 'project_root')
 
 
 def digest(data: bytes) -> str:
@@ -92,36 +104,7 @@ def safe_catalog(path: Path, extra: dict[str, Any] | None = None) -> dict[str, A
     catalog = json.loads(path.read_text())
     if isinstance(catalog, dict) and isinstance(catalog.get('mcpServers', {}), dict) and extra:
         catalog = {**catalog, 'mcpServers': {**extra, **catalog.get('mcpServers', {})}}
-    return safe_servers(catalog)
-
-
-def safe_servers(catalog: Any) -> dict[str, Any]:
-    if not isinstance(catalog, dict) or not isinstance(catalog.get('mcpServers', {}), dict):
-        raise ValueError('MCP catalog must map server names to objects')
-    servers = {}
-    for name, spec in catalog.get('mcpServers', {}).items():
-        if not re.fullmatch(r'[a-zA-Z0-9_-]+', name) or not isinstance(spec, dict):
-            raise ValueError('MCP catalog has an invalid server descriptor')
-        if set(spec) - {'command', 'args', 'url', 'type', 'description'}:
-            raise ValueError(f'MCP {name}: use native OAuth or a runtime wrapper, not inline secrets')
-        normalized = normalize_transport(spec)
-        query_names = {re.sub(r'[-_]', '', key).casefold()
-                       for key, _ in parse_qsl(urlsplit(normalized.get('url', '')).query)}
-        credential_query = query_names & {'apikey', 'key', 'accesskey', 'authkey', 'accesstoken',
-                                          'authtoken', 'token', 'password', 'secret', 'authorization'}
-        arguments = normalized.get('args', [])
-        credential_argument = isinstance(arguments, list) and any(
-            isinstance(argument, str) and re.match(r'^--(?:key|apikey|api[-_]key)(?:=|$)', argument, re.I)
-            for argument in arguments)
-        if credential_query or credential_argument or re.search(
-                r'(?:token|password|secret|api[-_]key|authorization|bearer|://[^/]+@)',
-                json.dumps(normalized), re.I):
-            raise ValueError(f'MCP {name}: common inline credential patterns are refused; use a runtime wrapper')
-        if 'args' in normalized and ('command' not in normalized or not isinstance(normalized['args'], list)
-                                    or not all(isinstance(value, str) for value in normalized['args'])):
-            raise ValueError('MCP args must be strings on a command transport')
-        servers[name] = normalized
-    return {'mcpServers': servers}
+    return validate_catalog(catalog)
 
 
 def toml_text(data: dict[str, Any]) -> str:
@@ -202,11 +185,10 @@ def host_target(args: argparse.Namespace, host: str, home: Path) -> Path:
         if len(args.hosts) != 1:
             raise ValueError('--host-root requires exactly one host')
         return Path(args.host_root).expanduser().absolute()
-    scoped = getattr(args, 'host_roots', {}).get(host)
+    scoped = args.host_roots.get(host)
     if scoped:
         return Path(scoped).expanduser().absolute()
-    variable = {'claude': 'CLAUDE_CONFIG_DIR', 'codex': 'CODEX_HOME'}.get(host)
-    return Path(os.environ[variable]).expanduser().absolute() if variable and os.environ.get(variable) else home / ('.' + host)
+    return default_host_root(host)
 
 
 def resolve_values(value: Any, view: Path, root: Path, host_view: Path, target: Path) -> Any:
@@ -269,32 +251,37 @@ def skill_hosts(skill_md: Path) -> set[str]:
     return set(HOSTS)
 
 
-def overlay_text(args: argparse.Namespace) -> str:
-    """local/setup-paths.env: the setup's own overlay keys."""
+def overlay_text(args: argparse.Namespace, from_preset: set[str]) -> str:
+    """local/setup-paths.env: setup's own answers, the top overlay layer. An answer the preset
+    supplied stays in the preset's layer (local/preset.env, under the user's kit.env), not here."""
     if any('\n' in value or '\r' in value for value in [*args.repo_roots, args.work_root]):
         raise ValueError('Repository and work roots must fit on one line')
-    overlay = 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
+    overlay = '' if 'repo_roots' in from_preset else 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
     if args.work_root:
         overlay += 'AGENT_WORK_ROOT=' + args.work_root + '\n'
-    if args.github_owner:
+    if args.github_owner and 'github_owner' not in from_preset:
         overlay += 'CODE_SEARCH_GH_OWNER=' + args.github_owner + '\n'
-    if args.zoekt_url:
+    if args.zoekt_url and 'zoekt_url' not in from_preset:
         overlay += 'CODE_SEARCH_ZOEKT_URL=' + args.zoekt_url + '\n'
     # Written either way: this layer sits over kit.env, so the saved choice is the one the sandbox gets.
     overlay += 'CODEX_SANDBOX_GCLOUD=' + ('1' if args.codex_gcloud == 'on' else '0') + '\n'
-    # A preset's team defaults; kit.env, read under this layer, cannot override them, so only these.
-    for key, value in getattr(args, 'kit_values', {}).items():
-        overlay += key + '=' + value + '\n'
     return overlay
 
 
-def setup_resume(args: argparse.Namespace) -> int:
-    """SUBAGENT_RESUME_MAX for this install: the preset's, else the user's kit.env, else the default."""
-    root = Path(args.root_dir).expanduser().absolute()
-    raw = getattr(args, 'kit_values', {}).get('SUBAGENT_RESUME_MAX')
-    if raw is None and (root / 'local/kit.env').is_file():
-        raw = kit_env(str(root / 'local/kit.env'))['SUBAGENT_RESUME_MAX']
-    return resume_max(raw or '')
+def stage_overlays(root: Path, overlays: dict[str, str], folder: Path) -> Path:
+    """The overlay layers this install writes, staged in folder beside the user's kit.env as
+    installed: the KIT_ENV the installed hooks will read."""
+    for name, text in overlays.items():
+        (folder / name).write_text(text)
+    if (root / 'local/kit.env').is_file():
+        shutil.copyfile(root / 'local/kit.env', folder / 'kit.env')
+    return folder / 'setup-paths.env'
+
+
+def setup_resume(root: Path, overlays: dict[str, str]) -> int:
+    """SUBAGENT_RESUME_MAX as the installed hooks and agent-kit will read it."""
+    with tempfile.TemporaryDirectory(prefix='agent-kit-overlay-') as folder:
+        return resume_max(kit_env(str(stage_overlays(root, overlays, Path(folder))))['SUBAGENT_RESUME_MAX'])
 
 
 def installed_work_root(root: Path) -> Path:
@@ -327,7 +314,8 @@ def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view:
     return {}
 
 
-def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) -> list[Change]:
+def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, overlays: dict[str, str],
+                 resume: int) -> list[Change]:
     root = Path(args.root_dir).expanduser().absolute()
     target = host_target(args, host, home)
     components = set(args.components)
@@ -338,18 +326,15 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
         api = kit_api(view)
         if 'rules' in components:
             # rules/AGENTS.md is imported as is; the host rules through their filled copy.
-            if '{{' in (view / 'rules/AGENTS.md').read_text():
-                raise ValueError('rules/AGENTS.md is imported unrendered, so it may hold no {{...}} placeholder')
-            host_rules = root / 'state/rendered/claude-host-rules.md'
-            filled = fill((view / 'rules/hosts/claude.md').read_text(), str(root), 'claude', str(target),
-                          'rules/hosts/claude.md', setup_resume(args))
+            host_rules = root / api.CLAUDE_HOST_RULES.relative_to(view)
+            filled = api.claude_host_rules(target / 'CLAUDE.md', resume).replace(str(view), str(root))
             changes.append(Change('file', host_rules, filled.encode()))
             text = '@' + str(root / 'rules/AGENTS.md') + '\n@' + str(host_rules) + '\n'
             changes.append(Change('text', target / 'CLAUDE.md', text))
         if 'roles' in components:
             roles = api.load_roles()
             for name, text in api.expected_agents(roles, 'claude', kit=str(root), host_root=str(target),
-                                                  resume=setup_resume(args)).items():
+                                                  resume=resume).items():
                 changes.append(Change('file', target / 'agents' / name, text.encode()))
             for provider in HOSTS:
                 changes.append(Change('file', root / 'state/rendered' / ('roles-' + provider + '.sh'),
@@ -377,15 +362,11 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
         selected = [name for name in ('hooks', 'rules', 'roles', 'mcp') if name in components]
         if selected:
             with tempfile.TemporaryDirectory(prefix='agent-kit-host-view-') as folder, \
-                    tempfile.TemporaryDirectory(prefix='agent-kit-overlay-') as overlays:
+                    tempfile.TemporaryDirectory(prefix='agent-kit-overlay-') as staged:
                 host_view = Path(folder)
                 seeded = seed_host_view(args, host, target, host_view)
-                # The overlay this install writes, layered over the user's kit.env as installed.
-                (Path(overlays) / 'setup-paths.env').write_text(overlay_text(args))
-                if (root / 'local/kit.env').is_file():
-                    shutil.copyfile(root / 'local/kit.env', Path(overlays) / 'kit.env')
                 env = dict(os.environ, AGENT_KIT_DIR=str(view), AGENT_KIT_HOST_ROOT=str(host_view),
-                           KIT_ENV=str(Path(overlays) / 'setup-paths.env'))
+                           KIT_ENV=str(stage_overlays(root, overlays, Path(staged))))
                 env.pop('CLAUDE_OUT_ROOT', None)
                 env['AGENT_GIT_HOOKS'] = 'on' if args.blocking_hooks else 'off'
                 result = subprocess.run([sys.executable, str(view / 'bin/agent-kit'), 'render', '--host', host,
@@ -411,17 +392,19 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
                             previous = previous[len(TOML_BEGIN):].removesuffix(TOML_END).strip()
                         # Each block from this render when its component is selected, else as installed,
                         # always in this order: a one-component update leaves the file byte-identical.
-                        # The sandbox block has its own gate (Q-12): hooks or mcp, not mcp alone.
-                        rest, blocks = previous, []
+                        # The sandbox block renders with hooks or mcp. An install from before it had its
+                        # own block kept the roots in the mcp one: they move to the sandbox block.
+                        rest, blocks, legacy = previous, [], ''
                         for component, (begin, end) in [('hooks', SHELL_MARKERS), ('mcp', MANAGED_MARKERS),
                                                         ('sandbox', (SANDBOX_BEGIN, SANDBOX_END))]:
                             rest, block = managed_block(rest, begin, end)
                             if component in components or (component == 'sandbox' and components & SANDBOX_COMPONENTS):
                                 _, block = managed_block(text, begin, end)
                             elif component == 'mcp' and 'sandbox_workspace_write' in block:
-                                # An install from before the sandbox block kept its roots in this one.
-                                inner = without_table(block[len(begin):-len(end)], 'sandbox_workspace_write')
+                                inner, legacy = strip_legacy_sandbox(block[len(begin):-len(end)])
                                 block = begin + '\n' + inner.strip() + ('\n' if inner.strip() else '') + end
+                            elif component == 'sandbox' and not block and legacy:
+                                block = begin + '\n' + legacy + '\n' + end
                             blocks.append(block)
                         combined = '\n'.join(part for part in (rest.strip(), *blocks) if part)
                         if combined.strip():
@@ -489,7 +472,11 @@ def copy_source_code(source: str | Path, destination: str | Path) -> str:
     return str(destination)
 
 
-def installation_view(args: argparse.Namespace, view: Path) -> None:
+def catalog_path(args: argparse.Namespace) -> Path:
+    return Path(args.mcp_catalog).expanduser() if args.mcp_catalog else Path(args.source).expanduser().resolve() / 'mcp/servers.json'
+
+
+def installation_view(args: argparse.Namespace, view: Path, preset: Preset, servers: dict[str, Any]) -> None:
     source = Path(args.source).expanduser().resolve()
     for name in ('bin', 'hooks', 'git-hooks', 'agents', 'commands', 'rules', 'hosts', 'skills', 'references'):
         path = source / name
@@ -504,17 +491,21 @@ def installation_view(args: argparse.Namespace, view: Path) -> None:
         copy_source_code(matrix, view / '.claude-plugin/components.json')
     registry = selected_registry(view, set(args.components), args.blocking_hooks)
     (view / 'hooks/registry.json').write_text(json.dumps(registry, indent=2) + '\n')
-    role_overrides(view / 'roles.toml', args.role_model, args.role_effort)
+    # The preset's role overrides first, so the user's own (flags, earlier answers) win.
+    role_overrides(view / 'roles.toml', [*preset.answers.get('role_model', []), *args.role_model],
+                   [*preset.answers.get('role_effort', []), *args.role_effort])
     kit_api(view).load_roles()
     if 'mcp' in args.components:
-        catalog = safe_catalog(Path(args.mcp_catalog).expanduser() if args.mcp_catalog else source / 'mcp/servers.json',
-                               getattr(args, 'preset_servers', {}))
+        # A server whose runtime is missing is left out, so no host starts a command that cannot run.
+        # Its descriptor stays in the catalog or preset: a rerun after installing the runtime adds it.
+        runnable = {name: spec for name, spec in servers.items()
+                    if not server_runtime(spec) or shutil.which(spec['command'])}
         (view / 'mcp').mkdir()
-        (view / 'mcp/servers.json').write_text(json.dumps(catalog, indent=2) + '\n')
+        (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': runnable}, indent=2) + '\n')
 
 
-def plan(args: argparse.Namespace, view: Path) -> list[Change]:
-    installation_view(args, view)
+def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str], servers: dict[str, Any]) -> list[Change]:
+    installation_view(args, view, preset, servers)
     root = Path(args.root_dir).expanduser().absolute()
     home = Path.home()
     changes = []
@@ -540,15 +531,20 @@ def plan(args: argparse.Namespace, view: Path) -> list[Change]:
             if relative.parts[0] == 'skills' and path.suffix == '.md':
                 content = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md').encode()
             changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
-    changes.append(Change('file', root / 'local/setup-paths.env', overlay_text(args).encode(), 0o600))
+    # The preset's layer is written when it has values or an earlier install wrote one.
+    overlays = {'preset.env': preset.env_text(), 'setup-paths.env': overlay_text(args, from_preset)}
+    for name, text in overlays.items():
+        if text or name == 'setup-paths.env' or (root / 'local' / name).is_file():
+            changes.append(Change('file', root / 'local' / name, text.encode(), 0o600))
     providers = {host: getattr(args, host + '_bin') for host in HOSTS}
     changes.append(Change('file', root / 'local/provider-paths.json', (json.dumps(providers, indent=2) + '\n').encode(), 0o600))
     api = kit_api(view)
     roles = api.load_roles()
     for host in HOSTS:
         changes.append(Change('file', root / 'state/rendered' / ('roles-' + host + '.sh'), api.roles_sh(roles, host).replace(str(view), str(root)).encode()))
+    resume = setup_resume(root, overlays) if args.hosts else 0
     for host in args.hosts:
-        changes.extend(host_changes(args, view, host, home))
+        changes.extend(host_changes(args, view, host, home, overlays, resume))
     previous = load_json(root / '.install-state/current.json', {})
     for record in previous.get('managed', {}).values():
         target = Path(record['target'])
@@ -608,7 +604,12 @@ def prior_record(root: Path, target: Path, kind: str | None = None) -> dict:
 
 
 class Collision(ValueError):
-    """A planned file or link where the user has their own content (preflight collects these)."""
+    """A planned change where the user has their own content. Preflight lists it, --collision skip
+    leaves it, and --collision backup replaces it when backup is true (the journal keeps theirs)."""
+
+    def __init__(self, message: str, backup: bool = True) -> None:
+        super().__init__(message)
+        self.backup = backup
 
 
 def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
@@ -616,18 +617,19 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
     prior = prior_record(Path(args.root_dir).expanduser().absolute(), target, change.kind)
     record = {'kind': change.kind, 'target': str(target), 'mode': change.mode}
     present = target.exists() or target.is_symlink()
+    backup = args.collision == 'backup'
     if change.kind in ('file', 'link', 'remove'):
         record['before_type'] = 'link' if target.is_symlink() else 'file' if target.is_file() else 'directory' if target.is_dir() else 'absent'
         if change.kind == 'remove':
             current = file_digest(target)
-            if present and current != change.wanted and args.collision != 'backup':
-                raise ValueError(f'Changed managed content is preserved; use --collision backup to save it before retiring: {target}')
+            if present and current != change.wanted and not backup:
+                raise Collision(f'Changed managed content is preserved; use --collision backup to save it before retiring: {target}')
             record.update(hash=None, present=present, before_hash=current, noop=not present)
             return record
         if change.kind == 'file' and target.suffix == '.mdc' and not prior:
             legacy = prior_record(Path(args.root_dir).expanduser().absolute(), target, 'text')
             if legacy and target.is_file() and not target.is_symlink():
-                if target.read_text() in (legacy.get('owned', ''), legacy.get('owned', '') + '\n') or args.collision == 'backup':
+                if target.read_text() in (legacy.get('owned', ''), legacy.get('owned', '') + '\n') or backup:
                     prior = {'hash': digest(target.read_bytes())}
                     record['retired_identity'] = 'text:' + str(target)
         if change.kind == 'link':
@@ -640,49 +642,52 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
         if current_hash == wanted_hash:
             record.update(hash=wanted_hash, present=present, before_hash=current_hash, noop=True)
             return record
-        if present and (not prior or current_hash is None or current_hash != prior.get('hash')) and args.collision != 'backup':
+        if present and (not prior or current_hash is None or current_hash != prior.get('hash')) and not backup:
             raise Collision(f'Existing user content is preserved; select --collision backup or skip, or another destination: {target}')
         record.update(hash=wanted_hash, present=present, before_hash=current_hash)
         return record
     if target.is_symlink():
-        raise ValueError(f'Existing user configuration link is preserved: {target}')
+        raise Collision(f'Existing user configuration link is preserved: {target}', backup=False)
     if change.kind == 'hooks' and target.name == 'hooks.json':
         config = target.parent / 'config.toml'
         if config.is_file():
             inline = tomllib.loads(config.read_text()).get('hooks', {})
             if set(inline) - {'state'}:
-                raise ValueError('Existing inline Codex event hooks are preserved; choose one event-definition source before installing hooks.json')
+                raise Collision('Existing inline Codex event hooks are preserved; choose one event-definition source before installing hooks.json', backup=False)
     if change.kind in ('hooks', 'cursor-hooks', 'servers', 'environment'):
         document = load_json(target, {})
         field = 'env' if change.kind == 'environment' else 'mcpServers' if change.kind == 'servers' else 'hooks'
         if change.kind == 'cursor-hooks' and document.get('version', 1) != 1:
-            raise ValueError(f'Existing Cursor hook version is preserved: {target}')
+            raise Collision(f'Existing Cursor hook version is preserved: {target}', backup=False)
         current = document.get(field, {})
         wanted = change.wanted
         previous = prior.get('owned', {})
         if change.kind in ('servers', 'environment'):
             for name, old in previous.items():
-                if name in current and current[name] != old:
-                    raise ValueError(f'User edited a previously managed entry; it is preserved: {target}')
-            for name, server in wanted.items():
-                if name in current and current[name] not in (server, previous.get(name)):
-                    raise ValueError(f'Existing MCP server {name} is preserved: {target}')
+                if name in current and current[name] != old and not backup:
+                    raise Collision(f'User edited a previously managed entry; it is preserved: {target}')
+            replaced = {name for name, server in wanted.items()
+                        if name in current and current[name] not in (server, previous.get(name))}
+            if replaced and not backup:
+                raise Collision(f'Existing MCP server {", ".join(sorted(replaced))} is preserved: {target}')
             updated = {name: server for name, server in current.items() if name not in previous}
             updated.update(wanted)
+            # Under backup the record keeps each entry it replaces, so rollback restores the user's.
+            kept = set(previous) | replaced
         else:
             updated = dict(current)
             for event in set(previous) | set(wanted):
-                kept = [entry for entry in current.get(event, []) if entry not in previous.get(event, [])]
+                entries = [entry for entry in current.get(event, []) if entry not in previous.get(event, [])]
                 for entry in wanted.get(event, []):
-                    if entry not in kept:
-                        kept.append(entry)
-                if kept:
-                    updated[event] = kept
+                    if entry not in entries:
+                        entries.append(entry)
+                if entries:
+                    updated[event] = entries
                 else:
                     updated.pop(event, None)
         record['cas_names'] = sorted(set(previous) | set(wanted))
         record['cas_before_digest'] = digest(json.dumps({name: current[name] for name in record['cas_names'] if name in current}, sort_keys=True).encode())
-        record.update(owned=wanted, previous={name: current[name] for name in previous if name in current} if change.kind in ('servers', 'environment') else previous,
+        record.update(owned=wanted, previous={name: current[name] for name in kept if name in current} if change.kind in ('servers', 'environment') else previous,
                       existed=present, noop=updated == current)
         record['before_document_hash'] = digest(target.read_bytes()) if present else None
         if change.kind == 'cursor-hooks':
@@ -698,13 +703,13 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
         if old == wanted:
             record.update(owned=wanted, previous=old, existed=present, noop=True)
             return record
-        if old and old != prior.get('owned'):
-            raise ValueError(f'User edited the managed block; it is preserved: {target}')
+        if old and old != prior.get('owned') and not backup:
+            raise Collision(f'User edited the managed block; it is preserved: {target}')
         if change.kind == 'toml':
             new_tables = tomllib.loads(change.wanted)
             existing = tomllib.loads(outside)
             if set(new_tables.get('mcp_servers', {})) & set(existing.get('mcp_servers', {})):
-                raise ValueError(f'Existing native MCP names are preserved: {target}')
+                raise Collision(f'Existing native MCP names are preserved: {target}', backup=False)
             tomllib.loads(outside + '\n' + wanted)
         record.update(owned=wanted, previous=old, existed=present)
         record['before_document_hash'] = digest(target.read_bytes()) if present else None
@@ -905,303 +910,12 @@ def rollback_record(record: dict) -> None:
             target.unlink()
 
 
-def dependencies(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
-    needs_hooks = 'hooks' in args.components
-    required = {'git': 'shared kit', **({'jq': 'hooks'} if needs_hooks else {})}
-    optional = {}
-    if 'skills' in args.components:
-        names = args.skills if args.skills is not None else [path.name for path in (Path(args.source) / 'skills').iterdir() if path.is_dir()]
-        if 'code-search' in names:
-            optional.update({'rg': 'local code search', 'gh': 'GitHub code search', 'jq': 'code-search root listing'})
-    for host in args.hosts:
-        command = getattr(args, host + '_bin')
-        (required if needs_hooks else optional)[command] = host
-    if 'commands' in args.components:
-        optional.update({'gh': 'workflow PR/CI commands; Jira commands also require an authorized connector'})
-    if 'data-wrappers' in args.components:
-        optional.update({'mysql': 'MySQL read wrapper', 'bq': 'BigQuery read wrapper', 'gcloud': 'BigQuery read wrapper login'})
-    if 'mcp' in args.components:
-        for name, spec in mcp_servers(args).items():
-            command = Path(str(spec.get('command', ''))).name
-            if command in ('npx', 'node', 'uvx', 'uv'):
-                optional.setdefault(command, 'MCP server ' + name)
-    result = {name: {'available': bool(shutil.which(name)), 'required_for_install': name in required,
-                     'used_by': required.get(name, optional.get(name))} for name in required | optional}
-    for name, data in result.items():
-        if not data['available']:
-            data['install'] = install_hint(name)
-    return result
-
-
-def install_hint(tool: str) -> str:
-    """This OS's install command for tool, from hooks/lib/install-hint (the hooks' one source)."""
+def mcp_servers(args: argparse.Namespace, extra: dict[str, Any]) -> dict[str, Any]:
+    """The servers an mcp install would register (catalog plus a preset's extra), {} when it cannot be read."""
     try:
-        result = subprocess.run(['sh', str(SOURCE / 'hooks/lib/install-hint'), tool], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return f'install {tool} with your package manager'
-
-
-def mcp_servers(args: argparse.Namespace) -> dict[str, Any]:
-    """The servers an mcp install would register (catalog plus preset), {} when it cannot be read."""
-    path = Path(args.mcp_catalog).expanduser() if args.mcp_catalog else Path(args.source) / 'mcp/servers.json'
-    try:
-        return safe_catalog(path, getattr(args, 'preset_servers', {}))['mcpServers']
+        return safe_catalog(catalog_path(args), extra)['mcpServers']
     except (OSError, ValueError):
         return {}
-
-
-def run_quiet(command: list[str], env: dict[str, str] | None = None) -> int | None:
-    """command's exit code, None when it cannot run (missing, or no answer in 10 seconds)."""
-    try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=10, env=env, stdin=subprocess.DEVNULL).returncode
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
-def host_login(host: str, command: str, target: Path) -> tuple[bool | None, str]:
-    """(logged in, how it was checked); None when this host's login cannot be checked locally."""
-    if host == 'claude':
-        if os.environ.get('ANTHROPIC_API_KEY'):
-            return True, 'ANTHROPIC_API_KEY is set'
-        state = target / '.claude.json' if target != Path.home() / '.claude' else Path.home() / '.claude.json'
-        try:
-            account = 'oauthAccount' in json.loads(state.read_text())
-        except (OSError, ValueError):
-            account = False
-        return account, ('signed in' if account else f'not signed in: run `{command}` and log in')
-    if host == 'codex':
-        if not shutil.which(command):
-            return None, f'{command} not on PATH'
-        code = run_quiet([command, 'login', 'status'], dict(os.environ, CODEX_HOME=str(target)))
-        return (code == 0), ('signed in' if code == 0 else f'not signed in: run `{command} login`')
-    if target.is_dir():
-        return True, f'configured ({target} exists)'
-    return None, 'open Cursor once and sign in, then rerun'
-
-
-def secret_store() -> str:
-    """Where the wrappers read credentials: the macOS Keychain, secret-tool, else environment variables."""
-    if Path('/usr/bin/security').exists():
-        return 'keychain'
-    return 'secret-tool' if shutil.which('secret-tool') else 'env'
-
-
-def detect_hosts(args: argparse.Namespace) -> list[str]:
-    """Hosts with their CLI on PATH or a config dir (CLAUDE_CONFIG_DIR and CODEX_HOME honoured)."""
-    found = []
-    for host in HOSTS:
-        command = getattr(args, host + '_bin', None) or host
-        if shutil.which(command) or host_target(argparse.Namespace(host_root=None, hosts=[host]), host, Path.home()).is_dir():
-            found.append(host)
-    return found
-
-
-def detect_cli(host: str) -> str:
-    """The host's CLI name on PATH, including the install locations each host's installer uses."""
-    candidates = {'claude': ['claude', str(Path.home() / '.claude/local/claude')], 'codex': ['codex'],
-                  'cursor': ['cursor', 'cursor-agent']}[host]
-    return next((name for name in candidates if shutil.which(name)), host)
-
-
-def detect_repo_roots() -> list[str]:
-    """~/Code, ~/src, ~/dev and ~/projects when they hold at least one git checkout."""
-    roots = []
-    for name in REPO_PARENTS:
-        parent = Path.home() / name
-        try:
-            if parent.is_dir() and any((child / '.git').exists() for child in parent.iterdir() if child.is_dir()):
-                roots.append(str(parent))
-        except OSError:
-            continue
-    return roots
-
-
-def detect_owner(roots: list[str]) -> tuple[str, str]:
-    """(GitHub owner, where it came from): your only org per `gh api user/orgs`, else the most common
-    owner among the origin remotes of the repos found. Empty when neither answers."""
-    if shutil.which('gh'):
-        try:
-            result = subprocess.run(['gh', 'api', 'user/orgs', '--jq', '.[].login'], capture_output=True, text=True,
-                                    timeout=10, stdin=subprocess.DEVNULL)
-            orgs = result.stdout.split() if result.returncode == 0 else []
-            if len(orgs) == 1:
-                return orgs[0], 'gh api user/orgs'
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    owners: dict[str, int] = {}
-    for root in roots:
-        for child in sorted(Path(root).iterdir())[:200]:
-            config = child / '.git/config'
-            if not config.is_file():
-                continue
-            match = re.search(r'url = (?:git@github\.com:|https://github\.com/)([A-Za-z0-9_.-]+)/', config.read_text(errors='replace'))
-            if match:
-                owners[match.group(1)] = owners.get(match.group(1), 0) + 1
-    if owners:
-        return max(owners, key=lambda name: owners[name]), 'origin remotes'
-    return '', ''
-
-
-def load_preset(spec: str) -> tuple[dict[str, Any], str]:
-    """(validated preset, its sha256). A local path or gh:owner/repo[/path] (default path
-    agent-kit-preset.toml), fetched with the user's own gh login. PresetUnavailable when a gh: fetch
-    fails; ValueError when the preset is invalid or holds an inline secret."""
-    if spec.startswith('gh:'):
-        parts = spec[3:].split('/', 2)
-        if len(parts) < 2 or not all(re.fullmatch(r'[A-Za-z0-9_.-]+', part) for part in parts[:2]):
-            raise ValueError(f'preset {spec}: expected gh:owner/repo[/path]')
-        path = parts[2] if len(parts) == 3 else 'agent-kit-preset.toml'
-        if not shutil.which('gh'):
-            raise PresetUnavailable(f'gh is not installed ({install_hint("gh")})')
-        try:
-            result = subprocess.run(['gh', 'api', '-H', 'Accept: application/vnd.github.raw',
-                                     f'repos/{parts[0]}/{parts[1]}/contents/{path}'], capture_output=True, text=True,
-                                    timeout=20, stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise PresetUnavailable(str(error)) from None
-        if result.returncode:
-            reason = (result.stderr.strip().splitlines() or ['gh api failed'])[0]
-            raise PresetUnavailable(f'{reason} (check `gh auth status` and your access to {parts[0]}/{parts[1]})')
-        text = result.stdout
-    else:
-        text = Path(spec).expanduser().read_text()
-    try:
-        preset = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
-        raise ValueError(f'preset {spec}: not valid TOML: {error}') from None
-    validate_preset(preset, spec)
-    return preset, digest(text.encode())
-
-
-class PresetUnavailable(Exception):
-    """A gh: preset that could not be fetched: setup continues on its own defaults."""
-
-
-def validate_preset(preset: dict[str, Any], spec: str) -> None:
-    """Refuse unknown tables or keys, wrong types, and anything that looks like an inline secret."""
-    unknown = set(preset) - {'kit', 'mcp', 'hosts', 'roles', 'skills'}
-    if unknown:
-        raise ValueError(f'preset {spec}: unknown table(s) {", ".join(sorted(unknown))}; expected kit, mcp, hosts, roles, skills')
-    kit = preset.get('kit', {})
-    bad = set(kit) - set(PRESET_ANSWERS) - set(PRESET_OVERLAY)
-    if bad:
-        raise ValueError(f'preset {spec}: unknown [kit] key(s) {", ".join(sorted(bad))}')
-    for key, value in kit.items():
-        values = value if key == 'CODE_DIRS' and isinstance(value, list) else [value]
-        if not all(isinstance(item, str) and '\n' not in item for item in values):
-            raise ValueError(f'preset {spec}: [kit] {key} must be a one-line string' + (' or a list of them' if key == 'CODE_DIRS' else ''))
-        if any(INLINE_SECRET.search(item) for item in values):
-            raise ValueError(f'preset {spec}: [kit] {key} looks like an inline secret; presets hold non-secret defaults only')
-    servers = preset.get('mcp', {}).get('servers', {})
-    if set(preset.get('mcp', {})) - {'servers'}:
-        raise ValueError(f'preset {spec}: [mcp] takes only [mcp.servers.<name>] tables')
-    try:
-        safe_servers({'mcpServers': servers})
-    except ValueError as error:
-        raise ValueError(f'preset {spec}: {error}') from None
-    hosts = preset.get('hosts', {}).get('recommended', [])
-    if not isinstance(hosts, list) or set(hosts) - set(HOSTS):
-        raise ValueError(f'preset {spec}: [hosts] recommended must list hosts from {", ".join(HOSTS)}')
-    for name, role in preset.get('roles', {}).items():
-        if not isinstance(role, dict) or set(role) - {'model', 'effort'} or not all(isinstance(v, str) for v in role.values()):
-            raise ValueError(f'preset {spec}: [roles.{name}] takes model and effort strings only')
-    skills = preset.get('skills', {})
-    if set(skills) - {'include', 'exclude'} or not all(isinstance(v, list) and all(isinstance(s, str) for s in v) for v in skills.values()):
-        raise ValueError(f'preset {spec}: [skills] takes include and exclude lists only')
-
-
-def org_access(owner: str, zoekt: str) -> tuple[str, str]:
-    """(section, line) for whether gh can read owner's org, the preset's code-search scope."""
-    if not shutil.which('gh'):
-        return 'Skipped', f'GitHub org check for {owner}: gh is missing. Fix: {install_hint("gh")}'
-    code = run_quiet(['gh', 'api', f'orgs/{owner}', '--silent'])
-    if code == 0:
-        return 'Ready', f'GitHub org {owner}: readable with your gh login'
-    if zoekt:
-        return 'Skipped', f'GitHub org {owner}: gh cannot read it, so code-search uses its Zoekt backend ({zoekt}) for those repos'
-    return 'Needs attention', f'GitHub org {owner}: gh cannot read it; code-search finds only public and local repos. Fix: gh auth refresh -s read:org, or ask an org admin for access'
-
-
-def preflight(args: argparse.Namespace, deps: dict, support: dict, duplicates: list[str], collisions: list[str],
-              notes: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], bool]:
-    """(section, line) rows for the summary, and whether apply is blocked. Each row that needs action
-    ends in its fix for this OS."""
-    rows = [('Ready', f'python {sys.version.split()[0]}')]
-    blocked = False
-    if not args.hosts:
-        recommended = getattr(args, 'recommended_hosts', [])
-        rows.append(('Skipped', 'hosts: none detected or selected (no claude, codex or cursor CLI or config dir); kit files '
-                     'install now and activate when you install a host'
-                     + (f' (the preset recommends {" ".join(recommended)})' if recommended else '') + ': '
-                     + ', '.join(f'{host} {link}' for host, link in HOST_LINKS.items())))
-    for host in args.hosts:
-        command = getattr(args, host + '_bin')
-        target = host_target(args, host, Path.home())
-        if not shutil.which(command):
-            rows.append(('Needs attention', f'{host}: {command} not on PATH; files install and activate once it is. Fix: {install_hint(host)}'))
-            continue
-        logged, how = host_login(host, command, target)
-        rows.append(('Ready' if logged else 'Needs attention', f'{host}: {command}, {how}'))
-    for name, data in deps.items():
-        if name in args.hosts or name in (getattr(args, host + '_bin') for host in args.hosts):
-            continue
-        if data['available']:
-            rows.append(('Ready', f'{name}: for {data["used_by"]}'))
-        elif data['required_for_install']:
-            rows.append(('Needs attention', f'{name} missing, required for {data["used_by"]} (blocks apply). Fix: {data["install"]}'))
-            blocked = True
-        else:
-            rows.append(('Skipped', f'{data["used_by"]} off: {name} missing. Fix: {data["install"]}'))
-    if shutil.which('gh') and any('gh' == name for name in deps):
-        if run_quiet(['gh', 'auth', 'status']) != 0:
-            rows.append(('Skipped', 'GitHub search and PR flows off: gh is not logged in. Fix: gh auth login'))
-    if 'data-wrappers' in args.components:
-        store = secret_store()
-        rows.append(('Ready' if store != 'env' else 'Skipped', {
-            'keychain': 'credentials: wrappers read the macOS Keychain',
-            'secret-tool': 'credentials: no Keychain here; wrappers read secret-tool (libsecret)',
-            'env': 'credentials: no Keychain or secret-tool; wrappers read env vars (RO_MYSQL_PASSWORD_<ACCOUNT>, '
-                   f'SENTRY_ACCESS_TOKEN). Fix for a store: {install_hint("secret-tool")}'}[store]))
-    if 'mcp' in args.components and not mcp_servers(args):
-        rows.append(('Skipped', 'mcp: no MCP servers configured (add them in mcp/servers.json or a preset)'))
-    for host, state in support.items():
-        if state in ('supported', 'hooks unselected'):
-            continue
-        fix = ('--confirm-hook-support cursor after checking Cursor > Settings > Hooks' if host == 'cursor'
-               else install_hint(getattr(args, host + '_bin')) if state == 'provider CLI missing' else 'enable hooks in the host, or drop the hooks component')
-        rows.append(('Needs attention', f'{host} hooks: {state} (blocks apply). Fix: {fix}'))
-        blocked = True
-    if duplicates:
-        rows.append(('Needs attention', 'plugins with the same hooks are enabled: ' + ', '.join(duplicates)
-                     + ' (blocks apply). Fix: disable them in Claude, or leave hooks unselected'))
-        blocked = True
-    for path in collisions:
-        rows.append(('Needs attention', f'{path} holds your own content (blocks apply). Fix: --collision backup or --collision skip'))
-        blocked = True
-    rows.extend(notes)
-    return rows, blocked
-
-
-def print_summary(rows: list[tuple[str, str]], prepared: list, args: argparse.Namespace, root: Path) -> None:
-    out = [f'agent-setup {"apply" if args.apply else "preview"}: hosts {" ".join(args.hosts) or "none"}; '
-           f'components {" ".join(args.components)}; kit root {root}']
-    for section in ('Ready', 'Needs attention', 'Skipped'):
-        lines = [line for name, line in rows if name == section]
-        if lines:
-            out.append(f'{section}:')
-            out.extend('  ' + line for line in lines)
-    counts: dict[str, int] = {}
-    for change, _ in prepared:
-        counts[change.kind] = counts.get(change.kind, 0) + 1
-    out.append(f'Changes: {len(prepared)}' + (' (' + ', '.join(f'{kind} {n}' for kind, n in sorted(counts.items())) + ')' if counts else ''))
-    if args.verbose:
-        out.extend(f'  {change.kind:12} {change.target}' for change, _ in prepared)
-    elif prepared:
-        out.append('  --verbose lists every path; --json prints the full plan')
-    sys.stdout.write('\n'.join(out) + '\n')
 
 
 def role_plan(args: argparse.Namespace, view: Path) -> dict[str, Any]:
@@ -1213,37 +927,16 @@ def role_plan(args: argparse.Namespace, view: Path) -> dict[str, Any]:
         rows = []
         for name, role in roles.roles.items():
             invocation = 'session' if name == 'main' else roles.invoke(role, host)
-            command = args.claude_bin if role.provider == 'anthropic' else args.codex_bin
+            provider_host = roles.host_for(role.provider)
+            command = getattr(args, provider_host + '_bin')
             unavailable = invocation == 'run' and not role.prefix
-            rows.append({'role': name, 'provider': role.provider, 'model': role.model,
+            rows.append({'role': name, 'provider': role.provider, 'host': provider_host, 'model': role.model,
                          'effort': role.effort, 'invoke': invocation, 'fallback': role.fallback,
                          'provider_cli': command, 'cli_available': bool(shutil.which(command)),
                          'required_for_review_run': invocation == 'run' and bool(role.prefix),
                          'login': 'not checked', 'availability': 'unavailable through agent-run: no review prefix; host native named role support is not enabled' if unavailable else 'configured'})
         routes[host] = rows
     return routes
-
-
-def capabilities(args: argparse.Namespace) -> dict[str, str]:
-    if 'hooks' not in args.components:
-        return {host: 'hooks unselected' for host in args.hosts}
-    if args.hook_runtime != 'local':
-        raise ValueError('Command hooks require a supported local host runtime; choose rules or skills for cloud runs')
-    result = {}
-    for host in args.hosts:
-        command = getattr(args, host + '_bin')
-        if not shutil.which(command):
-            result[host] = 'provider CLI missing'
-            continue
-        if host == 'codex':
-            probe = subprocess.run([command, 'features', 'list'], capture_output=True, text=True, timeout=10)
-            match = re.search(r'^hooks\s+.*?\s+(true|false)\s*$', probe.stdout, re.M)
-            result[host] = 'supported' if probe.returncode == 0 and match and match.group(1) == 'true' else 'hooks present but disabled: explicitly enable the feature in Codex first' if match else 'hooks unsupported or capability unknown'
-        elif host == 'cursor':
-            result[host] = 'supported' if host in args.confirm_hook_support else 'requires explicit confirmation of native hooks support'
-        else:
-            result[host] = 'supported'
-    return result
 
 
 def plugin_conflicts(args: argparse.Namespace) -> list[str]:
@@ -1260,7 +953,22 @@ def plugin_conflicts(args: argparse.Namespace) -> list[str]:
     return sorted(name for name, active in enabled.items() if active and selected & set(definitions.get(name.split('@', 1)[0], [])))
 
 
-def setup(args: argparse.Namespace) -> int:
+@dataclass(frozen=True)
+class Plan:
+    """A previewed install: its summary rows, the changes apply makes (prepared), and every record,
+    no-ops included, that current.json keeps."""
+    rows: list[Row]
+    prepared: list[tuple[Change, dict]]
+    records: list[tuple[Change, dict]]
+    collisions: list[tuple[str, bool]]
+
+    @property
+    def blocked(self) -> bool:
+        return any(row.blocks for row in self.rows)
+
+
+def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], notes: list[Row]) -> Plan:
+    """Plan the install, check it against what is on disk, and print the summary (or --json)."""
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
     if args.github_owner and not re.fullmatch(r'[A-Za-z0-9_.-]+', args.github_owner):
@@ -1277,129 +985,133 @@ def setup(args: argparse.Namespace) -> int:
         (root / '.install-state/pending.json').unlink()
     elif pending:
         raise ValueError('An interrupted installation requires recovery first: rollback ' + pending['id'])
+    servers = safe_catalog(catalog_path(args), preset.servers)['mcpServers'] if 'mcp' in args.components else {}
     with tempfile.TemporaryDirectory(prefix='agent-kit-install-view-') as folder:
         view = Path(folder) / 'kit source'
         view.mkdir()
-        changes = plan(args, view)
-        all_records, collisions, skipped = [], [], []
+        changes = plan(args, view, preset, from_preset, servers)
+        records, collisions, skipped = [], [], []
         for change in changes:
             try:
                 record = prepare_change(change, args)
-            except Collision:
-                (skipped if args.collision == 'skip' else collisions).append(str(change.target))
+            except Collision as collision:
+                if args.collision == 'skip':
+                    skipped.append(str(change.target))
+                else:
+                    collisions.append((str(change.target), collision.backup))
                 continue
             if record is not None:
-                all_records.append((change, record))
-        prepared = [(change, record) for change, record in all_records if not record.get('noop')]
-        deps = dependencies(args)
+                records.append((change, record))
         routes = role_plan(args, view)
-        notes = list(getattr(args, 'notes', []))
-        notes.extend(('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped)
-        providers = {'anthropic': 'claude', 'openai': 'codex'}
-        for rows in routes.values():
-            for row in rows:
-                if not row['required_for_review_run']:
-                    continue
-                if providers.get(row['provider']) in args.hosts or row['cli_available']:
-                    deps.setdefault(row['provider_cli'], {'available': row['cli_available'], 'required_for_install': False, 'required_for_role_execution': True, 'used_by': row['role'], 'login': 'not checked'})
-                elif ('Skipped', f'{row["role"]}: {row["provider_cli"]} not selected or installed; review rounds run its fallback {row["fallback"]}') not in notes:
-                    notes.append(('Skipped', f'{row["role"]}: {row["provider_cli"]} not selected or installed; review rounds run its fallback {row["fallback"]}'))
-        support = capabilities(args)
-        duplicates = plugin_conflicts(args)
-        summary, blocked = preflight(args, deps, support, duplicates, collisions, notes)
-        args.blocked, args.collided = blocked, bool(collisions)
-        if not args.json:
-            print_summary(summary, prepared, args, root)
-        else:
-            output({'mode': 'apply' if args.apply else 'preview', 'hosts': args.hosts, 'summary': [{'section': section, 'line': line} for section, line in summary],
-                'components': args.components, 'blocking_hooks': args.blocking_hooks, 'role_routing': routes,
-                'component_dependencies': ['roles and review references for blocking hooks'] if 'hooks' in args.components and args.blocking_hooks else [],
-                'root': str(root), 'source_checkout': str(source), 'host_targets': {host: str(host_target(args, host, Path.home())) for host in args.hosts}, 'changes': len(prepared), 'dependencies': deps, 'capabilities': support,
-                'conflicting_plugins': duplicates, 'collisions': collisions, 'skipped_collisions': skipped,
-                'paths': [{'kind': change.kind, 'path': str(change.target)} for change, record in prepared],
-                'shell_activation': 'export PATH=' + shlex.quote(str(root / 'bin')) + ':"$PATH"' if 'data-wrappers' in args.components else None,
-                'auth': 'Reuse each provider login; no auth files are read or copied.',
-                'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
-                'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'})
-        if not args.apply:
-            return 0
-        if collisions:
-            raise ValueError(f'Existing user content is preserved; select --collision backup or skip, or another destination: {", ".join(collisions)}')
-        if duplicates:
-            raise ValueError('Disable the overlapping plugin hook component in Claude first, or leave hooks unselected: ' + ', '.join(duplicates))
-        if any(not data['available'] and data['required_for_install'] for data in deps.values()):
-            raise ValueError('Install dependencies are missing; preview lists each required command')
-        if 'hooks' in args.components and any(value != 'supported' for value in support.values()):
-            raise ValueError('Selected host hooks are unsupported or unverified; preview lists the correction')
-        identifier = time.strftime('%Y%m%dT%H%M%S') + '-' + str(os.getpid())
-        journal = root / '.install-state' / identifier
-        journal.mkdir(parents=True, exist_ok=False)
-        previous = load_json(root / '.install-state/current.json', {})
-        records = []
-        atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
-        atomic(root / '.install-state/pending.json', (json.dumps({'id': identifier, 'previous_id': previous.get('id')}) + '\n').encode())
-        try:
-            for number, (change, record) in enumerate(prepared):
-                if record['kind'] in ('file', 'link', 'remove') and record['present']:
-                    record['backup'] = str(journal / 'backups' / str(number))
-                records.append(record)
-                atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
-                apply_change(change, record, journal, number)
-                record['status'] = 'completed'
-                atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
-            managed = dict(previous.get('managed', {}))
-            for change, record in all_records:
-                if record['kind'] == 'remove':
-                    managed.pop('file:' + record['target'], None)
-                    managed.pop('link:' + record['target'], None)
-                else:
-                    if record.get('retired_identity'):
-                        managed.pop(record['retired_identity'], None)
-                    managed[record['kind'] + ':' + record['target']] = record
-            configuration = {key: getattr(args, key) for key in ('repo_roots', 'work_root', 'role_model', 'role_effort',
-                             'claude_bin', 'codex_bin', 'cursor_bin', 'hosts', 'components', 'host_root', 'project_root', 'skills',
-                             'github_owner', 'zoekt_url', 'codex_gcloud')}
-            # The catalog as an absolute path, so a later update that reselects mcp keeps it.
-            configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
-            if getattr(args, 'preset_record', None):
-                # The preset's values outlive this run: a later update without --preset keeps them.
-                configuration.update(preset=args.preset_record, kit_values=args.kit_values, preset_servers=args.preset_servers)
-            configuration['source_checkout'] = str(source)
-            configuration['blocking_hooks'] = args.blocking_hooks
-            configuration['host_roots'] = dict(getattr(args, 'host_roots', {}))
-            if args.host_root:
-                configuration['host_roots'][args.hosts[0]] = str(host_target(args, args.hosts[0], Path.home()))
-            configuration['project_roots'] = dict(getattr(args, 'project_roots', {}))
-            if args.project_root and 'cursor' in args.hosts:
-                configuration['project_roots']['cursor'] = args.project_root
-            atomic(root / '.install-state/current.json', (json.dumps({'id': identifier, 'managed': managed,
-                   'configuration': configuration}, indent=2) + '\n').encode())
-            (root / '.install-state/pending.json').unlink(missing_ok=True)
-            if 'codex' in args.hosts and set(args.components) & SANDBOX_COMPONENTS:
-                installed_work_root(root).mkdir(parents=True, exist_ok=True)
-            (root / '.install-state/answers.json').unlink(missing_ok=True)
-        except BaseException as original:
-            failures = []
-            for record in reversed(records):
-                try:
-                    rollback_record(record)
-                except (ValueError, OSError) as error:
-                    failures.append(str(error))
-            if failures:
-                original.add_note('Some rollback records need explicit recovery: ' + '; '.join(failures))
+    prepared = [(change, record) for change, record in records if not record.get('noop')]
+    deps = dependencies(args, servers)
+    notes = [*notes, *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped)]
+    if preset.record and args.github_owner:
+        notes.append(org_access(args.github_owner, args.zoekt_url))
+    for rows in routes.values():
+        for row in rows:
+            if not row['required_for_review_run']:
+                continue
+            if row['host'] in args.hosts or row['cli_available']:
+                deps.setdefault(row['provider_cli'], {'available': row['cli_available'], 'required_for_install': False, 'required_for_role_execution': True, 'used_by': row['role'], 'login': 'not checked'})
+                continue
+            note = Row('Skipped', f'{row["role"]}: {row["provider_cli"]} not selected or installed; review rounds run its fallback {row["fallback"]}')
+            if note not in notes:
+                notes.append(note)
+    support = capabilities(args)
+    duplicates = plugin_conflicts(args)
+    targets = {host: host_target(args, host, Path.home()) for host in args.hosts}
+    summary = preflight(args, targets, deps, support, duplicates, collisions, notes, servers, preset.recommended_hosts)
+    if not args.json:
+        print_summary(summary, prepared, args, root)
+    else:
+        output({'mode': 'apply' if args.apply else 'preview', 'hosts': args.hosts,
+            'summary': [{'section': row.section, 'line': row.line, 'blocks': row.blocks} for row in summary],
+            'components': args.components, 'blocking_hooks': args.blocking_hooks, 'role_routing': routes,
+            'component_dependencies': ['roles and review references for blocking hooks'] if 'hooks' in args.components and args.blocking_hooks else [],
+            'root': str(root), 'source_checkout': str(source), 'host_targets': {host: str(target) for host, target in targets.items()}, 'changes': len(prepared), 'dependencies': deps, 'capabilities': support,
+            'conflicting_plugins': duplicates, 'collisions': [path for path, _ in collisions], 'skipped_collisions': skipped,
+            'paths': [{'kind': change.kind, 'path': str(change.target)} for change, record in prepared],
+            'shell_activation': 'export PATH=' + shlex.quote(str(root / 'bin')) + ':"$PATH"' if 'data-wrappers' in args.components else None,
+            'auth': 'Reuse each provider login; no auth files are read or copied.',
+            'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
+            'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'})
+    return Plan(summary, prepared, records, collisions)
+
+
+def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[str]) -> int:
+    """Make the previewed changes under a journal, then record the install and its answers."""
+    if planned.blocked:
+        raise ValueError('apply blocked: ' + '; '.join(row.line for row in planned.rows if row.blocks))
+    root = Path(args.root_dir).expanduser().absolute()
+    source = Path(args.source).expanduser().resolve()
+    identifier = time.strftime('%Y%m%dT%H%M%S') + '-' + str(os.getpid())
+    journal = root / '.install-state' / identifier
+    journal.mkdir(parents=True, exist_ok=False)
+    previous = load_json(root / '.install-state/current.json', {})
+    records = []
+    atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+    atomic(root / '.install-state/pending.json', (json.dumps({'id': identifier, 'previous_id': previous.get('id')}) + '\n').encode())
+    try:
+        for number, (change, record) in enumerate(planned.prepared):
+            if record['kind'] in ('file', 'link', 'remove') and record['present']:
+                record['backup'] = str(journal / 'backups' / str(number))
+            records.append(record)
+            atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+            apply_change(change, record, journal, number)
+            record['status'] = 'completed'
+            atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+        managed = dict(previous.get('managed', {}))
+        for change, record in planned.records:
+            if record['kind'] == 'remove':
+                managed.pop('file:' + record['target'], None)
+                managed.pop('link:' + record['target'], None)
             else:
-                if previous:
-                    atomic(root / '.install-state/current.json', (json.dumps(previous, indent=2) + '\n').encode())
-                else:
-                    (root / '.install-state/current.json').unlink(missing_ok=True)
-                (root / '.install-state/pending.json').unlink(missing_ok=True)
-            raise
-        undo = shlex.join([sys.executable, str(source / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
-        if args.json:
-            output({'installed': len(records), 'journal': identifier, 'rollback': undo})
+                if record.get('retired_identity'):
+                    managed.pop(record['retired_identity'], None)
+                managed[record['kind'] + ':' + record['target']] = record
+        configuration = {key: getattr(args, key) for key in SAVED_KEYS}
+        # The catalog as an absolute path, so a later update that reselects mcp keeps it.
+        configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
+        configuration['answered'] = sorted(answered)
+        if preset.record:
+            # The preset outlives this run: a later update without --preset applies the same values.
+            configuration.update(preset=preset.record, preset_values=preset.saved())
+        configuration['source_checkout'] = str(source)
+        configuration['host_roots'] = dict(args.host_roots)
+        if args.host_root:
+            configuration['host_roots'][args.hosts[0]] = str(host_target(args, args.hosts[0], Path.home()))
+        configuration['project_roots'] = dict(args.project_roots)
+        if args.project_root and 'cursor' in args.hosts:
+            configuration['project_roots']['cursor'] = args.project_root
+        atomic(root / '.install-state/current.json', (json.dumps({'id': identifier, 'managed': managed,
+               'configuration': configuration}, indent=2) + '\n').encode())
+        (root / '.install-state/pending.json').unlink(missing_ok=True)
+        if 'codex' in args.hosts and set(args.components) & SANDBOX_COMPONENTS:
+            installed_work_root(root).mkdir(parents=True, exist_ok=True)
+        (root / '.install-state/answers.json').unlink(missing_ok=True)
+    except BaseException as original:
+        failures = []
+        for record in reversed(records):
+            try:
+                rollback_record(record)
+            except (ValueError, OSError) as error:
+                failures.append(str(error))
+        if failures:
+            original.add_note('Some rollback records need explicit recovery: ' + '; '.join(failures))
         else:
-            sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n')
-        return 0
+            if previous:
+                atomic(root / '.install-state/current.json', (json.dumps(previous, indent=2) + '\n').encode())
+            else:
+                (root / '.install-state/current.json').unlink(missing_ok=True)
+            (root / '.install-state/pending.json').unlink(missing_ok=True)
+        raise
+    undo = shlex.join([sys.executable, str(source / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
+    if args.json:
+        output({'installed': len(records), 'journal': identifier, 'rollback': undo})
+    else:
+        sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n')
+    return 0
 
 
 def rollback(args: argparse.Namespace) -> int:
@@ -1459,14 +1171,16 @@ def doctor(args: argparse.Namespace) -> int:
                 if mismatch:
                     drift.append(str(target))
                     break
-    deps = dependencies(args)
+    deps = dependencies(args, mcp_servers(args, state.get('configuration', {}).get('preset_values', {}).get('servers', {})))
     problems = []
     if not state:
         problems.append(f'not installed at {root}: run agent-setup --apply (or pass --root-dir)')
     problems.extend(f'{name} missing, required for {data["used_by"]}. Fix: {data["install"]}'
                     for name, data in deps.items() if not data['available'] and data['required_for_install'])
     if drift:
-        problems.append(f'{len(drift)} installed path(s) changed since setup; rerun agent-setup --apply, or --collision backup to keep yours')
+        problems.append(f'{len(drift)} installed path(s) changed since setup: rerun agent-setup --apply with '
+                        '--collision skip to keep your edits, or --collision backup to replace them (the install '
+                        'journal keeps your version)')
     preset = state.get('configuration', {}).get('preset')
     if preset and not preset['source'].startswith('gh:') and Path(preset['source']).expanduser().is_file():
         preset['current'] = 'unchanged' if digest(Path(preset['source']).expanduser().read_bytes()) == preset['sha256'] else 'changed since setup: rerun with --preset to apply it'
@@ -1520,41 +1234,30 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def apply_preset(args: argparse.Namespace, saved: dict[str, Any]) -> dict[str, Any]:
-    """Load --preset (or the saved one's values) onto args; return the answers it supplies, which sit
-    under the user's own (flags, saved configuration, prompts)."""
-    args.notes = []
-    args.kit_values = dict(saved.get('kit_values', {}))
-    args.preset_servers = dict(saved.get('preset_servers', {}))
-    args.preset_record = saved.get('preset')
-    if not args.preset:
-        return {}
-    try:
-        preset, sha = load_preset(args.preset)
-    except PresetUnavailable as error:
-        print(f'agent-setup: preset {args.preset} unavailable: {error}; continuing with '
-              f'{"interactive " if args.interactive else ""}defaults', file=sys.stderr)
-        args.notes.append(('Skipped', f'preset {args.preset}: {error}'))
-        return {}
-    kit = preset.get('kit', {})
-    args.kit_values = {key: kit[key] for key in PRESET_OVERLAY if key in kit}
-    args.preset_servers = preset.get('mcp', {}).get('servers', {})
-    source = args.preset if args.preset.startswith('gh:') else str(Path(args.preset).expanduser().absolute())
-    args.preset_record = {'source': source, 'sha256': sha}
-    answers: dict[str, Any] = {field: kit[key] for key, field in PRESET_ANSWERS.items() if key in kit}
-    if isinstance(answers.get('repo_roots'), str):
-        answers['repo_roots'] = [answers['repo_roots']]
-    answers['recommended_hosts'] = preset.get('hosts', {}).get('recommended', [])
-    skills = preset.get('skills', {})
-    if skills.get('include') or skills.get('exclude'):
-        names = skills.get('include') or [path.name for path in sorted((Path(args.source) / 'skills').iterdir()) if path.is_dir()]
-        answers['skills'] = [name for name in names if name not in skills.get('exclude', [])]
-    for flag in ('model', 'effort'):
-        answers['role_' + flag] = [f'{name}={role[flag]}' for name, role in preset.get('roles', {}).items() if flag in role]
-    args.notes.append(('Ready', f'preset {source} (sha256 {sha[:12]})'))
-    if kit.get('GITHUB_OWNER'):
-        args.notes.append(org_access(kit['GITHUB_OWNER'], kit.get('ZOEKT_URL', '')))
-    return answers
+def resolve_answers(args: argparse.Namespace, given: set[str], saved: dict[str, Any], preset: Preset,
+                    detected: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Each saved answer onto args, the first of: its flag, an earlier answer the user chose, the
+    preset, a value detected now, an earlier saved value, the default. Returns (the keys the user
+    chose, the keys the preset supplied). An install from before "answered" was saved counts every
+    value that is not the default as chosen."""
+    chosen = (set(saved['answered']) if 'answered' in saved
+              else {key for key in DEFAULTS if key in saved and saved[key] != DEFAULTS[key]})
+    answered, from_preset = set(given), set()
+    for key, default in DEFAULTS.items():
+        if key in given:
+            continue
+        if key in chosen and key in saved:
+            value = saved[key]
+            answered.add(key)
+        elif key in preset.answers:
+            value = preset.answers[key]
+            from_preset.add(key)
+        elif detected.get(key):
+            value = detected[key]
+        else:
+            value = saved.get(key, default)
+        setattr(args, key, value)
+    return answered, from_preset
 
 
 def ask(prompt: str, args: argparse.Namespace) -> str:
@@ -1564,44 +1267,43 @@ def ask(prompt: str, args: argparse.Namespace) -> str:
 
 def main() -> int:
     args = parser().parse_args()
-    if args.interactive and args.action == 'setup':
-        if not sys.stdin.isatty():
-            raise ValueError('--interactive needs a terminal; use explicit flags in scripts')
+    setup_run = args.action == 'setup'
+    if args.interactive and setup_run:
+        if not args.yes and not sys.stdin.isatty():
+            raise ValueError('--interactive needs a terminal; use explicit flags, or --yes to take every default')
         entered = ask('Kit root [' + args.root_dir + ']: ', args)
         if entered:
             args.root_dir = entered
-    saved = load_json(Path(args.root_dir).expanduser() / '.install-state/current.json', {}).get('configuration', {})
-    if args.interactive and args.action == 'setup':
+    root = Path(args.root_dir).expanduser()
+    saved = load_json(root / '.install-state/current.json', {}).get('configuration', {})
+    if args.interactive and setup_run:
         # The answers of an interactive run that stopped before apply: a rerun starts from them.
-        saved = {**saved, **load_json(Path(args.root_dir).expanduser() / '.install-state/answers.json', {})}
+        saved = {**saved, **load_json(root / '.install-state/answers.json', {})}
     if args.source is None:
-        selected_root = Path(args.root_dir).expanduser()
-        installed = selected_root.exists() and selected_root.samefile(SOURCE)
-        if args.action == 'setup' and installed:
+        installed = root.exists() and root.samefile(SOURCE)
+        if setup_run and installed:
             origin = saved.get('source_checkout')
             if not isinstance(origin, str) or not origin or not Path(origin).is_dir():
                 raise ValueError('Original source checkout is unavailable; pass --source /path/to/checkout. Doctor and rollback remain available without it.')
             args.source = origin
         else:
             args.source = str(SOURCE)
-    preset = apply_preset(args, saved) if args.action == 'setup' else {}
-    guided = args.action == 'setup' and (args.interactive or args.yes or bool(args.preset))
-    detected = detect_hosts(args)
-    # --host-root names one host's root; with no --hosts that host is claude, as before detection.
-    defaults = {'repo_roots': detect_repo_roots() if guided else [], 'work_root': str(Path.home() / 'agent-work'),
-                'hosts': ['claude'] if args.host_root else detected, 'components': ['rules', 'skills'],
-                'claude_bin': detect_cli('claude'), 'codex_bin': detect_cli('codex'), 'cursor_bin': detect_cli('cursor'),
-                'skills': None, 'github_owner': '', 'zoekt_url': '', 'codex_gcloud': 'off', 'blocking_hooks': False,
-                'mcp_catalog': None, 'collision': 'refuse'}
-    for key, default in defaults.items():
-        if getattr(args, key) is None:
-            setattr(args, key, saved.get(key, preset.get(key, default)))
-    args.recommended_hosts = preset.get('recommended_hosts', [])
-    if guided and not args.github_owner and 'github_owner' not in saved:
+    given = {key for key in DEFAULTS if getattr(args, key) is not None}
+    preset = apply_preset(args.preset, saved, Path(args.source), args.interactive) if setup_run else Preset()
+    guided = setup_run and (args.interactive or args.yes or bool(args.preset))
+    detected_hosts = detect_hosts()
+    # --host-root names one host's root; with no --hosts that host is claude.
+    detected = {'hosts': ['claude'] if args.host_root else detected_hosts,
+                'repo_roots': detect_repo_roots() if guided else [],
+                **{host + '_bin': detect_cli(host) for host in HOSTS}}
+    answered, from_preset = resolve_answers(args, given, saved, preset, detected)
+    args.collision = args.collision or saved.get('collision', 'refuse')
+    notes = [Row(*note) for note in preset.notes]
+    if guided and not args.github_owner:
         owner, origin = detect_owner(args.repo_roots)
         if owner:
             args.github_owner = owner
-            args.notes.append(('Ready', f'GitHub owner {owner} (from {origin})'))
+            notes.append(Row('Ready', f'GitHub owner {owner} (from {origin})'))
     if args.skills == ['all']:
         args.skills = None
     elif args.skills is not None and 'all' in args.skills:
@@ -1614,38 +1316,38 @@ def main() -> int:
         args.project_roots['cursor'] = saved['project_root']
     if args.project_root is None and 'cursor' in args.hosts:
         args.project_root = args.project_roots.get('cursor')
+    # The user's own role overrides; the preset's sit under them (installation_view).
     for key in ('role_model', 'role_effort'):
         values = {}
-        for value in [*preset.get(key, []), *saved.get(key, []), *getattr(args, key)]:
+        for value in [*saved.get(key, []), *getattr(args, key)]:
             name, separator, setting = value.partition('=')
             name = ROLE_ALIASES.get(name, name)
             values[name] = name + separator + setting
         setattr(args, key, [value for value in values.values() if value.partition('=')[2]])
-    if args.interactive and args.action == 'setup':
-        interview(args, detected, preset)
-        root = Path(args.root_dir).expanduser()
-        answers = {key: getattr(args, key) for key in ('hosts', 'components', 'skills', 'repo_roots', 'github_owner', 'work_root',
-                                                         'claude_bin', 'codex_bin', 'cursor_bin', 'codex_gcloud', 'blocking_hooks',
-                                                         'role_model', 'role_effort', 'collision')}
-        answers['host_roots'] = args.host_roots
+    if args.interactive and setup_run:
+        interview(args, detected_hosts, preset, answered)
+        answers = {key: getattr(args, key) for key in (*SAVED_KEYS, 'collision', 'host_roots')}
+        answers['answered'] = sorted(answered)
         args.apply = False
-        setup(args)
-        if args.collision == 'refuse' and getattr(args, 'collided', False):
+        planned = preview(args, preset, from_preset - answered, notes)
+        if args.collision == 'refuse' and planned.collisions:
             choice = ask('Some paths hold your own content: [b]ackup and replace, [s]kip them, or [a]bort? [a]: ', args).lower()
             if choice[:1] in ('b', 's'):
                 args.collision = answers['collision'] = 'backup' if choice[:1] == 'b' else 'skip'
-                setup(args)
-        if args.blocked:
+                planned = preview(args, preset, from_preset - answered, notes)
+        if planned.blocked:
             # Saved only when the run stops here: the rerun after the fix offers them as defaults.
             atomic(root / '.install-state/answers.json', (json.dumps(answers, indent=2) + '\n').encode())
             print('agent-setup: apply is blocked: fix the items under Needs attention, then rerun; '
                   'your answers are saved as its defaults.', file=sys.stderr)
             return 2
-        if ask('Apply this previewed selection? [y/N]: ', args).lower() != 'y':
+        if not args.yes and ask('Apply this previewed selection? [y/N]: ', args).lower() != 'y':
             return 0
         args.apply = True
-    if args.action == 'setup':
-        return setup(args)
+        return apply(args, planned, preset, answered)
+    if setup_run:
+        planned = preview(args, preset, from_preset, notes)
+        return apply(args, planned, preset, answered) if args.apply else 0
     if args.action == 'rollback':
         if not args.journal:
             raise ValueError('rollback needs the journal id printed by setup')
@@ -1653,40 +1355,46 @@ def main() -> int:
     return doctor(args)
 
 
-def interview(args: argparse.Namespace, detected: list[str], preset: dict[str, Any]) -> None:
-    """The guided questions, each defaulting to the saved, preset or detected answer. A preset's
-    answers are not asked again."""
+def interview(args: argparse.Namespace, detected: list[str], preset: Preset, answered: set[str]) -> None:
+    """The guided questions, each defaulting to the saved, preset or detected answer; an entered
+    answer is the user's own (answered). A preset's answers are not asked again."""
     if not detected:
         print('No agent host detected. Files can install for the hosts you name now; they activate when you install the host:')
-        for host, link in HOST_LINKS.items():
-            print(f'  {host}: {link}')
+        for host in HOSTS:
+            print(f'  {host}: {install_hint(host)}')
     entered = ask('Hosts [' + (' '.join(args.hosts) or 'none') + '] (detected: ' + (' '.join(detected) or 'none')
                   + '), choices claude codex cursor, or none: ', args)
     if entered:
         args.hosts = [] if entered == 'none' else entered.split()
+        answered.add('hosts')
     entered = ask('Components [' + ' '.join(args.components) + '], choices ' + ' '.join(sorted(COMPONENTS)) + ': ', args)
     if entered:
         args.components = entered.split()
+        answered.add('components')
     if set(args.hosts) - set(HOSTS) or set(args.components) - COMPONENTS:
         raise ValueError('Unknown host or component selection')
-    if 'skills' in args.components and 'skills' not in preset:
+    if 'skills' in args.components and 'skills' not in preset.answers:
         entered = ask('Skills [' + ('all bundled' if args.skills is None else ' '.join(args.skills) or 'none') + '], names, all, or none: ', args)
         if entered:
             args.skills = None if entered == 'all' else [] if entered == 'none' else entered.split()
-    if 'repo_roots' not in preset:
+            answered.add('skills')
+    if 'repo_roots' not in preset.answers:
         entered = ask('Local repository parent directories as a JSON array [' + json.dumps(args.repo_roots) + ']; [] means remote-only: ', args)
         if entered:
             roots = json.loads(entered)
             if not isinstance(roots, list) or not all(isinstance(value, str) for value in roots):
                 raise ValueError('Repository roots must be a JSON array of directory strings')
             args.repo_roots = roots
-    if 'github_owner' not in preset:
+            answered.add('repo_roots')
+    if 'github_owner' not in preset.answers:
         entered = ask('GitHub owner or organization [' + args.github_owner + '], optional when --repo is supplied during search: ', args)
         if entered:
             args.github_owner = entered
+            answered.add('github_owner')
     entered = ask('Work root [' + args.work_root + ']; enter "" to leave unset: ', args)
     if entered:
         args.work_root = '' if entered == '""' else entered
+        answered.add('work_root')
     for host in args.hosts:
         target = host_target(args, host, Path.home())
         entered = ask(host + ' configuration root [' + str(target) + ']: ', args)
@@ -1698,14 +1406,17 @@ def interview(args: argparse.Namespace, detected: list[str], preset: dict[str, A
         entered = ask(host + ' CLI [' + getattr(args, key) + ']: ', args)
         if entered:
             setattr(args, key, entered)
+            answered.add(key)
     if 'codex' in args.hosts and set(args.components) & SANDBOX_COMPONENTS:
         entered = ask("Let Codex's sandbox write gcloud's config dir? It holds credentials; bq needs it [" + args.codex_gcloud + '] (on/off): ', args)
         if entered in ('on', 'off'):
             args.codex_gcloud = entered
+            answered.add('codex_gcloud')
     if 'hooks' in args.components:
         entered = ask('Enable blocking safety and review hooks? [' + ('Y/n' if args.blocking_hooks else 'y/N') + ']: ', args).lower()
         if entered:
             args.blocking_hooks = entered == 'y'
+            answered.add('blocking_hooks')
         if 'cursor' in args.hosts and 'cursor' not in args.confirm_hook_support:
             entered = ask('Cursor hooks: does your Cursor build list Hooks under Settings? Without native hook support '
                           'the kit installs no Cursor hooks. [y/N]: ', args).lower()

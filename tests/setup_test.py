@@ -22,6 +22,8 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[1]
 # The last release before the role renames: upgrade tests install it first, then this checkout.
 BASE = '2b07c10017f87e354d8dc1aa8b578a7b041b385b'
+# The last release whose Codex sandbox roots sat in the mcp block.
+SANDBOX_IN_MCP_BLOCK = 'c7738b427f876470281cc642a89ee4ee67933c5d'
 
 
 class SetupTests(unittest.TestCase):
@@ -79,13 +81,13 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(shlex.split(command)[2], str(self.root / 'skills/process-doc/scripts/catalog.py'),
                          'CX-3: the installed path is one shell word even with spaces')
 
-    def run_base_setup(self, *flags: str) -> None:
+    def run_base_setup(self, *flags: str, commit: str = BASE) -> None:
         """Install with the base release, so an upgrade test starts from the state it really leaves."""
-        if subprocess.run(['git', '-C', str(SOURCE), 'cat-file', '-e', BASE + '^{commit}'], capture_output=True).returncode:
-            self.skipTest(f'base commit {BASE[:7]} is not in this clone (CI fetches full history)')
+        if subprocess.run(['git', '-C', str(SOURCE), 'cat-file', '-e', commit + '^{commit}'], capture_output=True).returncode:
+            self.skipTest(f'base commit {commit[:7]} is not in this clone (CI fetches full history)')
         base = Path(self.temporary.name) / 'base source'
         base.mkdir()
-        archive = subprocess.run(['git', '-C', str(SOURCE), 'archive', BASE], capture_output=True, check=True)
+        archive = subprocess.run(['git', '-C', str(SOURCE), 'archive', commit], capture_output=True, check=True)
         subprocess.run(['tar', '-x', '-C', str(base)], input=archive.stdout, check=True)
         result = subprocess.run([sys.executable, str(base / 'bin/agent-setup'), '--source', str(base), '--root-dir', str(self.root),
                                  '--host-root', str(self.host), *flags], capture_output=True, text=True, env=self.env, timeout=60)
@@ -142,12 +144,12 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work), str(gcloud)])
 
     def test_codex_sandbox_has_its_own_block_gated_on_hooks_too(self) -> None:
-        """Q-12: hooks alone name the work root; the sandbox block is its own, and an update without
-        mcp keeps it without a second [sandbox_workspace_write] from an install before the split."""
+        """Hooks alone name the work root; the sandbox block is its own, and an update without mcp
+        keeps it without a second [sandbox_workspace_write] from an install before the split."""
         work = self.home / 'work'
         self.run_setup('--hosts', 'codex', '--components', 'hooks', '--work-root', str(work), '--apply')
         text = (self.host / 'config.toml').read_text()
-        self.assertEqual(tomllib.loads(text)['sandbox_workspace_write']['writable_roots'], [str(work)], 'Q-12: hooks only')
+        self.assertEqual(tomllib.loads(text)['sandbox_workspace_write']['writable_roots'], [str(work)], 'hooks only')
         self.assertIn('# BEGIN agent-kit sandbox', text)
         self.assertTrue(work.is_dir())
         shutil.rmtree(self.root)
@@ -159,6 +161,15 @@ class SetupTests(unittest.TestCase):
         self.run_setup('--hosts', 'codex', '--components', 'rules', '--apply')
         self.assertEqual(tomllib.loads((self.host / 'config.toml').read_text()), config, 'rules alone leave config.toml')
         self.run_setup('doctor')
+
+    def test_rules_only_update_moves_a_legacy_install_s_sandbox_roots(self) -> None:
+        work = self.home / 'work'
+        self.run_base_setup('--hosts', 'codex', '--components', 'rules', 'mcp', '--work-root', str(work), '--apply',
+                            commit=SANDBOX_IN_MCP_BLOCK)
+        self.run_setup('--hosts', 'codex', '--components', 'rules', '--apply')
+        text = (self.host / 'config.toml').read_text()
+        self.assertEqual(tomllib.loads(text)['sandbox_workspace_write']['writable_roots'], [str(work)])
+        self.assertIn('# BEGIN agent-kit sandbox', text)
 
     def test_user_sandbox_table_is_kept_not_duplicated(self) -> None:
         self.host.mkdir()
