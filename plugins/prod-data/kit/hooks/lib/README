@@ -23,7 +23,8 @@ the environment, and turns its check off, so a hook without an overlay is inert;
 guards need no key. Documented with placeholder values in ~/.claude/kit.env.example.
   GIT_AUTHOR         commit author the docs name (CLAUDE.md); git config when unset
   RELEASE_BRANCH_RE  extra local bases for bash-guards' two-dot diff check (ERE)
-  REVIEW_BASE  the branch review-state diffs against first, before origin/HEAD, main and master
+  REVIEW_BASE  the branch review-state diffs against first, before origin/HEAD, main and master; the
+                     one key an exported value still sets when the overlay lacks it (review-state)
   TEST_GATE_FILE     file at a repo root that turns on test-exec-gate and the SessionStart TESTS line
   TEST_RUNNER        the one test wrapper allowed there; ci-watch allowlists it for its repair agent
   TEST_RUNNER_RE     runner names that count as a test run (ERE; default TEST_RUNNER): test-run, session-digest
@@ -34,6 +35,7 @@ guards need no key. Documented with placeholder values in ~/.claude/kit.env.exam
   CODE_DIRS_JSON     JSON array of repo parent directories; takes precedence and preserves spaces
   BQRO_PROJECT       bqro's jobs project when a query passes no --project_id
   AGENT_WORK_ROOT    the work root (projects/, tasks/, retro/); default ~/agent-work, else ~/claude-scratch: kit_env.work_root() for agent_task.py and comment-guard; tests-ran-mark
+  CODEX_SANDBOX_GCLOUD  1 adds gcloud's config dir (it holds credentials) to Codex's sandbox writable roots, for bq; agent-setup --codex-gcloud
   CONTEXT_HANDOFF_AT  context tokens at which context-watch nudges a handoff (default 600000, 0 = no nudge; the idle-resume notice stays); the status line turns red there
   CODE_SEARCH_ZOEKT_URL  code-search skill: the Zoekt server behind browser SSO (unset turns that backend off)
   CODE_SEARCH_SSO_COOKIE  code-search: the SSO session cookie's name, read from the local Chrome profile

@@ -106,5 +106,5 @@ n=${#s}
 set -C
 { : >"$f.fired"; } 2>/dev/null || exit 0
 hook_lib open || exit 0
-add_context PostToolUse "$n read-only calls in a row with no edit. If the next step is more searching, reading across files, browsing or web research, hand it to the \`researcher\` agent (Agent tool, subagent_type \"researcher\") with the one question to answer and the paths to start from: it returns at most 300 words with file:line evidence and keeps this context small. Ignore this if you are about to act on what you have."
+add_context PostToolUse "$n read-only calls in a row with no edit. If the next step is more searching, reading across files, browsing or web research, hand it to $(host_noun delegate) with the one question to answer and the paths to start from: it returns at most 300 words with file:line evidence and keeps this context small. Ignore this if you are about to act on what you have."
 exit 0

@@ -20,6 +20,8 @@ import tomllib
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1]
+# The last release before the role renames: upgrade tests install it first, then this checkout.
+BASE = '2b07c10017f87e354d8dc1aa8b578a7b041b385b'
 
 
 class SetupTests(unittest.TestCase):
@@ -72,7 +74,113 @@ class SetupTests(unittest.TestCase):
         self.assertIn('not a kit link', result.stderr)
         installed = (self.root / 'skills/process-doc/SKILL.md').read_text()
         self.assertNotIn('${CLAUDE_SKILL_DIR}', installed)
-        self.assertIn(str(self.root / 'skills/process-doc') + '/scripts/catalog.py', installed)
+        command = re.search(r'`(uv run [^`]*catalog\.py[^`]*)`', installed).group(1)
+        self.assertEqual(shlex.split(command)[2], str(self.root / 'skills/process-doc/scripts/catalog.py'),
+                         'CX-3: the installed path is one shell word even with spaces')
+
+    def run_base_setup(self, *flags: str) -> None:
+        """Install with the base release, so an upgrade test starts from the state it really leaves."""
+        if subprocess.run(['git', '-C', str(SOURCE), 'cat-file', '-e', BASE + '^{commit}'], capture_output=True).returncode:
+            self.skipTest(f'base commit {BASE[:7]} is not in this clone (CI fetches full history)')
+        base = Path(self.temporary.name) / 'base source'
+        base.mkdir()
+        archive = subprocess.run(['git', '-C', str(SOURCE), 'archive', BASE], capture_output=True, check=True)
+        subprocess.run(['tar', '-x', '-C', str(base)], input=archive.stdout, check=True)
+        result = subprocess.run([sys.executable, str(base / 'bin/agent-setup'), '--source', str(base), '--root-dir', str(self.root),
+                                 '--host-root', str(self.host), *flags], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_upgrade_canonicalizes_saved_role_overrides(self) -> None:
+        self.run_base_setup('--components', 'roles', '--role-model', 'review-cross=openai:chosen-model',
+                            '--role-effort', 'worker=low', '--apply')
+        self.run_setup('--components', 'rules', '--apply')
+        roles = tomllib.loads((self.root / 'roles.toml').read_text())['roles']
+        self.assertEqual(roles['cross-reviewer']['model'], 'openai:chosen-model')
+        self.assertEqual(roles['engineer']['effort'], 'low')
+        saved = self.state()['configuration']
+        self.assertEqual(saved['role_model'], ['cross-reviewer=openai:chosen-model'])
+        self.assertEqual(saved['role_effort'], ['engineer=low'])
+
+    def test_upgrade_retires_codex_skills_and_agents_no_longer_produced(self) -> None:
+        self.run_base_setup('--hosts', 'codex', '--components', 'skills', 'roles', '--apply')
+        self.assertTrue((self.host / 'skills/pr-study').is_symlink())
+        self.assertTrue((self.host / 'agents/review-cross.toml').is_file())
+        (self.host / 'agents/mine.toml').write_text('name = "mine"\n')
+        self.run_setup('--hosts', 'codex', '--components', 'skills', 'roles', '--apply')
+        self.assertFalse((self.host / 'skills/pr-study').exists(), 'a hosts: [claude] skill stayed linked for codex')
+        self.assertFalse((self.host / 'skills/session-review').exists())
+        self.assertTrue((self.host / 'skills/grilling').is_symlink())
+        self.assertFalse((self.host / 'agents/review-cross.toml').exists())
+        self.assertTrue((self.host / 'agents/cross-reviewer.toml').is_file())
+        self.assertEqual((self.host / 'agents/mine.toml').read_text(), 'name = "mine"\n')
+        self.assertFalse((self.root / 'agents/thermo-bugs.md').exists())
+        managed = self.state()['managed']
+        self.assertFalse([key for key in managed if 'pr-study' in key and key.startswith('link:')])
+        self.run_setup('doctor')
+
+    def test_upgrade_retires_claude_agents_for_renamed_roles(self) -> None:
+        self.run_base_setup('--hosts', 'claude', '--components', 'roles', '--apply')
+        self.assertTrue((self.host / 'agents/thermo-bugs.md').is_file())
+        self.run_setup('--hosts', 'claude', '--components', 'roles', '--apply')
+        agents = sorted(path.name for path in (self.host / 'agents').iterdir())
+        for old in ('thermo-bugs.md', 'thermo-quality.md', 'reviewer.md', 'worker.md', 'scout.md', 'adversary.md'):
+            self.assertNotIn(old, agents)
+        self.assertIn('bug-reviewer.md', agents)
+
+    def test_codex_sandbox_names_a_fresh_work_root_and_gcloud_only_on_opt_in(self) -> None:
+        work = self.home / 'fresh work root'
+        gcloud = self.home / '.config/gcloud'
+        gcloud.mkdir(parents=True)
+        env = dict(self.env, CLAUDE_OUT_ROOT=str(self.home / 'not the work root'))
+        self.run_setup('--hosts', 'codex', '--components', 'mcp', '--work-root', str(work), '--apply', env=env)
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work)], 'CX-4 / Q-10 / B-10')
+        self.assertTrue(work.is_dir(), 'CX-4: the work root the sandbox names exists after the install')
+        self.run_setup('--hosts', 'codex', '--components', 'mcp', '--codex-gcloud', 'on', '--apply')
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work), str(gcloud)])
+
+    def test_user_sandbox_table_is_kept_not_duplicated(self) -> None:
+        self.host.mkdir()
+        (self.host / 'config.toml').write_text('model = "x"\n\n[sandbox_workspace_write]\nnetwork_access = true\n')
+        result = self.run_setup('--hosts', 'codex', '--components', 'mcp', '--apply')
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write'], {'network_access': True})
+        self.assertIn('agent-kit: note: your [sandbox_workspace_write] is kept', result.stderr)
+
+    def test_codex_tables_appended_inside_the_setup_block_survive_a_rerun(self) -> None:
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', 'mcp', '--apply')
+        path = self.host / 'config.toml'
+        text = path.read_text()
+        end = text.rindex('# END agent-kit setup')
+        path.write_text(text[:end] + '[hooks.state."abc"]\ntrusted_hash = "sha256:x"\n\n[projects."/p"]\ntrust_level = "trusted"\n\n' + text[end:])
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', 'mcp', '--apply')
+        config = tomllib.loads(path.read_text())
+        self.assertEqual(config['hooks']['state']['abc']['trusted_hash'], 'sha256:x')
+        self.assertEqual(config['projects']['/p']['trust_level'], 'trusted')
+        self.run_setup('doctor')
+
+    def test_cursor_hand_added_server_spelling_is_not_registered_twice(self) -> None:
+        self.host.mkdir()
+        config = self.host / 'mcp.json'
+        config.write_text(json.dumps({'mcpServers': {'Sentry': {'command': 'user-choice'}}}))
+        catalog = self.home / 'catalog.json'
+        catalog.write_text(json.dumps({'mcpServers': {'sentry': {'command': 'true'}}}))
+        result = self.run_setup('--hosts', 'cursor', '--components', 'mcp', '--mcp-catalog', str(catalog), '--apply', success=False)
+        self.assertIn('Sentry', result.stderr)
+        self.assertEqual(json.loads(config.read_text())['mcpServers'], {'Sentry': {'command': 'user-choice'}})
+
+    def test_skill_hosts_rejects_what_would_install_nowhere(self) -> None:
+        module = self.module()
+        skill = self.home / 'SKILL.md'
+        for front, expected in (('hosts: ["claude"]', {'claude'}), ('hosts: [claude, cursor]', {'claude', 'cursor'}),
+                                ('name: x', {'claude', 'codex', 'cursor'})):
+            skill.write_text(f'---\n{front}\n---\nbody\n')
+            self.assertEqual(module.skill_hosts(skill), expected, front)
+        for front in ('hosts: [claud]', 'hosts:\n  - claude', 'hosts: []'):
+            skill.write_text(f'---\n{front}\n---\nbody\n')
+            with self.assertRaises(ValueError, msg=front):
+                module.skill_hosts(skill)
 
     def test_default_is_preview(self) -> None:
         result = self.run_setup()

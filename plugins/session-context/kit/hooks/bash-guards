@@ -26,7 +26,7 @@ set -uo pipefail
 [ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
 
 . "${0%/*}/lib/hook-io" 2>/dev/null || {
-  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"bash-guards: hooks/lib/hook-io is missing, so no guard can inspect this command and the hook refuses all Bash calls. Restore it: git -C <your kit source checkout> checkout -- hooks/lib"}}'
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"bash-guards: hooks/lib/hook-io is missing, so no guard can inspect this command and the hook refuses all Bash calls. Restore it: git -C %s checkout -- hooks/lib"}}\n' "${0%/*}/.."
   exit 0
 }
 hook_lib closed cmd-view cmd-repo
@@ -792,7 +792,7 @@ case $cmd in *'$('*|*'`'*)
   while IFS= read -r _l; do
     case $_l in *'WRAPPERS = "'*) _wrap=${_l#*\"}; _wrap=${_wrap%%\"*}; break ;; esac
   done < "$HOOK_LIB/cmd-tokens"
-  [ -n "$_wrap" ] || deny "bash-guards: hooks/lib/cmd-tokens has no WRAPPERS list, so the runtime-path guard cannot run. Restore it: git -C <your kit source checkout> checkout -- hooks/lib"
+  [ -n "$_wrap" ] || deny "bash-guards: hooks/lib/cmd-tokens has no WRAPPERS list, so the runtime-path guard cannot run. Restore it: git -C ${0%/*}/.. checkout -- hooks/lib"
   if printf '%s' "$cmd" | grep -Eiq "(^|[;&|]|&&|\|\|)[[:space:]]*(($_wrap)[[:space:]]+)*(\\\$\\(|\`)[^)\`]*(command[[:space:]]+-v|which|type[[:space:]]+-p)[[:space:]]+($_cli)[^)\`]*(\\)|\`)"; then
     deny "Denied: a MySQL client path resolved at runtime, then executed. $_ROUTE
 \`command -v <name>\` alone, to check it exists, is fine."
@@ -1486,11 +1486,9 @@ _ip_exempt() {
   local out line p d r seen=0
   case $cmd in *'`'*) return 1 ;; esac
   out=$(printf '%s\n' "$cmd" | drop_heredocs 1 | awk -v q="'" "$_IP_AWK") || return 1
-  kit_env
   _ip_roots=(/nonexistent)   # never empty: "${a[@]}" of an empty array fails under set -u in bash 3.2
-  for r in "$(kit_work_root)"; do
-    [ -n "$r" ] && r=$(cd -P -- "$r" 2>/dev/null && pwd -P) && _ip_roots+=("$r")
-  done
+  r=$(kit_work_root)
+  if [ -n "$r" ] && r=$(cd -P -- "$r" 2>/dev/null && pwd -P); then _ip_roots+=("$r"); fi
   while IFS= read -r line; do
     case $line in N) seen=1; continue ;; 'F '/*|'F ~/'*) p=${line#F } ;; *) return 1 ;; esac
     case $p in '~/'*) p=$HOME/${p#'~/'} ;; esac

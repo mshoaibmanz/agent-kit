@@ -110,6 +110,8 @@ def main() -> int:
     got, lines = outcomes(rp, [("", "tally", "B-1=FIXED"), ("t1", "round", ""), ("t2", "tally", "B-1=FIXED")])
     check("B-6: an event with no timestamp is skipped, not counted before every round", got == {"bug-reviewer": {"FIXED": 1}}, got)
 
+    check("Q-6: a fix agent's TALLY counts under its old name too (worker before 2026-10-05)",
+          {"engineer", "worker"} <= rp.FIXER_AGENTS, rp.FIXER_AGENTS)
     check("CX- is attributed to the cross-reviewer role", rp.TALLY_PREFIX.get("CX") == "cross-reviewer", rp.TALLY_PREFIX)
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "roles.toml"

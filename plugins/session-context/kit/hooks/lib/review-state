@@ -50,7 +50,7 @@ _RV_NL=$'\n'
 # reminder reuses RV_VERIFY.
 _RV_VERIFY_T="REPRODUCE, THEN FIX: hand every report's findings VERBATIM with their ids (B-, Q-, R-, CX-) to whoever fixes: you, or @FIXER@ for a large round. Every report in the round counts (round 1: @ROUND1@). Reproduce each finding before fixing it, with a failing test or a concrete trace; fix what reproduces, plus small items under the fix policy. One that does not reproduce is NOT_REPRODUCED, with a line saying what was tried; a dismissal cites the code line that disproves it. End your final message with ONE line covering every finding: TALLY <id>=FIXED|NOT_REPRODUCED|OPTION|SKIPPED:<reason> ... Zero findings: say so, no TALLY."
 _RV_R1="bug-reviewer's AND Codex's"   # the default roles' round 1; _rv_verify rebuilds it from roles.toml
-command -v host_noun >/dev/null 2>&1 || . "${BASH_SOURCE[0]%/*}/host-words"
+. "${BASH_SOURCE[0]%/*}/host-words"
 _RV_VERIFY_T=${_RV_VERIFY_T/@FIXER@/$(host_noun fixer)}
 RV_VERIFY=${_RV_VERIFY_T/@ROUND1@/$_RV_R1}
 # A TALLY line as review-trigger and review-agent-mark match it (grep -E): `TALLY B-1=FIXED ...`,
@@ -83,8 +83,7 @@ _rv_verify() {
   RV_VERIFY=${_RV_VERIFY_T/@ROUND1@/$o}
 }
 RV_NOANCHOR="NO ANCHORING: give the agents ONLY the objective and the diff scope: no list of deliberate changes, no provenance of who wrote what, no invariant you already checked. Everything you pre-declare gets lighter scrutiny."
-RV_MAIN="YOU are the main session: spawn the agents yourself; a subagent has no Agent tool."
-[ "${AGENT_HOST:-claude}" = claude ] || RV_MAIN="YOU are the main session: dispatch the configured roles yourself; a subagent must not delegate."
+RV_MAIN="YOU are the main session: $(host_noun main)"
 _RV_SELF="yourself for NEW blocking correctness/security issues: no subagents, no re-litigating reviewed structure, style or comments. Fix verified defects only, report in one short list."
 
 rv_is_code() {
@@ -94,8 +93,8 @@ rv_is_code() {
   esac
 }
 
-# rv_review_agent <agent_type>: its return feeds a review round. A fix worker or second-opinion is not
-# one: its return must not close a round.
+# rv_review_agent <agent_type>: its return feeds a review round. An engineer fixing findings, or a
+# second-opinion, is not one: its return must not close a round.
 rv_review_agent() {
   case "$1" in auto-review:*) set -- "${1#auto-review:}" ;; esac
   set -- "$(rv_role_name "$1")"
@@ -170,8 +169,8 @@ rv_available() {
     elif [ "$native" != claude ]; then return 1
     fi
     if [ "$native" != claude ] && [ "${RV_R_INVOKE:-}" != agent ]; then return 1; fi
-    case $role in thermo-*)
-      grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null || { role=task-reviewer; continue; } ;;
+    case $role in bug-reviewer|quality-reviewer)
+      _rv_thermos || { role=task-reviewer; continue; } ;;
     esac
     RV_AVAILABLE=$role
     return 0
@@ -182,28 +181,16 @@ rv_available() {
 # _rv_once <role>: a once-per-PR role (quality-reviewer): its return marks quality_done, completes
 # no round, and the round's correctness reviewers do not wait for it.
 _rv_once() { rv_roles; case " $RV_ONCE " in *" $1 "*) return 0 ;; esac; return 1; }
-# Role names from before the renames, as session state and branch records may still hold them:
-# codex (session state) and codex-review (branch record) before review-cross, and the 2026-10-05
-# names (thermo-bugs, thermo-quality, review-cross, reviewer). rv_role_name maps one to today's.
-rv_role_name() {
-  case $1 in
-    codex|codex-review|review-cross) printf cross-reviewer ;;
-    thermo-bugs) printf bug-reviewer ;;
-    thermo-quality) printf quality-reviewer ;;
-    reviewer) printf task-reviewer ;;
-    *) printf '%s' "$1" ;;
-  esac
-}
+# _rv_thermos: the thermos plugin is enabled, so bug-reviewer and quality-reviewer have their rubric.
+_rv_thermos() { grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null; }
+# Role names from before the renames (old:new), as session state and branch records may still hold
+# them: codex (session state) and codex-review (branch record) before review-cross, then the
+# pre-2026-10-05 names. Both live at most a pending TTL (2h) or a branch's life: delete after 2026-10-19.
+_RV_ALIASES='codex:cross-reviewer codex-review:cross-reviewer review-cross:cross-reviewer thermo-bugs:bug-reviewer thermo-quality:quality-reviewer reviewer:task-reviewer'
+# rv_role_name <role>: today's name for an old one.
+rv_role_name() { local p; for p in $_RV_ALIASES; do [ "$1" = "${p%%:*}" ] && { printf '%s' "${p#*:}"; return; }; done; printf '%s' "$1"; }
 # rv_role_drop <role>: a JSON list of the role and its old names, for removing it from a record.
-rv_role_drop() {
-  case $1 in
-    cross-reviewer) printf '["cross-reviewer","review-cross","codex-review","codex"]' ;;
-    bug-reviewer) printf '["bug-reviewer","thermo-bugs"]' ;;
-    quality-reviewer) printf '["quality-reviewer","thermo-quality"]' ;;
-    task-reviewer) printf '["task-reviewer","reviewer"]' ;;
-    *) printf '["%s"]' "$1" ;;
-  esac
-}
+rv_role_drop() { local p o="\"$1\""; for p in $_RV_ALIASES; do [ "${p#*:}" = "$1" ] && o="$o,\"${p%%:*}\""; done; printf '[%s]' "$o"; }
 _rv_legacy() {
   local w o=''
   for w in ${!1}; do
@@ -590,7 +577,7 @@ rv_decide() {
   if [ "$tier" = 1 ]; then
     lead="Code changed since the last review"; what="ONE light review pass"
     spawn="Spawn ONE subagent_type \"task-reviewer\" Agent with (1) the task objective and (2) a summary of the files in that diff and what changed in each (a fresh agent cannot see what changed)."
-  elif ! grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null; then
+  elif ! _rv_thermos; then
     # The local bug-reviewer / quality-reviewer agents Read the thermos rubric themselves (the
     # plugin's own agents call the Skill tool, which a subagent cannot: 34 of 34 such calls failed
     # in 30 days). Kit installs without the thermos plugin fall back to one reviewer.
@@ -682,8 +669,8 @@ _rv_complete() {
     auto-review:*) ag=${at#auto-review:} ;;
     thermos:thermo-nuclear-review-subagent) ag=bug-reviewer ;;
     thermos:thermo-nuclear-code-quality-review-subagent) ag=quality-reviewer ;;
-    *) ag=$(rv_role_name "$at") ;;
   esac
+  ag=$(rv_role_name "$ag")
   _rv_load "$sid"
   # Counted once: a foreground agent fires PostToolUse and SubagentStop.
   if [ -n "$aid" ] && _rv_get d "done.$aid" && [ "$d" = 1 ]; then return 0; fi
@@ -853,7 +840,16 @@ _rv_rec_mark() {
   rv_rec_update "$p" "$br" "$@"
 }
 
-# _rv_bases <root> [merge]: the base branches that exist, REVIEW_BASE (kit.env) first.
+# _rv_review_base: REVIEW_BASE from kit.env, else as exported when this lib loaded. kit_env unsets
+# every declared key, so the exported value is kept here, and kit_env runs in a subshell.
+_RV_BASE_ENV=${REVIEW_BASE:-}
+_rv_review_base() {
+  local f lib=${BASH_SOURCE[0]%/*}
+  f=$(command -v kit_env >/dev/null 2>&1 || . "$lib/hook-io" 2>/dev/null; kit_env 2>/dev/null; printf '%s' "${REVIEW_BASE:-}")
+  printf '%s' "${f:-${_RV_BASE_ENV:-${REVIEW_BASE:-}}}"
+}
+
+# _rv_bases <root> [merge]: the base branches that exist, REVIEW_BASE (kit.env or exported) first.
 # `merge` lists only where a branch merges for good (REVIEW_BASE, origin/HEAD, main, master): a
 # feature merged into origin/staging or origin/develop to test it (some repos do this before the
 # master PR) has not merged, and reading that as a merge reset its rounds and re-asked quality-reviewer.
@@ -861,7 +857,7 @@ _rv_bases() {
   local r h more='origin/develop origin/staging'
   [ "${2:-}" != merge ] || more=''
   h=$(git -C "$1" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
-  for r in ${REVIEW_BASE:-} $h origin/main origin/master $more; do
+  for r in $(_rv_review_base) $h origin/main origin/master $more; do
     git -C "$1" rev-parse -q --verify "$r^{commit}" >/dev/null 2>&1 && printf '%s\n' "$r"
   done | awk '!seen[$0]++'
 }
@@ -979,7 +975,7 @@ rv_round_swap() {
 # spawn; one on another provider (invoke `run`: cross-reviewer on gpt-6.1-sol) is bin/agent-run
 # through Bash, which writes its own round into the record, and without its provider's CLI
 # (CODEX_BIN, default codex) its fallback role (bug-reviewer) takes its place. Without the thermos
-# plugin the thermo agents become one reviewer.
+# plugin bug-reviewer and quality-reviewer become one task-reviewer.
 rv_push_decide() {
   local sid=$1 root=$2 br=$3 rsha=${4:-} cur=$RV_TREE budget=${REVIEW_MAX_ROUNDS:-3}
   local from rhead up b sens=0 now list a w spawn='' n=0 rk scope since anchor
@@ -1060,7 +1056,7 @@ rv_push_decide() {
   for a in $agents; do n=$((n + 1)); spawn="${spawn:+$spawn and }subagent_type \"$a\""; done
   list="$agents${runs:+ $runs}"
   [ "$n" = 0 ] || run="in the FOREGROUND (no run_in_background), spawn $n Agent call(s): $spawn, each given the objective and the diff scope (they load their own rubric and run in the working tree)"
-  if [ "${AGENT_HOST:-claude}" != claude ] && [ "$n" != 0 ]; then
+  if ! host_agent_tool && [ "$n" != 0 ]; then
     run="select the named native agent(s): $agents, each given the objective, worktree and diff scope, and wait for their results"
   fi
   for a in $runs; do

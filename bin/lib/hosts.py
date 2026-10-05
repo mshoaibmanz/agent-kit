@@ -7,10 +7,16 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import tomllib
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
+from kit_env import kit_env, work_root  # noqa: E402
+
+HOSTS = ("claude", "codex", "cursor")
 
 EVENTS = {
     "PreToolUse": "preToolUse",
@@ -61,28 +67,41 @@ def block(existing: str, managed: str, begin: str = BEGIN, end: str = END) -> st
     return existing + ("\n" if existing and not existing.endswith("\n") else "") + new + "\n"
 
 
-def keep_host_tables(existing: str) -> str:
-    """Move tables the host wrote inside the managed block (Codex hook trust) past its END.
+# The top-level tables a kit block writes: MCP servers, the sandbox roots, and (agent-setup's outer
+# block) the shell policy.
+OWNED_TABLES = frozenset({"mcp_servers", "sandbox_workspace_write", "shell_environment_policy"})
 
-    Codex appends `[hooks.state.*]` before the file's trailing comment, which is our END marker,
-    so replacing the block would silently revoke hook trust.
+
+def _table_name(chunk: str) -> str:
+    """The top-level key of a chunk's table header, quoted or bare."""
+    try:
+        return next(iter(tomllib.loads(chunk.split("\n", 1)[0])), "")
+    except tomllib.TOMLDecodeError:
+        return ""
+
+
+def keep_host_tables(existing: str, begin: str = BEGIN, end: str = END) -> str:
+    """Move tables the host wrote inside a kit block (hook trust, project trust) past its END.
+
+    Codex appends `[hooks.state.*]` and `[projects.*]` before the file's trailing comment, which is
+    our END marker, so replacing the block would silently revoke that trust.
     """
-    if BEGIN not in existing or END not in existing:
+    if begin not in existing or end not in existing:
         return existing
-    start = existing.index(BEGIN) + len(BEGIN)
-    stop = existing.index(END)
+    start = existing.index(begin) + len(begin)
+    stop = existing.index(end)
     owned, host = [], []
     for chunk in re.split(r"(?m)^(?=\[)", existing[start:stop]):
-        (host if chunk.startswith("[hooks.") else owned).append(chunk)
+        (owned if not chunk.startswith("[") or _table_name(chunk) in OWNED_TABLES else host).append(chunk)
     if not host:
         return existing
-    tail = existing[stop + len(END) :].lstrip("\n")
+    tail = existing[stop + len(end) :].lstrip("\n")
     moved = "".join(host).rstrip() + "\n"
     return (
         existing[:start]
         + "".join(owned).rstrip()
         + "\n"
-        + END
+        + end
         + "\n\n"
         + moved
         + ("\n" + tail if tail else "")
@@ -272,16 +291,30 @@ def safe_servers(kit: Path) -> dict[str, Any]:
     return out
 
 
-def sandbox_roots(kit: Path) -> list[str]:
+def sandbox_roots() -> list[str]:
     """Paths a workspace-write Codex session must write outside the repo: the work root (task
-    folders hold TMPDIR and evidence) and gcloud's config dir, which bq rewrites on every call."""
-    import sys
-
-    sys.path.insert(0, str(kit / "hooks/lib"))
-    from kit_env import work_root
-
+    folders hold TMPDIR and evidence), named even before it exists because agent-setup creates it
+    after rendering; and, when the overlay sets CODEX_SANDBOX_GCLOUD=1, gcloud's config dir, which
+    bq rewrites on every call (it holds credentials, so it is opt-in)."""
+    roots = [work_root()]
     gcloud = os.environ.get("CLOUDSDK_CONFIG") or str(Path.home() / ".config/gcloud")
-    return [path for path in (work_root(), gcloud) if Path(path).is_dir()]
+    if kit_env()["CODEX_SANDBOX_GCLOUD"] == "1" and Path(gcloud).is_dir():
+        roots.append(gcloud)
+    return roots
+
+
+def install_text(text: str, kit: str, skill: str | None = None, export: bool = True) -> str:
+    """A kit markdown file as installed with its kit at <kit>: {{AGENT_KIT_DIR}} names the kit, each
+    ```sh block first exports AGENT_KIT_DIR (with export), and ${CLAUDE_SKILL_DIR}, which only Claude
+    Code expands, names <kit>/skills/<skill> as one shell word. A kit given as a shell expression
+    (${CLAUDE_PLUGIN_ROOT}/kit) is double-quoted so it still expands."""
+    word = f'"{kit}"' if "$" in kit else shlex.quote(kit)
+    text = text.replace("{{AGENT_KIT_DIR}}", kit)
+    if export:
+        text = text.replace("```sh\n", f"```sh\nexport AGENT_KIT_DIR={word}\n")
+    if skill:
+        text = text.replace("${CLAUDE_SKILL_DIR}", shlex.quote(f"{kit}/skills/{skill}"))
+    return text
 
 
 def toml_sandbox(roots: list[str]) -> str:
@@ -473,10 +506,6 @@ def render(api: Any, args: Any) -> int:
             raise SystemExit(
                 "agent-kit: unmanaged MCP names already exist: " + ", ".join(collisions)
             )
-        if "mcp" in components and "sandbox_workspace_write" in config:
-            raise SystemExit(
-                "agent-kit: an unmanaged [sandbox_workspace_write] exists; reconcile it first"
-            )
         new_config = existing
         if "hooks" in components:
             values = shell_env(api.KIT, host)
@@ -504,7 +533,16 @@ def render(api: Any, args: Any) -> int:
             ownership[shell_key] = values
             new_config = shell_config(new_config, values, versions(shell_key))
         if "mcp" in components:
-            managed = toml_servers(servers) + toml_sandbox(sandbox_roots(api.KIT))
+            roots = sandbox_roots()
+            if "sandbox_workspace_write" in config:
+                # The user's own table stands; a second one would make the file invalid TOML.
+                print(
+                    "agent-kit: note: your [sandbox_workspace_write] is kept; add these to its "
+                    f"writable_roots for task folders: {json.dumps(roots)}",
+                    file=sys.stderr,
+                )
+                roots = []
+            managed = toml_servers(servers) + toml_sandbox(roots)
             new_config = block(keep_host_tables(new_config), managed)
         tomllib.loads(new_config)
         plans.append((config_path, new_config))

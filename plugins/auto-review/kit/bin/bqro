@@ -49,7 +49,7 @@ def overlay_project() -> str:
     try:
         from kit_env import kit_env
     except ImportError as e:
-        die(f"cannot load {KIT_LIB}/kit_env.py ({e}); restore it: git -C ~/.claude checkout -- hooks/lib")
+        die(f"cannot load {KIT_LIB}/kit_env.py ({e}); restore it: git -C {Path(__file__).resolve().parents[1]} checkout -- hooks/lib")
     return kit_env()["BQRO_PROJECT"]
 
 

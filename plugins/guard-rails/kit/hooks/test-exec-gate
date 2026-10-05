@@ -31,7 +31,7 @@ gate_off_notice() {
   local f=${KIT_ENV:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/kit.env}
   hook_input
   [[ $HOOK_INPUT =~ $re ]] && sid=${BASH_REMATCH[1]}
-  m="${AGENT_STATE_DIR:-$HOME/.claude/tmp}/claude-tests/gate-off-$sid"
+  m="$HOME/.claude/tmp/claude-tests/gate-off-$sid"
   [ ! -e "$m" ] || return 0
   { mkdir -p "${m%/*}" && touch "$m"; } 2>/dev/null || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -108,12 +108,13 @@ note=${TEST_NOTE:+ $TEST_NOTE}
 # 1. No backgrounded test runs — must be foreground with fast feedback. A run whose stdout is
 #    redirected to a log file is the one legitimate background shape (a cold-namespace run can
 #    exceed the 600s Bash cap); the log is then read, not the stream. Codex and Cursor carry no
-#    run_in_background field, so a trailing `&` or a nohup/setsid prefix is the background there.
-if [ "$bg" != true ] && printf '%s' "$CMD_BARE" | grep -Eq '(^|[^&])&[[:space:]]*$|(^|[;&|[:space:]])(nohup|setsid)[[:space:]]'; then
+#    run_in_background field, so a lone `&` (not &&, >&, &>, |&) or a nohup/setsid prefix is the
+#    background there; `& wait` waits for it, so that one is the foreground.
+_bgcmd=$(printf '%s' "$CMD_BARE" | tr '\n' ' ' | sed -E 's/&[[:space:];]*wait([[:space:];]|$)/; wait\1/g')
+if [ "$bg" != true ] && printf '%s' "$_bgcmd" | grep -Eq '(^|[^&<>|])&([^&>]|$)|(^|[;&|([:space:]])(nohup|setsid)[[:space:]]'; then
   bg=true
 fi
-logdir='the scratchpad dir named in your system prompt'
-[ "${AGENT_HOST:-claude}" = claude ] || logdir='your bound task folder (or TMPDIR)'
+logdir=$(host_noun logdir)
 if [ "$bg" = "true" ] && ! printf '%s' "$CMD_BARE" | grep -Eq '>[[:space:]]*[^[:space:]&|;]+'; then
   deny "Do not run tests in the background. Run them in the FOREGROUND so feedback is immediate (≤1 min). Scope tightly with a path and/or -k plus -x. If the run genuinely needs >600s, redirect stdout to a log in $logdir — a redirected run may be backgrounded.$doc"
 fi

@@ -1023,9 +1023,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.host is None and args.components is None:
         return cmd_doctor_claude(args)
     sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from hosts import inventory
+    from hosts import HOSTS, inventory
 
-    names = ("claude", "codex", "cursor") if args.host == "all" else (args.host or "claude",)
+    names = HOSTS if args.host == "all" else (args.host or "claude",)
     results = [
         inventory(
             sys.modules[__name__],

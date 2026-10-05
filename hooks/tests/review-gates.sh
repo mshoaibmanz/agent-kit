@@ -714,17 +714,40 @@ check "an effort off the provider's scale: exit 2" "$out" 'not on the openai sca
 sed -n '1,3p' "$(git -C "$RA" rev-parse --path-format=absolute --git-common-dir)"/agent-review-runs/cross-reviewer-fa-*.prompt.md 2>/dev/null | grep -q 'cross-model reviewer' \
   && ok "the prompt is the cross-reviewer agent body" || bad "the prompt is the cross-reviewer agent body"
 
-echo "--- cross-reviewer: rounds issued before the rename (codex, codex-review) ---"
+echo "--- rounds issued before the renames (codex, codex-review; thermo-bugs, thermo-quality, review-cross) ---"
 RL="$FX/rl"; SL="$SID-rl"; mkfeat "$RL" fl
 workin "$RL" "$SL" a 60; issue "$RL" "$SL" CODEX_BIN="$FK" >/dev/null
 rkl=$(rs path_key "$RL")
-rs _rv_set "$SL" "ragents.$rkl=bug-reviewer quality-reviewer codex"
-( . "$H/lib/review-state" && rv_rec_update "$RL" fl '.agents = ["bug-reviewer","quality-reviewer","codex-review"]' )
+rs _rv_set "$SL" "ragents.$rkl=thermo-bugs thermo-quality codex"
+( . "$H/lib/review-state" && rv_rec_update "$RL" fl '.agents = ["thermo-bugs","thermo-quality","review-cross"]' )
 out=$(gpush "$SID-rl2" "$RL" CODEX_BIN="$FK"); check "a legacy record's wait names agent-run cross-reviewer" "$out" 'cross-reviewer is not an Agent: run `[^`]*/bin/agent-run cross-reviewer'
+check "...and the old agent names, never the retired ones" "$out" 'thermo-|review-cross' absent
 out=$(RC="$RL" cxr "$SL" FAKE_JSON="$FX/cx0.json")
 rs rv_pending "$SL" "$RL" && ok "...cross-reviewer returning to a legacy round leaves bug-reviewer out" || bad "...cross-reviewer returning to a legacy round leaves bug-reviewer out"
-sstopin "$RL" "$SL" bug-reviewer "No findings."
-[ "$(rec "$RL" fl '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "...and bug-reviewer completes it" || bad "...and bug-reviewer completes it" "$(rec "$RL" fl .)"
+sstopin "$RL" "$SL" auto-review:thermo-bugs "No findings."
+[ "$(rec "$RL" fl '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "Q-2/CX-2: ...and a plugin-qualified auto-review:thermo-bugs return completes it" || bad "Q-2/CX-2: ...and a plugin-qualified auto-review:thermo-bugs return completes it" "$(rec "$RL" fl .)"
+out=$({ CODEX_BIN=codex "$CR" review-cross "$RA" --dry-run 2>&1; echo "rc=$?"; } | tr '\n' ' ')
+check "B-6: agent-run takes an old role name (review-cross) as today's" "$out" 'dry run, cross-reviewer .*rc=0'
+
+echo "--- no thermos plugin: bug-reviewer and quality-reviewer fall back to task-reviewer (Q-1, B-2) ---"
+NT="$FX/nothermos-home"; mkdir -p "$NT/.claude"; printf '{"enabledPlugins": {}}\n' > "$NT/.claude/settings.json"
+RN="$FX/rn"; SN="$SID-rn"; mkfeat "$RN" fn
+workin "$RN" "$SN" a 60
+out=$(issue "$RN" "$SN" HOME="$NT" CODEX_BIN="$FK")
+check "the push asks for one task-reviewer" "$out" 'subagent_type "task-reviewer"'
+check "...not the two agents whose rubric is missing" "$out" 'subagent_type "(bug|quality)-reviewer"' absent
+( HOME="$NT"; . "$H/lib/review-state" && rv_available quality-reviewer && [ "$RV_AVAILABLE" = task-reviewer ] ) \
+  && ok "...rv_available quality-reviewer -> task-reviewer" || bad "...rv_available quality-reviewer -> task-reviewer"
+
+echo "--- REVIEW_BASE: from kit.env, or as exported (B-3) ---"
+git -C "$RN" update-ref refs/remotes/origin/rel HEAD
+printf 'REVIEW_BASE=origin/rel\n' > "$FX/rb.env"
+out=$(unset REVIEW_BASE; export KIT_ENV="$FX/rb.env"; . "$H/lib/hook-io" && . "$H/lib/review-state" && _rv_bases "$RN" | head -1)
+[ "$out" = origin/rel ] && ok "kit.env's REVIEW_BASE leads the bases with no kit_env call first (the push path)" \
+  || bad "kit.env's REVIEW_BASE leads the bases with no kit_env call first (the push path)" "$out"
+out=$(export REVIEW_BASE=origin/rel KIT_ENV=/dev/null; . "$H/lib/hook-io" && . "$H/lib/review-state" && kit_env && _rv_bases "$RN" | head -1)
+[ "$out" = origin/rel ] && ok "...and an exported REVIEW_BASE survives a kit_env call" \
+  || bad "...and an exported REVIEW_BASE survives a kit_env call" "$out"
 
 echo "--- review rounds shared across sessions (RC-CX-1..4) ---"
 # RC-CX-1: session B adopts A's round T1, completes it and issues T2; A's late return for T1 must

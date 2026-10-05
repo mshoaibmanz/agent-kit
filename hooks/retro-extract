@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "li
 try:
     import agent_task as at
 except ImportError as e:
-    print(json.dumps({"systemMessage": f"retro-extract is off: hooks/lib/agent_task.py failed to import ({e}). Restore it: git -C <your kit source checkout> checkout -- hooks/lib"}))
+    print(json.dumps({"systemMessage": f"retro-extract is off: hooks/lib/agent_task.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
     sys.exit(0)
 
 CORRECTION = re.compile(r"^(no\b|nope\b|don'?t\b|do not\b|stop\b|wrong\b|that'?s (not|wrong)|not (that|what)|why did you|you (should|shouldn'?t|didn'?t|forgot)|actually\b|instead\b|undo\b|revert\b)", re.I)

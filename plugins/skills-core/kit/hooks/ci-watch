@@ -23,7 +23,7 @@ set -uo pipefail
 
 HOOK_LIB="$(cd "$(dirname "$0")" && pwd)/lib"
 { . "$HOOK_LIB/notify" && . "$HOOK_LIB/state" && . "$HOOK_LIB/hook-io"; } 2>/dev/null \
-  || { echo "ci-watch: $HOOK_LIB is missing a lib; restore it: git -C <your kit source checkout> checkout -- hooks/lib"; exit 0; }
+  || { echo "ci-watch: $HOOK_LIB is missing a lib; restore it: git -C ${0%/*}/.. checkout -- hooks/lib"; exit 0; }
 kit_env
 
 REPO_DIR="${1:-$PWD}"

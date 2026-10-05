@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -107,6 +108,39 @@ with tempfile.TemporaryDirectory(prefix="host-words-", dir=os.environ.get("TMPDI
     out = bash_hook("test-exec-gate", "run-tests tests/a_test.py > log.txt 2>&1 &", repo, "codex",
                     KIT_ENV=str(overlay))
     check("codex: a redirected background run is allowed", out.get("permissionDecision") != "deny", out)
+    for command in ("run-tests tests/a_test.py & disown", "(run-tests tests/a_test.py &)"):
+        out = bash_hook("test-exec-gate", command, repo, "codex", KIT_ENV=str(overlay))
+        check(f"codex: B-7 a backgrounded test run is refused ({command})",
+              out.get("permissionDecision") == "deny" and "in the background" in out.get("permissionDecisionReason", ""), out)
+    for command in ("run-tests tests/a_test.py &\nwait", "run-tests tests/a_test.py 2>&1 | tail -5",
+                    "run-tests tests/a_test.py && run-tests tests/b_test.py"):
+        out = bash_hook("test-exec-gate", command, repo, "codex", KIT_ENV=str(overlay))
+        check(f"codex: B-7 a foreground run is not taken for a background one ({command!r})",
+              "in the background" not in out.get("permissionDecisionReason", ""), out)
+    out = bash_hook("test-exec-gate", "run-tests tests/a_test.py &", repo, None, KIT_ENV=str(overlay))
+    check("claude: Q-4 the background refusal names the scratchpad",
+          "system prompt" in out.get("permissionDecisionReason", ""), out)
+
+    script = root / "a.py"
+    script.write_text("x = 1\n")
+    out = bash_hook("bash-guards", f"sed -i '' 's/1/2/' {script}", repo, "cursor",
+                    CLAUDE_OUT_ROOT=str(root / "work"))
+    reason = out.get("permissionDecisionReason", "")
+    check("cursor: the in-place refusal names the editor tool and the Cursor rules",
+          "the editor's file-edit tool" in reason and "the Cursor rules" in reason and "CLAUDE.md" not in reason, out)
+
+    # Q-3: without host-words, a closed hook refuses with the restore hint instead of guessing words.
+    broken = root / "broken-kit"
+    shutil.copytree(KIT / "hooks", broken / "hooks", symlinks=True)
+    (broken / "hooks/lib/host-words").unlink()
+    payload = {"tool_name": "Bash", "hook_event_name": "PreToolUse", "session_id": "hw", "cwd": str(repo),
+               "tool_input": {"command": "git push --force origin topic"}}
+    run = subprocess.run([str(broken / "hooks/bash-guards")], input=json.dumps(payload), capture_output=True,
+                         text=True, env=env_for(None), cwd=repo, timeout=60)
+    out = json.loads(run.stdout or "{}").get("hookSpecificOutput", {})
+    check("Q-3: bash-guards without lib/host-words refuses and names the restore command",
+          out.get("permissionDecision") == "deny" and "checkout -- hooks/lib" in out.get("permissionDecisionReason", "")
+          and "command not found" not in run.stderr, (out, run.stderr))
 
 print(f"{failures} failure(s)")
 sys.exit(1 if failures else 0)

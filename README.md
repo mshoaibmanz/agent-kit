@@ -41,6 +41,8 @@ The default source root is `~/.local/share/agent-kit`, outside shared skill disc
 | `commands` | Optional Claude workflow commands under the selected host directory | `gh` and provider login when invoked; Jira actions need an authorized connector |
 | `data-wrappers` | Read-only `ro-mysql` and `bqro` commands | macOS/Homebrew `mysql-client` and SSH/Keychain for `ro-mysql`; `bq` and native Google auth for `bqro`; no connections during setup |
 
+For Codex, `mcp` also names the work root in `[sandbox_workspace_write]` writable roots and creates it; an existing table of your own is kept and setup prints the roots to add. `--codex-gcloud on` (or the guided prompt) adds gcloud's config directory, which holds credentials, so `bq` works inside the sandbox; it is off by default.
+
 Rules and skills are the default. Hooks start with advisory events. To enable blocking safety and review gates, explicitly choose `--components hooks --blocking-hooks`. That selection also installs the Git dispatcher environment into the model's shell. Setup never adjusts the host's permission policy.
 
 Codex command hooks require a local runtime exposing `hooks` in `codex features list`. Cloud command hooks are refused. Review the installed hook commands through `/hooks` and trust their current hash yourself. Cursor hook support must be checked in the installed app and confirmed with `--confirm-hook-support cursor`.

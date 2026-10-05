@@ -3,7 +3,7 @@
 #   PostToolUse(Agent)     a review type's spawn records agent_id -> subagent_type in the session's
 #                          review state (SubagentStop payloads have carried agent_type "" since about
 #                          2026-09-29). A FOREGROUND review agent's tool result already holds its
-#                          report, so the round completes here. Any other agent (a fix worker)
+#                          report, so the round completes here. Any other agent (an engineer)
 #                          whose report holds a TALLY line settles the tally review-trigger owes.
 #   SubagentStop           fires when any subagent returns, foreground or background. The type comes
 #                          from the payload, else the agent map above, else the transcript's

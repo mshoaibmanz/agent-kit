@@ -34,6 +34,12 @@ TEXT_BEGIN = '<!-- BEGIN agent-kit setup -->'
 TEXT_END = '<!-- END agent-kit setup -->'
 TOML_BEGIN = '# BEGIN agent-kit setup'
 TOML_END = '# END agent-kit setup'
+# Role names before 2026-10-05, as a saved install's role_model / role_effort may still hold them.
+ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'second-opinion',
+                'reviewer': 'task-reviewer', 'thermo-bugs': 'bug-reviewer',
+                'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
+sys.path.insert(0, str(SOURCE / 'bin/lib'))
+from hosts import HOSTS, install_text, keep_host_tables, normalize_transport  # noqa: E402
 
 
 def digest(data: bytes) -> str:
@@ -69,8 +75,6 @@ def safe_catalog(path: Path) -> dict[str, Any]:
     catalog = json.loads(path.read_text())
     if not isinstance(catalog, dict) or not isinstance(catalog.get('mcpServers', {}), dict):
         raise ValueError('MCP catalog must map server names to objects')
-    sys.path.insert(0, str(SOURCE / 'bin/lib'))
-    from hosts import normalize_transport
     servers = {}
     for name, spec in catalog.get('mcpServers', {}).items():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', name) or not isinstance(spec, dict):
@@ -131,6 +135,13 @@ def managed_block(text: str, begin: str, end: str) -> tuple[str, str]:
     first = text.index(begin)
     last = text.index(end, first) + len(end)
     return text[:first] + text[last:], text[first:last]
+
+
+def setup_block(text: str, kind: str) -> tuple[str, str]:
+    """managed_block for this installer's text or toml block. In TOML, tables the host appended
+    inside it (Codex hook and project trust, before the file's trailing comment) count as outside."""
+    begin, end = (TEXT_BEGIN, TEXT_END) if kind == 'text' else (TOML_BEGIN, TOML_END)
+    return managed_block(keep_host_tables(text, begin, end) if kind == 'toml' else text, begin, end)
 
 
 def selected_registry(source: Path, components: set[str], blocking: bool) -> list[dict]:
@@ -218,14 +229,66 @@ def validate_toml_boundary(text: str) -> None:
 
 
 def skill_hosts(skill_md: Path) -> set[str]:
-    """The hosts a skill's `hosts:` frontmatter names; every host when it has none."""
+    """The hosts a skill's `hosts:` frontmatter names, as an inline list; every host when it has none.
+    Any other form, or an unknown name, is an error: either would install the skill nowhere."""
     text = skill_md.read_text()
     if text.startswith('---\n'):
         for line in text[4:text.find('\n---', 4)].splitlines():
             key, _, value = line.partition(':')
-            if key.strip() == 'hosts':
-                return {name.strip() for name in value.strip().strip('[]').split(',') if name.strip()}
-    return {'claude', 'codex', 'cursor'}
+            if key.strip() != 'hosts':
+                continue
+            value = value.strip()
+            names = {name.strip().strip('\'"') for name in value[1:-1].split(',')} - {''} if value[:1] + value[-1:] == '[]' else set()
+            if not names or names - set(HOSTS):
+                raise ValueError(f'{skill_md}: hosts: must be an inline list of {", ".join(HOSTS)}, got {value or "a block list"}')
+            return names
+    return set(HOSTS)
+
+
+def overlay_text(args: argparse.Namespace) -> str:
+    """local/setup-paths.env: the setup's own overlay keys."""
+    if any('\n' in value or '\r' in value for value in [*args.repo_roots, args.work_root]):
+        raise ValueError('Repository and work roots must fit on one line')
+    overlay = 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
+    if args.work_root:
+        overlay += 'AGENT_WORK_ROOT=' + args.work_root + '\n'
+    if args.github_owner:
+        overlay += 'CODE_SEARCH_GH_OWNER=' + args.github_owner + '\n'
+    if args.zoekt_url:
+        overlay += 'CODE_SEARCH_ZOEKT_URL=' + args.zoekt_url + '\n'
+    if args.codex_gcloud == 'on':
+        overlay += 'CODEX_SANDBOX_GCLOUD=1\n'
+    return overlay
+
+
+def installed_work_root(root: Path) -> Path:
+    """The work root as hooks resolve it under this install's overlay (Codex's sandbox names it)."""
+    from kit_env import work_root
+    saved = dict(os.environ)
+    os.environ.pop('CLAUDE_OUT_ROOT', None)
+    os.environ['KIT_ENV'] = str(root / 'local/setup-paths.env')
+    try:
+        return Path(work_root())
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view: Path) -> dict:
+    """Give the renderer the user's own host config (this installer's block removed), so its checks
+    and choices (no second [sandbox_workspace_write], the live Cursor server spelling) see what the
+    install will merge into."""
+    root = Path(args.root_dir).expanduser().absolute()
+    if host == 'codex' and (target / 'config.toml').is_file():
+        outside, _ = managed_block(keep_host_tables((target / 'config.toml').read_text(), TOML_BEGIN, TOML_END), TOML_BEGIN, TOML_END)
+        (host_view / 'config.toml').write_text(outside)
+    if host == 'cursor' and (target / 'mcp.json').is_file():
+        document = load_json(target / 'mcp.json', {})
+        owned = prior_record(root, target / 'mcp.json', 'servers').get('owned', {})
+        servers = {name: spec for name, spec in document.get('mcpServers', {}).items() if name not in owned}
+        (host_view / 'mcp.json').write_text(json.dumps({'mcpServers': servers}))
+        return servers
+    return {}
 
 
 def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) -> list[Change]:
@@ -243,8 +306,8 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
         if 'roles' in components:
             roles = api.load_roles()
             for name, text in api.expected_agents(roles, 'claude').items():
-                changes.append(Change('file', target / 'agents' / name, text.replace('{{AGENT_KIT_DIR}}', str(root)).encode()))
-            for provider in ('claude', 'codex', 'cursor'):
+                changes.append(Change('file', target / 'agents' / name, install_text(text, str(root), export=False).encode()))
+            for provider in HOSTS:
                 changes.append(Change('file', root / 'state/rendered' / ('roles-' + provider + '.sh'),
                                       api.roles_sh(roles, provider).replace(str(view), str(root)).encode()))
         if 'hooks' in components:
@@ -269,17 +332,25 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
     else:
         selected = [name for name in ('hooks', 'rules', 'roles', 'mcp') if name in components]
         if selected:
-            with tempfile.TemporaryDirectory(prefix='agent-kit-host-view-') as folder:
+            with tempfile.TemporaryDirectory(prefix='agent-kit-host-view-') as folder, \
+                    tempfile.TemporaryDirectory(prefix='agent-kit-overlay-') as overlays:
                 host_view = Path(folder)
-                env = dict(os.environ, AGENT_KIT_DIR=str(view), AGENT_KIT_HOST_ROOT=str(host_view))
+                seeded = seed_host_view(args, host, target, host_view)
+                # The overlay this install writes, layered over the user's kit.env as installed.
+                (Path(overlays) / 'setup-paths.env').write_text(overlay_text(args))
+                if (root / 'local/kit.env').is_file():
+                    shutil.copyfile(root / 'local/kit.env', Path(overlays) / 'kit.env')
+                env = dict(os.environ, AGENT_KIT_DIR=str(view), AGENT_KIT_HOST_ROOT=str(host_view),
+                           KIT_ENV=str(Path(overlays) / 'setup-paths.env'))
+                env.pop('CLAUDE_OUT_ROOT', None)
                 env['AGENT_GIT_HOOKS'] = 'on' if args.blocking_hooks else 'off'
-                if args.work_root:
-                    # The Codex sandbox's writable roots name the work root this install chose.
-                    env['CLAUDE_OUT_ROOT'] = str(Path(args.work_root).expanduser())
                 result = subprocess.run([sys.executable, str(view / 'bin/agent-kit'), 'render', '--host', host,
-                                         '--components', *selected], capture_output=True, env=env, timeout=30)
+                                         '--components', *selected], capture_output=True, text=True, env=env, timeout=30)
                 if result.returncode:
-                    raise ValueError(f'{host} renderer refused the selected component plan')
+                    raise ValueError(f'{host} renderer refused the selected component plan: {result.stderr.strip()}')
+                for line in result.stderr.splitlines():
+                    if line.startswith('agent-kit: note:'):
+                        print(line, file=sys.stderr)
                 for path in sorted(host_view.rglob('*')):
                     if not path.is_file():
                         continue
@@ -305,6 +376,7 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
                             changes.append(Change('toml', target / relative, combined.strip(), 0o600))
                     elif path.name == 'mcp.json':
                         servers = resolve_values(json.loads(text), view, root, host_view, target).get('mcpServers', {})
+                        servers = {name: spec for name, spec in servers.items() if name not in seeded}
                         changes.append(Change('servers', target / relative, servers, 0o600))
                     elif path.name.endswith('.md') or path.name.endswith('.mdc'):
                         text = resolve_values(text, view, root, host_view, target)
@@ -322,7 +394,7 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
             if host not in skill_hosts(view / 'skills' / name / 'SKILL.md'):
                 continue
             link = target / 'skills' / name
-            if (link.exists() or link.is_symlink()) and not link.is_symlink() and not prior_record(root, link, 'link'):
+            if link.exists() and not link.is_symlink() and not prior_record(root, link, 'link'):
                 print(f'agent-setup: kept {link}: a folder that is not a kit link; skill {name} not linked for {host}', file=sys.stderr)
                 continue
             changes.append(Change('link', link, str(root / 'skills' / name)))
@@ -410,27 +482,15 @@ def plan(args: argparse.Namespace, view: Path) -> list[Change]:
             if relative.parts[0] == 'bin' and path.name in ('ro-mysql', 'bqro') and 'data-wrappers' not in args.components:
                 continue
             content = path.read_bytes()
-            if relative.parts[0] == 'skills' and path.name == 'SKILL.md':
-                content = content.replace(b'```sh\n', ('```sh\nexport AGENT_KIT_DIR=' + shlex.quote(str(root)) + '\n').encode())
             if relative.parts[0] == 'skills' and path.suffix == '.md':
-                # Only Claude Code expands ${CLAUDE_SKILL_DIR}; every host can follow the installed path.
-                content = content.replace(b'${CLAUDE_SKILL_DIR}', str(root / 'skills' / relative.parts[1]).encode())
+                content = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md').encode()
             changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
-    if any('\n' in value or '\r' in value for value in [*args.repo_roots, args.work_root]):
-        raise ValueError('Repository and work roots must fit on one line')
-    overlay = 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
-    if args.work_root:
-        overlay += 'AGENT_WORK_ROOT=' + args.work_root + '\n'
-    if args.github_owner:
-        overlay += 'CODE_SEARCH_GH_OWNER=' + args.github_owner + '\n'
-    if args.zoekt_url:
-        overlay += 'CODE_SEARCH_ZOEKT_URL=' + args.zoekt_url + '\n'
-    changes.append(Change('file', root / 'local/setup-paths.env', overlay.encode(), 0o600))
-    providers = {host: getattr(args, host + '_bin') for host in ('claude', 'codex', 'cursor')}
+    changes.append(Change('file', root / 'local/setup-paths.env', overlay_text(args).encode(), 0o600))
+    providers = {host: getattr(args, host + '_bin') for host in HOSTS}
     changes.append(Change('file', root / 'local/provider-paths.json', (json.dumps(providers, indent=2) + '\n').encode(), 0o600))
     api = kit_api(view)
     roles = api.load_roles()
-    for host in ('claude', 'codex', 'cursor'):
+    for host in HOSTS:
         changes.append(Change('file', root / 'state/rendered' / ('roles-' + host + '.sh'), api.roles_sh(roles, host).replace(str(view), str(root)).encode()))
     for host in args.hosts:
         changes.extend(host_changes(args, view, host, home))
@@ -439,20 +499,7 @@ def plan(args: argparse.Namespace, view: Path) -> list[Change]:
         target = Path(record['target'])
         if record['kind'] == 'file' and root in target.parents and ('__pycache__' in target.relative_to(root).parts or target.suffix in ('.pyc', '.pyo')):
             changes.append(Change('remove', target, record['hash']))
-    if 'skills' in args.components:
-        selected = set(args.skills if args.skills is not None else [path.name for path in (view / 'skills').iterdir() if path.is_dir()])
-        previous = load_json(root / '.install-state/current.json', {})
-        for record in previous.get('managed', {}).values():
-            target = Path(record['target'])
-            retired = False
-            if record['kind'] == 'file' and root / 'skills' in target.parents:
-                skill = target.relative_to(root / 'skills').parts[0]
-                retired = skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md')
-            if record['kind'] == 'link':
-                link = Path(record.get('link', ''))
-                retired = link.parent == root / 'skills' and link.name not in selected
-            if retired:
-                changes.append(Change('remove', target, record['hash']))
+    changes.extend(retirements(args, view, home, changes))
     unique = {}
     for change in changes:
         identity = (change.kind, str(change.target))
@@ -460,6 +507,41 @@ def plan(args: argparse.Namespace, view: Path) -> list[Change]:
             raise ValueError(f'Two selected components conflict: {change.target}')
         unique[identity] = change
     return list(unique.values())
+
+
+def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change]) -> list[Change]:
+    """Removals for what an earlier install managed and this plan no longer produces: kit files gone
+    from the source, a deselected skill's files, the selected hosts' agent files for renamed roles
+    (when this plan renders that agents folder), and skill links that are deselected or no longer
+    eligible for their host (`hosts:`). A removal refuses changed content unless --collision backup."""
+    root = Path(args.root_dir).expanduser().absolute()
+    planned = {str(change.target) for change in changes}
+    planned_dirs = {change.target.parent for change in changes}
+    hosts = {host_target(args, host, home) for host in args.hosts}
+    skills = 'skills' in args.components
+    selected = set(args.skills if args.skills is not None else [path.name for path in (view / 'skills').iterdir() if path.is_dir()])
+    removals = []
+    for record in load_json(root / '.install-state/current.json', {}).get('managed', {}).values():
+        target = Path(record['target'])
+        if record['kind'] not in ('file', 'link') or str(target) in planned:
+            continue
+        retired = False
+        if record['kind'] == 'file' and root in target.parents:
+            relative = target.relative_to(root)
+            if relative.parts[0] in ('local', 'state', '.install-state'):
+                continue
+            retired = not (view / relative).exists()
+            if skills and relative.parts[0] == 'skills':
+                skill = relative.parts[1]
+                retired = retired or (skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md'))
+        elif record['kind'] == 'file':
+            retired = target.parent.name == 'agents' and target.parent.parent in hosts and target.parent in planned_dirs
+        else:
+            link = Path(record.get('link', ''))
+            retired = skills and link.parent == root / 'skills' and (link.name not in selected or target.parent.parent in hosts)
+        if retired:
+            removals.append(Change('remove', target, record['hash']))
+    return removals
 
 
 def prior_record(root: Path, target: Path, kind: str | None = None) -> dict:
@@ -550,7 +632,7 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
         if change.kind == 'toml':
             validate_toml_boundary(original)
         begin, end = (TEXT_BEGIN, TEXT_END) if change.kind == 'text' else (TOML_BEGIN, TOML_END)
-        outside, old = managed_block(original, begin, end)
+        outside, old = setup_block(original, change.kind)
         wanted = begin + '\n' + change.wanted.rstrip() + '\n' + end
         if old == wanted:
             record.update(owned=wanted, previous=old, existed=present, noop=True)
@@ -590,11 +672,10 @@ def validate_planned_change(change: Change, record: dict) -> None:
         if change.kind == 'cursor-hooks' and document.get('version') != record['previous_version']:
             raise ValueError(f'Cursor hook version changed after preflight: {target}')
     else:
-        begin, end = (TEXT_BEGIN, TEXT_END) if change.kind == 'text' else (TOML_BEGIN, TOML_END)
         text = target.read_text() if target.exists() else ''
         if change.kind == 'toml':
             validate_toml_boundary(text)
-        _, block = managed_block(text, begin, end)
+        _, block = setup_block(text, change.kind)
         if block != record['previous']:
             raise ValueError(f'Configuration changed after preflight; user content is preserved: {target}')
 
@@ -639,9 +720,8 @@ def apply_change(change: Change, record: dict, journal: Path, number: int) -> No
             document[field] = updated
         atomic(target, (json.dumps(document, indent=2) + '\n').encode(), 0o600)
     else:
-        begin, end = (TEXT_BEGIN, TEXT_END) if change.kind == 'text' else (TOML_BEGIN, TOML_END)
         original = target.read_text() if target.exists() else ''
-        outside, old = managed_block(original, begin, end)
+        outside, old = setup_block(original, change.kind)
         if old != record['previous']:
             raise ValueError(f'Configuration changed during installation: {target}')
         atomic(target, (outside.rstrip() + '\n\n' + record['owned'] + '\n').lstrip().encode(), change.mode)
@@ -685,8 +765,7 @@ def rollback_preflight(record: dict) -> bool:
                 if any(group not in current.get(event, []) for group in groups):
                     raise ValueError(f'Changed managed hook is preserved during rollback: {target}')
         return False
-    begin, end = (TEXT_BEGIN, TEXT_END) if kind == 'text' else (TOML_BEGIN, TOML_END)
-    _, current = managed_block(target.read_text() if target.exists() else '', begin, end)
+    _, current = setup_block(target.read_text() if target.exists() else '', kind)
     if current == record['previous']:
         return True
     if current != record['owned']:
@@ -755,8 +834,7 @@ def rollback_record(record: dict) -> None:
         else:
             target.unlink()
     else:
-        begin, end = (TEXT_BEGIN, TEXT_END) if kind == 'text' else (TOML_BEGIN, TOML_END)
-        outside, current = managed_block(target.read_text(), begin, end)
+        outside, current = setup_block(target.read_text(), kind)
         if current != record['owned']:
             raise ValueError(f'Changed rule/config block is preserved during rollback: {target}')
         restored = outside.rstrip() + ('\n\n' + record['previous'] if record['previous'] else '')
@@ -917,7 +995,7 @@ def setup(args: argparse.Namespace) -> int:
                     managed[record['kind'] + ':' + record['target']] = record
             configuration = {key: getattr(args, key) for key in ('repo_roots', 'work_root', 'role_model', 'role_effort',
                              'claude_bin', 'codex_bin', 'cursor_bin', 'hosts', 'components', 'host_root', 'project_root', 'skills',
-                             'github_owner', 'zoekt_url')}
+                             'github_owner', 'zoekt_url', 'codex_gcloud')}
             configuration['source_checkout'] = str(source)
             configuration['blocking_hooks'] = args.blocking_hooks
             configuration['host_roots'] = dict(getattr(args, 'host_roots', {}))
@@ -929,6 +1007,8 @@ def setup(args: argparse.Namespace) -> int:
             atomic(root / '.install-state/current.json', (json.dumps({'id': identifier, 'managed': managed,
                    'configuration': configuration}, indent=2) + '\n').encode())
             (root / '.install-state/pending.json').unlink(missing_ok=True)
+            if 'codex' in args.hosts and 'mcp' in args.components:
+                installed_work_root(root).mkdir(parents=True, exist_ok=True)
         except BaseException as original:
             failures = []
             for record in reversed(records):
@@ -993,7 +1073,7 @@ def doctor(args: argparse.Namespace) -> int:
             if actual != record['hash']:
                 drift.append(str(target))
         elif record['kind'] in ('text', 'toml'):
-            if not target.exists() or record['owned'] not in target.read_text():
+            if not target.exists() or setup_block(target.read_text(), record['kind'])[1] != record['owned']:
                 drift.append(str(target))
         else:
             document = load_json(target, {})
@@ -1019,13 +1099,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('journal', nargs='?')
     result.add_argument('--source', help='Source checkout; installed setup inherits its recorded original checkout')
     result.add_argument('--root-dir', default=os.environ.get('AGENT_KIT_DIR', str(Path.home() / '.local/share/agent-kit')))
-    result.add_argument('--hosts', nargs='+', choices=('claude', 'codex', 'cursor'))
+    result.add_argument('--hosts', nargs='+', choices=HOSTS)
     result.add_argument('--components', nargs='+', choices=sorted(COMPONENTS))
     result.add_argument('--skills', nargs='*', help='Names, all for every bundled skill, or no values for none')
     result.add_argument('--repo-roots', nargs='*', help='Parent directories for local clones; no values clears saved roots')
     result.add_argument('--work-root')
     result.add_argument('--github-owner', help='Default GitHub organization or owner for scoped code search')
     result.add_argument('--zoekt-url', help='Optional configured Zoekt backend')
+    result.add_argument('--codex-gcloud', choices=('on', 'off'),
+                        help="Let Codex's sandbox write gcloud's config dir (credentials; bq rewrites it). Default off")
     result.add_argument('--host-root')
     result.add_argument('--project-root', help='Project directory for active Cursor project rules')
     result.add_argument('--claude-bin')
@@ -1066,7 +1148,7 @@ def main() -> int:
     defaults = {'repo_roots': [], 'work_root': str(Path.home() / 'agent-work'),
                 'hosts': ['claude'], 'components': ['rules', 'skills'], 'claude_bin': 'claude',
                 'codex_bin': 'codex', 'cursor_bin': 'cursor', 'skills': None,
-                'github_owner': '', 'zoekt_url': ''}
+                'github_owner': '', 'zoekt_url': '', 'codex_gcloud': 'off'}
     for key, default in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, saved.get(key, default))
@@ -1083,8 +1165,11 @@ def main() -> int:
     if args.project_root is None and 'cursor' in args.hosts:
         args.project_root = args.project_roots.get('cursor')
     for key in ('role_model', 'role_effort'):
-        values = {value.split('=', 1)[0]: value for value in saved.get(key, [])}
-        values.update({value.split('=', 1)[0]: value for value in getattr(args, key)})
+        values = {}
+        for value in [*saved.get(key, []), *getattr(args, key)]:
+            name, separator, setting = value.partition('=')
+            name = ROLE_ALIASES.get(name, name)
+            values[name] = name + separator + setting
         setattr(args, key, [value for value in values.values() if value.partition('=')[2]])
     if args.interactive and args.action == 'setup':
         entered = input('Hosts [' + ' '.join(args.hosts) + '], choices claude codex cursor: ').strip()
@@ -1093,7 +1178,7 @@ def main() -> int:
         entered = input('Components [' + ' '.join(args.components) + '], choices ' + ' '.join(sorted(COMPONENTS)) + ': ').strip()
         if entered:
             args.components = entered.split()
-        if set(args.hosts) - {'claude', 'codex', 'cursor'} or set(args.components) - COMPONENTS:
+        if set(args.hosts) - set(HOSTS) or set(args.components) - COMPONENTS:
             raise ValueError('Unknown host or component selection')
         if 'skills' in args.components:
             entered = input('Skills [' + ('all bundled' if args.skills is None else ' '.join(args.skills) or 'none') + '], names, all, or none: ').strip()
@@ -1122,6 +1207,10 @@ def main() -> int:
             entered = input(host + ' CLI [' + getattr(args, key) + ']: ').strip()
             if entered:
                 setattr(args, key, entered)
+        if 'codex' in args.hosts and 'mcp' in args.components:
+            entered = input("Let Codex's sandbox write gcloud's config dir? It holds credentials; bq needs it [" + args.codex_gcloud + '] (on/off): ').strip()
+            if entered in ('on', 'off'):
+                args.codex_gcloud = entered
         if 'hooks' in args.components:
             args.blocking_hooks = input('Enable blocking safety and review hooks? [y/N]: ').strip().lower() == 'y'
         if 'roles' in args.components or ('hooks' in args.components and args.blocking_hooks):

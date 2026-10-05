@@ -1,5 +1,4 @@
 ---
-hosts: [claude, codex, cursor]
 name: review-rubric
 description: The code-review rubric shared by every reviewer in the kit (bug-reviewer, quality-reviewer, task-reviewer, second-opinion and cross-reviewer) - correctness checks, architecture and design-critique checks, and the one fix policy. Reference material read by path; not a task skill.
 disable-model-invocation: true
@@ -7,7 +6,7 @@ disable-model-invocation: true
 
 # Review rubric
 
-One rubric, read by path from `{{AGENT_KIT_DIR}}/skills/review-rubric/references/`. The installer owns this skill and its references.
+One rubric, read by path from `${CLAUDE_PLUGIN_ROOT}/kit/skills/review-rubric/references/`. The installer owns this skill and its references.
 
 | File | Read by | Use |
 |---|---|---|
@@ -18,7 +17,7 @@ One rubric, read by path from `{{AGENT_KIT_DIR}}/skills/review-rubric/references
 
 The fixer verifies findings directly. The fixer reproduces each finding before fixing it
 and closes with one line, `TALLY <id>=FIXED|NOT_REPRODUCED|OPTION|SKIPPED:<reason> ...`. Ids carry
-the raising role (`prefix` in `{{AGENT_KIT_DIR}}/roles.toml`): `B-` bug-reviewer, `Q-` quality-reviewer, `R-`
+the raising role (`prefix` in `${CLAUDE_PLUGIN_ROOT}/kit/roles.toml`): `B-` bug-reviewer, `Q-` quality-reviewer, `R-`
 task-reviewer, `CX-` cross-reviewer (the cross-model reviewer, Codex by default). A finding
 named after a `correctness.md` check is a defect claim and needs its trigger; one named after an
 `architecture.md` or `design-critique.md` check is an option unless it claims a behavioural failure.

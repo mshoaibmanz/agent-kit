@@ -3,10 +3,10 @@
 Precision comes only from recorded outcomes, never from a heuristic: a number inferred from what
 the main session said about a finding would be a guess wearing a percentage sign. Two sources:
 - the fixer's `TALLY <id>=FIXED|NOT_REPRODUCED|OPTION|SKIPPED:<reason> ...` line (main session or
-  a `engineer`), attributed to the role by id prefix (`prefix` in $AGENT_KIT_DIR/roles.toml: `CX-`
+  an `engineer`), attributed to the role by id prefix (`prefix` in $AGENT_KIT_DIR/roles.toml: `CX-`
   cross-reviewer, `B-` bug-reviewer, `Q-` quality-reviewer, `R-` task-reviewer); precision is FIXED / (FIXED +
   NOT_REPRODUCED). Outcomes are deduplicated within a review round only: ids restart at 1 in every
-  report, so the same `CX-1=FIXED` in two rounds is two outcomes, while a worker's line restated by
+  report, so the same `CX-1=FIXED` in two rounds is two outcomes, while an engineer's line restated by
   the main session in the same round is one;
 - the retired critic's verdicts (to 2026-10-03), kept for history; a verdict whose finding carries
   a `CX-<n>` id is attributed to cross-reviewer (labelled `codex` before the roles rename).
@@ -40,7 +40,8 @@ REVIEW_AGENTS = {
     "bug-reviewer": "bug-reviewer",
     "quality-reviewer": "quality-reviewer",
     "cross-reviewer": "cross-reviewer",
-    # The role names before 2026-10-05, so older transcripts attribute to today's roles.
+    # The role names before 2026-10-05. Permanent, unlike the hooks' aliases: old transcripts
+    # persist, and they attribute to today's roles.
     "reviewer": "task-reviewer",
     "thermo-bugs": "bug-reviewer",
     "thermo-quality": "quality-reviewer",
@@ -109,8 +110,9 @@ ROUND_BASH = re.compile(
 
 def round_command(command: str) -> bool:
     return bool(ROUND_BASH.search(command)) and "--dry-run" not in command
-# Subagents whose own text can carry the fixer's TALLY line (a large round's fix worker).
-FIXER_AGENTS = frozenset({"engineer"})
+# Subagents whose own text can carry the fixer's TALLY line (a large round's engineer; `worker`
+# before 2026-10-05).
+FIXER_AGENTS = frozenset({"engineer", "worker"})
 TITLE_ID = re.compile(
     r"^(?:[a-z]{0,3}-?[a-z]?\d+[a-z]?[.:)]?\s+|(?:low|medium|high|nit|blocking)\W*\s)+"
 )
@@ -397,7 +399,7 @@ def critic_attribution(resolved: list[Resolved]) -> tuple[dict, int, int]:
 
 
 def tally_attribution(tally_lines: dict[str, list[tuple[str, str, str]]]) -> tuple[dict, int]:
-    """Fixer outcomes by raising role. A line repeated within one review round (a worker's TALLY
+    """Fixer outcomes by raising role. A line repeated within one review round (an engineer's TALLY
     restated by the main session to close it) counts once; the same line in another round is
     another round's outcomes, since every report numbers its findings from 1. An event with no
     timestamp cannot be placed in a round (it sorted before all of them) and is skipped."""

@@ -34,7 +34,7 @@ except ImportError as e:
     # hooks/lib/hook-io's policy for an advisory hook: tell the user it is off, never fall back.
     msg = (
         f"comment-guard is off: hooks/lib/kit_env.py, or a file it reads, is missing or broken "
-        f"({e}). Restore it: git -C <your kit source checkout> checkout -- hooks/lib"
+        f"({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"
     )
     print(json.dumps({"systemMessage": msg}))
     sys.exit(0)
@@ -177,7 +177,7 @@ if added >= THRESHOLD:
     # form fired 300+ times in 30 days and the model never saw one.
     msg = (
         f"You added {added} comment lines to {os.path.basename(fp)} (line comments, plus docstring lines "
-        f"past the first {DOCSTRING_FREE_LINES + 1} of each docstring; this fires at {THRESHOLD}). CLAUDE.md: "
+        f"past the first {DOCSTRING_FREE_LINES + 1} of each docstring; this fires at {THRESHOLD}). The rule: "
         f"a comment only where it clarifies something non-obvious; never restate the code, narrate the change, "
         f"or label a section. Delete the rest before continuing."
     )

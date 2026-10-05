@@ -1,5 +1,4 @@
 ---
-hosts: [claude, codex, cursor]
 name: review-rubric
 description: The code-review rubric shared by every reviewer in the kit (bug-reviewer, quality-reviewer, task-reviewer, second-opinion and cross-reviewer) - correctness checks, architecture and design-critique checks, and the one fix policy. Reference material read by path; not a task skill.
 disable-model-invocation: true

@@ -19,19 +19,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-try:
-    from kit_env import kit_env_path
-    from kit_env import work_root as _work_root
-except ImportError:  # hook-io is missing: the CLI and hooks still work, with the default root
-
-    def kit_env_path() -> str:
-        return os.devnull
-
-    def _work_root() -> str:
-        return os.environ.get("CLAUDE_OUT_ROOT") or os.path.expanduser("~/agent-work")
+from kit_env import kit_env_path
+from kit_env import work_root as _work_root
 
 
-# The installed agent-task, as model-facing text names it (the kit root is not always ~/.agents).
+# The installed agent-task, as model-facing text names it.
 AGENT_TASK = str(Path(os.environ.get("AGENT_KIT_DIR") or Path(__file__).resolve().parents[2]) / "bin/agent-task")
 TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,5}-[0-9]+)\b")
 # Look like ticket keys, never are one.

@@ -8,7 +8,8 @@
 # names no task: a session there works whatever the user asks, so it binds explicitly.
 # Bindings are keyed by the first 8 characters of the session id, the part folder names carry.
 
-TD_ROOT=$(command -v kit_work_root >/dev/null 2>&1 && kit_work_root || printf '%s' "${CLAUDE_OUT_ROOT:-$HOME/agent-work}")
+command -v kit_work_root >/dev/null 2>&1 || . "${BASH_SOURCE[0]%/*}/hook-io"
+TD_ROOT=$(kit_work_root)
 TD_TASKS="$TD_ROOT/tasks"
 TD_BIND="${CLAUDE_STATE_DIR:-$HOME/.claude/state}/task-bindings"
 
