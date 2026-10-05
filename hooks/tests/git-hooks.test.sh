@@ -21,7 +21,7 @@ trap cleanup EXIT
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$G"
 export CLAUDECODE=1 CLAUDE_CODE_SESSION_ID="$SID" AGENT_GIT_HOOKS_ENFORCE=1
 unset AGENT_PUSH_NOW CI_WATCH_ACTIVE AGENT_GIT_HOOKS REVIEW_MAX_ROUNDS
-# No Codex CLI: round 1 is thermo-bugs alone, so its one return completes the round.
+# No Codex CLI: round 1 is bug-reviewer alone, so its one return completes the round.
 export CODEX_BIN="$FX/no-codex"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 TRAILER=$'\n\nCo-authored-by: Claude <noreply@anthropic.com>'
@@ -52,7 +52,7 @@ out=$(cd "$WT" && push git push -q)
 check "cd <wt> && git push: same gate (round in flight)" "$out" 'has not returned'
 out=$(cd "$WT" && AGENT_PUSH_NOW="" push git push -q)
 check "empty AGENT_PUSH_NOW: refused" "$out" 'AGENT_PUSH_NOW is set but empty'
-jq -cn --arg d "$WT" --arg s "$SID" '{hook_event_name:"SubagentStop",session_id:$s,cwd:$d,agent_id:"g1",agent_type:"thermo-bugs",last_assistant_message:"No findings."}' | "$H/review-agent-mark"
+jq -cn --arg d "$WT" --arg s "$SID" '{hook_event_name:"SubagentStop",session_id:$s,cwd:$d,agent_id:"g1",agent_type:"bug-reviewer",last_assistant_message:"No findings."}' | "$H/review-agent-mark"
 out=$(push git -C "$WT" push -q)
 check "reviewed push: allowed" "$out" 'rc=0'
 

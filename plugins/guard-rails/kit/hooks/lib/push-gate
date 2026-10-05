@@ -127,7 +127,7 @@ Otherwise hold until the review cycle ends, keep follow-ups uncommitted, then co
     fi
 
     # After the review gate: a tested-but-unreviewed push is the case that produces the sprawl.
-    tr_ran "$sid" "$top" || pg_refuse "no local test run is recorded for this session or worktree. CLAUDE.md: run a representative local test subset before pushing. If test infra is down: AGENT_PUSH_NOW=\"untested: <why>\" git push ..., then watch CI to a verdict in this session."
+    tr_ran "$sid" "$top" || pg_refuse "no local test run is recorded for this session or worktree. The agent rules: run a representative local test subset before pushing. If test infra is down: AGENT_PUSH_NOW=\"untested: <why>\" git push ..., then watch CI to a verdict in this session."
   fi
   [ -z "$ctx" ] || pg_note "$ctx"
   return 0

@@ -235,7 +235,7 @@ class InstalledGuardTests(unittest.TestCase):
             self.replace(
                 "claude", root, mcp_path, '"true"', '"changed-owned-mcp"', denied=True
             )
-        role = root / "agents/reviewer.md"
+        role = root / "agents/task-reviewer.md"
         self.decision(
             self.guard("claude", root, role, {"content": "overwritten"}), "claude", True
         )
@@ -264,7 +264,7 @@ class InstalledGuardTests(unittest.TestCase):
         (self.root / ".install-state/current.json").write_text(json.dumps(state))
         root = self.home / "custom claude host"
         denial = self.guard(
-            "claude", root, root / "agents/reviewer.md", {"content": "overwritten"}
+            "claude", root, root / "agents/task-reviewer.md", {"content": "overwritten"}
         )
         self.decision(denial, "claude", True)
         reason = json.loads(denial.stdout)["hookSpecificOutput"][
@@ -337,7 +337,7 @@ class InstalledGuardTests(unittest.TestCase):
         registry = self.root / "hooks/registry.json"
         registry.write_text(registry.read_text() + "\n")
         denial = self.guard(
-            "claude", root, root / "agents/reviewer.md", {"content": "overwritten"}
+            "claude", root, root / "agents/task-reviewer.md", {"content": "overwritten"}
         )
         self.decision(denial, "claude", True)
         reason = json.loads(denial.stdout)["hookSpecificOutput"][
@@ -451,7 +451,7 @@ class InstalledGuardTests(unittest.TestCase):
             "codex",
             True,
         )
-        role = root / "agents/review-cross.toml"
+        role = root / "agents/cross-reviewer.toml"
         self.decision(
             self.guard("codex", root, role, {"content": 'name="overwritten"\n'}),
             "codex",
@@ -572,7 +572,7 @@ class InstalledGuardTests(unittest.TestCase):
         for target in (
             root / "CONFIG.TOML",
             root / "Hooks.json",
-            root / "agents/REVIEW-CROSS.TOML",
+            root / "agents/CROSS-REVIEWER.TOML",
         ):
             with self.subTest(target=target):
                 self.assertTrue(target.exists())

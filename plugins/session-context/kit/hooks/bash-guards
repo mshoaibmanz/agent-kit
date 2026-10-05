@@ -26,7 +26,7 @@ set -uo pipefail
 [ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
 
 . "${0%/*}/lib/hook-io" 2>/dev/null || {
-  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"bash-guards: hooks/lib/hook-io is missing, so no guard can inspect this command and the hook refuses all Bash calls. Restore it: git -C ~/.agents checkout -- hooks/lib"}}'
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"bash-guards: hooks/lib/hook-io is missing, so no guard can inspect this command and the hook refuses all Bash calls. Restore it: git -C <your kit source checkout> checkout -- hooks/lib"}}'
   exit 0
 }
 hook_lib closed cmd-view cmd-repo
@@ -792,7 +792,7 @@ case $cmd in *'$('*|*'`'*)
   while IFS= read -r _l; do
     case $_l in *'WRAPPERS = "'*) _wrap=${_l#*\"}; _wrap=${_wrap%%\"*}; break ;; esac
   done < "$HOOK_LIB/cmd-tokens"
-  [ -n "$_wrap" ] || deny "bash-guards: hooks/lib/cmd-tokens has no WRAPPERS list, so the runtime-path guard cannot run. Restore it: git -C ~/.agents checkout -- hooks/lib"
+  [ -n "$_wrap" ] || deny "bash-guards: hooks/lib/cmd-tokens has no WRAPPERS list, so the runtime-path guard cannot run. Restore it: git -C <your kit source checkout> checkout -- hooks/lib"
   if printf '%s' "$cmd" | grep -Eiq "(^|[;&|]|&&|\|\|)[[:space:]]*(($_wrap)[[:space:]]+)*(\\\$\\(|\`)[^)\`]*(command[[:space:]]+-v|which|type[[:space:]]+-p)[[:space:]]+($_cli)[^)\`]*(\\)|\`)"; then
     deny "Denied: a MySQL client path resolved at runtime, then executed. $_ROUTE
 \`command -v <name>\` alone, to check it exists, is fine."
@@ -808,7 +808,7 @@ esac
 # a false deny here costs a full round-trip and trains you to route around the guard.
 if printf '%s' "$bare" | grep -Eq '(^|[;&|[:space:]])(python3?|uv)([[:space:]]|$)' \
    && printf '%s' "$cmd" | grep -Eqi '(import|from)[[:space:]]+(pymysql|MySQLdb|mysql\.connector)|(pymysql|MySQLdb|mysql\.connector)\.connect|create_engine\([^)]*mysql|mysql\+(mysqldb|pymysql)://'; then
-  deny "Refusing a direct MySQL driver connection. CLAUDE.md: prod MySQL goes through ro-mysql, and a pymysql/python one-liner is not a workaround — it bypasses the read-only session, the single-statement check and the write-verb guard in one step. The login-path credential is NOT read-only (it holds full DML/DDL on a writable primary), so the wrapper is the only thing standing between this and a prod write. $_ROUTE"
+  deny "Refusing a direct MySQL driver connection. The agent rules ($(host_noun rules)): prod MySQL goes through ro-mysql, and a pymysql/python one-liner is not a workaround — it bypasses the read-only session, the single-statement check and the write-verb guard in one step. The login-path credential is NOT read-only (it holds full DML/DDL on a writable primary), so the wrapper is the only thing standing between this and a prod write. $_ROUTE"
 fi
 
 # ---- commit-trailers ------------------------------------------------------------
@@ -832,7 +832,7 @@ $(cat "$mfile")" || msg=""
     # session URL, so the only way to satisfy it was a bare id nobody else can resolve.
     if ! printf '%s' "$msg" | grep -qi 'Co-authored-by:'; then
       deny "Commit message is missing the Co-authored-by trailer. Append it, then re-run (history can't be rewritten once pushed):
-Co-authored-by: Claude <noreply@anthropic.com>"
+$(host_trailer)"
     fi
   fi
 fi
@@ -859,7 +859,7 @@ case $_flat in *--amend*)
         gup=$(git -C "$gdir" rev-parse '@{u}' 2>/dev/null)
         case $(git -C "$gdir" rev-parse --symbolic-full-name '@{u}' 2>/dev/null) in refs/remotes/*) ;; *) gup= ;; esac
         if [ -n "$ghead" ] && [ "$ghead" = "$gup" ]; then
-          deny "HEAD is already the upstream tip (@{u}) — --amend would rewrite pushed history (CLAUDE.md: Git / PR). Make a NEW commit on top instead."
+          deny "HEAD is already the upstream tip (@{u}) — --amend would rewrite pushed history ($(host_noun rules): Git / PR). Make a NEW commit on top instead."
         fi ;;
     esac
   done <<<"$_amends"
@@ -1316,9 +1316,9 @@ if [ "${#_gc_sub[@]}" -gt 0 ]; then
     case $_dg_sub in
       push)
         _dg_arg '--force|-[a-zA-Z]*f[a-zA-Z]*|--force-with-lease(=[^[:space:]]*)?|--force-if-includes' \
-          && ask "That is a FORCE push. CLAUDE.md: stop and ask before destructive ops, even in auto mode. Force-pushing rewrites published history — anyone who pulled this branch gets a conflicting history, and any CI run in flight is now testing a sha that no longer exists. To fix an already-pushed commit, add a NEW commit on top. Confirm only if rewriting the remote branch is the actual intent."
+          && confirm "That is a FORCE push, a destructive op the user approves. Force-pushing rewrites published history — anyone who pulled this branch gets a conflicting history, and any CI run in flight is now testing a sha that no longer exists. To fix an already-pushed commit, add a NEW commit on top."
         _dg_arg '\+[A-Za-z0-9._/@-]+(:[^[:space:]]*)?' \
-          && ask "That push uses a '+refspec', which force-updates the remote ref exactly like --force, with the same consequence for published history. Confirm only if that is deliberate."
+          && confirm "That push uses a '+refspec', which force-updates the remote ref exactly like --force, with the same consequence for published history."
         # ci-watch and unfinished-work resolve the PR with a bare `gh pr view`, which follows the
         # branch's upstream. HEAD:<other-branch> without -u leaves that on the old branch and its PR.
         _dg_arg 'HEAD:[A-Za-z0-9._/-]+' && ! _dg_arg '-u|--set-upstream' \
@@ -1326,20 +1326,20 @@ if [ "${#_gc_sub[@]}" -gt 0 ]; then
 Re-run as: git push -u origin HEAD:<branch>" ;;
       reset)
         _dg_arg '--hard' \
-          && ask "\`git reset --hard\` discards every uncommitted change in the worktree, with no recovery path. CLAUDE.md requires asking first. If the intent is only to move the branch pointer, \`--soft\`/\`--mixed\` keep the edits." ;;
+          && confirm "\`git reset --hard\` discards every uncommitted change in the worktree, with no recovery path. If the intent is only to move the branch pointer, \`--soft\`/\`--mixed\` keep the edits." ;;
       clean)
         _dg_arg '-[a-zA-Z]*f[a-zA-Z]*|--force' \
-          && ask "\`git clean -f\` permanently deletes untracked files, including scratch and config files that were never added. Run it with \`-n\` first to see the list, or confirm if you already have." ;;
+          && confirm "\`git clean -f\` permanently deletes untracked files, including scratch and config files that were never added. Run it with \`-n\` first to see the list." ;;
       branch)
         _dg_arg '-d|-D|--delete' \
-          && ask "That deletes a branch — one of the destructive ops CLAUDE.md says to confirm first. With -D an unmerged branch's commits go with it." ;;
+          && confirm "That deletes a branch, a destructive op the user approves. With -D an unmerged branch's commits go with it." ;;
       stash)
         case $_dg_first in drop|clear)
-          ask "That discards stashed work permanently — dropped stash entries are not reachable afterwards. Confirm this is the stash you mean." ;;
+          confirm "That discards stashed work permanently — dropped stash entries are not reachable afterwards. Check it is the stash you mean." ;;
         esac ;;
       worktree)
         [ "$_dg_first" = remove ] \
-          && ask "Removing a worktree deletes its working directory, including uncommitted edits and untracked scratch files inside it. Confirm the branch's work is committed and pushed." ;;
+          && confirm "Removing a worktree deletes its working directory, including uncommitted edits and untracked scratch files inside it. Check the branch's work is committed and pushed." ;;
     esac
   done
   unset -f _dg_arg
@@ -1488,8 +1488,7 @@ _ip_exempt() {
   out=$(printf '%s\n' "$cmd" | drop_heredocs 1 | awk -v q="'" "$_IP_AWK") || return 1
   kit_env
   _ip_roots=(/nonexistent)   # never empty: "${a[@]}" of an empty array fails under set -u in bash 3.2
-  p=${AGENT_WORK_ROOT:-}; p=${p/#\~/$HOME}
-  for r in "$HOME/agent-work" "$HOME/claude-scratch" "$p"; do
+  for r in "$(kit_work_root)"; do
     [ -n "$r" ] && r=$(cd -P -- "$r" 2>/dev/null && pwd -P) && _ip_roots+=("$r")
   done
   while IFS= read -r line; do
@@ -1515,7 +1514,7 @@ if ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*sweep([[:space:]]|$)'; then
   _ip_sed="${_pos}g?sed${_words}(-[EnrsuzlE]*i|--in-place)"
   _ip_perl="${_pos}perl${_words}-[pnlaw0-9]*i([^A-Za-z]|e|\$)"
   if printf '%s' "$_code" | grep -Eq "$_ip_sed" || printf '%s' "$_code" | grep -Eq "$_ip_perl"; then
-    _ip_exempt || deny "In-place sed/perl rewrite refused: edit the file with Edit/Write (CLAUDE.md: Tooling). For a deliberate multi-file sweep, append \`# sweep\` to the command."
+    _ip_exempt || deny "In-place sed/perl rewrite refused: edit the file with $(host_noun edit) ($(host_noun rules): Tooling). For a deliberate multi-file sweep, append \`# sweep\` to the command."
   fi
 fi
 
@@ -1600,11 +1599,11 @@ is_num() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ ${#1} -le 18 ]; }
 
 # deny() exits, so each check denies where it finds the problem.
 deny_dump() {
-  deny "That emits ~$2 into context ($1). Bash file dumps were half of this setup's context spend and, unlike the Read tool, they neither paginate nor dedupe a re-read.
+  deny "That emits ~$2 into context ($1). Unbounded file dumps were half of this setup's context spend.
 
 Use instead:
-  * Read(file_path=…, offset=…, limit=…) — to read a file, even a long one
-  * Grep(pattern=…, path=…, -n, -C 2)    — to find something inside it
+  * $(host_noun read) — to read a range of a file, even a long one
+  * $(host_noun search) — to find something inside it
   * a bounded shell form: | head -c 4000, | head -50, | grep -n <pat>
 
 If you genuinely need the whole span, append \`| cat\` to say so deliberately."

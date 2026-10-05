@@ -270,21 +270,21 @@ def mcp(sb: Sandbox) -> None:
 ROLES_TOML = """[roles.main]
 model = "anthropic:opus[1m]"
 effort = "high"
-[roles.worker]
+[roles.engineer]
 model = "anthropic:opus"
 effort = "high"
-[roles.thermo-bugs]
+[roles.bug-reviewer]
 model = "anthropic:inherit"
 effort = "high"
 prefix = "B"
-[roles.review-cross]
+[roles.cross-reviewer]
 model = "openai:gpt-6.1-sol"
 effort = "high"
 prefix = "CX"
-fallback = "thermo-bugs"
+fallback = "bug-reviewer"
 [review]
-round1 = ["thermo-bugs", "review-cross"]
-later = ["review-cross"]
+round1 = ["bug-reviewer", "cross-reviewer"]
+later = ["cross-reviewer"]
 [hosts.claude]
 provider = "anthropic"
 effort_models = ["m1", "m2"]
@@ -313,7 +313,7 @@ def roles(root: Path) -> None:
     check("roles: an isolated executable reads its own kit, not the live kit",
           proc.returncode == 0 and "main anthropic sonnet high agent" in proc.stdout,
           proc.stdout + proc.stderr)
-    for n in ("worker", "thermo-bugs", "review-cross"):
+    for n in ("engineer", "bug-reviewer", "cross-reviewer"):
         (kit / "agents").mkdir(exist_ok=True)
         (kit / "agents" / f"{n}.md").write_text(AGENT_MD.format(n=n))
     target = root / "claude-agents"
@@ -333,12 +333,12 @@ def roles(root: Path) -> None:
     check("roles: render rc 0", rc == 0, out)
     check("roles: the agents link became a directory", target.is_dir() and not target.is_symlink(), out)
     names = sorted(p.name for p in target.iterdir()) if target.is_dir() else []
-    check("roles: one file per host-provider role; review-cross (openai) renders none",
-          names == ["thermo-bugs.md", "worker.md"], names)
-    worker = (target / "worker.md").read_text() if (target / "worker.md").exists() else ""
+    check("roles: one file per host-provider role; cross-reviewer (openai) renders none",
+          names == ["bug-reviewer.md", "engineer.md"], names)
+    worker = (target / "engineer.md").read_text() if (target / "engineer.md").exists() else ""
     check("roles: model and effort from roles.toml, after tools:, other keys kept",
-          worker == "---\nname: worker\ndescription: d\ntools: Read, Grep\nmodel: opus\neffort: high\nmaxTurns: 9\n---\nbody worker\n", worker)
-    bugs = (target / "thermo-bugs.md").read_text() if (target / "thermo-bugs.md").exists() else ""
+          worker == "---\nname: engineer\ndescription: d\ntools: Read, Grep\nmodel: opus\neffort: high\nmaxTurns: 9\n---\nbody engineer\n", worker)
+    bugs = (target / "bug-reviewer.md").read_text() if (target / "bug-reviewer.md").exists() else ""
     check("roles: inherit renders no model line", "model:" not in bugs and "effort: high" in bugs, bugs)
     live = json.loads(settings.read_text()) if settings.exists() else {}
     check("roles: settings model, effortLevel and modelSettings from [roles.main]",
@@ -346,50 +346,50 @@ def roles(root: Path) -> None:
           and live.get("modelSettings") == {"m1": {"effortLevel": "high"}, "m2": {"effortLevel": "high"}}, live)
     sh = kit / "state/rendered/roles-claude.sh"
     text = sh.read_text() if sh.exists() else ""
-    check("roles: roles-claude.sh has the rounds and a run row for review-cross",
-          "RV_ROUND1='thermo-bugs review-cross'" in text and "review-cross openai gpt-6.1-sol high run CX thermo-bugs 900" in text, text)
+    check("roles: roles-claude.sh has the rounds and a run row for cross-reviewer",
+          "RV_ROUND1='bug-reviewer cross-reviewer'" in text and "cross-reviewer openai gpt-6.1-sol high run CX bug-reviewer 900" in text, text)
     ino = target.stat().st_ino if target.exists() else 0
     rc, out = render()
     check("roles: a second render writes nothing, same directory",
           rc == 0 and "0 written, 0 removed" in out and target.stat().st_ino == ino, out)
 
     (kit / "roles.toml").write_text(ROLES_TOML.replace(
-        '[roles.worker]\nmodel = "anthropic:opus"\neffort = "high"', '[roles.worker]\nmodel = "anthropic:opus"\neffort = "xhigh"'))
+        '[roles.engineer]\nmodel = "anthropic:opus"\neffort = "high"', '[roles.engineer]\nmodel = "anthropic:opus"\neffort = "xhigh"'))
     rc, out = render()
     check("roles: changing one role's effort rewrites only its file",
-          rc == 0 and "1 written" in out and "effort: xhigh" in (target / "worker.md").read_text(), out)
+          rc == 0 and "1 written" in out and "effort: xhigh" in (target / "engineer.md").read_text(), out)
 
     switched = ROLES_TOML.replace('model = "openai:gpt-6.1-sol"', 'model = "anthropic:opus"')
     (kit / "roles.toml").write_text(switched)
     rc, out = render()
-    check("roles: review-cross on anthropic renders its agent file", rc == 0 and (target / "review-cross.md").exists(), out)
+    check("roles: cross-reviewer on anthropic renders its agent file", rc == 0 and (target / "cross-reviewer.md").exists(), out)
     check("roles: ...and its row is an Agent spawn",
-          "review-cross anthropic opus high agent CX" in (sh.read_text() if sh.exists() else ""))
+          "cross-reviewer anthropic opus high agent CX" in (sh.read_text() if sh.exists() else ""))
     (kit / "roles.toml").write_text(ROLES_TOML)
     rc, out = render()
-    check("roles: back on openai, its rendered file is removed", rc == 0 and not (target / "review-cross.md").exists(), out)
+    check("roles: back on openai, its rendered file is removed", rc == 0 and not (target / "cross-reviewer.md").exists(), out)
 
     before = settings.read_text()
     for bad, label, want in (
         (ROLES_TOML.replace('effort = "xhigh"', 'effort = "minimal"').replace(
-            '[roles.worker]\nmodel = "anthropic:opus"\neffort = "high"', '[roles.worker]\nmodel = "anthropic:opus"\neffort = "minimal"'),
+            '[roles.engineer]\nmodel = "anthropic:opus"\neffort = "high"', '[roles.engineer]\nmodel = "anthropic:opus"\neffort = "minimal"'),
          "an anthropic role at minimal", "not on the anthropic scale"),
         (ROLES_TOML.replace('model = "openai:gpt-6.1-sol"\neffort = "high"', 'model = "openai:gpt-6.1-sol"\neffort = "max"'),
          "an openai role at max", "not on the openai scale"),
         (ROLES_TOML.replace('model = "openai:gpt-6.1-sol"', 'model = "gpt-6.1-sol"'), "a model with no provider", "<provider>:<model>"),
-        (ROLES_TOML.replace('later = ["review-cross"]', 'later = ["nobody"]'), "a round naming no role", "has no [roles.nobody]"),
+        (ROLES_TOML.replace('later = ["cross-reviewer"]', 'later = ["nobody"]'), "a round naming no role", "has no [roles.nobody]"),
         # B-3: a typo'd, missing, mistyped or once-only [review] used to render a round nobody completes.
         (ROLES_TOML.replace("round1 =", "round_1 ="), "a typo'd [review] key", "unknown keys ['round_1']"),
         (ROLES_TOML.replace("[review]", "[reveiw]"), "a typo'd top-level table", "unknown top-level keys ['reveiw']"),
-        ("review = 3\n" + ROLES_TOML.replace('[review]\nround1 = ["thermo-bugs", "review-cross"]\nlater = ["review-cross"]\n', ""),
+        ("review = 3\n" + ROLES_TOML.replace('[review]\nround1 = ["bug-reviewer", "cross-reviewer"]\nlater = ["cross-reviewer"]\n', ""),
          "a [review] that is not a table", "review must be a table"),
         ("roles = 1\n[review]" + ROLES_TOML.split("[review]")[1],
          "a roles key that is not a table", "roles must be a table"),
-        (ROLES_TOML.replace('round1 = ["thermo-bugs", "review-cross"]', 'round1 = ["thermo-bugs"]\nonce = ["thermo-bugs"]'),
+        (ROLES_TOML.replace('round1 = ["bug-reviewer", "cross-reviewer"]', 'round1 = ["bug-reviewer"]\nonce = ["bug-reviewer"]'),
          "a round 1 of the once-per-PR role alone", "round1 names no correctness reviewer"),
         (ROLES_TOML.replace('model = "anthropic:inherit"', 'model = "openai:inherit"'),
          "an openai role inheriting main's anthropic model", "would take main's anthropic model"),
-        (ROLES_TOML.replace('fallback = "thermo-bugs"', 'fallback = "worker"'),
+        (ROLES_TOML.replace('fallback = "bug-reviewer"', 'fallback = "engineer"'),
          "a fallback that is not a review role", "must be another review role"),
     ):
         (kit / "roles.toml").write_text(bad)
@@ -407,15 +407,15 @@ def roles(root: Path) -> None:
     (kit / "agents/orphan.md").unlink()
     (kit / "roles.toml").write_text(ROLES_TOML)
     # CX-3: a role in the rounds with no source used to render, publishing a reviewer nobody can spawn.
-    (kit / "agents/thermo-bugs.md").rename(kit / "thermo-bugs.md.off")
+    (kit / "agents/bug-reviewer.md").rename(kit / "bug-reviewer.md.off")
     rc, out = render()
     check("roles: a role with no agents/<role>.md fails the render",
-          rc != 0 and "has no agents/thermo-bugs.md" in out and settings.read_text() == before, out)
-    (kit / "thermo-bugs.md.off").rename(kit / "agents/thermo-bugs.md")
-    (kit / "agents/review-cross.md").write_text("no frontmatter\n")
+          rc != 0 and "has no agents/bug-reviewer.md" in out and settings.read_text() == before, out)
+    (kit / "bug-reviewer.md.off").rename(kit / "agents/bug-reviewer.md")
+    (kit / "agents/cross-reviewer.md").write_text("no frontmatter\n")
     rc, out = render()
-    check("roles: an openai role's source is validated too", rc != 0 and "review-cross.md has no frontmatter" in out, out)
-    (kit / "agents/review-cross.md").write_text(AGENT_MD.format(n="review-cross"))
+    check("roles: an openai role's source is validated too", rc != 0 and "cross-reviewer.md has no frontmatter" in out, out)
+    (kit / "agents/cross-reviewer.md").write_text(AGENT_MD.format(n="cross-reviewer"))
     write_json(kit / "hosts/claude/settings.base.json", {**base, "effortLevel": "low"})
     rc, out = render()
     check("roles: settings.base.json may not set a role key", rc != 0 and "[roles.main]" in out, out)
@@ -423,13 +423,13 @@ def roles(root: Path) -> None:
     rc, out = run("adopt", "effortLevel")
     check("roles: adopt refuses a role key", rc != 0 and "roles.toml" in out, out)
     rc, out = run("roles", "--host", "codex")
-    check("roles: on the codex host review-cross is native and worker runs through agent-run",
-          rc == 0 and any(ln.startswith("review-cross") and " agent " in ln for ln in out.splitlines())
-          and any(ln.startswith("worker") and " run " in ln for ln in out.splitlines()), out)
+    check("roles: on the codex host cross-reviewer is native and engineer runs through agent-run",
+          rc == 0 and any(ln.startswith("cross-reviewer") and " agent " in ln for ln in out.splitlines())
+          and any(ln.startswith("engineer") and " run " in ln for ln in out.splitlines()), out)
     rc, out = render()
-    (target / "worker.md").write_text("hand edit\n")
+    (target / "engineer.md").write_text("hand edit\n")
     rc, out = run("doctor")
-    check("roles: doctor reports a hand-edited rendered agent", "agents drift" in out and "worker.md" in out, out)
+    check("roles: doctor reports a hand-edited rendered agent", "agents drift" in out and "engineer.md" in out, out)
 
     # CX-2: the first render replaces a link; a role moved off the host on the very next render must
     # lose its file. The manifest used to be keyed through the link, so the next render found none.
@@ -438,11 +438,11 @@ def roles(root: Path) -> None:
     env2 = dict(env, AGENT_KIT_AGENTS=str(fresh))
     (kit / "roles.toml").write_text(switched)
     p = subprocess.run([str(AGENT_KIT), "render", "--host", "claude"], env=env2, capture_output=True, text=True, check=False)
-    check("roles: first render over a link, review-cross on anthropic", p.returncode == 0 and (fresh / "review-cross.md").exists(), p.stdout + p.stderr)
+    check("roles: first render over a link, cross-reviewer on anthropic", p.returncode == 0 and (fresh / "cross-reviewer.md").exists(), p.stdout + p.stderr)
     (kit / "roles.toml").write_text(ROLES_TOML)
     p = subprocess.run([str(AGENT_KIT), "render", "--host", "claude"], env=env2, capture_output=True, text=True, check=False)
     check("roles: ...moved to openai on the next render, its file is removed",
-          p.returncode == 0 and not (fresh / "review-cross.md").exists(), p.stdout + p.stderr)
+          p.returncode == 0 and not (fresh / "cross-reviewer.md").exists(), p.stdout + p.stderr)
 
     # B-4: a kit other than ~/.agents (a worktree) renders live only on purpose.
     home = root / "home"

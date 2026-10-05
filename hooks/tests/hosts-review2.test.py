@@ -331,7 +331,7 @@ class RoundTwo(base.ReviewTests):
         result = subprocess.run(
             [
                 str(self.kit / "bin/agent-run"),
-                "thermo-bugs",
+                "bug-reviewer",
                 str(repo),
                 "--out",
                 str(output),

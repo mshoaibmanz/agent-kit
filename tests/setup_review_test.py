@@ -45,17 +45,23 @@ class SetupReviewTests(unittest.TestCase):
         return source
 
     def test_directory_collision_preserves_skill_and_bin(self) -> None:
-        for folder, flags in [
-            ("skills/unslop", ("--components", "skills", "--skills", "unslop")),
-            ("bin", ("--components", "hooks")),
-        ]:
-            target = self.host / folder
-            target.mkdir(parents=True)
-            sentinel = target / "user.md"
-            sentinel.write_text("original directory\n")
-            self.run_setup(*flags, "--apply", success=False)
-            self.assertEqual(sentinel.read_text(), "original directory\n")
-            self.assertFalse(self.root.exists())
+        # A user's own skill folder is kept and that skill skipped (spec 2026-10-05: never overwrite
+        # a non-link skill); a bin collision still refuses the whole install.
+        skill = self.host / "skills/unslop"
+        skill.mkdir(parents=True)
+        (skill / "user.md").write_text("original directory\n")
+        result = self.run_setup("--components", "skills", "--skills", "unslop", "--apply")
+        self.assertEqual((skill / "user.md").read_text(), "original directory\n")
+        self.assertFalse(skill.is_symlink())
+        self.assertIn("not a kit link", result.stderr)
+        shutil.rmtree(self.root)
+        target = self.host / "bin"
+        target.mkdir(parents=True)
+        sentinel = target / "user.md"
+        sentinel.write_text("original directory\n")
+        self.run_setup("--components", "hooks", "--apply", success=False)
+        self.assertEqual(sentinel.read_text(), "original directory\n")
+        self.assertFalse(self.root.exists())
 
     def test_killed_apply_recovers_original_and_blocks_rerun(self) -> None:
         self.root.mkdir()
@@ -224,7 +230,7 @@ module.main()
             "--components",
             "rules",
             "--role-effort",
-            "reviewer=invalid",
+            "task-reviewer=invalid",
             "--apply",
             success=False,
         )
@@ -233,15 +239,15 @@ module.main()
             "--components",
             "rules",
             "--role-model",
-            "review-cross=openai:chosen-model",
+            "cross-reviewer=openai:chosen-model",
             "--apply",
         )
         self.run_setup(
-            "--components", "roles", "--role-model", "review-cross=", "--apply"
+            "--components", "roles", "--role-model", "cross-reviewer=", "--apply"
         )
         self.assertNotEqual(
             tomllib.loads((self.root / "roles.toml").read_text())["roles"][
-                "review-cross"
+                "cross-reviewer"
             ]["model"],
             "openai:chosen-model",
         )
@@ -265,7 +271,7 @@ module.main()
             "--components",
             "roles",
             "--role-model",
-            "review-cross=openai:chosen-model",
+            "cross-reviewer=openai:chosen-model",
             "--apply",
         )
         script = '. "$1/hooks/lib/review-state"; rv_roles; printf "%s" "$RV_ROLE_TABLE"'
@@ -276,7 +282,7 @@ module.main()
             text=True,
             check=True,
         )
-        self.assertIn("review-cross openai chosen-model", result.stdout)
+        self.assertIn("cross-reviewer openai chosen-model", result.stdout)
         repo = self.home / "role run repository"
         repo.mkdir()
         for args in [
@@ -301,7 +307,7 @@ module.main()
         result = subprocess.run(
             [
                 str(self.root / "bin/agent-run"),
-                "review-cross",
+                "cross-reviewer",
                 str(repo),
                 "--base",
                 "HEAD",
@@ -437,7 +443,7 @@ module.main()
         )
         self.assertTrue(
             any(
-                row["role"] == "worker" and "unavailable" in row["availability"]
+                row["role"] == "engineer" and "unavailable" in row["availability"]
                 for row in rows
             )
         )

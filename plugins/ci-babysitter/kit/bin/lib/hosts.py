@@ -61,6 +61,34 @@ def block(existing: str, managed: str, begin: str = BEGIN, end: str = END) -> st
     return existing + ("\n" if existing and not existing.endswith("\n") else "") + new + "\n"
 
 
+def keep_host_tables(existing: str) -> str:
+    """Move tables the host wrote inside the managed block (Codex hook trust) past its END.
+
+    Codex appends `[hooks.state.*]` before the file's trailing comment, which is our END marker,
+    so replacing the block would silently revoke hook trust.
+    """
+    if BEGIN not in existing or END not in existing:
+        return existing
+    start = existing.index(BEGIN) + len(BEGIN)
+    stop = existing.index(END)
+    owned, host = [], []
+    for chunk in re.split(r"(?m)^(?=\[)", existing[start:stop]):
+        (host if chunk.startswith("[hooks.") else owned).append(chunk)
+    if not host:
+        return existing
+    tail = existing[stop + len(END) :].lstrip("\n")
+    moved = "".join(host).rstrip() + "\n"
+    return (
+        existing[:start]
+        + "".join(owned).rstrip()
+        + "\n"
+        + END
+        + "\n\n"
+        + moved
+        + ("\n" + tail if tail else "")
+    )
+
+
 def shell_without_owned(existing: str) -> str:
     if (
         existing.count(SHELL_BEGIN) != existing.count(SHELL_END)
@@ -242,6 +270,24 @@ def safe_servers(kit: Path) -> dict[str, Any]:
                 raise SystemExit(f"agent-kit: {name} needs a runtime credential wrapper")
             out[name] = spec
     return out
+
+
+def sandbox_roots(kit: Path) -> list[str]:
+    """Paths a workspace-write Codex session must write outside the repo: the work root (task
+    folders hold TMPDIR and evidence) and gcloud's config dir, which bq rewrites on every call."""
+    import sys
+
+    sys.path.insert(0, str(kit / "hooks/lib"))
+    from kit_env import work_root
+
+    gcloud = os.environ.get("CLOUDSDK_CONFIG") or str(Path.home() / ".config/gcloud")
+    return [path for path in (work_root(), gcloud) if Path(path).is_dir()]
+
+
+def toml_sandbox(roots: list[str]) -> str:
+    if not roots:
+        return ""
+    return f"[sandbox_workspace_write]\nwritable_roots = {json.dumps(roots)}\n"
 
 
 def toml_servers(servers: dict[str, Any]) -> str:
@@ -427,6 +473,10 @@ def render(api: Any, args: Any) -> int:
             raise SystemExit(
                 "agent-kit: unmanaged MCP names already exist: " + ", ".join(collisions)
             )
+        if "mcp" in components and "sandbox_workspace_write" in config:
+            raise SystemExit(
+                "agent-kit: an unmanaged [sandbox_workspace_write] exists; reconcile it first"
+            )
         new_config = existing
         if "hooks" in components:
             values = shell_env(api.KIT, host)
@@ -454,7 +504,8 @@ def render(api: Any, args: Any) -> int:
             ownership[shell_key] = values
             new_config = shell_config(new_config, values, versions(shell_key))
         if "mcp" in components:
-            new_config = block(new_config, toml_servers(servers))
+            managed = toml_servers(servers) + toml_sandbox(sandbox_roots(api.KIT))
+            new_config = block(keep_host_tables(new_config), managed)
         tomllib.loads(new_config)
         plans.append((config_path, new_config))
     if host == "codex" and "roles" in components:
@@ -484,6 +535,10 @@ def render(api: Any, args: Any) -> int:
         mcp_path = root / "mcp.json"
         mcp = json.loads(api.read_or_empty(mcp_path) or "{}")
         old_servers = mcp.get("mcpServers", {})
+        # Cursor keys are case-sensitive, so a hand-added "Sentry" plus the catalog's "sentry"
+        # would register the same server twice. Render under the live spelling instead.
+        live_names = {name.lower(): name for name in old_servers}
+        servers = {live_names.get(name.lower(), name): spec for name, spec in servers.items()}
         mcp_key = api.state_name("cursor-mcp", mcp_path)
         mcp_versions = versions(mcp_key)
         previous_mcp = {name: spec for version in mcp_versions for name, spec in version.items()}

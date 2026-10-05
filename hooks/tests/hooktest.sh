@@ -615,7 +615,7 @@ check "context-watch: Stop while stop_hook_active defers" "$(flat "$out")" '^<rc
 out=$(cw "$(cwp cw-s2 "$CW/t1.jsonl" Stop)")
 check "context-watch: Stop at the threshold blocks once" "$out" '"decision": "block"'
 check "...with the handoff text" "$out" '"reason": "CONTEXT 605K: past the 600K'
-out=$(cw "$(cwp cw-s3 "$CW/t1.jsonl" PostToolUse '{"agent_id":"a1","agent_type":"worker"}')")
+out=$(cw "$(cwp cw-s3 "$CW/t1.jsonl" PostToolUse '{"agent_id":"a1","agent_type":"engineer"}')")
 check "context-watch: a subagent's tool call is silent" "$(flat "$out")" '^<rc 0>$'
 out=$(CW_KIT=/dev/null cw "$(cwp cw-s4 "$CW/t1.jsonl")")
 check "context-watch: no overlay value falls back to 600000" "$out" 'CONTEXT 605K: past the 600K'

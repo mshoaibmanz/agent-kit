@@ -31,6 +31,8 @@ except ImportError:  # hook-io is missing: the CLI and hooks still work, with th
         return os.environ.get("CLAUDE_OUT_ROOT") or os.path.expanduser("~/agent-work")
 
 
+# The installed agent-task, as model-facing text names it (the kit root is not always ~/.agents).
+AGENT_TASK = str(Path(os.environ.get("AGENT_KIT_DIR") or Path(__file__).resolve().parents[2]) / "bin/agent-task")
 TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,5}-[0-9]+)\b")
 # Look like ticket keys, never are one.
 NOT_TICKETS = {
@@ -801,7 +803,7 @@ def nudge_marker(sid: str) -> Path:
 def nudge_text(sid: str, ctx: int, at: int, cwd: str) -> str:
     b, folder = handoff_folder(sid, cwd)
     head = f"CONTEXT {ctx // 1000}K: past the {at // 1000}K handoff point; auto-compaction follows near {COMPACT_NEAR}."
-    retro = f'record up to 3 learnings with `~/.agents/bin/agent-task retro "<mistake|fact|doc|tooling>: <text>" --session {sid}`'
+    retro = f'record up to 3 learnings with `{AGENT_TASK} retro "<mistake|fact|doc|tooling>: <text>" --session {sid}`'
     if b:
         if b.project.legacy:
             index = f"{b.project.path}/INDEX.md (a line per file you leave)"
@@ -810,7 +812,7 @@ def nudge_text(sid: str, ctx: int, at: int, cwd: str) -> str:
         return f"{head} At the next natural break (not mid-edit): update {folder}/HANDOFF.md (state, next steps, decisions) and {index}, {retro}, then carry on with the task."
     return (
         f"{head} No project is bound. At the next natural break (not mid-edit): bind one with "
-        f"`~/.agents/bin/agent-task bind <project>[/<item>] --session {sid}` (the user's /bind) and write HANDOFF.md there, "
+        f"`{AGENT_TASK} bind <project>[/<item>] --session {sid}` (the user's /bind) and write HANDOFF.md there, "
         f"or write a short HANDOFF.md (state, next steps, decisions) in {folder}; {retro}; then carry on with the task."
     )
 

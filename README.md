@@ -55,8 +55,8 @@ python3 bin/agent-setup \
   --root-dir "$HOME/Agent tools" \
   --host-root "$HOME/Codex configuration" \
   --codex-bin /path/to/codex \
-  --role-model review-cross=openai:your-model \
-  --role-effort review-cross=high
+  --role-model cross-reviewer=openai:your-model \
+  --role-effort cross-reviewer=high
 ```
 
 Use `--claude-bin`, `--codex-bin` and `--cursor-bin` for alternate CLI paths. `--host-root` requires one host. Model values use `anthropic:model` or `openai:model`; the renderer validates the provider's effort scale. Omitted model, path and provider choices are inherited on later component upgrades. Installed `KIT/bin/agent-setup --root-dir KIT` previews from its recorded original source checkout. A directly invoked newer checkout uses itself; explicit `--source` wins. If the origin moved or an older install lacks provenance, supply `--source /path/to/checkout`. Doctor and rollback use installed state and work without the origin. Use `--skills all` to return to every bundled skill after saving a subset; `--skills` with no values selects none. Interactive setup accepts `all` and `none` too. Edited deselected skills stay in place and block retirement by default. After reviewing the preview, `--collision backup --apply` saves those edits in the journal before retiring the skill; rolling that journal back restores them. Unchanged Cursor rules from earlier setup versions upgrade from managed text blocks to full-file ownership, with rollback preserving the original format.
@@ -66,7 +66,7 @@ When selecting `data-wrappers`, setup prints a shell-quoted `shell_activation` c
 Host selection chooses configuration outputs. Each role independently chooses its provider, model and effort; preview shows that routing, provider CLI availability and fallback. Login status is not checked. The default review roles include both Anthropic and OpenAI providers. For a Claude-only review setup, override the OpenAI review role:
 
 ```sh
-python3 bin/agent-setup --hosts claude --components roles --role-model review-cross=anthropic:inherit
+python3 bin/agent-setup --hosts claude --components roles --role-model cross-reviewer=anthropic:inherit
 ```
 
 For a Codex-only review setup, choose an OpenAI model for all Anthropic roles:
@@ -74,15 +74,15 @@ For a Codex-only review setup, choose an OpenAI model for all Anthropic roles:
 ```sh
 python3 bin/agent-setup --hosts codex --components roles \
   --role-model main=openai:your-model \
-  --role-model worker=openai:your-model \
-  --role-model scout=openai:your-model \
-  --role-model reviewer=openai:your-model \
-  --role-model adversary=openai:your-model \
-  --role-model thermo-bugs=openai:your-model \
-  --role-model thermo-quality=openai:your-model
+  --role-model engineer=openai:your-model \
+  --role-model researcher=openai:your-model \
+  --role-model task-reviewer=openai:your-model \
+  --role-model second-opinion=openai:your-model \
+  --role-model bug-reviewer=openai:your-model \
+  --role-model quality-reviewer=openai:your-model
 ```
 
-Keep review prefixes and rounds; existing high effort is valid for both providers. Codex named role activation remains unverified. Roles without a review prefix, such as worker/scout/adversary, are unavailable through `agent-run` when native invocation is disabled; preview labels those routes. Setup does not enable native role support automatically. Role overrides route review CLIs and supported native agents. The active main-session model for Codex and Cursor stays in that provider's own settings; the `main` catalog entry describes inherited review routing.
+Keep review prefixes and rounds; existing high effort is valid for both providers. Codex named role activation remains unverified. Roles without a review prefix, such as engineer/researcher/second-opinion, are unavailable through `agent-run` when native invocation is disabled; preview labels those routes. Setup does not enable native role support automatically. Role overrides route review CLIs and supported native agents. The active main-session model for Codex and Cursor stays in that provider's own settings; the `main` catalog entry describes inherited review routing.
 
 Keep user workflow values in `local/kit.env`; generated path choices live in `local/setup-paths.env`. The shared parser loads the user layer first, then the generated path layer. Setup never reads or copies the user's values into its journal. `kit.env.example` describes optional, non-secret settings. There is no default commit author override; Git's existing identity is used.
 

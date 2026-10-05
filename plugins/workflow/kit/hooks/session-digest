@@ -19,7 +19,7 @@ except ImportError as e:
     # hooks/lib/hook-io's policy for an advisory hook: tell the user it is off, never fall back.
     msg = (
         f"session-digest is off: hooks/lib/kit_env.py, or a file it reads, is missing or broken "
-        f"({e}). Restore it: git -C ~/.agents checkout -- hooks/lib"
+        f"({e}). Restore it: git -C <your kit source checkout> checkout -- hooks/lib"
     )
     print(json.dumps({"systemMessage": msg}))
     sys.exit(0)

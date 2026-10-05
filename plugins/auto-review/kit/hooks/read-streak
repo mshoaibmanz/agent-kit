@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Read-streak nudge: after 8 consecutive read-only tool calls with no edit, point the MAIN session
-# at the `scout` agent once per streak.
+# at the `researcher` agent once per streak.
 #
 #   PostToolUse (Read|Grep|Glob|LSP|Bash|Edit|Write|MultiEdit|NotebookEdit|Agent)
 #       Read, Grep, Glob, LSP and a Bash command that only reads add 1. An edit, a Bash command that
@@ -11,7 +11,7 @@
 #   Main session only: a payload with agent_id is a subagent's and is skipped.
 #
 # WHY. Inline exploration in the main session is paid for on every later call (the session re-reads
-# its whole context each time); a scout run on Sonnet returns a 300-word answer instead. The nudge
+# its whole context each time); a researcher run on Sonnet returns a 300-word answer instead. The nudge
 # goes through additionalContext because a systemMessage never reaches the model (claude-kit-rules).
 #
 # BASH CLASSIFICATION. A positive list: every command-position word (lib/cmd-view cmd_tokens) must be a
@@ -106,5 +106,5 @@ n=${#s}
 set -C
 { : >"$f.fired"; } 2>/dev/null || exit 0
 hook_lib open || exit 0
-add_context PostToolUse "$n read-only calls in a row with no edit. If the next step is more searching, reading across files, browsing or web research, hand it to the \`scout\` agent (Agent tool, subagent_type \"scout\") with the one question to answer and the paths to start from: it returns at most 300 words with file:line evidence and keeps this context small. Ignore this if you are about to act on what you have."
+add_context PostToolUse "$n read-only calls in a row with no edit. If the next step is more searching, reading across files, browsing or web research, hand it to the \`researcher\` agent (Agent tool, subagent_type \"researcher\") with the one question to answer and the paths to start from: it returns at most 300 words with file:line evidence and keeps this context small. Ignore this if you are about to act on what you have."
 exit 0

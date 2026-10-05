@@ -71,10 +71,10 @@ def main() -> int:
         logger.info("skip: ~/.claude/agents is still a link (agent-kit render has not rendered it)")
     else:
         expect("a rendered agent: deny, names its source and roles.toml",
-               str(HOME / ".claude/agents/worker.md"), "deny", f"{KIT}/agents/worker.md (model and effort")
+               str(HOME / ".claude/agents/engineer.md"), "deny", f"{KIT}/agents/engineer.md (model and effort")
         expect("a rendered agent through an account's link",
-               str(HOME / ".claude-work/agents/scout.md"), "deny", f"{KIT}/agents/scout.md")
-        expect("the agent source itself is allowed", str(HOME / ".agents/agents/worker.md"), "allow")
+               str(HOME / ".claude-work/agents/researcher.md"), "deny", f"{KIT}/agents/researcher.md")
+        expect("the agent source itself is allowed", str(HOME / ".agents/agents/engineer.md"), "allow")
     if sys.platform != "darwin":
         logger.info("skip: case-variant cases need a case-insensitive disk (macOS)")
         return 1 if failures else 0

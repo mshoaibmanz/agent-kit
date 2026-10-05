@@ -32,7 +32,7 @@ lines() { i=0; while [ "$i" -lt "$2" ]; do echo "v_$1_$i = $i"; i=$((i+1)); done
 
 # Some sequences complete several agent rounds on one branch; the budget case sets its own.
 export REVIEW_MAX_ROUNDS=9
-# No Codex CLI unless a case names one (CODEX_BIN=$FK): round 1 is then thermo-bugs alone.
+# No Codex CLI unless a case names one (CODEX_BIN=$FK): round 1 is then bug-reviewer alone.
 export CODEX_BIN="$FX/no-codex"
 export CLAUDE_BIN="$FX/no-claude"  # Only explicit synthetic Anthropic cases may run a CLI.
 # The review roles as the kit renders them from roles.toml; a case that switches a role writes its own.
@@ -100,42 +100,42 @@ out=$(issue "$REPO" "$SID")
 check "unreviewed lines on the branch: refused" "$out" 'rc=1'
 check "refusal is the review trigger" "$out" 'This refusal is the review trigger'
 check "refusal names the override first" "$out" 'AGENT_PUSH_NOW.*review trigger'
-check "round 1: thermo-bugs and thermo-quality, one message, foreground" "$out" 'subagent_type "thermo-bugs" and subagent_type "thermo-quality".*FOREGROUND|ONE message, in the FOREGROUND.*subagent_type "thermo-bugs" and subagent_type "thermo-quality"'
+check "round 1: bug-reviewer and quality-reviewer, one message, foreground" "$out" 'subagent_type "bug-reviewer" and subagent_type "quality-reviewer".*FOREGROUND|ONE message, in the FOREGROUND.*subagent_type "bug-reviewer" and subagent_type "quality-reviewer"'
 check "...with reproduce-first and the TALLY line" "$out" 'REPRODUCE, THEN FIX.*TALLY <id>=FIXED\|NOT_REPRODUCED\|OPTION\|SKIPPED'
 check "...and no critic" "$out" 'critic' absent
 check "...and the one fix policy text" "$out" 'FIX POLICY.*reason'
 [ "$(rec "$REPO" "$BR" '.pending_tree | length')" = 40 ] && ok "the round is pending on the branch record" || bad "the round is pending on the branch record" "$(rec "$REPO" "$BR" .)"
 rs rv_pending "$SID" "$REPO" && ok "...and in the session" || bad "...and in the session"
 out=$(gpush "$SID" "$REPO"); check "round in flight: wait" "$out" 'has not returned'
-check "...naming the agents to spawn" "$out" 'thermo-bugs thermo-quality'
+check "...naming the agents to spawn" "$out" 'bug-reviewer quality-reviewer'
 out=$(gpush "$SID" "$REPO" AGENT_PUSH_NOW="WIP share"); check "AGENT_PUSH_NOW overrides" "$out" 'rc=0'
 
 echo "--- review-agent-mark: completion, not spawn ---"
-agent thermo-bugs async_launched | "$H/review-agent-mark"
+agent bug-reviewer async_launched | "$H/review-agent-mark"
 rs rv_pending "$SID" "$REPO" && ok "background spawn completes nothing" || bad "background spawn completes nothing"
-agent thermo-bugs completed | "$H/review-agent-mark"
+agent bug-reviewer completed | "$H/review-agent-mark"
 rs rv_pending "$SID" "$REPO" && ok "PostToolUse(Agent) without a report completes nothing" || bad "PostToolUse(Agent) without a report completes nothing"
-sstop thermo-bugs ""
+sstop bug-reviewer ""
 rs rv_pending "$SID" "$REPO" && ok "interrupted agent completes nothing" || bad "interrupted agent completes nothing"
 sstop Explore
 rs rv_pending "$SID" "$REPO" && ok "non-review agent completes nothing" || bad "non-review agent completes nothing"
-sstop worker
+sstop engineer
 out=$(gpush "$SID" "$REPO"); check "a worker's return does not close the round" "$out" 'has not returned'
 ptree=$(rec "$REPO" "$BR" .pending_tree)
-sstop thermo-bugs
-rs rv_pending "$SID" "$REPO" && bad "SubagentStop(thermo-bugs) completes the round" || ok "SubagentStop(thermo-bugs) completes the round"
+sstop bug-reviewer
+rs rv_pending "$SID" "$REPO" && bad "SubagentStop(bug-reviewer) completes the round" || ok "SubagentStop(bug-reviewer) completes the round"
 [ "$(rec "$REPO" "$BR" '"\(.rounds) \(.reviewed_tree) \(.pending_tree)"')" = "1 $ptree null" ] \
   && ok "...and writes the branch record: round 1, the issued tree reviewed" || bad "...and writes the branch record: round 1, the issued tree reviewed" "$(rec "$REPO" "$BR" .)"
 rs rv_edited "$SID" "$REPO" && bad "unchanged tree after completion clears markers" || ok "unchanged tree after completion clears markers"
 rs rv_tally_owed "$SID" && ok "a TALLY is owed" || bad "a TALLY is owed"
-out=$(stop "$SID" "$REPO" | "$H/review-trigger"); check "tally owed: a Stop without a TALLY line blocks" "$out" 'thermo-bugs review returned findings and no TALLY line closed them'
+out=$(stop "$SID" "$REPO" | "$H/review-trigger"); check "tally owed: a Stop without a TALLY line blocks" "$out" 'bug-reviewer review returned findings and no TALLY line closed them'
 check "...with the reproduce-first instruction" "$out" 'Reproduce each finding before fixing it'
 out=$(stop "$SID" "$REPO" true | "$H/review-trigger"); empty "tally reminder fires once" "$out"
-sstop thermo-bugs
+sstop bug-reviewer
 rs rv_tally_owed "$SID" && bad "unrelated reviewer (no round pending) owes nothing" || ok "unrelated reviewer (no round pending) owes nothing"
-sstop thermo-quality
-[ "$(rec "$REPO" "$BR" .quality_done)" = true ] && ok "thermo-quality's return marks the branch quality_done" || bad "thermo-quality's return marks the branch quality_done" "$(rec "$REPO" "$BR" .)"
-( . "$H/lib/review-state" && rv_tally_owed "$SID" && [ "$RV_OWED" = thermo-quality ] ) \
+sstop quality-reviewer
+[ "$(rec "$REPO" "$BR" .quality_done)" = true ] && ok "quality-reviewer's return marks the branch quality_done" || bad "quality-reviewer's return marks the branch quality_done" "$(rec "$REPO" "$BR" .)"
+( . "$H/lib/review-state" && rv_tally_owed "$SID" && [ "$RV_OWED" = quality-reviewer ] ) \
   && ok "...and its findings owe the TALLY (RC-CX-4)" || bad "...and its findings owe the TALLY (RC-CX-4)"
 rs rv_tally_settle "$SID"
 out=$(gpush "$SID" "$REPO"); check "reviewed tree: push passes" "$out" 'rc=0'
@@ -148,10 +148,10 @@ check "20 lines since the round: allowed" "$out" 'rc=0'
 check "...with a self-check note" "$out" 'agent pre-push: .*[Ss]elf-check'
 work f 40; out=$(issue "$REPO" "$SID")
 check "60 lines since the round: refused for round 2" "$out" 'Review round 2 of'
-check "round 2 is thermo-bugs only (thermo-quality ran on this branch)" "$out" 'thermo-quality' absent
+check "round 2 is bug-reviewer only (quality-reviewer ran on this branch)" "$out" 'quality-reviewer' absent
 check "round 2 is sized on its own delta" "$out" '~60 line delta'
 check "round 2 scope is only the delta" "$out" 'ONLY what changed since the last review round'
-sstop thermo-bugs "No findings."
+sstop bug-reviewer "No findings."
 rs rv_tally_owed "$SID" && bad "a zero-finding round owes no TALLY" || ok "a zero-finding round owes no TALLY"
 out=$(gpush "$SID" "$REPO"); check "after completion the push passes" "$out" 'rc=0'
 rm -f "$TESTS"
@@ -161,7 +161,7 @@ echo "--- git pre-push: the budget is the branch's, kept until merge ---"
 S2="$SID-2"; touch "$TESTS2"
 work g 60; out=$(issue "$REPO" "$S2" REVIEW_MAX_ROUNDS=3)
 check "a new session on the branch continues its count: round 3 of 3" "$out" 'Review round 3 of 3'
-sstopin "$REPO" "$S2" thermo-bugs "No findings."
+sstopin "$REPO" "$S2" bug-reviewer "No findings."
 work h 60; out=$(issue "$REPO" "$S2" REVIEW_MAX_ROUNDS=3)
 check "past the budget: allowed" "$out" 'rc=0'
 check "...with a warning and no new round" "$out" 'WARNING: this branch has used its 3 agent review rounds'
@@ -169,7 +169,7 @@ check "...and no agents" "$out" 'subagent_type' absent
 env -u CLAUDECODE -u AI_AGENT -u AGENT_HOST git -C "$REPO" push -q origin "HEAD:refs/heads/main" 2>/dev/null; g fetch -q origin 2>/dev/null
 work i 60; out=$(issue "$REPO" "$S2" REVIEW_MAX_ROUNDS=3)
 check "a record whose reviewed commit reached a base branch is stale: round 1 again" "$out" 'Review round 1 of 3'
-sstopin "$REPO" "$S2" thermo-bugs "No findings."
+sstopin "$REPO" "$S2" bug-reviewer "No findings."
 
 echo "--- git pre-push: what is not a push ---"
 work j 60; g add -A; g commit -qm pp-np
@@ -294,7 +294,7 @@ echo "--- git pre-push: a deferred round ---"
 # stacking a second round, until REVIEW_PENDING_TTL says the round was abandoned.
 RD="$FX/rd"; SD="$SID-d"; mkrepo "$RD" "$FX/rd.git"
 workin "$RD" "$SD" a 200
-out=$(issue "$RD" "$SD"); check "heavy round issued" "$out" 'subagent_type "thermo-quality"'
+out=$(issue "$RD" "$SD"); check "heavy round issued" "$out" 'subagent_type "quality-reviewer"'
 workin "$RD" "$SD" b 200
 out=$(issue "$RD" "$SD"); check "deferred round: the next push waits for it" "$out" 'has not returned'
 check "...and asks no second round" "$out" 'This refusal is the review trigger' absent
@@ -305,7 +305,7 @@ echo "--- review-agent-mark: a reviewer that cd'd to another checkout ---"
 RX="$FX/rx"; RY="$FX/ry"; SX="$SID-x"; mkrepo "$RX" "$FX/rx.git"; mkrepo "$RY"
 workin "$RX" "$SX" c 60
 out=$(issue "$RX" "$SX"); check "cd case: 60 lines -> a round" "$out" 'This refusal is the review trigger'
-sstopin "$RY" "$SX" thermo-bugs
+sstopin "$RY" "$SX" bug-reviewer
 rs rv_pending "$SX" "$RX" && bad "a reviewer returning from another checkout completes the session's one round" \
   || ok "a reviewer returning from another checkout completes the session's one round"
 out=$(gpush "$SX" "$RX"); check "...so the next push asks for nothing" "$out" 'review trigger|has not returned' absent
@@ -324,7 +324,7 @@ handback() { jq -cn --arg m "$2" '{type:"assistant",message:{content:[{type:"too
 rounds_of() { ( . "$H/lib/review-state" 2>/dev/null && _rv_load "$1" && _rv_get r rounds; echo "${r:-0}" ); }
 issue_round() { workin "${3:-$RH}" "$1" "$2" 60; issue "${3:-$RH}" "$1" >/dev/null; }
 issue_round "$SH" h1
-spawn "$SH" thermo-bugs async_launched ah1
+spawn "$SH" bug-reviewer async_launched ah1
 handback ah1 "1. a.py:3 off by one"
 sstopx "$SH" ah1 "" "" "$TR/ah1.jsonl"
 rs rv_pending "$SH" "$RH" && bad "empty message + handback in the transcript completes the round" \
@@ -332,12 +332,12 @@ rs rv_pending "$SH" "$RH" && bad "empty message + handback in the transcript com
 rs rv_tally_owed "$SH" && ok "...and the handback's findings owe a TALLY" || bad "...and the handback's findings owe a TALLY"
 rs rv_tally_settle "$SH"
 issue_round "$SH" h2
-spawn "$SH" thermo-bugs async_launched ah2
+spawn "$SH" bug-reviewer async_launched ah2
 printf '%s\n' '{"type":"user"}' > "$TR/ah2.jsonl"
 sstopx "$SH" ah2 "" "No findings." "$TR/ah2.jsonl"
 rs rv_pending "$SH" "$RH" && bad "empty agent_type resolved from the spawn map" || ok "empty agent_type resolved from the spawn map"
 issue_round "$SH" h3
-spawn "$SH" thermo-bugs async_launched ah3
+spawn "$SH" bug-reviewer async_launched ah3
 printf '%s\n' '{"type":"user"}' > "$TR/ah3.jsonl"
 sstopx "$SH" ah3 "" "" "$TR/ah3.jsonl"
 rs rv_pending "$SH" "$RH" && ok "interrupted agent (no message, no handback) completes nothing" \
@@ -345,29 +345,29 @@ rs rv_pending "$SH" "$RH" && ok "interrupted agent (no message, no handback) com
 sstopx "$SH" ah9 "" "No findings." "$TR/ah3.jsonl"
 rs rv_pending "$SH" "$RH" && ok "unknown agent id with no type completes nothing" || bad "unknown agent id with no type completes nothing"
 before=$(rounds_of "$SH")
-spawn "$SH" thermo-bugs completed ah4 "No findings."
+spawn "$SH" bug-reviewer completed ah4 "No findings."
 rs rv_pending "$SH" "$RH" && bad "foreground completion from the tool result" || ok "foreground completion from the tool result"
-sstopx "$SH" ah4 thermo-bugs "No findings." "$TR/ah3.jsonl"
+sstopx "$SH" ah4 bug-reviewer "No findings." "$TR/ah3.jsonl"
 [ "$(rounds_of "$SH")" = $((before + 1)) ] && ok "...counted once though SubagentStop fires too" \
   || bad "...counted once though SubagentStop fires too" "rounds $(rounds_of "$SH"), was $before"
 # SubagentStop can arrive before PostToolUse(Agent): no spawn map entry, agent_type "", so the type
 # comes from the transcript's .meta.json.
 issue_round "$SH" h4
-handback ah8 "No findings."; printf '%s\n' '{"agentType":"thermo-bugs"}' > "$TR/ah8.meta.json"
+handback ah8 "No findings."; printf '%s\n' '{"agentType":"bug-reviewer"}' > "$TR/ah8.meta.json"
 sstopx "$SH" ah8 "" "" "$TR/ah8.jsonl"
 rs rv_pending "$SH" "$RH" && bad "SubagentStop before the spawn's PostToolUse: type from .meta.json" \
   || ok "SubagentStop before the spawn's PostToolUse: type from .meta.json"
 before=$(rounds_of "$SH")
-spawn "$SH" thermo-bugs completed ah8 "No findings."
+spawn "$SH" bug-reviewer completed ah8 "No findings."
 [ "$(rounds_of "$SH")" = "$before" ] && ok "...and the late PostToolUse counts nothing more" || bad "...and the late PostToolUse counts nothing more"
 RH2="$FX/rh2"; mkrepo "$RH2" "$FX/rh2.git"
 issue_round "$SH" h5; issue_round "$SH" h5 "$RH2"
 { rs rv_pending "$SH" "$RH" && rs rv_pending "$SH" "$RH2"; } && ok "two rounds pending" || bad "two rounds pending"
-spawn "$SH" thermo-bugs completed ah5 "No findings."
+spawn "$SH" bug-reviewer completed ah5 "No findings."
 { ! rs rv_pending "$SH" "$RH" && rs rv_pending "$SH" "$RH2"; } && ok "a return closes only its own root's round" \
   || bad "a return closes only its own root's round"
 issue_round "$SH" h6
-XD="$RY" spawn "$SH" thermo-bugs completed ah10 "No findings."
+XD="$RY" spawn "$SH" bug-reviewer completed ah10 "No findings."
 { rs rv_pending "$SH" "$RH" && rs rv_pending "$SH" "$RH2"; } && ok "two pending, a return from a third root: neither closes" \
   || bad "two pending, a return from a third root: neither closes"
 DBG="$FX/agent-state"
@@ -499,8 +499,8 @@ qw a & qw b & qw c & qw d & wait
 n=$(grep -c '=1$' "$R/session-$SC" 2>/dev/null)
 [ "${n:-0}" = 40 ] && ok "four writers behind a dead lock keep all 40 keys" || bad "four writers behind a dead lock kept ${n:-0} of 40 keys"
 
-echo "--- review-cross: the second reviewer, through agent-run ---"
-# Round 1 is thermo-bugs plus review-cross; later rounds review-cross on the delta, thermo-bugs back
+echo "--- cross-reviewer: the second reviewer, through agent-run ---"
+# Round 1 is bug-reviewer plus cross-reviewer; later rounds cross-reviewer on the delta, bug-reviewer back
 # on a sensitive path. bin/agent-run runs a stand-in codex (CODEX_BIN) here: the real CLI spends
 # quota, and its real run is in the codex-reviewer phase notes.
 CR="$H/../bin/agent-run"; FK="$FX/fake-codex"
@@ -508,40 +508,40 @@ printf '%s\n' '#!/bin/bash' 'o=; while [ $# -gt 0 ]; do case $1 in -o) o=$2; shi
   'cat >/dev/null' '[ -z "${FAKE_JSON:-}" ] || cat "$FAKE_JSON" > "$o"' 'exit "${FAKE_RC:-0}"' > "$FK"; chmod +x "$FK"
 printf '%s\n' '{"verdict":"needs-attention","summary":"s","findings":[{"id":"x","severity":"high","title":"t1","body":"b","file":"a.py","line_start":1,"line_end":1,"confidence":0.9,"recommendation":"r"},{"id":"y","severity":"low","title":"t2","body":"b","file":"a.py","line_start":1,"line_end":1,"confidence":0.5,"recommendation":"r"}],"next_steps":[]}' > "$FX/cx2.json"
 printf '%s\n' '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}' > "$FX/cx0.json"
-# cxr <sid> [VAR=value...]: run agent-run review-cross on $RC with the stand-in; its output and rc on one line.
+# cxr <sid> [VAR=value...]: run agent-run cross-reviewer on $RC with the stand-in; its output and rc on one line.
 # CRR: the cross reviewer's command, and CXT its agent type, as this copy of the kit names them
 # (codex-review and codex before the roles rename), so the RC-CX cases run against the old hooks too.
-if [ -x "$CR" ]; then CRR=("$CR" review-cross --timeout 10); CXT=review-cross; else CRR=("$H/../bin/codex-review"); CXT=codex; fi
+if [ -x "$CR" ]; then CRR=("$CR" cross-reviewer --timeout 10); CXT=cross-reviewer; else CRR=("$H/../bin/codex-review"); CXT=codex; fi
 cxr() { local s=$1; shift; { env CLAUDE_CODE_SESSION_ID="$s" AGENT_SESSION_ID= CODEX_BIN="$FK" "$@" "${CRR[@]}" "$RC" 2>&1; echo "rc=$?"; } | tr '\n' ' '; }
 # A new branch, never pushed: round 1 is the whole PR, from the fork point.
 RC="$FX/rc"; SC2="$SID-c"; BC=cxb; mkrepo "$RC" "$FX/rc.git"; git -C "$RC" checkout -qb "$BC"; git -C "$RC" config push.default current
 workin "$RC" "$SC2" a 60
 out=$(issue "$RC" "$SC2" CODEX_BIN="$FK" | tr '\n' ' ')
-check "round 1: thermo-bugs and review-cross in one message" "$out" 'ONE message, in the FOREGROUND.*subagent_type "thermo-bugs".*agent-run review-cross'
-check "...review-cross through Bash in the background, on the whole PR" "$out" 'run Codex through Bash with run_in_background: true \(up to ~15 min[^`]*`[^`]*/bin/agent-run review-cross [^ `]+ --objective'
+check "round 1: bug-reviewer and cross-reviewer in one message" "$out" 'ONE message, in the FOREGROUND.*subagent_type "bug-reviewer".*agent-run cross-reviewer'
+check "...cross-reviewer through Bash in the background, on the whole PR" "$out" 'run Codex through Bash with run_in_background: true \(up to ~15 min[^`]*`[^`]*/bin/agent-run cross-reviewer [^ `]+ --objective'
 check "...its findings come from its file with their CX- ids, and the round waits for every reviewer" "$out" 'completes when every correctness reviewer has returned.*CX- ids'
-check "...the fixer instruction: round 1 is thermo-bugs' AND Codex's" "$out" "round 1: thermo-bugs' AND Codex's\)"
-[ "$(rec "$RC" "$BC" '.agents | join(" ")')" = "thermo-bugs thermo-quality review-cross" ] \
-  && ok "...the record lists review-cross among the round's agents" || bad "...the record lists review-cross among the round's agents" "$(rec "$RC" "$BC" .)"
-out=$(gpush "$SC2" "$RC" CODEX_BIN="$FK"); check "round in flight: the wait names the agent-run command" "$out" 'review-cross is not an Agent: run `[^`]*/bin/agent-run review-cross'
+check "...the fixer instruction: round 1 is bug-reviewer's AND Codex's" "$out" "round 1: bug-reviewer's AND Codex's\)"
+[ "$(rec "$RC" "$BC" '.agents | join(" ")')" = "bug-reviewer quality-reviewer cross-reviewer" ] \
+  && ok "...the record lists cross-reviewer among the round's agents" || bad "...the record lists cross-reviewer among the round's agents" "$(rec "$RC" "$BC" .)"
+out=$(gpush "$SC2" "$RC" CODEX_BIN="$FK"); check "round in flight: the wait names the agent-run command" "$out" 'cross-reviewer is not an Agent: run `[^`]*/bin/agent-run cross-reviewer'
 out=$(cxr "$SC2" FAKE_JSON="$FX/cx2.json")
-check "agent-run review-cross: every finding gets a CX- id" "$out" 'CX-1 \[high 0.9\] t1 .*CX-2 \[low 0.5\] t2 .*rc=0'
+check "agent-run cross-reviewer: every finding gets a CX- id" "$out" 'CX-1 \[high 0.9\] t1 .*CX-2 \[low 0.5\] t2 .*rc=0'
 check "...and prints the findings file for whoever fixes" "$out" 'verbatim for whoever fixes[^:]*: [^ ]+\.md'
 cxout=$(printf '%s' "$out" | grep -oE 'JSON: [^ ]+' | sed 's/^JSON: //')
 [ "$(jq -c '[.findings[].id]' "$cxout" 2>/dev/null)" = '["CX-1","CX-2"]' ] && ok "...in the JSON too" || bad "...in the JSON too" "$(cat "$cxout" 2>/dev/null)"
-rs rv_pending "$SC2" "$RC" && ok "review-cross first: the round waits for thermo-bugs" || bad "review-cross first: the round waits for thermo-bugs"
-[ "$(rec "$RC" "$BC" '"\(.rounds // 0) \(.pending_tree | length) \(.reviews[-1].agent) \(.reviews[-1].findings)"')" = "0 40 review-cross 2" ] \
+rs rv_pending "$SC2" "$RC" && ok "cross-reviewer first: the round waits for bug-reviewer" || bad "cross-reviewer first: the round waits for bug-reviewer"
+[ "$(rec "$RC" "$BC" '"\(.rounds // 0) \(.pending_tree | length) \(.reviews[-1].agent) \(.reviews[-1].findings)"')" = "0 40 cross-reviewer 2" ] \
   && ok "...the record keeps the round pending and logs the codex review, 2 findings" || bad "...the record keeps the round pending and logs the codex review, 2 findings" "$(rec "$RC" "$BC" .)"
 rs rv_tally_owed "$SC2" && ok "...and its findings owe the TALLY" || bad "...and its findings owe the TALLY"
-sstopin "$RC" "$SC2" thermo-bugs
-[ "$(rec "$RC" "$BC" '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "thermo-bugs returning second completes round 1" || bad "thermo-bugs returning second completes round 1" "$(rec "$RC" "$BC" .)"
-( . "$H/lib/review-state" && rv_tally_owed "$SC2" && [ "$RV_OWED" = "review-cross thermo-bugs" ] ) && ok "round 1: the TALLY owed covers both reports" || bad "round 1: the TALLY owed covers both reports"
+sstopin "$RC" "$SC2" bug-reviewer
+[ "$(rec "$RC" "$BC" '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "bug-reviewer returning second completes round 1" || bad "bug-reviewer returning second completes round 1" "$(rec "$RC" "$BC" .)"
+( . "$H/lib/review-state" && rv_tally_owed "$SC2" && [ "$RV_OWED" = "cross-reviewer bug-reviewer" ] ) && ok "round 1: the TALLY owed covers both reports" || bad "round 1: the TALLY owed covers both reports"
 rs rv_tally_settle "$SC2"
-sstopin "$RC" "$SC2" thermo-quality
+sstopin "$RC" "$SC2" quality-reviewer
 workin "$RC" "$SC2" b 60
 out=$(issue "$RC" "$SC2" CODEX_BIN="$FK")
-check "round 2: review-cross on the delta" "$out" 'Review round 2 of.*/bin/agent-run review-cross [^ `]+ --since [0-9a-f]{40} '
-check "...with no review Agent (non-sensitive delta, thermo-quality done)" "$out" 'subagent_type "(thermo|reviewer)' absent
+check "round 2: cross-reviewer on the delta" "$out" 'Review round 2 of.*/bin/agent-run cross-reviewer [^ `]+ --since [0-9a-f]{40} '
+check "...with no review Agent (non-sensitive delta, quality-reviewer done)" "$out" 'subagent_type "(thermo|task-reviewer)' absent
 out=$(cxr "" FAKE_JSON="$FX/cx0.json")
 check "agent-run with no session (another host): no findings" "$out" 'approve, 0 finding\(s\).*round 2'
 [ "$(rec "$RC" "$BC" '"\(.rounds) \(.pending_tree)"')" = "2 null" ] \
@@ -551,19 +551,19 @@ out=$(cxr "" FAKE_JSON="$FX/cx0.json")
 [ "$(rec "$RC" "$BC" '"\(.rounds) \(.reviews | length)"')" = "2 3" ] \
   && ok "a second codex run on a reviewed tree adds no round" || bad "a second codex run on a reviewed tree adds no round" "$(rec "$RC" "$BC" .)"
 out=$(cxr "" FAKE_RC=1); check "Codex failing: non-zero, says nothing was recorded" "$out" 'nothing recorded.*rc=4'
-out=$(cxr "" CODEX_BIN="$FX/no-codex"); check "no Codex CLI: exit 3, names the fallback" "$out" 'not on PATH.*thermo-bugs.*rc=3'
+out=$(cxr "" CODEX_BIN="$FX/no-codex"); check "no Codex CLI: exit 3, names the fallback" "$out" 'not on PATH.*bug-reviewer.*rc=3'
 printf '%s\n' '{"verdict":"maybe"}' > "$FX/cxbad.json"
 out=$(cxr "" FAKE_JSON="$FX/cxbad.json"); check "an answer off the schema: exit 5" "$out" 'does not match.*rc=5'
 [ "$(rec "$RC" "$BC" '"\(.rounds) \(.reviews | length)"')" = "2 3" ] && ok "...and failures record nothing" || bad "...and failures record nothing" "$(rec "$RC" "$BC" .)"
 mkdir -p "$RC/models"; workin "$RC" "$SC2" models/tables 60
 out=$(issue "$RC" "$SC2" CODEX_BIN="$FK")
-check "a sensitive delta (models/tables.py): thermo-bugs joins review-cross" "$out" 'Review round 3 of.*subagent_type "thermo-bugs".*agent-run review-cross'
+check "a sensitive delta (models/tables.py): bug-reviewer joins cross-reviewer" "$out" 'Review round 3 of.*subagent_type "bug-reviewer".*agent-run cross-reviewer'
 out=$(cxr "$SC2" FAKE_JSON="$FX/cx0.json")
-out=$(gpush "$SC2" "$RC" CODEX_BIN="$FK"); check "codex returned, thermo-bugs still out: the round waits" "$out" 'has not returned'
-sstopin "$RC" "$SC2" thermo-bugs "No findings."
+out=$(gpush "$SC2" "$RC" CODEX_BIN="$FK"); check "codex returned, bug-reviewer still out: the round waits" "$out" 'has not returned'
+sstopin "$RC" "$SC2" bug-reviewer "No findings."
 workin "$RC" "$SC2" c 60
 out=$(issue "$RC" "$SC2" CODEX_BIN="$FX/no-codex")
-check "no Codex CLI on the push: thermo-bugs takes review-cross's place" "$out" 'Review round 4 of.*subagent_type "thermo-bugs"'
+check "no Codex CLI on the push: bug-reviewer takes cross-reviewer's place" "$out" 'Review round 4 of.*subagent_type "bug-reviewer"'
 check "...and no agent-run command" "$out" 'agent-run' absent
 # _rv_sensitive by file name: schema files and fee modules, not their look-alikes.
 RS="$FX/rs"; mkrepo "$RS"
@@ -585,18 +585,18 @@ stopmsg() { jq -cn --arg s "$1" --arg d "$2" --arg m "$3" --arg p "${4:-}" '{hoo
 # realpush <repo> <refspec>: a push outside the agent layer (the remote moves; nothing is gated).
 realpush() { env -u CLAUDECODE -u AI_AGENT -u AGENT_HOST git -C "$1" push -q origin "$2" 2>/dev/null; git -C "$1" fetch -q origin 2>/dev/null; }
 RT2="$FX/rt2"; ST="$SID-t"; mkfeat "$RT2" ft
-issue_round "$ST" t1 "$RT2"; sstopin "$RT2" "$ST" thermo-bugs "B-1 a.py:1 off by one"
+issue_round "$ST" t1 "$RT2"; sstopin "$RT2" "$ST" bug-reviewer "B-1 a.py:1 off by one"
 out=$(stopmsg "$ST" "$RT2" "Fixed B-1.
 - TALLY B-1=FIXED B-2=NOT_REPRODUCED")
 empty "tally owed: a final message with a TALLY line settles it, no block" "$out"
 out=$(stopmsg "$ST" "$RT2" "done"); empty "...and nothing is owed after it" "$out"
-issue_round "$ST" t2 "$RT2"; sstopin "$RT2" "$ST" thermo-bugs "B-1 a.py:1 off by one"
+issue_round "$ST" t2 "$RT2"; sstopin "$RT2" "$ST" bug-reviewer "B-1 a.py:1 off by one"
 printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"TALLY B-1=OPTION"}]}}' > "$FX/tt2.jsonl"
 out=$(stopmsg "$ST" "$RT2" "" "$FX/tt2.jsonl"); empty "...read from the transcript when the payload has no final message" "$out"
-issue_round "$ST" t3 "$RT2"; sstopin "$RT2" "$ST" thermo-bugs "B-1 a.py:1 off by one"
+issue_round "$ST" t3 "$RT2"; sstopin "$RT2" "$ST" bug-reviewer "B-1 a.py:1 off by one"
 out=$(stopmsg "$ST" "$RT2" "TALLY: 1 confirmed, 0 false positive"); check "the critic's old TALLY: summary is not a TALLY line: blocks" "$out" 'no TALLY line closed them'
-issue_round "$ST" t4 "$RT2"; sstopin "$RT2" "$ST" thermo-bugs "B-1 a.py:1 off by one"
-jq -cn --arg s "$ST" --arg d "$RT2" '{hook_event_name:"PostToolUse",tool_name:"Agent",session_id:$s,cwd:$d,tool_input:{subagent_type:"worker",prompt:"x"},tool_response:{status:"completed",content:[{type:"text",text:"Fixed.\nTALLY B-1=FIXED"}]}}' | "$H/review-agent-mark"
+issue_round "$ST" t4 "$RT2"; sstopin "$RT2" "$ST" bug-reviewer "B-1 a.py:1 off by one"
+jq -cn --arg s "$ST" --arg d "$RT2" '{hook_event_name:"PostToolUse",tool_name:"Agent",session_id:$s,cwd:$d,tool_input:{subagent_type:"engineer",prompt:"x"},tool_response:{status:"completed",content:[{type:"text",text:"Fixed.\nTALLY B-1=FIXED"}]}}' | "$H/review-agent-mark"
 out=$(stopmsg "$ST" "$RT2" "done"); empty "a fix worker's report with a TALLY line settles it" "$out"
 
 echo "--- a Stop during a pending push round ---"
@@ -605,26 +605,26 @@ workin "$R4" "$S4" a 25; stopin "$R4" "$S4" >/dev/null; stopin "$R4" "$S4" true 
 workin "$R4" "$S4" b 20; out=$(issue "$R4" "$S4"); check "fixture: 45 lines on the branch: refused" "$out" 'This refusal is the review trigger'
 workin "$R4" "$S4" c 15; out=$(stopin "$R4" "$S4")
 empty "a Stop while the push round is pending asks no self-check" "$out"
-sstopin "$R4" "$S4" thermo-bugs "No findings."
+sstopin "$R4" "$S4" bug-reviewer "No findings."
 out=$(gpush "$S4" "$R4"); check "...so its review's return completes the round: the push does not wait" "$out" 'has not returned' absent
 
 echo "--- a pending round taken on by another session ---"
 R5="$FX/r5"; A5="$SID-5a"; B5="$SID-5b"; mkfeat "$R5" f5
 workin "$R5" "$A5" a 60; out=$(issue "$R5" "$A5"); check "fixture: session A refused" "$out" 'This refusal is the review trigger'
 out=$(gpush "$B5" "$R5"); check "session B (a handoff) waits on A's round" "$out" 'has not returned'
-sstopin "$R5" "$B5" thermo-bugs "No findings."
+sstopin "$R5" "$B5" bug-reviewer "No findings."
 out=$(gpush "$B5" "$R5"); check "...and B's own review's return completes it" "$out" 'has not returned' absent
-sstopin "$R5" "$A5" thermo-bugs "No findings."
+sstopin "$R5" "$A5" bug-reviewer "No findings."
 [ "$(rec "$R5" f5 .rounds)" = 1 ] && ok "...A's late return adds no second round" || bad "...A's late return adds no second round" "$(rec "$R5" f5 .)"
 
 echo "--- a feature merged into origin/staging has not merged ---"
 R6="$FX/r6"; S6="$SID-6"; mkfeat "$R6" f6; realpush "$R6" main:staging
 workin "$R6" "$S6" a 60; out=$(issue "$R6" "$S6"); check "fixture: round 1 on f6" "$out" 'Review round 1 of'
-sstopin "$R6" "$S6" thermo-bugs "No findings."; sstopin "$R6" "$S6" thermo-quality "No findings."
+sstopin "$R6" "$S6" bug-reviewer "No findings."; sstopin "$R6" "$S6" quality-reviewer "No findings."
 realpush "$R6" f6:staging
 workin "$R6" "$S6" b 60; out=$(issue "$R6" "$S6")
 check "after f6 merged into origin/staging: round 2, the count kept" "$out" 'Review round 2 of'
-check "...and thermo-quality is not asked again" "$out" 'thermo-quality' absent
+check "...and quality-reviewer is not asked again" "$out" 'quality-reviewer' absent
 
 echo "--- the anchor: small pushes before any round add up ---"
 R3="$FX/r3"; S3="$SID-3"; mkfeat "$R3" f3
@@ -639,31 +639,31 @@ realpush "$R3b" f3b
 workin "$R3b" "$S3" b 30; out=$(issue "$R3b" "$S3")
 check "after an AGENT_PUSH_NOW push the next push still counts its lines: round 1 on 60" "$out" 'Review round 1 of.*~60 line delta|~60 line delta.*Review round 1 of'
 
-echo "--- thermo-quality returning to another checkout's cwd ---"
+echo "--- quality-reviewer returning to another checkout's cwd ---"
 R11="$FX/r11"; W11="$FX/w11"; S11="$SID-11"; mkrepo "$R11" "$FX/r11.git"
 git -C "$R11" worktree add -q -b f11 "$W11" 2>/dev/null; git -C "$W11" config push.default current
-workin "$W11" "$S11" a 60; out=$(issue "$W11" "$S11"); check "fixture: a round in the worktree" "$out" 'subagent_type "thermo-quality"'
-sstopin "$R11" "$S11" thermo-bugs "No findings."; sstopin "$R11" "$S11" thermo-quality "No findings."
-[ "$(rec "$W11" f11 .quality_done)" = true ] && ok "thermo-quality after thermo-bugs, cwd in the main checkout: quality_done kept" \
-  || bad "thermo-quality after thermo-bugs, cwd in the main checkout: quality_done kept" "$(rec "$W11" f11 .)"
+workin "$W11" "$S11" a 60; out=$(issue "$W11" "$S11"); check "fixture: a round in the worktree" "$out" 'subagent_type "quality-reviewer"'
+sstopin "$R11" "$S11" bug-reviewer "No findings."; sstopin "$R11" "$S11" quality-reviewer "No findings."
+[ "$(rec "$W11" f11 .quality_done)" = true ] && ok "quality-reviewer after bug-reviewer, cwd in the main checkout: quality_done kept" \
+  || bad "quality-reviewer after bug-reviewer, cwd in the main checkout: quality_done kept" "$(rec "$W11" f11 .)"
 
-echo "--- review-cross: completion is per reviewer and per snapshot ---"
+echo "--- cross-reviewer: completion is per reviewer and per snapshot ---"
 R7="$FX/r7"; S7="$SID-7"; mkfeat "$R7" f7
-workin "$R7" "$S7" a 60; out=$(issue "$R7" "$S7" CODEX_BIN="$FK"); check "fixture: round 1 with review-cross" "$out" 'agent-run review-cross'
-sstopin "$R7" "$S7" thermo-bugs "No findings."; sstopin "$R7" "$S7" thermo-quality "No findings."
-out=$(gpush "$S7" "$R7" CODEX_BIN="$FK"); check "thermo-bugs alone does not complete a round Codex is in" "$out" 'has not returned'
+workin "$R7" "$S7" a 60; out=$(issue "$R7" "$S7" CODEX_BIN="$FK"); check "fixture: round 1 with cross-reviewer" "$out" 'agent-run cross-reviewer'
+sstopin "$R7" "$S7" bug-reviewer "No findings."; sstopin "$R7" "$S7" quality-reviewer "No findings."
+out=$(gpush "$S7" "$R7" CODEX_BIN="$FK"); check "bug-reviewer alone does not complete a round Codex is in" "$out" 'has not returned'
 out=$(RC="$R7" cxr "$S7" FAKE_JSON="$FX/cx0.json")
 out=$(gpush "$S7" "$R7" CODEX_BIN="$FK"); check "...Codex returning completes it" "$out" 'has not returned' absent
-workin "$R7" "$S7" b 60; out=$(issue "$R7" "$S7" CODEX_BIN="$FK"); check "fixture: round 2, review-cross only" "$out" 'Review round 2 of'
-out=$(RC="$R7" cxr "$S7" FAKE_RC=1); check "Codex failing in a session's round: thermo-bugs takes its place" "$out" 'thermo-bugs.*rc=4'
-sstopin "$R7" "$S7" thermo-bugs "No findings."
+workin "$R7" "$S7" b 60; out=$(issue "$R7" "$S7" CODEX_BIN="$FK"); check "fixture: round 2, cross-reviewer only" "$out" 'Review round 2 of'
+out=$(RC="$R7" cxr "$S7" FAKE_RC=1); check "Codex failing in a session's round: bug-reviewer takes its place" "$out" 'bug-reviewer.*rc=4'
+sstopin "$R7" "$S7" bug-reviewer "No findings."
 out=$(gpush "$S7" "$R7" CODEX_BIN="$FK"); check "...and its return completes the round" "$out" 'has not returned' absent
 R8="$FX/r8"; S8="$SID-8"; mkfeat "$R8" f8
 workin "$R8" "$S8" a 60; issue "$R8" "$S8" CODEX_BIN="$FK" >/dev/null
 t1=$(rec "$R8" f8 .pending_tree)
 workin "$R8" "$S8" b 60; out=$(issue "$R8" "$S8" CODEX_BIN="$FK" REVIEW_PENDING_TTL=0); check "fixture: a second snapshot's round issued" "$out" 'This refusal is the review trigger'
-sstopin "$R8" "$S8" thermo-bugs "No findings."
-rs rv_complete "$S8" "$R8" review-cross "agent-run review-cross reported 0 findings" "" "$t1"
+sstopin "$R8" "$S8" bug-reviewer "No findings."
+rs rv_complete "$S8" "$R8" cross-reviewer "agent-run cross-reviewer reported 0 findings" "" "$t1"
 rs rv_pending "$S8" "$R8" && ok "a Codex result for an older snapshot leaves the new round pending" \
   || bad "a Codex result for an older snapshot leaves the new round pending"
 R9="$FX/r9"; mkfeat "$R9" f9
@@ -681,50 +681,50 @@ mkdir -p "$FX/od"
 
 
 echo "--- roles: the rounds and the invocation come from roles.toml ---"
-# review-cross moved to an anthropic model (one edit in roles.toml): round 1 is Agent spawns only.
+# cross-reviewer moved to an anthropic model (one edit in roles.toml): round 1 is Agent spawns only.
 sed 's/"openai:gpt-6.1-sol"/"anthropic:opus"/' "$H/../roles.toml" > "$FX/anth.toml"
 AGENT_KIT_ROLES="$FX/anth.toml" "$H/../bin/agent-kit" roles --format sh > "$FX/anth.sh" 2>/dev/null
 RA="$FX/ra"; SA="$SID-ra"; mkfeat "$RA" fa
 workin "$RA" "$SA" a 60
 out=$(issue "$RA" "$SA" CODEX_BIN="$FK" AGENT_ROLES_SH="$FX/anth.sh" | tr '\n' ' ')
-check "review-cross on an anthropic model: round 1 is Agent spawns, review-cross among them" "$out" 'spawn 3 Agent call\(s\): subagent_type "thermo-bugs" and subagent_type "review-cross" and subagent_type "thermo-quality"'
+check "cross-reviewer on an anthropic model: round 1 is Agent spawns, cross-reviewer among them" "$out" 'spawn 3 Agent call\(s\): subagent_type "bug-reviewer" and subagent_type "cross-reviewer" and subagent_type "quality-reviewer"'
 check "...with no agent-run and no Codex findings file" "$out" 'agent-run|Codex findings' absent
-check "B-5: ...and the fixer instruction names round 1 as configured, not Codex" "$out" "round 1: thermo-bugs' AND review-cross'\)"
+check "B-5: ...and the fixer instruction names round 1 as configured, not Codex" "$out" "round 1: bug-reviewer's AND cross-reviewer's\)"
 AGENT_ROLES_SH="$FX/anth.sh"
-sstopin "$RA" "$SA" thermo-bugs "B-1 a.py:1 off by one"
-rs rv_pending "$SA" "$RA" && ok "...thermo-bugs alone leaves it pending" || bad "...thermo-bugs alone leaves it pending"
-sstopin "$RA" "$SA" review-cross "CX-1 a.py:2 wrong bound"
+sstopin "$RA" "$SA" bug-reviewer "B-1 a.py:1 off by one"
+rs rv_pending "$SA" "$RA" && ok "...bug-reviewer alone leaves it pending" || bad "...bug-reviewer alone leaves it pending"
+sstopin "$RA" "$SA" cross-reviewer "CX-1 a.py:2 wrong bound"
 AGENT_ROLES_SH="$FX/roles.sh"
-[ "$(rec "$RA" fa '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "...the review-cross agent's return completes the round" \
-  || bad "...the review-cross agent's return completes the round" "$(rec "$RA" fa .)"
-( . "$H/lib/review-state" && rv_tally_owed "$SA" && [ "$RV_OWED" = "thermo-bugs review-cross" ] ) \
+[ "$(rec "$RA" fa '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "...the cross-reviewer agent's return completes the round" \
+  || bad "...the cross-reviewer agent's return completes the round" "$(rec "$RA" fa .)"
+( . "$H/lib/review-state" && rv_tally_owed "$SA" && [ "$RV_OWED" = "bug-reviewer cross-reviewer" ] ) \
   && ok "...and both reports owe the TALLY" || bad "...and both reports owe the TALLY"
 
 echo "--- agent-run: the provider command line per role (dry run) ---"
-out=$(CODEX_BIN=codex "$CR" review-cross "$RA" --dry-run 2>&1)
+out=$(CODEX_BIN=codex "$CR" cross-reviewer "$RA" --dry-run 2>&1)
 check "openai role: codex exec with the role's model and effort, read-only" "$out" 'codex exec -C [^ ]+ -m gpt-6.1-sol -c model_reasoning_effort=high -s read-only'
 check "...nothing run" "$out" 'nothing run or recorded'
-out=$(AGENT_ROLES_SH="$FX/anth.sh" CLAUDE_BIN=claude "$CR" review-cross "$RA" --dry-run 2>&1)
+out=$(AGENT_ROLES_SH="$FX/anth.sh" CLAUDE_BIN=claude "$CR" cross-reviewer "$RA" --dry-run 2>&1)
 check "anthropic role: claude -p with its model and effort (its body is the prompt)" "$out" 'claude -p --model opus --effort high --output-format json --json-schema'
 check "...its --json-schema without the draft-2020-12 \$schema id, which claude -p rejects" "$out" 'draft/2020-12' absent
-out=$(CLAUDE_BIN=claude "$CR" thermo-bugs "$RA" --dry-run 2>&1)
+out=$(CLAUDE_BIN=claude "$CR" bug-reviewer "$RA" --dry-run 2>&1)
 check "a role that inherits takes main's model" "$out" 'claude -p --model opus\\\[1m\\\] --effort high'
-out=$({ CODEX_BIN=codex "$CR" review-cross "$RA" --effort max --dry-run 2>&1; echo "rc=$?"; } | tr '\n' ' ')
+out=$({ CODEX_BIN=codex "$CR" cross-reviewer "$RA" --effort max --dry-run 2>&1; echo "rc=$?"; } | tr '\n' ' ')
 check "an effort off the provider's scale: exit 2" "$out" 'not on the openai scale.*rc=2'
-sed -n '1,3p' "$(git -C "$RA" rev-parse --path-format=absolute --git-common-dir)"/agent-review-runs/review-cross-fa-*.prompt.md 2>/dev/null | grep -q 'cross-model reviewer' \
-  && ok "the prompt is the review-cross agent body" || bad "the prompt is the review-cross agent body"
+sed -n '1,3p' "$(git -C "$RA" rev-parse --path-format=absolute --git-common-dir)"/agent-review-runs/cross-reviewer-fa-*.prompt.md 2>/dev/null | grep -q 'cross-model reviewer' \
+  && ok "the prompt is the cross-reviewer agent body" || bad "the prompt is the cross-reviewer agent body"
 
-echo "--- review-cross: rounds issued before the rename (codex, codex-review) ---"
+echo "--- cross-reviewer: rounds issued before the rename (codex, codex-review) ---"
 RL="$FX/rl"; SL="$SID-rl"; mkfeat "$RL" fl
 workin "$RL" "$SL" a 60; issue "$RL" "$SL" CODEX_BIN="$FK" >/dev/null
 rkl=$(rs path_key "$RL")
-rs _rv_set "$SL" "ragents.$rkl=thermo-bugs thermo-quality codex"
-( . "$H/lib/review-state" && rv_rec_update "$RL" fl '.agents = ["thermo-bugs","thermo-quality","codex-review"]' )
-out=$(gpush "$SID-rl2" "$RL" CODEX_BIN="$FK"); check "a legacy record's wait names agent-run review-cross" "$out" 'review-cross is not an Agent: run `[^`]*/bin/agent-run review-cross'
+rs _rv_set "$SL" "ragents.$rkl=bug-reviewer quality-reviewer codex"
+( . "$H/lib/review-state" && rv_rec_update "$RL" fl '.agents = ["bug-reviewer","quality-reviewer","codex-review"]' )
+out=$(gpush "$SID-rl2" "$RL" CODEX_BIN="$FK"); check "a legacy record's wait names agent-run cross-reviewer" "$out" 'cross-reviewer is not an Agent: run `[^`]*/bin/agent-run cross-reviewer'
 out=$(RC="$RL" cxr "$SL" FAKE_JSON="$FX/cx0.json")
-rs rv_pending "$SL" "$RL" && ok "...review-cross returning to a legacy round leaves thermo-bugs out" || bad "...review-cross returning to a legacy round leaves thermo-bugs out"
-sstopin "$RL" "$SL" thermo-bugs "No findings."
-[ "$(rec "$RL" fl '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "...and thermo-bugs completes it" || bad "...and thermo-bugs completes it" "$(rec "$RL" fl .)"
+rs rv_pending "$SL" "$RL" && ok "...cross-reviewer returning to a legacy round leaves bug-reviewer out" || bad "...cross-reviewer returning to a legacy round leaves bug-reviewer out"
+sstopin "$RL" "$SL" bug-reviewer "No findings."
+[ "$(rec "$RL" fl '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "...and bug-reviewer completes it" || bad "...and bug-reviewer completes it" "$(rec "$RL" fl .)"
 
 echo "--- review rounds shared across sessions (RC-CX-1..4) ---"
 # RC-CX-1: session B adopts A's round T1, completes it and issues T2; A's late return for T1 must
@@ -732,38 +732,38 @@ echo "--- review rounds shared across sessions (RC-CX-1..4) ---"
 RX="$FX/x1"; SXA="$SID-x1a"; SXB="$SID-x1b"; mkfeat "$RX" fx1
 workin "$RX" "$SXA" a 60; issue "$RX" "$SXA" >/dev/null
 out=$(gpush "$SXB" "$RX"); check "fixture: session B adopts A's round" "$out" 'has not returned'
-sstopin "$RX" "$SXB" thermo-bugs "No findings."
+sstopin "$RX" "$SXB" bug-reviewer "No findings."
 workin "$RX" "$SXB" b 60; out=$(issue "$RX" "$SXB"); check "fixture: B issues round 2" "$out" 'Review round 2 of'
 t2=$(rec "$RX" fx1 .pending_tree)
-sstopin "$RX" "$SXA" thermo-bugs "No findings."
+sstopin "$RX" "$SXA" bug-reviewer "No findings."
 [ "$(rec "$RX" fx1 '"\(.rounds) \(.pending_tree)"')" = "1 $t2" ] && ok "RC-CX-1: a late return for an older round leaves the newer one pending" \
   || bad "RC-CX-1: a late return for an older round leaves the newer one pending" "$(rec "$RX" fx1 .)"
-# RC-CX-2: thermo-bugs and the cross reviewer returning at the same moment both count.
+# RC-CX-2: bug-reviewer and the cross reviewer returning at the same moment both count.
 stuck=0
 for i in 1 2 3 4 5 6; do
   Rr="$FX/x2-$i"; Sr="$SID-x2-$i"; mkfeat "$Rr" "fx2$i"
   workin "$Rr" "$Sr" a 60; issue "$Rr" "$Sr" CODEX_BIN="$FK" >/dev/null
-  rs rv_complete "$Sr" "$Rr" thermo-bugs "No findings." "b$i" &
+  rs rv_complete "$Sr" "$Rr" bug-reviewer "No findings." "b$i" &
   rs rv_complete "$Sr" "$Rr" "$CXT" "No findings." "c$i" &
   wait
   ! rs rv_pending "$Sr" "$Rr" || stuck=$((stuck + 1))
 done
 [ "$stuck" = 0 ] && ok "RC-CX-2: two reviewers returning at once complete the round (6 of 6)" \
   || bad "RC-CX-2: two reviewers returning at once complete the round" "$stuck of 6 stuck pending"
-# RC-CX-3: thermo-bugs returns in a session, the cross reviewer on another host (no session).
+# RC-CX-3: bug-reviewer returns in a session, the cross reviewer on another host (no session).
 RX3="$FX/x3"; SX3="$SID-x3"; mkfeat "$RX3" fx3
 workin "$RX3" "$SX3" a 60; issue "$RX3" "$SX3" CODEX_BIN="$FK" >/dev/null
-sstopin "$RX3" "$SX3" thermo-bugs "No findings."; sstopin "$RX3" "$SX3" thermo-quality "No findings."
+sstopin "$RX3" "$SX3" bug-reviewer "No findings."; sstopin "$RX3" "$SX3" quality-reviewer "No findings."
 out=$(RC="$RX3" cxr "" FAKE_JSON="$FX/cx0.json")
 [ "$(rec "$RX3" fx3 '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "RC-CX-3: returns split across a session and another host complete the round" \
   || bad "RC-CX-3: returns split across a session and another host complete the round" "$(rec "$RX3" fx3 .)"
-# RC-CX-4: thermo-quality's findings owe the TALLY like a correctness reviewer's.
+# RC-CX-4: quality-reviewer's findings owe the TALLY like a correctness reviewer's.
 RX4="$FX/x4"; SX4="$SID-x4"; mkfeat "$RX4" fx4
 workin "$RX4" "$SX4" a 60; issue "$RX4" "$SX4" >/dev/null
-sstopin "$RX4" "$SX4" thermo-bugs "No findings."
-sstopin "$RX4" "$SX4" thermo-quality "Q-1 a.py:3 the retry charges twice"
-( . "$H/lib/review-state" && rv_tally_owed "$SX4" && [ "$RV_OWED" = thermo-quality ] ) \
-  && ok "RC-CX-4: thermo-quality findings owe the TALLY" || bad "RC-CX-4: thermo-quality findings owe the TALLY"
+sstopin "$RX4" "$SX4" bug-reviewer "No findings."
+sstopin "$RX4" "$SX4" quality-reviewer "Q-1 a.py:3 the retry charges twice"
+( . "$H/lib/review-state" && rv_tally_owed "$SX4" && [ "$RV_OWED" = quality-reviewer ] ) \
+  && ok "RC-CX-4: quality-reviewer findings owe the TALLY" || bad "RC-CX-4: quality-reviewer findings owe the TALLY"
 
 echo "--- roles review findings (B-1, B-2, B-7, B-9, CX-1) ---"
 # ppre <repo> <sid>: pre-push-gate's PreToolUse answer to a plain `git push`: decision, then reason.
@@ -775,47 +775,47 @@ RB1="$FX/b1"; SB1="$SID-b1"; mkfeat "$RB1" fb1
 workin "$RB1" "$SB1" a 300; g1() { git -C "$RB1" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
 g1 add -A; g1 commit -qm w1
 out=$(ppre "$RB1" "$SB1"); check "B-1 fixture: pre-push-gate denies with the review trigger" "$out" '^deny: .*review trigger'
-sstopin "$RB1" "$SB1" thermo-bugs "No findings."; sstopin "$RB1" "$SB1" thermo-quality "No findings."
+sstopin "$RB1" "$SB1" bug-reviewer "No findings."; sstopin "$RB1" "$SB1" quality-reviewer "No findings."
 [ "$(rec "$RB1" fb1 .rounds)" = 1 ] && ok "B-1: the session round's completion counts in the branch record" || bad "B-1: the session round's completion counts in the branch record" "$(rec "$RB1" fb1 .)"
 out=$(gpush "$SB1" "$RB1"); check "B-1: ...so the git pre-push asks for no second round 1" "$out" 'Review round|review trigger' absent
-# B-2: thermo-bugs returns in session A, review-cross runs in another session: the record completes,
+# B-2: bug-reviewer returns in session A, cross-reviewer runs in another session: the record completes,
 # and A's copy of the round must not stay pending (pre-push-gate denied every push from A).
 RB2="$FX/b2"; SB2="$SID-b2"; mkfeat "$RB2" fb2
-workin "$RB2" "$SB2" a 60; out=$(issue "$RB2" "$SB2" CODEX_BIN="$FK"); check "B-2 fixture: round 1 with review-cross" "$out" 'agent-run review-cross'
-sstopin "$RB2" "$SB2" thermo-bugs "No findings."; sstopin "$RB2" "$SB2" thermo-quality "No findings."
+workin "$RB2" "$SB2" a 60; out=$(issue "$RB2" "$SB2" CODEX_BIN="$FK"); check "B-2 fixture: round 1 with cross-reviewer" "$out" 'agent-run cross-reviewer'
+sstopin "$RB2" "$SB2" bug-reviewer "No findings."; sstopin "$RB2" "$SB2" quality-reviewer "No findings."
 out=$(RC="$RB2" cxr "$SID-b2-other" FAKE_JSON="$FX/cx0.json")
-[ "$(rec "$RB2" fb2 '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "B-2 fixture: another session's review-cross completes the record" || bad "B-2 fixture: another session's review-cross completes the record" "$(rec "$RB2" fb2 .)"
+[ "$(rec "$RB2" fb2 '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "B-2 fixture: another session's cross-reviewer completes the record" || bad "B-2 fixture: another session's cross-reviewer completes the record" "$(rec "$RB2" fb2 .)"
 rs rv_pending "$SB2" "$RB2" && bad "B-2: session A's copy of the round is no longer pending" || ok "B-2: session A's copy of the round is no longer pending"
 out=$(ppre "$RB2" "$SB2"); check "B-2: ...and pre-push-gate does not deny A's push as not returned" "$out" 'has not returned' absent
 # B-9: the CLI gone when agent-run runs: its fallback takes its place, so the round can complete.
 RB9="$FX/b9"; SB9="$SID-b9"; mkfeat "$RB9" fb9
 workin "$RB9" "$SB9" a 60; issue "$RB9" "$SB9" CODEX_BIN="$FK" >/dev/null
-sstopin "$RB9" "$SB9" thermo-bugs "No findings."; sstopin "$RB9" "$SB9" thermo-quality "No findings."
+sstopin "$RB9" "$SB9" bug-reviewer "No findings."; sstopin "$RB9" "$SB9" quality-reviewer "No findings."
 out=$(RC="$RB9" cxr "$SB9" CODEX_BIN="$FX/no-codex"); check "B-9 fixture: no Codex CLI at run time: exit 3" "$out" 'not on PATH.*rc=3'
-sstopin "$RB9" "$SB9" thermo-bugs "No findings."
-[ "$(rec "$RB9" fb9 '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "B-9: ...thermo-bugs took its place, and its return completes the round" \
-  || bad "B-9: ...thermo-bugs took its place, and its return completes the round" "$(rec "$RB9" fb9 .)"
-# CX-1: a later round with no correctness reviewer (later = [], Codex taken out) asks for thermo-bugs.
+sstopin "$RB9" "$SB9" bug-reviewer "No findings."
+[ "$(rec "$RB9" fb9 '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "B-9: ...bug-reviewer took its place, and its return completes the round" \
+  || bad "B-9: ...bug-reviewer took its place, and its return completes the round" "$(rec "$RB9" fb9 .)"
+# CX-1: a later round with no correctness reviewer (later = [], Codex taken out) asks for bug-reviewer.
 sed "s/^RV_LATER=.*/RV_LATER=''/" "$FX/roles.sh" > "$FX/nolater.sh"
 RX1="$FX/cx1"; SX1="$SID-cx1"; mkfeat "$RX1" fcx1
 workin "$RX1" "$SX1" a 60; issue "$RX1" "$SX1" AGENT_ROLES_SH="$FX/nolater.sh" >/dev/null
-AGENT_ROLES_SH="$FX/nolater.sh" sstopin "$RX1" "$SX1" thermo-bugs "No findings."
-AGENT_ROLES_SH="$FX/nolater.sh" sstopin "$RX1" "$SX1" thermo-quality "No findings."
+AGENT_ROLES_SH="$FX/nolater.sh" sstopin "$RX1" "$SX1" bug-reviewer "No findings."
+AGENT_ROLES_SH="$FX/nolater.sh" sstopin "$RX1" "$SX1" quality-reviewer "No findings."
 workin "$RX1" "$SX1" b 60; out=$(issue "$RX1" "$SX1" AGENT_ROLES_SH="$FX/nolater.sh" | tr '\n' ' ')
-check "CX-1: an empty later list: round 2 asks for thermo-bugs" "$out" 'Review round 2 of.*spawn 1 Agent call\(s\): subagent_type "thermo-bugs"'
+check "CX-1: an empty later list: round 2 asks for bug-reviewer" "$out" 'Review round 2 of.*spawn 1 Agent call\(s\): subagent_type "bug-reviewer"'
 check "CX-1: ...not an empty instruction" "$out" 'in ONE message, \.' absent
 # B-7: claude -p's answer is its stdout; a warning on stderr must not make it unparseable.
 FC="$FX/fake-claude"
 printf '%s\n' '#!/bin/bash' 'cat >/dev/null' 'echo "warning: a hook printed this" >&2' \
   'jq -c "{type: \"result\", structured_output: .}" "$FAKE_JSON"' > "$FC"; chmod +x "$FC"
 RB7="$FX/b7"; mkfeat "$RB7" fb7; workin "$RB7" "$SID-b7" a 60
-out=$( { env CLAUDE_CODE_SESSION_ID= AGENT_SESSION_ID= AGENT_ROLES_SH="$FX/anth.sh" CLAUDE_BIN="$FC" FAKE_JSON="$FX/cx0.json" "$CR" review-cross "$RB7" --timeout 10 2>&1; echo "rc=$?"; } | tr '\n' ' ')
+out=$( { env CLAUDE_CODE_SESSION_ID= AGENT_SESSION_ID= AGENT_ROLES_SH="$FX/anth.sh" CLAUDE_BIN="$FC" FAKE_JSON="$FX/cx0.json" "$CR" cross-reviewer "$RB7" --timeout 10 2>&1; echo "rc=$?"; } | tr '\n' ' ')
 check "B-7: an anthropic run with stderr noise still parses its answer" "$out" 'approve, 0 finding\(s\).*rc=0'
 # The first real claude -p run (2026-10-03): with verbose on, stdout is every message as an array,
 # and --agent narrowed the tools to the agent's list, so the result carried no structured_output.
 FV="$FX/fake-claude-verbose"
 printf '%s\n' '#!/bin/bash' 'cat >/dev/null' 'so=.; case " $* " in *" --agent "*) so=null ;; esac' \
   'jq -c "[{type: \"system\", subtype: \"init\"}, {type: \"result\", subtype: \"success\", structured_output: $so}]" "$FAKE_JSON"' > "$FV"; chmod +x "$FV"
-out=$( { env CLAUDE_CODE_SESSION_ID= AGENT_SESSION_ID= AGENT_ROLES_SH="$FX/anth.sh" CLAUDE_BIN="$FV" FAKE_JSON="$FX/cx2.json" "$CR" review-cross "$RB7" --timeout 10 2>&1; echo "rc=$?"; } | tr '\n' ' ')
+out=$( { env CLAUDE_CODE_SESSION_ID= AGENT_SESSION_ID= AGENT_ROLES_SH="$FX/anth.sh" CLAUDE_BIN="$FV" FAKE_JSON="$FX/cx2.json" "$CR" cross-reviewer "$RB7" --timeout 10 2>&1; echo "rc=$?"; } | tr '\n' ' ')
 check "claude -p as the real CLI answers (array stdout, no --agent): the findings parse" "$out" 'needs-attention, 2 finding\(s\).*rc=0'
 finish

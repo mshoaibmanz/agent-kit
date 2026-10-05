@@ -5,6 +5,7 @@
 # Scope (lib/push-gate pg_enforced): repos with a network remote, plus the kit repos ~/.agents and
 # ~/.claude; scratch and test repos commit freely. A merge's generated message is exempt.
 L="$(cd -P "${0%/*}/../../hooks/lib" 2>/dev/null && pwd)"
+. "$L/host-words" 2>/dev/null || host_trailer() { printf 'Co-authored-by: Claude <noreply@anthropic.com>'; }
 . "$L/push-gate" 2>/dev/null || exit 0   # an advisory miss: the PreToolUse warning still runs
 msg=$1
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
@@ -25,5 +26,5 @@ fi
 pg_enforced "$url" || exit 0
 grep -qi '^Co-authored-by:' "$msg" 2>/dev/null && exit 0
 printf '%s\n' "agent commit-msg: REFUSED. The message lacks the trailer. Append it and commit again:" \
-  "Co-authored-by: Claude <noreply@anthropic.com>" >&2
+  "$(host_trailer)" >&2
 exit 1

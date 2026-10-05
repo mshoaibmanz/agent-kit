@@ -5,9 +5,9 @@ argument-hint: "What will the next session be used for?"
 disable-model-invocation: true
 ---
 
-Write a handoff document summarising the current conversation so a fresh agent can continue the work. Save to `~/.claude/handoffs/<TICKET-or-branch>.md` (create the folder if needed), replacing any older handoff for the same key. SessionStart surfaces it when a session opens on that branch.
+Write a handoff document summarising the current conversation so a fresh agent can continue the work. Save it as `HANDOFF.md` in the bound work item's folder under the work root (`$AGENT_WORK_ROOT`), else `<work root>/handoffs/<TICKET-or-branch>.md` (create the folder if needed), replacing any older handoff for the same key. Tell the next session that path: no host is guaranteed to surface it on its own.
 
-Include a "suggested skills" section in the document, naming which skills the next agent should call the Skill tool for.
+Include a "suggested skills" section in the document, naming which skills the next agent should load.
 
 Do not duplicate content already captured in other artifacts (specs, plans, ADRs, issues, commits, diffs). Reference them by path or URL instead.
 

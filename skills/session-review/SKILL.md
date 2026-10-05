@@ -1,5 +1,6 @@
 ---
 name: session-review
+hosts: [claude]
 description: End-of-session retro. Routes each mistake, learned fact, environment caveat and durable rule to its ONE config layer after a dedup check across every layer, then applies the change-set (adds, edits, deletes, archives) on a single confirmation. Use at the end of a work session, on "session review" / "retro" / "what did you learn". "session-review audit" runs the periodic whole-setup sweep: spend and review-precision scripts, contradictions, dead references, budgets.
 ---
 

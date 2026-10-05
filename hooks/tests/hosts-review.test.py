@@ -335,7 +335,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.render("cursor").returncode, 0)
         for path in (
             self.root / ".codex/config.toml",
-            self.root / ".codex/agents/review-cross.toml",
+            self.root / ".codex/agents/cross-reviewer.toml",
             self.root / ".cursor/rules/agent-kit.mdc",
         ):
             out = self.hook(

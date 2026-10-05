@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agent-run: one read-only review by a role on its own provider, recorded as a review round. The
-# provider adapter for roles a host cannot spawn natively (roles.toml; review-cross on Claude).
+# provider adapter for roles a host cannot spawn natively (roles.toml; cross-reviewer on Claude).
 #
 #   agent-run <role> <worktree> [--base origin/<b>] [--since <tree-or-sha>] [--out <file>]
 #             [--effort <e>] [--model <m>] [--objective "<one line>"] [--timeout <seconds>] [--dry-run]
@@ -18,7 +18,7 @@
 # (skills/review-rubric/references/correctness.md), then the scope: the whole PR as `git diff --stat`
 # plus its file list, and the delta since --since when given. No diff text: the reviewer inspects it
 # with the git commands the scope names. The answer follows skills/review-rubric/
-# review-output.schema.json, and every finding gets the id <prefix>-<n> (CX-<n> for review-cross).
+# review-output.schema.json, and every finding gets the id <prefix>-<n> (CX-<n> for cross-reviewer).
 # --dry-run writes the prompt, prints the provider command line, runs and records nothing.
 #
 # Writes <out> (JSON), <out>.md (the findings verbatim, for whoever fixes), <out>.log and
@@ -264,8 +264,8 @@ if [ "$br" != HEAD ]; then
   # this role from its agents and completes once no correctness reviewer is left (the once-per-PR
   # roles do not count); a round pending for another tree is not touched (this run reviewed an
   # older snapshot); with none pending, a tree not yet reviewed gains a round. A stale record is
-  # reset first (rv_rec_fresh). Records from before the roles rename list review-cross as codex-review.
-  drop="[\"$role\"]"; [ "$role" != review-cross ] || drop='["review-cross","codex-review"]'
+  # reset first (rv_rec_fresh). Records from before a roles rename hold an old name (rv_role_drop).
+  drop=$(rv_role_drop "$role")
   once=''
   for w in $RV_ONCE; do once="${once:+$once,}\"$w\""; done
   once="[$once]"

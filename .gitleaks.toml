@@ -23,10 +23,12 @@ id = "email-address"
 description = "An email address that is not a noreply or documentation address"
 regex = '''\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b'''
   [[rules.allowlists]]
-  description = "the Claude co-author trailer, GitHub noreply identities and RFC 2606 example domains"
+  description = "the Claude, Codex and Cursor co-author trailers, GitHub noreply identities and RFC 2606 example domains"
   regexTarget = "match"
   regexes = [
     '''^noreply@anthropic\.com$''',
+    '''^noreply@openai\.com$''',
+    '''^cursoragent@cursor\.com$''',
     '''@users\.noreply\.github\.com$''',
     '''@example\.(?:com|org|net|invalid)$''',
   ]

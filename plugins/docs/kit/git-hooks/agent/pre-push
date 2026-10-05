@@ -4,7 +4,7 @@
 L="$(cd -P "${0%/*}/../../hooks/lib" 2>/dev/null && pwd)"
 # shellcheck source=/dev/null
 . "$L/push-gate" 2>/dev/null || {
-  printf '%s\n' "agent pre-push: REFUSED. hooks/lib/push-gate (or a lib it reads) is missing. Restore it: git -C ~/.agents checkout -- hooks/lib" >&2
+  printf '%s\n' "agent pre-push: REFUSED. hooks/lib/push-gate (or a lib it reads) is missing. Restore it: git -C <your kit source checkout> checkout -- hooks/lib" >&2
   exit 1
 }
 pg_check "$1" "$2" "$(cat)"

@@ -47,7 +47,9 @@ def main() -> int:
             os.environ,
             AGENT_HOST=host,
             AI_AGENT=host,
+            # CLAUDE_PROJECT_DIR is the shim the shared hooks read; AGENT_PROJECT_DIR is the host-neutral name.
             CLAUDE_PROJECT_DIR=item["cwd"],
+            AGENT_PROJECT_DIR=item["cwd"],
             AGENT_SESSION_ID=item["session_id"],
         )
         env.setdefault('KIT_ENV', str(Path(__file__).resolve().parent.parent / 'local/setup-paths.env'))

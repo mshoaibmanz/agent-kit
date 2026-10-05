@@ -59,6 +59,21 @@ class SetupTests(unittest.TestCase):
     def state(self) -> dict:
         return json.loads((self.root / '.install-state/current.json').read_text())
 
+    def test_skills_honor_hosts_and_keep_user_folders(self) -> None:
+        user = self.host / 'skills/debug'
+        user.mkdir(parents=True)
+        (user / 'SKILL.md').write_text('user-owned fixture\n')
+        result = self.run_setup('--hosts', 'cursor', '--components', 'skills', '--apply')
+        self.assertFalse((self.host / 'skills/pr-study').exists(), 'a hosts: [claude] skill reached cursor')
+        self.assertTrue((self.host / 'skills/review-rubric').is_symlink())
+        self.assertTrue((self.host / 'skills/grilling').is_symlink())
+        self.assertFalse(user.is_symlink())
+        self.assertEqual((user / 'SKILL.md').read_text(), 'user-owned fixture\n')
+        self.assertIn('not a kit link', result.stderr)
+        installed = (self.root / 'skills/process-doc/SKILL.md').read_text()
+        self.assertNotIn('${CLAUDE_SKILL_DIR}', installed)
+        self.assertIn(str(self.root / 'skills/process-doc') + '/scripts/catalog.py', installed)
+
     def test_default_is_preview(self) -> None:
         result = self.run_setup()
         self.assertEqual(json.loads(result.stdout)['mode'], 'preview')
@@ -96,12 +111,12 @@ class SetupTests(unittest.TestCase):
     def test_partial_upgrade_preserves_model_paths_and_registry(self) -> None:
         repo = str(self.home / 'repository roots with spaces')
         work = str(self.home / 'work root with spaces')
-        self.run_setup('--components', 'roles', '--role-model', 'reviewer=openai:chosen-model',
+        self.run_setup('--components', 'roles', '--role-model', 'task-reviewer=openai:chosen-model',
                        '--repo-roots', repo, '--work-root', work, '--apply')
         registry = (self.root / 'hooks/registry.json').read_bytes()
         self.run_setup('--components', 'rules', '--apply')
         roles = tomllib.loads((self.root / 'roles.toml').read_text())
-        self.assertEqual(roles['roles']['reviewer']['model'], 'openai:chosen-model')
+        self.assertEqual(roles['roles']['task-reviewer']['model'], 'openai:chosen-model')
         self.assertEqual((self.root / 'hooks/registry.json').read_bytes(), registry)
         overlay = (self.root / 'local/setup-paths.env').read_text()
         self.assertIn('CODE_DIRS_JSON=' + json.dumps([repo]), overlay)
@@ -276,7 +291,7 @@ class SetupTests(unittest.TestCase):
         for command in ('codex', 'claude'):
             (self.commands / command).write_text('#!/bin/sh\ntouch "' + str(marker) + '"\nexit 97\n')
         out = self.home / 'review output.json'
-        result = subprocess.run([str(self.root / 'bin/agent-run'), 'review-cross', str(repo),
+        result = subprocess.run([str(self.root / 'bin/agent-run'), 'cross-reviewer', str(repo),
                                  '--base', 'HEAD', '--out', str(out), '--dry-run'], env=self.env,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -321,10 +336,10 @@ class SetupTests(unittest.TestCase):
 
     def test_blocking_hooks_also_render_required_native_agents(self) -> None:
         self.run_setup('--components', 'hooks', '--blocking-hooks', '--apply')
-        self.assertTrue((self.host / 'agents/worker.md').exists())
-        self.assertTrue((self.host / 'agents/reviewer.md').exists())
+        self.assertTrue((self.host / 'agents/engineer.md').exists())
+        self.assertTrue((self.host / 'agents/task-reviewer.md').exists())
         self.assertTrue((self.root / 'references/conventions.md').exists())
-        for name in ('worker.md', 'reviewer.md', 'thermo-quality.md'):
+        for name in ('engineer.md', 'task-reviewer.md', 'quality-reviewer.md'):
             text = (self.host / 'agents' / name).read_text()
             self.assertNotIn('/skills/conventions/SKILL.md', text)
             self.assertNotIn('/skills/debug/SKILL.md', text)
@@ -437,7 +452,7 @@ class SetupTests(unittest.TestCase):
 
     def test_plugin_scoped_review_agent_is_recognized(self) -> None:
         helper = SOURCE / 'plugins/auto-review/kit/hooks/lib/review-state'
-        script = '. "$1"; rv_review_agent auto-review:thermo-bugs'
+        script = '. "$1"; rv_review_agent auto-review:bug-reviewer'
         result = subprocess.run(['bash', '-c', script, 'probe', str(helper)], env=self.env,
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)

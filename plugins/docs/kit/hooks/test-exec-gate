@@ -31,13 +31,13 @@ gate_off_notice() {
   local f=${KIT_ENV:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/kit.env}
   hook_input
   [[ $HOOK_INPUT =~ $re ]] && sid=${BASH_REMATCH[1]}
-  m="$HOME/.claude/tmp/claude-tests/gate-off-$sid"
+  m="${AGENT_STATE_DIR:-$HOME/.claude/tmp}/claude-tests/gate-off-$sid"
   [ ! -e "$m" ] || return 0
   { mkdir -p "${m%/*}" && touch "$m"; } 2>/dev/null || return 0
   command -v jq >/dev/null 2>&1 || return 0
   jq -n --arg f "$f" '{systemMessage: ("test-exec-gate is off: the overlay sets TEST_GATE_FILE but "
     + "not TEST_RUNNER, the one command tests must run through. Set TEST_RUNNER in \($f) (keys: "
-    + "~/.claude/kit.env.example).")}'
+    + "kit.env.example in the kit).")}'
 }
 if [ -z "$TEST_GATE_FILE" ] || [ -z "$TEST_RUNNER" ]; then
   [ -z "$TEST_GATE_FILE" ] || gate_off_notice
@@ -95,18 +95,27 @@ tr_refused_each invoked && is_test=1
 top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || true)
 [ -n "$top" ] && [ -f "$top/$TEST_GATE_FILE" ] || exit 0
 
-# The repo's testing doc, when there is one (CLAUDE.md: ~/.claude/local/<repo>-testing.md).
+# The repo's testing doc, when there is one: <overlay>/<repo>-testing.md, the overlay being the
+# kit's local/ dir or the config dir's.
 doc=''
 repo=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
 repo=$(basename "$(dirname "${repo:-/.}")")
-[ -f "$HOME/.claude/local/$repo-testing.md" ] && doc=" See ~/.claude/local/$repo-testing.md."
+for d in "${AGENT_KIT_DIR:+$AGENT_KIT_DIR/local}" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local"; do
+  [ -n "$d" ] && [ -f "$d/$repo-testing.md" ] && { doc=" See $d/$repo-testing.md."; break; }
+done
 note=${TEST_NOTE:+ $TEST_NOTE}
 
 # 1. No backgrounded test runs — must be foreground with fast feedback. A run whose stdout is
 #    redirected to a log file is the one legitimate background shape (a cold-namespace run can
-#    exceed the 600s Bash cap); the log is then read, not the stream.
+#    exceed the 600s Bash cap); the log is then read, not the stream. Codex and Cursor carry no
+#    run_in_background field, so a trailing `&` or a nohup/setsid prefix is the background there.
+if [ "$bg" != true ] && printf '%s' "$CMD_BARE" | grep -Eq '(^|[^&])&[[:space:]]*$|(^|[;&|[:space:]])(nohup|setsid)[[:space:]]'; then
+  bg=true
+fi
+logdir='the scratchpad dir named in your system prompt'
+[ "${AGENT_HOST:-claude}" = claude ] || logdir='your bound task folder (or TMPDIR)'
 if [ "$bg" = "true" ] && ! printf '%s' "$CMD_BARE" | grep -Eq '>[[:space:]]*[^[:space:]&|;]+'; then
-  deny "Do not run tests with run_in_background. Run them in the FOREGROUND so feedback is immediate (≤1 min). Scope tightly with a path and/or -k plus -x. If the run genuinely needs >600s, redirect stdout to a log in the scratchpad dir named in your system prompt — a redirected run may be backgrounded.$doc"
+  deny "Do not run tests in the background. Run them in the FOREGROUND so feedback is immediate (≤1 min). Scope tightly with a path and/or -k plus -x. If the run genuinely needs >600s, redirect stdout to a log in $logdir — a redirected run may be backgrounded.$doc"
 fi
 
 # 2. Everywhere in this repo: a refused form or bare pytest is wrong — require the runner.

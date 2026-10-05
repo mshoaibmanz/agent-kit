@@ -217,6 +217,17 @@ def validate_toml_boundary(text: str) -> None:
         raise ValueError('TOML scalar keys after the managed END retain its table context; move them before the block or add an explicit table header')
 
 
+def skill_hosts(skill_md: Path) -> set[str]:
+    """The hosts a skill's `hosts:` frontmatter names; every host when it has none."""
+    text = skill_md.read_text()
+    if text.startswith('---\n'):
+        for line in text[4:text.find('\n---', 4)].splitlines():
+            key, _, value = line.partition(':')
+            if key.strip() == 'hosts':
+                return {name.strip() for name in value.strip().strip('[]').split(',') if name.strip()}
+    return {'claude', 'codex', 'cursor'}
+
+
 def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) -> list[Change]:
     root = Path(args.root_dir).expanduser().absolute()
     target = host_target(args, host, home)
@@ -262,6 +273,9 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
                 host_view = Path(folder)
                 env = dict(os.environ, AGENT_KIT_DIR=str(view), AGENT_KIT_HOST_ROOT=str(host_view))
                 env['AGENT_GIT_HOOKS'] = 'on' if args.blocking_hooks else 'off'
+                if args.work_root:
+                    # The Codex sandbox's writable roots name the work root this install chose.
+                    env['CLAUDE_OUT_ROOT'] = str(Path(args.work_root).expanduser())
                 result = subprocess.run([sys.executable, str(view / 'bin/agent-kit'), 'render', '--host', host,
                                          '--components', *selected], capture_output=True, env=env, timeout=30)
                 if result.returncode:
@@ -305,7 +319,13 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path) ->
         for name in names:
             if not (view / 'skills' / name / 'SKILL.md').is_file():
                 raise ValueError(f'Unknown selected skill: {name}')
-            changes.append(Change('link', target / 'skills' / name, str(root / 'skills' / name)))
+            if host not in skill_hosts(view / 'skills' / name / 'SKILL.md'):
+                continue
+            link = target / 'skills' / name
+            if (link.exists() or link.is_symlink()) and not link.is_symlink() and not prior_record(root, link, 'link'):
+                print(f'agent-setup: kept {link}: a folder that is not a kit link; skill {name} not linked for {host}', file=sys.stderr)
+                continue
+            changes.append(Change('link', link, str(root / 'skills' / name)))
     if host == 'claude' and 'commands' in components:
         for command in sorted((view / 'commands').glob('*.md')):
             text = command.read_text()
@@ -392,6 +412,9 @@ def plan(args: argparse.Namespace, view: Path) -> list[Change]:
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.name == 'SKILL.md':
                 content = content.replace(b'```sh\n', ('```sh\nexport AGENT_KIT_DIR=' + shlex.quote(str(root)) + '\n').encode())
+            if relative.parts[0] == 'skills' and path.suffix == '.md':
+                # Only Claude Code expands ${CLAUDE_SKILL_DIR}; every host can follow the installed path.
+                content = content.replace(b'${CLAUDE_SKILL_DIR}', str(root / 'skills' / relative.parts[1]).encode())
             changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
     if any('\n' in value or '\r' in value for value in [*args.repo_roots, args.work_root]):
         raise ValueError('Repository and work roots must fit on one line')

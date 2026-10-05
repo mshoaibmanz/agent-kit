@@ -216,7 +216,7 @@ def load_roles(path: Path | None = None) -> Roles | None:
         raise SystemExit(f"agent-kit: {path}: {exc}") from None
     bad: list[str] = []
     # A typo'd key used to be read as absent: `round_1` left round 1 empty, and a round of
-    # thermo-quality alone never completed.
+    # quality-reviewer alone never completed.
     unknown = sorted(set(data) - {"roles", "review", "hosts"})
     if unknown:
         bad.append(f"unknown top-level keys {unknown}: only [roles.*], [review] and [hosts.*]")

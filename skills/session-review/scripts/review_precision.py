@@ -3,19 +3,20 @@
 Precision comes only from recorded outcomes, never from a heuristic: a number inferred from what
 the main session said about a finding would be a guess wearing a percentage sign. Two sources:
 - the fixer's `TALLY <id>=FIXED|NOT_REPRODUCED|OPTION|SKIPPED:<reason> ...` line (main session or
-  a `worker`), attributed to the role by id prefix (`prefix` in ~/.agents/roles.toml: `CX-`
-  review-cross, `B-` thermo-bugs, `Q-` thermo-quality, `R-` reviewer); precision is FIXED / (FIXED +
+  a `engineer`), attributed to the role by id prefix (`prefix` in $AGENT_KIT_DIR/roles.toml: `CX-`
+  cross-reviewer, `B-` bug-reviewer, `Q-` quality-reviewer, `R-` task-reviewer); precision is FIXED / (FIXED +
   NOT_REPRODUCED). Outcomes are deduplicated within a review round only: ids restart at 1 in every
   report, so the same `CX-1=FIXED` in two rounds is two outcomes, while a worker's line restated by
   the main session in the same round is one;
 - the retired critic's verdicts (to 2026-10-03), kept for history; a verdict whose finding carries
-  a `CX-<n>` id is attributed to review-cross (labelled `codex` before the roles rename).
+  a `CX-<n>` id is attributed to cross-reviewer (labelled `codex` before the roles rename).
 
 Usage: review_precision.py [--since DATE] [--until DATE] [--project SUBSTR] [--json PATH]
 """
 
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
@@ -35,10 +36,15 @@ from transcripts import (
 )
 
 REVIEW_AGENTS = {
-    "reviewer": "reviewer",
-    "thermo-bugs": "thermo-bugs",
-    "thermo-quality": "thermo-quality",
-    "review-cross": "review-cross",
+    "task-reviewer": "task-reviewer",
+    "bug-reviewer": "bug-reviewer",
+    "quality-reviewer": "quality-reviewer",
+    "cross-reviewer": "cross-reviewer",
+    # The role names before 2026-10-05, so older transcripts attribute to today's roles.
+    "reviewer": "task-reviewer",
+    "thermo-bugs": "bug-reviewer",
+    "thermo-quality": "quality-reviewer",
+    "review-cross": "cross-reviewer",
     "critic": "critic",
     "thermos:thermo-nuclear-review-subagent": "thermos:bugs",
     "thermos:thermo-nuclear-code-quality-review-subagent": "thermos:quality",
@@ -47,7 +53,7 @@ GRADED = ("CONFIRMED", "FALSE_POSITIVE", "UNPROVEN")
 VERDICT = re.compile(r"^\s*VERDICT:\s*\**\s*(CONFIRMED|FALSE_POSITIVE|UNPROVEN|OPINION)\b", re.M)
 TALLY = re.compile(r"^\s*TALLY:", re.M)
 # Thermos-style reports number each finding under a severity heading (`**M1. …**`, `### B2.`);
-# `reviewer` emits bullets citing path:line. Prefer the id form so a numbered finding that also
+# `task-reviewer` emits bullets citing path:line. Prefer the id form so a numbered finding that also
 # cites paths is counted once.
 FINDING_ID = re.compile(r"^\s*(?:#{2,4}\s*)?\**\s*\[?[A-Z]{0,3}\d+[a-z]?\]?[.:)]\s", re.M)
 FINDING_BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+.*?[\w./-]+\.\w+:\d+", re.M)
@@ -74,8 +80,8 @@ TALLY_ITEM = re.compile(
     r"(?<![\w-])(?P<prefix>[A-Z]{1,3})-(?P<num>\d+)=(?P<outcome>FIXED|NOT_REPRODUCED|OPTION|SKIPPED)\b"
 )
 TALLY_OUTCOMES = ("FIXED", "NOT_REPRODUCED", "OPTION", "SKIPPED")
-ROLES_TOML = Path.home() / ".agents/roles.toml"
-LEGACY_PREFIX = {"CX": "review-cross", "B": "thermo-bugs", "Q": "thermo-quality", "R": "reviewer"}
+ROLES_TOML = Path(os.environ.get("AGENT_KIT_DIR") or Path(__file__).resolve().parents[3]) / "roles.toml"
+LEGACY_PREFIX = {"CX": "cross-reviewer", "B": "bug-reviewer", "Q": "quality-reviewer", "R": "task-reviewer"}
 
 
 def role_prefixes(path: Path = ROLES_TOML) -> dict[str, str]:
@@ -104,7 +110,7 @@ ROUND_BASH = re.compile(
 def round_command(command: str) -> bool:
     return bool(ROUND_BASH.search(command)) and "--dry-run" not in command
 # Subagents whose own text can carry the fixer's TALLY line (a large round's fix worker).
-FIXER_AGENTS = frozenset({"worker"})
+FIXER_AGENTS = frozenset({"engineer"})
 TITLE_ID = re.compile(
     r"^(?:[a-z]{0,3}-?[a-z]?\d+[a-z]?[.:)]?\s+|(?:low|medium|high|nit|blocking)\W*\s)+"
 )

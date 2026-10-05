@@ -1,5 +1,6 @@
 ---
 name: pr-study
+hosts: [claude]
 description: Understand a large PR or branch before reviewing it — cluster the diff into change units by intent, order them dependency-first, teach each one, and publish a navigable HTML study artifact you can keep asking questions about. Delegates bug-hunting to the thermos subagents and folds confirmed findings in. Use when the user says "study this PR", "walk me through PR <n>", "help me understand this branch", "/pr-study", or hands over a large PR they need to review or learn.
 ---
 
