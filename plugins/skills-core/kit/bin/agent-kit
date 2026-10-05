@@ -335,6 +335,22 @@ def fill_for_host(text: str, kit: str | None = None, host: str = "claude", host_
     return fill(text, kit or str(KIT), host, host_root, what, resume)
 
 
+def rules_root(host: str) -> str | None:
+    """The root whose rules file agent text names: for Claude, that of the CLAUDE.md being rendered
+    (AGENT_KIT_RULES, which claude_install_targets fills from an install's record); else
+    hosts.host_root_for. None leaves fill on default_host_root."""
+    if host == "claude" and os.environ.get("AGENT_KIT_RULES"):
+        return str(expand(os.environ["AGENT_KIT_RULES"]).parent)
+    lib = Path(__file__).resolve().parent / "lib"
+    if not (lib / "hosts.py").is_file():
+        return None  # a synthetic kit without bin/lib, as in fill_for_host
+    sys.path.insert(0, str(lib))
+    from hosts import host_root_for
+
+    root = host_root_for(KIT, host)
+    return str(root) if root else None
+
+
 def render_agent_text(src: str, role: Role, name: str, host: str = "claude", **where: Any) -> str:
     """The source with its placeholders filled for host and the role's model and effort in its
     frontmatter, after `tools:`. where: fill's kit, host_root and resume."""
@@ -392,7 +408,7 @@ def swap_paths(a: Path, b: Path) -> None:
 
 def render_agents(roles: Roles, host: dict[str, Any], dry_run: bool) -> int:
     target: Path = host["agents_path"]
-    want = expected_agents(roles, "claude")
+    want = expected_agents(roles, "claude", host_root=rules_root("claude"))
     state = state_name("claude-agents", target, follow=False)
     if target.is_symlink() or not target.exists():
         what = f"replace the link {target} -> {os.readlink(target)}" if target.is_symlink() else f"create {target}"
@@ -962,7 +978,8 @@ def agent_body(name: str, host: str) -> str:
     text = (AGENT_SRC / f"{name}.md").read_text()
     if not text.startswith("---\n") or "\n---\n" not in text[3:]:
         raise SystemExit(f"agent-kit: agents/{name}.md has no frontmatter")
-    return fill_for_host(text[text.index("\n---\n", 3) + 5 :], host=host, what=f"agents/{name}.md")
+    return fill_for_host(text[text.index("\n---\n", 3) + 5 :], host=host, host_root=rules_root(host),
+                         what=f"agents/{name}.md")
 
 
 def cmd_agent_body(args: argparse.Namespace) -> int:
@@ -1090,7 +1107,7 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
     roles = load_roles()
     if roles is not None:
         target = host["agents_path"]
-        want = expected_agents(roles, "claude")
+        want = expected_agents(roles, "claude", host_root=rules_root("claude"))
         if target.is_symlink():
             print(f"agents: {target} is still a link; run `agent-kit render --host claude`")
             problems += 1

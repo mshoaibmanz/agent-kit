@@ -17,7 +17,7 @@
 #   inplace-edit      sed -i / perl -i rewriting a file                -> deny
 #   zsh-modifier      unbraced $name:<letter>, eaten as a zsh modifier  -> deny
 #   foreground-poll   an until/while sleep>=5 loop or gh --watch, not in background -> deny
-#   context-dumps    an uncapped file read into context               -> deny
+#   context-dumps     an uncapped file read into context               -> deny
 # macOS bash is 3.2 — no mapfile/readarray/declare -A.
 # Fails CLOSED: without jq, hook-io, cmd-view or cmd-tokens every command-position guard reads
 # an empty token list and allows (verified 2026-08-25: `mysql -e 'DROP TABLE t'` returned allow,
@@ -1536,7 +1536,10 @@ fi
 # spins (sleep < 5) and a command marked `# fg-wait` stay allowed.
 if [ "$bg" != true ] && [ "${AGENT_HOST:-claude}" = claude ] \
    && ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*fg-wait([[:space:]]|$)'; then
-  _poll=$(printf '%s\n' "$cmd" | drop_heredocs 0 | grep -Eo '(until|while)\b.*\bsleep[[:space:]]+([5-9]|[1-9][0-9]+)|\b(gh[[:space:]]+(run[[:space:]]+watch|pr[[:space:]]+checks[^|;&]*--watch))' | head -1)
+  # Heredoc bodies dropped and quoted spans masked (a search for 'gh run watch' is not a wait),
+  # then joined onto one line so a loop written across lines still pairs `until` with its sleep.
+  _ptext=$(printf '%s\n' "$cmd" | drop_heredocs 0 | sed "${_CV_SED[@]}" | tr '\n' ' ')
+  _poll=$(printf '%s' "$_ptext" | grep -Eo '(^|[;&|({[:space:]])(until|while)[[:space:]].*[;&|[:space:]]sleep[[:space:]]+([5-9]|[1-9][0-9]+)|(^|[;&|([:space:]])gh[[:space:]]+(run[[:space:]]+watch|pr[[:space:]]+checks[^|;&]*--watch)' | head -1)
   [ -z "$_poll" ] || deny "Append \`# fg-wait\` only for a wait under a minute. Otherwise rerun this with run_in_background: true; you are notified when it exits. Foreground polling blocks this agent with no output for up to 10 minutes."
 fi
 

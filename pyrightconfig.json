@@ -1,0 +1,9 @@
+{
+  "extraPaths": ["bin/lib", "hooks/lib"],
+  "typeCheckingMode": "basic",
+  "reportPossiblyUnboundVariable": "none",
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalSubscript": "none",
+  "reportArgumentType": "none",
+  "exclude": ["plugins/**/kit", ".claude/worktrees", "state"]
+}

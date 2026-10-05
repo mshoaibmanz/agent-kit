@@ -574,6 +574,10 @@ CASES = [
     ("allow", "until gh run view 1 | grep -q done; do sleep 30; done # fg-wait", "the fg-wait marker"),
     ("allow", "gh pr checks 1",                              "a one-shot status read"),
     ("allow", "cat > w.sh <<'EOF2'\nuntil x; do sleep 30; done\nEOF2", "a loop written into a quoted heredoc"),
+    ("deny",  "until gh run view 1 | grep -q done\ndo\n  sleep 30\ndone", "a loop written across lines"),
+    ("allow", "rg -n 'gh run watch' bin/agent-run",         "a quoted search for the words is not a wait"),
+    ("allow", 'grep -n "until .* sleep 30" notes.md',       "a quoted pattern naming a loop"),
+    ("allow", "sleep 30",                                   "a bare sleep is not a polling loop"),
     # --- zsh-modifier ------------------------------------------------------------
     ("deny",  'git fetch origin "+refs/heads/$b:refs/remotes/origin/$b"', "refspec eaten by :r"),
     ("deny",  "echo $f:h",                         ":h on an unbraced var"),

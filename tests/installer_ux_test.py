@@ -316,6 +316,63 @@ class InstallerUxTests(unittest.TestCase):
                                 capture_output=True, text=True, env=environment, check=True)
         self.assertIn(f'{self.home}/cx/AGENTS.md', result.stdout)
 
+    def test_a_root_named_by_the_host_variable_is_recorded_for_later_runs(self) -> None:
+        self.host_cli('claude')
+        self.host_cli('codex')
+        roots = {'claude': self.home / 'claude-profile', 'codex': self.home / 'codex-profile'}
+        flags = ('--hosts', 'claude', 'codex', '--components', 'rules', '--apply')
+        self.setup(*flags, env={'CLAUDE_CONFIG_DIR': str(roots['claude']), 'CODEX_HOME': str(roots['codex'])})
+        recorded = json.loads((self.root / '.install-state/current.json').read_text())['configuration']['host_roots']
+        self.assertEqual(recorded, {host: str(root) for host, root in roots.items()})
+        # A later shell without either variable: render and setup still target the installed roots.
+        environment = {'HOME': str(self.home), 'PATH': str(self.shim), 'TMPDIR': str(self.tmp)}
+        for host, rules in (('claude', 'CLAUDE.md'), ('codex', 'AGENTS.md')):
+            (roots[host] / rules).unlink()
+            subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'render', '--host', host, '--components', 'rules'],
+                           capture_output=True, text=True, env=environment, check=True)
+            self.assertTrue((roots[host] / rules).is_file(), f'{host} rendered into another root')
+        self.setup(*flags)
+        for host in roots:
+            self.assertFalse((self.home / f'.{host}').exists(), f'{host} set up in the default root instead')
+
+    def test_agent_text_names_the_rules_file_under_the_installed_root(self) -> None:
+        self.link('jq')
+        self.host_cli('claude')
+        custom = self.home / 'claude-profile'
+        self.setup('--hosts', 'claude', '--host-root', str(custom), '--components', 'rules', 'roles', '--apply')
+        rules = f'`{custom}/CLAUDE.md`'
+        self.assertIn(rules, (custom / 'agents/engineer.md').read_text())
+        shutil.rmtree(custom / 'agents')
+        environment = {'HOME': str(self.home), 'PATH': str(self.shim), 'TMPDIR': str(self.tmp)}
+        kit = [sys.executable, str(self.root / 'bin/agent-kit')]
+        subprocess.run([*kit, 'render', '--host', 'claude', '--components', 'roles'],
+                       capture_output=True, text=True, env=environment, check=True)
+        self.assertIn(rules, (custom / 'agents/engineer.md').read_text(), 'render filled the default root')
+        body = subprocess.run([*kit, 'agent-body', 'engineer', '--host', 'claude'],
+                              capture_output=True, text=True, env=environment, check=True).stdout
+        self.assertIn(rules, body, 'agent-body ignored the recorded root')
+        named = self.home / 'named-root'
+        body = subprocess.run([*kit, 'agent-body', 'engineer', '--host', 'codex'], capture_output=True, text=True,
+                              env={**environment, 'AGENT_KIT_HOST_ROOT': str(named)}, check=True).stdout
+        self.assertIn(f'{named}/AGENTS.md', body, 'agent-body ignored AGENT_KIT_HOST_ROOT')
+
+    def test_a_key_a_changed_preset_drops_is_not_kept_as_your_answer(self) -> None:
+        (self.root / 'local').mkdir(parents=True)
+        (self.root / 'local/kit.env').write_text('CODE_SEARCH_GH_OWNER=my-org\n')
+        preset = self.home / 'team.toml'
+        preset.write_text('[kit]\nCODE_SEARCH_GH_OWNER = "a-org"\nCODE_DIRS_JSON = ["~/Code"]\n\n'
+                          '[skills]\ninclude = ["conventions"]\n')
+        flags = ('--components', 'rules', 'skills', '--hosts', 'claude', '--apply')
+        self.setup('--preset', str(preset), *flags)
+        preset.write_text('[kit]\nREVIEW_BASE = "main"\n')
+        self.setup('--preset', str(preset), *flags)
+        paths = (self.root / 'local/setup-paths.env').read_text()
+        self.assertNotIn('a-org', paths, 'the dropped preset owner became your own answer')
+        self.assertNotIn('~/Code', paths, 'the dropped preset roots became your own answer')
+        self.assertEqual(self.effective()['CODE_SEARCH_GH_OWNER'], 'my-org')
+        self.assertNotEqual(sorted(path.name for path in (self.home / '.claude/skills').iterdir()), ['conventions'],
+                            'the dropped preset skill selection was kept')
+
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(InstallerUxTests)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
