@@ -1239,9 +1239,10 @@ def resolve_answers(args: argparse.Namespace, given: set[str], saved: dict[str, 
                     detected: dict[str, Any]) -> tuple[set[str], set[str]]:
     """Each saved answer onto args, the first of: its flag, an earlier answer the user chose, the
     preset, a value detected now, an earlier saved value, the default. Returns (the keys the user
-    chose, the keys the preset supplied). An install from before "answered" was saved counts every
-    value that is not the default as chosen. A value the saved preset supplied and the current one
-    drops is not kept: it falls back to detection or the default, never to the user's layer."""
+    chose, the keys the preset layer owns, which setup-paths.env leaves out). An install from
+    before "answered" was saved counts every value that is not the default as chosen. A value the
+    saved preset supplied and the current one drops is not kept: it falls back to detection, else
+    to the default, which the preset layer still owns so the user's kit.env shows through."""
     chosen = (set(saved['answered']) if 'answered' in saved
               else {key for key in DEFAULTS if key in saved and saved[key] != DEFAULTS[key]})
     dropped = set(saved.get('preset_values', {}).get('answers', {})) - set(preset.answers)
@@ -1257,8 +1258,11 @@ def resolve_answers(args: argparse.Namespace, given: set[str], saved: dict[str, 
             from_preset.add(key)
         elif detected.get(key):
             value = detected[key]
+        elif key in dropped:
+            value = default
+            from_preset.add(key)
         else:
-            value = default if key in dropped else saved.get(key, default)
+            value = saved.get(key, default)
         setattr(args, key, value)
     return answered, from_preset
 
@@ -1306,6 +1310,7 @@ def main() -> int:
         owner, origin = detect_owner(args.repo_roots)
         if owner:
             args.github_owner = owner
+            from_preset.discard('github_owner')  # detected now, as in resolve_answers
             notes.append(Row('Ready', f'GitHub owner {owner} (from {origin})'))
     if args.skills == ['all']:
         args.skills = None

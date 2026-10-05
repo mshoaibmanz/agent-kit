@@ -1538,7 +1538,12 @@ if [ "$bg" != true ] && [ "${AGENT_HOST:-claude}" = claude ] \
    && ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*fg-wait([[:space:]]|$)'; then
   # Heredoc bodies dropped and quoted spans masked (a search for 'gh run watch' is not a wait),
   # then joined onto one line so a loop written across lines still pairs `until` with its sleep.
-  _ptext=$(printf '%s\n' "$cmd" | drop_heredocs 0 | sed "${_CV_SED[@]}" | tr '\n' ' ')
+  # Masking also hides "$(gh run watch 1)", which still runs: substitutions outside single
+  # quotes are appended back unmasked.
+  _praw=$(printf '%s\n' "$cmd" | drop_heredocs 0)
+  _psubs=$(printf '%s' "$_praw" | sed "s/'[^']*'//g" | grep -Eo '\$\([^()]*\)|`[^`]*`' \
+    | sed -e 's/^\$(//' -e 's/)$//' -e 's/^`//' -e 's/`$//' | tr '\n' ';')
+  _ptext="$(printf '%s\n' "$_praw" | sed "${_CV_SED[@]}" | tr '\n' ' ') ; ${_psubs}"
   _poll=$(printf '%s' "$_ptext" | grep -Eo '(^|[;&|({[:space:]])(until|while)[[:space:]].*[;&|[:space:]]sleep[[:space:]]+([5-9]|[1-9][0-9]+)|(^|[;&|([:space:]])gh[[:space:]]+(run[[:space:]]+watch|pr[[:space:]]+checks[^|;&]*--watch)' | head -1)
   [ -z "$_poll" ] || deny "Append \`# fg-wait\` only for a wait under a minute. Otherwise rerun this with run_in_background: true; you are notified when it exits. Foreground polling blocks this agent with no output for up to 10 minutes."
 fi

@@ -578,6 +578,9 @@ CASES = [
     ("allow", "rg -n 'gh run watch' bin/agent-run",         "a quoted search for the words is not a wait"),
     ("allow", 'grep -n "until .* sleep 30" notes.md',       "a quoted pattern naming a loop"),
     ("allow", "sleep 30",                                   "a bare sleep is not a polling loop"),
+    ("deny",  'printf "%s\\n" "$(gh run watch 1)"',          "a watch run inside a double-quoted substitution"),
+    ("deny",  'x="`gh pr checks 1 --watch`"',                "a watch in backticks inside double quotes"),
+    ("allow", "echo '$(gh run watch 1)'",                   "single quotes keep a substitution literal"),
     # --- zsh-modifier ------------------------------------------------------------
     ("deny",  'git fetch origin "+refs/heads/$b:refs/remotes/origin/$b"', "refspec eaten by :r"),
     ("deny",  "echo $f:h",                         ":h on an unbraced var"),

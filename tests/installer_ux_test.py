@@ -358,7 +358,7 @@ class InstallerUxTests(unittest.TestCase):
 
     def test_a_key_a_changed_preset_drops_is_not_kept_as_your_answer(self) -> None:
         (self.root / 'local').mkdir(parents=True)
-        (self.root / 'local/kit.env').write_text('CODE_SEARCH_GH_OWNER=my-org\n')
+        (self.root / 'local/kit.env').write_text('CODE_SEARCH_GH_OWNER=my-org\nCODE_DIRS_JSON=["~/src"]\n')
         preset = self.home / 'team.toml'
         preset.write_text('[kit]\nCODE_SEARCH_GH_OWNER = "a-org"\nCODE_DIRS_JSON = ["~/Code"]\n\n'
                           '[skills]\ninclude = ["conventions"]\n')
@@ -369,7 +369,9 @@ class InstallerUxTests(unittest.TestCase):
         paths = (self.root / 'local/setup-paths.env').read_text()
         self.assertNotIn('a-org', paths, 'the dropped preset owner became your own answer')
         self.assertNotIn('~/Code', paths, 'the dropped preset roots became your own answer')
-        self.assertEqual(self.effective()['CODE_SEARCH_GH_OWNER'], 'my-org')
+        self.assertNotIn('CODE_DIRS_JSON', paths, 'a fallback for the dropped preset roots hides kit.env')
+        values = self.effective()
+        self.assertEqual((values['CODE_SEARCH_GH_OWNER'], values['CODE_DIRS_JSON']), ('my-org', '["~/src"]'))
         self.assertNotEqual(sorted(path.name for path in (self.home / '.claude/skills').iterdir()), ['conventions'],
                             'the dropped preset skill selection was kept')
 
