@@ -23,6 +23,7 @@ the environment, and turns its check off, so a hook without an overlay is inert;
 guards need no key. Documented with placeholder values in ~/.claude/kit.env.example.
   GIT_AUTHOR         commit author the docs name (CLAUDE.md); git config when unset
   RELEASE_BRANCH_RE  extra local bases for bash-guards' two-dot diff check (ERE)
+  REVIEW_BASE  the branch review-state diffs against first, before origin/HEAD, main and master
   TEST_GATE_FILE     file at a repo root that turns on test-exec-gate and the SessionStart TESTS line
   TEST_RUNNER        the one test wrapper allowed there; ci-watch allowlists it for its repair agent
   TEST_RUNNER_RE     runner names that count as a test run (ERE; default TEST_RUNNER): test-run, session-digest
