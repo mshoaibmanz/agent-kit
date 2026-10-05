@@ -581,6 +581,9 @@ CASES = [
     ("deny",  'printf "%s\\n" "$(gh run watch 1)"',          "a watch run inside a double-quoted substitution"),
     ("deny",  'x="`gh pr checks 1 --watch`"',                "a watch in backticks inside double quotes"),
     ("allow", "echo '$(gh run watch 1)'",                   "single quotes keep a substitution literal"),
+    ("deny",  "echo \"'$(gh run watch 1)'\"",                "an apostrophe inside double quotes does not quote"),
+    ("allow", 'echo "\\$(gh run watch 1)"',                  "an escaped substitution is literal text"),
+    ("deny",  'x="$(gh run watch $(printf 1))"',             "a nested substitution keeps the outer wait"),
     # --- zsh-modifier ------------------------------------------------------------
     ("deny",  'git fetch origin "+refs/heads/$b:refs/remotes/origin/$b"', "refspec eaten by :r"),
     ("deny",  "echo $f:h",                         ":h on an unbraced var"),

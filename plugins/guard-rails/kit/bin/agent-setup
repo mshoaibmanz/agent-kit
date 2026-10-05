@@ -1039,8 +1039,9 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
     return Plan(summary, prepared, records, collisions)
 
 
-def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[str]) -> int:
-    """Make the previewed changes under a journal, then record the install and its answers."""
+def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[str], preset_owned: set[str]) -> int:
+    """Make the previewed changes under a journal, then record the install, its answers and which
+    of them the preset layer owns (left out of setup-paths.env)."""
     if planned.blocked:
         raise ValueError('apply blocked: ' + '; '.join(row.line for row in planned.rows if row.blocks))
     root = Path(args.root_dir).expanduser().absolute()
@@ -1074,6 +1075,9 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
         # The catalog as an absolute path, so a later update that reselects mcp keeps it.
         configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
         configuration['answered'] = sorted(answered)
+        # Kept across runs: once a preset drops a key, the next run's saved preset no longer names
+        # it, and only this record keeps the default out of setup-paths.env, above kit.env.
+        configuration['preset_owned'] = sorted(preset_owned)
         if preset.record:
             # The preset outlives this run: a later update without --preset applies the same values.
             configuration.update(preset=preset.record, preset_values=preset.saved())
@@ -1241,11 +1245,13 @@ def resolve_answers(args: argparse.Namespace, given: set[str], saved: dict[str, 
     preset, a value detected now, an earlier saved value, the default. Returns (the keys the user
     chose, the keys the preset layer owns, which setup-paths.env leaves out). An install from
     before "answered" was saved counts every value that is not the default as chosen. A value the
-    saved preset supplied and the current one drops is not kept: it falls back to detection, else
-    to the default, which the preset layer still owns so the user's kit.env shows through."""
+    saved preset supplied, or the preset layer owned last run, and the current preset drops is not
+    kept: it falls back to detection, else to the default, which the preset layer still owns so
+    the user's kit.env shows through on this run and every later one."""
     chosen = (set(saved['answered']) if 'answered' in saved
               else {key for key in DEFAULTS if key in saved and saved[key] != DEFAULTS[key]})
-    dropped = set(saved.get('preset_values', {}).get('answers', {})) - set(preset.answers)
+    dropped = ((set(saved.get('preset_values', {}).get('answers', {})) | set(saved.get('preset_owned', [])))
+               - set(preset.answers))
     answered, from_preset = set(given), set()
     for key, default in DEFAULTS.items():
         if key in given:
@@ -1352,10 +1358,10 @@ def main() -> int:
         if not args.yes and ask('Apply this previewed selection? [y/N]: ', args).lower() != 'y':
             return 0
         args.apply = True
-        return apply(args, planned, preset, answered)
+        return apply(args, planned, preset, answered, from_preset - answered)
     if setup_run:
         planned = preview(args, preset, from_preset, notes)
-        return apply(args, planned, preset, answered) if args.apply else 0
+        return apply(args, planned, preset, answered, from_preset) if args.apply else 0
     if args.action == 'rollback':
         if not args.journal:
             raise ValueError('rollback needs the journal id printed by setup')
