@@ -96,6 +96,7 @@ class RoundThree(base.ReviewTests):
     def test_B2_CX2_case_aliases(self):
         if sys.platform != "darwin":
             self.skipTest("Requires the user's case-insensitive filesystem")
+        self.native_agents_on()
         for host in ("codex", "cursor"):
             self.assertEqual(self.render(host).returncode, 0)
         cases = (

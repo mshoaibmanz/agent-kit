@@ -74,6 +74,12 @@ class ReviewTests(unittest.TestCase):
     def catalog_write(self):
         (self.kit / "mcp/servers.json").write_text(json.dumps(self.catalog))
 
+    def native_agents_on(self):
+        # The shipped roles.toml runs every Codex role through agent-run (no agents/*.toml); tests
+        # of a kit-owned agent file turn native agents on.
+        roles = self.kit / "roles.toml"
+        roles.write_text(roles.read_text().replace("native_agents = false\n", ""))
+
     def render(self, host="codex", extra=(), env=None):
         return subprocess.run(
             [str(self.kit / "bin/agent-kit"), "render", "--host", host, *extra],
@@ -331,6 +337,7 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse((self.root / "out/settings.json").exists())
 
     def test_B4_native_outputs_and_source_alias(self):
+        self.native_agents_on()
         self.assertEqual(self.render().returncode, 0)
         self.assertEqual(self.render("cursor").returncode, 0)
         for path in (

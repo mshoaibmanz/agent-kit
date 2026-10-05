@@ -537,7 +537,7 @@ printf '{"session_id":"%s"}' "$SID-chime" | "$H/stop-chime"
 sleep 3
 [ ! -f "$SB/$SID-chime" ] && ok "stop-chime consumes the block marker without the env" || bad "stop-chime control: marker not consumed"
 rm -f "$SB/$SID-chime"
-# retro-extract replaced session-digest at SessionEnd.
+# retro-extract at SessionEnd.
 TR=$T/hooktestdigest.jsonl; DG=$T/retro-root
 printf '%s\n' '{"type":"system","subtype":"compact_boundary"}' > "$TR"
 rm -rf "$DG"

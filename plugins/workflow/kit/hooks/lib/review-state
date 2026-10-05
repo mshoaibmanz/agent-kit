@@ -315,7 +315,7 @@ rv_since() {
 # rv_pending <sid> <root>: the round issued there has not returned. A round the branch record issued
 # (branch.<rk>) is live only while the record has its tree pending: once another session or host
 # completed it there, or a newer round replaced it, no return in this session can close it, and
-# pre-push-gate denied every push for good. Such a round is closed here (reviewed when the record
+# the session's push stayed refused for good. Such a round is closed here (reviewed when the record
 # reviewed that tree); reviewers still out go to late.<rk>, so their findings still owe the TALLY.
 rv_pending() {
   local p rk t br pr ra h
@@ -602,7 +602,7 @@ rv_decide() {
 
 # _rv_round <sid> <rk> <self|agents> <tier> <text>: set RV_KIND, RV_TIER and RV_TEXT, and record the
 # round in one write. A self round is trusted as done, so it is also the last completed review.
-# An agent round here is the session's own (pre-push-gate's deny), not the branch record's: no
+# An agent round here is the session's own (rv_decide, from review-trigger), not the branch record's: no
 # branch.<rk>, which is what tells rv_complete to fold it into the record on completion.
 _rv_round() {
   RV_KIND=$3; RV_TIER=$4; RV_TEXT=$5
@@ -759,7 +759,7 @@ _rv_complete() {
   _rv_set "$sid" "$@"
   if [ -n "$p" ]; then
     # A round the record issued (branch.<rk>) completes there only while the record still has its
-    # tree pending. The session's own round (pre-push-gate) was never in the record: it completes
+    # tree pending. The session's own round (rv_decide) was never in the record: it completes
     # the record unless a round is pending there or this tree is already the reviewed one, so the
     # git pre-push that follows does not ask for round 1 again.
     _rv_rec_mark "$sid" "$sel" "$p" 'if (.pending_tree // "") == $t or ($own == "1" and (.pending_tree // "") == "" and (.reviewed_tree // "") != $t) then (.rounds = ((.rounds // 0) + 1) | .reviewed_tree = $t | .reviewed_head = $h | del(.pending_tree, .pending_head, .pending_since, .agents, .anchor)) else . end' \

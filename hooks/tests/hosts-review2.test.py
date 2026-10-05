@@ -202,6 +202,7 @@ class RoundTwo(base.ReviewTests):
                     self.assertEqual(result.returncode, expected)
 
     def test_B4_user_native_fields_and_owned_content(self):
+        self.native_agents_on()
         self.assertEqual(self.render().returncode, 0)
         root = self.root / ".codex"
         config = root / "config.toml"

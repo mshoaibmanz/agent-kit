@@ -114,7 +114,8 @@ class SetupTests(unittest.TestCase):
         self.assertFalse((self.host / 'skills/session-review').exists())
         self.assertTrue((self.host / 'skills/grilling').is_symlink())
         self.assertFalse((self.host / 'agents/review-cross.toml').exists())
-        self.assertTrue((self.host / 'agents/cross-reviewer.toml').is_file())
+        # roles.toml sets native_agents = false for codex: every role runs through agent-run.
+        self.assertFalse((self.host / 'agents/cross-reviewer.toml').exists())
         self.assertEqual((self.host / 'agents/mine.toml').read_text(), 'name = "mine"\n')
         self.assertFalse((self.root / 'agents/thermo-bugs.md').exists())
         managed = self.state()['managed']
@@ -476,6 +477,15 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), [str(repo_parent)])
         helper = self.root / 'skills/code-search/scripts/code_search.py'
         subprocess.run([str(helper), '--help'], env=self.env, capture_output=True, check=True)
+
+    def test_the_retired_pre_push_gate_is_not_rendered(self) -> None:
+        # The git pre-push hook gates a push (it honors AGENT_PUSH_NOW); the old PreToolUse gate did not.
+        for flags in (('--blocking-hooks',), ()):
+            self.run_setup('--components', 'hooks', *flags, '--apply')
+            settings = (self.host / 'settings.json').read_text()
+            self.assertIn('bash-guards', settings)
+            self.assertNotIn('pre-push-gate', settings, f'rendered with {flags or "default hooks"}')
+            self.assertFalse((self.root / 'hooks/pre-push-gate').exists())
 
     def test_blocking_hooks_also_render_required_native_agents(self) -> None:
         self.run_setup('--components', 'hooks', '--blocking-hooks', '--apply')

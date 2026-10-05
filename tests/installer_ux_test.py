@@ -208,7 +208,11 @@ class InstallerUxTests(unittest.TestCase):
         rules = (self.root / 'state/rendered/claude-host-rules.md').read_text()
         self.assertIn('below 150K context', rules)
         self.assertIn(str(self.root / 'state/rendered/claude-host-rules.md'), (self.home / '.claude/CLAUDE.md').read_text())
-        reviewer = tomllib.loads((codex / 'agents/cross-reviewer.toml').read_text())['developer_instructions']
+        # Codex runs the reviewer through agent-run (native_agents = false), which reads agent-body.
+        self.assertFalse((codex / 'agents/cross-reviewer.toml').exists())
+        reviewer = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'agent-body', 'cross-reviewer', '--host', 'codex'],
+                                  capture_output=True, text=True, check=True,
+                                  env={'HOME': str(self.home), 'PATH': str(self.shim), 'TMPDIR': str(self.tmp)}).stdout
         self.assertNotIn('{{', reviewer)
         self.assertIn(f'{self.root}/skills/review-rubric/references/correctness.md', reviewer)
 

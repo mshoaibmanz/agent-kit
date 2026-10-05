@@ -70,12 +70,7 @@ class HostTests(unittest.TestCase):
         shell = tomllib.loads(text)["shell_environment_policy"]["set"]
         self.assertEqual(shell["AGENT_HOST"], "codex")
         self.assertEqual(shell["GIT_CONFIG_VALUE_0"], str(self.kit / "git-hooks"))
-        role = tomllib.loads((root / "agents/cross-reviewer.toml").read_text())
-        self.assertEqual(role["model"], "gpt-6.1-sol")
-        self.assertEqual(role["model_reasoning_effort"], "high")
-        self.assertEqual(role["sandbox_mode"], "read-only")
-        self.assertIn("cross-model reviewer", role["developer_instructions"])
-        self.assertFalse((root / "agents/engineer.toml").exists())
+        self.assertEqual(sorted((root / "agents").glob("*.toml")), [], "native_agents = false renders none")
         hooks = json.loads((root / "hooks.json").read_text())["hooks"]
         for event in ("PreToolUse", "PostToolUse"):
             edits = [
@@ -149,7 +144,12 @@ class HostTests(unittest.TestCase):
         self.assertEqual(hooks["hooks"]["Stop"].count(user["hooks"]["Stop"][0]), 1)
         self.assertTrue((root / "AGENTS.md").read_text().startswith("User rule stays.\n"))
 
+    def native_agents_on(self) -> None:
+        roles = self.kit / "roles.toml"
+        roles.write_text(roles.read_text().replace("native_agents = false\n", ""))
+
     def test_agent_user_edit_refuses_partial_render(self) -> None:
+        self.native_agents_on()
         root = self.root / ".codex"
         (root / "agents").mkdir(parents=True)
         (root / "agents/cross-reviewer.toml").write_text('name = "user-owned"\n')
@@ -298,6 +298,44 @@ class HostTests(unittest.TestCase):
         self.assertNotIn("fixture-only", result.stdout)
         after = {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
         self.assertEqual(before, after)
+
+    def test_doctor_counts_a_skill_without_hosts_for_every_host(self) -> None:
+        # The installer links a skill with no `hosts:` for every host; the doctor must agree.
+        for name, front in (("plain", ""), ("claude-only", "hosts: [claude]\n")):
+            (self.kit / "skills" / name).mkdir(parents=True)
+            (self.kit / "skills" / name / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: fixture\n{front}---\nbody\n"
+            )
+        for host in ("codex", "cursor"):
+            result = subprocess.run(
+                [str(self.kit / "bin/agent-kit"), "doctor", "--host", host],
+                capture_output=True, text=True, env=self.env, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)[0]
+            self.assertEqual((report["skills"], report["incompatible_skills"]), (["plain"], ["claude-only"]), host)
+
+    def test_codex_agents_follow_native_agents(self) -> None:
+        # Roles.invoke runs every role through agent-run when native_agents is false, so no
+        # agents/*.toml may be rendered for codex then; one rendered earlier is removed as stale.
+        agents = self.root / ".codex/agents"
+        roles = self.kit / "roles.toml"
+        shipped = roles.read_text()
+        self.assertIn("native_agents = false\n", shipped)
+        self.assertEqual(self.run_kit("codex").returncode, 0)
+        self.assertEqual(sorted(agents.glob("*.toml")), [], "rendered with native_agents = false")
+        self.native_agents_on()
+        result = self.run_kit("codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([path.name for path in agents.glob("*.toml")], ["cross-reviewer.toml"])
+        role = tomllib.loads((agents / "cross-reviewer.toml").read_text())
+        self.assertEqual(role["model"], "gpt-6.1-sol")
+        self.assertEqual(role["model_reasoning_effort"], "high")
+        self.assertEqual(role["sandbox_mode"], "read-only")
+        self.assertIn("cross-model reviewer", role["developer_instructions"])
+        roles.write_text(shipped)
+        self.assertEqual(self.run_kit("codex").returncode, 0)
+        self.assertEqual(sorted(agents.glob("*.toml")), [], "a toml no longer wanted was kept")
 
 
 class CodexRolloutTests(unittest.TestCase):

@@ -39,7 +39,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parent.parent
 COMPONENTS = {'rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands'}
-BLOCKING = {'bash-guards', 'test-exec-gate', 'pre-push-gate', 'edit-guard',
+BLOCKING = {'bash-guards', 'test-exec-gate', 'edit-guard',
             'commit-cohesion', 'context-guard', 'review-trigger', 'unfinished-work',
             'context-watch', 'read-streak', 'pre-compact', 'project-bind', 'ci-watch-on-push'}
 SECRET_NAMES = {'auth.json', 'credentials.json', 'kit.env', 'settings.local.json', '.env'}
@@ -53,7 +53,7 @@ ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'secon
                 'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
 from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root, install_text,  # noqa: E402
-                   keep_host_tables, resume_max, strip_legacy_sandbox)
+                   keep_host_tables, resume_max, skill_hosts, strip_legacy_sandbox)
 from kit_env import kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
@@ -232,23 +232,6 @@ def validate_toml_boundary(text: str) -> None:
         if stripped.startswith('['):
             return
         raise ValueError('TOML scalar keys after the managed END retain its table context; move them before the block or add an explicit table header')
-
-
-def skill_hosts(skill_md: Path) -> set[str]:
-    """The hosts a skill's `hosts:` frontmatter names, as an inline list; every host when it has none.
-    Any other form, or an unknown name, is an error: either would install the skill nowhere."""
-    text = skill_md.read_text()
-    if text.startswith('---\n'):
-        for line in text[4:text.find('\n---', 4)].splitlines():
-            key, _, value = line.partition(':')
-            if key.strip() != 'hosts':
-                continue
-            value = value.strip()
-            names = {name.strip().strip('\'"') for name in value[1:-1].split(',')} - {''} if value[:1] + value[-1:] == '[]' else set()
-            if not names or names - set(HOSTS):
-                raise ValueError(f'{skill_md}: hosts: must be an inline list of {", ".join(HOSTS)}, got {value or "a block list"}')
-            return names
-    return set(HOSTS)
 
 
 def overlay_text(args: argparse.Namespace, from_preset: set[str]) -> str:
@@ -563,7 +546,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
 def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change]) -> list[Change]:
     """Removals for what an earlier install managed and this plan no longer produces: kit files gone
     from the source, a deselected skill's files, the selected hosts' agent files for renamed roles
-    (when this plan renders that agents folder), and skill links that are deselected or no longer
+    (when this plan renders that agents folder or selects roles), and skill links that are deselected or no longer
     eligible for their host (`hosts:`). A removal refuses changed content unless --collision backup."""
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
@@ -588,7 +571,10 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
                 skill = relative.parts[1]
                 retired = retired or (skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md'))
         elif record['kind'] == 'file':
-            retired = target.parent.name == 'agents' and target.parent.parent in hosts and target.parent in planned_dirs
+            # With roles selected the render owns the host's agents folder even when it writes nothing
+            # there (Codex with native_agents = false), so what it wrote before is retired.
+            retired = (target.parent.name == 'agents' and target.parent.parent in hosts
+                       and (target.parent in planned_dirs or 'roles' in args.components))
         else:
             link = Path(record.get('link', ''))
             retired = skills and link.parent == root / 'skills' and (link.name not in selected or target.parent.parent in hosts)

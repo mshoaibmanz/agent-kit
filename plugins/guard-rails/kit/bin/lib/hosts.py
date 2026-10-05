@@ -41,6 +41,30 @@ RULES_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "cursor": "rules/age
 HOST_HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 
 
+def skill_hosts(skill_md: Path) -> set[str]:
+    """The hosts a skill's `hosts:` frontmatter names, as an inline list; every host when it has none.
+    The installer links a skill by this rule and the doctor checks by it. Any other form, or an
+    unknown name, is an error: either would install the skill nowhere."""
+    text = skill_md.read_text()
+    if text.startswith("---\n"):
+        for line in text[4 : text.find("\n---", 4)].splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() != "hosts":
+                continue
+            value = value.strip()
+            names = (
+                {name.strip().strip("'\"") for name in value[1:-1].split(",")} - {""}
+                if value[:1] + value[-1:] == "[]"
+                else set()
+            )
+            if not names or names - set(HOSTS):
+                raise ValueError(
+                    f'{skill_md}: hosts: must be an inline list of {", ".join(HOSTS)}, got {value or "a block list"}'
+                )
+            return names
+    return set(HOSTS)
+
+
 def default_host_root(host: str) -> Path:
     """The host's config root when nothing names another: its own variable, else ~/.<host>."""
     configured = os.environ.get(HOST_HOME_ENV.get(host, ""))
@@ -509,12 +533,14 @@ def merge_hooks(
 
 
 def role_files(api: Any, roles: Any, root: Path) -> dict[str, str]:
+    """agents/<role>.toml for each role Codex spawns natively: the rule Roles.invoke applies, so
+    native_agents = false renders none and the render removes any it wrote before."""
     result = {}
     if roles is None:
         return result
     api.expected_agents(roles, "codex")
     for name, role in roles.roles.items():
-        if name == "main" or role.provider != roles.provider("codex"):
+        if name == "main" or roles.invoke(role, "codex") != "agent":
             continue
         text = fill((api.AGENT_SRC / f"{name}.md").read_text(), str(api.KIT), "codex", str(root),
                     f"agents/{name}.md")
@@ -811,11 +837,10 @@ def inventory(
             rules += [repo / n for n in ("AGENTS.md", "CLAUDE.md") if (repo / n).is_file()]
     skills, incompatible = [], []
     for path in sorted((api.KIT / "skills").glob("*/SKILL.md")):
-        text = path.read_text()
-        match = re.search(r"^hosts:\s*\[([^\]]*)\]", text, re.MULTILINE)
-        allowed = (
-            [h.strip().strip("\"'") for h in match.group(1).split(",")] if match else ["claude"]
-        )
+        try:
+            allowed = skill_hosts(path)
+        except ValueError:
+            allowed = set()  # a malformed hosts: line installs nowhere
         (skills if host in allowed else incompatible).append(path.parent.name)
     if components is not None and "mcp" not in components:
         mcp = {}

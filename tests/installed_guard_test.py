@@ -452,13 +452,10 @@ class InstalledGuardTests(unittest.TestCase):
             "codex",
             True,
         )
-        role = root / "agents/cross-reviewer.toml"
-        self.decision(
-            self.guard("codex", root, role, {"content": 'name="overwritten"\n'}),
-            "codex",
-            True,
-        )
+        # native_agents = false: the kit owns no agents/*.toml (hosts.test.py covers the render).
+        self.assertFalse((root / "agents/cross-reviewer.toml").exists())
         user_role = root / "agents/user-defined.toml"
+        user_role.parent.mkdir(exist_ok=True)
         user_role.write_text('name="user-role"\n')
         self.replace(
             "codex", root, user_role, "user-role", "changed-user-role", denied=False
@@ -573,7 +570,6 @@ class InstalledGuardTests(unittest.TestCase):
         for target in (
             root / "CONFIG.TOML",
             root / "Hooks.json",
-            root / "agents/CROSS-REVIEWER.TOML",
         ):
             with self.subTest(target=target):
                 self.assertTrue(target.exists())

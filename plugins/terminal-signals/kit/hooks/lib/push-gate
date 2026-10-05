@@ -1,5 +1,5 @@
 # The agent push gate, run by the git pre-push hook (~/.agents/git-hooks/agent/pre-push). It is the
-# one authority for an agent's push; the PreToolUse(Bash) pre-push-gate it replaces matched the
+# one authority for an agent's push; the retired PreToolUse(Bash) push gate it replaces matched the
 # command text, so `git -C <wt> push` (the form CLAUDE.md prescribes, 56 of 178 pushes in the week
 # to 2026-10-03) skipped every check. Sourced; defines functions only. In order:
 #   force     a remote ref the local sha does not descend from        -> refuse, no override
