@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>agent-kit setup</title>
+<style>
+:root{color-scheme:light;--line:#dde1e6;--ink:#1d232b;--soft:#5b6570;--link:#24527a;--bg:#f5f6f8}
+*{box-sizing:border-box}
+html{scroll-padding-top:16px}
+body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg)}
+.side{position:fixed;top:0;left:0;bottom:0;width:240px;overflow-y:auto;background:#fff;border-right:1px solid var(--line);padding:18px 14px}
+.side .kit{font-weight:650;font-size:16px;word-break:break-all}
+.side .gen{font-size:12px;color:var(--soft);margin:2px 0 12px}
+#q{width:100%;font-size:14px;padding:6px 9px;border:1px solid #cfd6de;border-radius:6px;margin-bottom:12px}
+.side nav a{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;color:var(--ink);text-decoration:none;font-size:14px}
+.side nav a:hover{background:#f0f3f6}
+.side nav a.on{background:#e7eef6;color:var(--link);font-weight:600}
+.side nav a:first-child{margin-bottom:6px;border:1px solid var(--line)}
+.side nav .t{flex:1}
+.side nav .n{font-size:12px;color:var(--soft);min-width:1.5em;text-align:right}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot.warn{background:#d9a21b}.dot.bad{background:#c43c3c}
+main{margin-left:240px;padding:24px 32px 64px}
+.wrap{max-width:1100px}
+.intro{font-size:13px;color:var(--soft);margin-bottom:18px}
+.intro .path{margin-right:2px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin:0 0 28px}
+.tile{background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.tile.warn{background:#fff8e6;border-color:#e8c766}.tile.bad{background:#fdeeee;border-color:#e3a1a1}
+.tile .k{font-size:11px;color:var(--soft);text-transform:uppercase;letter-spacing:.05em}.tile .v{font-size:19px;font-weight:600}
+.tile .s{font-size:12px;color:var(--soft)}
+.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:0 20px 18px;margin-bottom:28px}
+.card .head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:16px 0 12px;margin-bottom:12px;border-bottom:1px solid #eceff2}
+.card h2{margin:0;font-size:19px}
+.card .sum{font-size:13px;color:var(--soft);margin-top:2px}
+.card .src{font-size:12px;text-align:right;max-width:50%}
+.attention.warn{border-color:#e8c766;background:#fffaf0}
+.attention ul{margin:0;padding-left:20px}.attention li{margin:5px 0}
+h3{font-size:15px;margin:20px 0 8px}
+.alert{background:#fdeeee;color:#9b2323;border-radius:6px;padding:6px 10px}
+.tw{overflow-x:auto;border:1px solid #eceff2;border-radius:6px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;vertical-align:top;padding:7px 9px;border-bottom:1px solid #eceff2}
+tbody tr:last-child td{border-bottom:0}
+th{background:#f4f6f8;font-weight:600;white-space:nowrap}
+code{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;background:#f2f4f6;border-radius:4px;padding:1px 4px;word-break:break-all}
+code.p{display:inline-block;max-width:32em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;word-break:normal;vertical-align:bottom}
+pre{font:12px/1.4 ui-monospace,Menlo,monospace;background:#f2f4f6;padding:8px;border-radius:6px;overflow:auto}
+.path{display:inline-flex;gap:4px;align-items:center;margin:1px 6px 1px 0;max-width:100%}.path a{font-size:12px;color:var(--link)}
+.cmd{display:flex;gap:6px;align-items:flex-start;margin:3px 0}
+button.cp{font-size:11px;border:1px solid #cfd6de;background:#fff;border-radius:4px;padding:1px 6px;cursor:pointer;color:var(--link);flex:none}
+button.cp.done{background:#e3f4e8;border-color:#7cc49a}
+.b{display:inline-block;font-size:11px;border-radius:10px;padding:1px 8px;margin:1px 3px 1px 0;background:#eef1f4;color:#3b4550;white-space:nowrap}
+.b.ok{background:#e3f4e8;color:#1d6b3b}.b.bad{background:#fbe6e6;color:#9b2323}.b.warn{background:#fff3d6;color:#7a5600}
+.b.off{background:#f3f4f6;color:#8a939c;text-decoration:line-through}
+.muted{color:#7b858f}details summary{cursor:pointer;color:var(--link)}details[open]>summary{margin-bottom:4px}
+@media (max-width:900px){
+.side{position:static;width:auto;border-right:0;border-bottom:1px solid var(--line)}
+.side nav{display:flex;flex-wrap:wrap;gap:4px}.side nav a:first-child{margin-bottom:0}
+main{margin-left:0;padding:18px}
+.card .head{flex-direction:column}.card .src{text-align:left;max-width:100%}
+}
+</style>
+</head>
+<body>
+<aside class="side">
+<div class="kit">${kit_name}</div>
+<div class="gen">Generated ${generated}</div>
+<input id="q" type="search" placeholder="Filter rows">
+<nav>${nav}</nav>
+</aside>
+<main><div class="wrap">
+<div class="intro">The kit at ${kit} read by the engine at ${engine}. Read-only: copy a command to change anything.</div>
+${attention}
+<div class="tiles">${tiles}</div>
+${sections}
+</div></main>
+<script>
+document.addEventListener('click',function(e){var b=e.target.closest('button.cp');if(!b)return;
+var t=b.getAttribute('data-c');var done=function(){b.classList.add('done');b.textContent='copied';
+setTimeout(function(){b.classList.remove('done');b.textContent='copy'},1200)};
+if(navigator.clipboard){navigator.clipboard.writeText(t).then(done,function(){fallback(t);done()})}else{fallback(t);done()}});
+function fallback(t){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();
+try{document.execCommand('copy')}catch(x){}document.body.removeChild(a)}
+document.getElementById('q').addEventListener('input',function(){var q=this.value.toLowerCase();
+document.querySelectorAll('tbody tr').forEach(function(r){r.style.display=!q||r.textContent.toLowerCase().indexOf(q)>=0?'':'none'})});
+(function(){var links={};document.querySelectorAll('.side nav a').forEach(function(a){links[a.getAttribute('data-k')]=a});
+if(!('IntersectionObserver' in window))return;var seen={};
+var mark=function(){var best=null,top=Infinity;Object.keys(seen).forEach(function(k){if(seen[k]<top){top=seen[k];best=k}});
+Object.keys(links).forEach(function(k){links[k].classList.toggle('on',k===best)})};
+var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){seen[e.target.id]=e.boundingClientRect.top}else{delete seen[e.target.id]}});mark()},{rootMargin:'0px 0px -60% 0px'});
+document.querySelectorAll('main section.card').forEach(function(s){io.observe(s)})})();
+</script>
+</body>
+</html>

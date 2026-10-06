@@ -1,0 +1,847 @@
+"""The dashboard's collectors: each reads one part of the setup and returns a Section of plain values
+(dashboard_html renders it). They read only; a credential is checked for presence, never read."""
+
+from __future__ import annotations
+
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+from blocking import BLOCKING
+from credentials import credential_name, declared_credentials, holds_secret, show_args, show_url
+from dashboard_html import (
+    Action,
+    Badge,
+    Code,
+    Command,
+    Fold,
+    Lines,
+    Muted,
+    Para,
+    Pre,
+    Section,
+    Strong,
+    Table,
+    Tile,
+)
+from hosts import (
+    HOSTS,
+    RULES_FILES,
+    account_dirs,
+    default_host_root,
+    fill_servers,
+    frontmatter,
+    host_root_for,
+    inventory,
+    skill_dirs,
+    skill_hosts,
+)
+from kit_env import KEYS, kit_env, layers, parse
+
+LIB = Path(__file__).resolve().parent
+ENGINE = LIB.parents[1]
+# The presence check runs this binary, never one from PATH; tests point it at a fixture.
+SECURITY = os.environ.get("AGENT_KIT_SECURITY", "/usr/bin/security")
+
+
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def when(stamp: float | None) -> str:
+    return "never" if stamp is None else dt.datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M")
+
+
+def run(command: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def keychain_present(service: str, account: str) -> str:
+    """present, missing, or unknown (no Keychain tool, or it failed to run). No -w or -g: the item's
+    attributes are found, its secret is never asked for, and the output is discarded."""
+    if not Path(SECURITY).exists():
+        return "unknown"
+    proc = run([SECURITY, "find-generic-password", "-s", service, "-a", account])
+    if proc is None:
+        return "unknown"
+    return "present" if proc.returncode == 0 else "missing"
+
+
+def keychain_add(service: str, account: str) -> str:
+    """The prompt form: -w last with no value, so the password is typed, never on a command line."""
+    return shlex.join(["security", "add-generic-password", "-s", service, "-a", account, "-w"])
+
+
+def kit_command(setup: Setup, *args: str) -> str:
+    return shlex.join([str(setup.kit / "bin/agent-kit"), *args])
+
+
+class Setup:
+    """What every collector reads, once: the kit, its install record and each host's root."""
+
+    def __init__(self, api: ModuleType, check_updates: bool) -> None:
+        self.api = api
+        self.kit = Path(api.KIT)
+        self.check_updates = check_updates
+        self.state = read_json(self.kit / ".install-state/current.json") or {}
+        self.config = self.state.get("configuration", {})
+        self.roots = {h: host_root_for(self.kit, h) or default_host_root(h) for h in HOSTS}
+        if self.state:
+            self.configured = [h for h in HOSTS if h in self.config.get("hosts", [])]
+        else:
+            self.configured = [h for h in HOSTS if self.roots[h].is_dir()]
+        self.catalog_path = self.kit / "mcp/servers.json"
+        chosen = self.config.get("mcp_catalog")
+        self.catalog_input = Path(chosen) if chosen else None
+        catalog = (read_json(self.catalog_path) or {}).get("mcpServers", {})
+        self.catalog: dict[str, Any] = catalog if isinstance(catalog, dict) else {}
+        self.alerts: list[str] = []
+        try:
+            self.filled = fill_servers(self.catalog, str(self.kit))
+        except (ValueError, SystemExit) as error:
+            self.alerts.append(f"MCP catalog placeholders not filled: {error}")
+            self.filled = self.catalog
+        self.roles = None
+        self.roles_error = ""
+        try:
+            self.roles = api.load_roles()
+        except SystemExit as error:
+            self.roles_error = str(error)
+        self.missing: list[tuple[str, str, str]] = []
+        self.inventories: dict[str, dict[str, Any]] = {}
+
+    def kit_bin(self, name: str) -> Path:
+        """The kit's own copy of a bin script, else the engine's."""
+        own = self.kit / "bin" / name
+        return own if own.is_file() else ENGINE / "bin" / name
+
+    def source(self) -> Path:
+        """The checkout agent-setup installed from, else the kit itself."""
+        source = self.config.get("source_checkout")
+        return Path(source) if source else self.kit
+
+    def inventory(self, host: str) -> dict[str, Any]:
+        if host not in self.inventories:
+            self.inventories[host] = inventory(self.api, host)
+        return self.inventories[host]
+
+    def live_servers(self, host: str) -> set[str] | None:
+        """Server names only (hosts.inventory): the live files hold resolved credentials."""
+        try:
+            return set(self.inventory(host)["mcp_servers"])
+        except (OSError, ValueError, SystemExit):
+            return None
+
+    def credential(self, service: str, account: str, why: str) -> str:
+        state = keychain_present(service, account)
+        if state == "missing" and (service, account, why) not in self.missing:
+            self.missing.append((service, account, why))
+        return state
+
+
+def credential_cell(setup: Setup, service: str, account: str, why: str) -> tuple:
+    state = setup.credential(service, account, why)
+    command = Command(keychain_add(service, account)) if state == "missing" else ""
+    return (f"Keychain {service} / {account}", Badge.state(state), command)
+
+
+def last_render(setup: Setup, host: str) -> float | None:
+    rendered = setup.kit / "state/rendered"
+    stamps = [mtime(p) for p in rendered.glob(f"{host}-*")] + [mtime(rendered / f"roles-{host}.sh")]
+    return max((s for s in stamps if s is not None), default=None)
+
+
+def host_drift(setup: Setup, host: str) -> list[str]:
+    """claude: agent-kit doctor's own findings with MCP compared by name (no Keychain value is
+    resolved). Others: hosts.inventory's errors and duplicate hooks, and MCP names."""
+    if host == "claude":
+        return setup.api.claude_findings(mcp="names")
+    inv = setup.inventory(host)
+    out = list(inv["errors"])
+    out += [
+        f"duplicate hook {d['event']} {d['matcher'] or ''} x{d['count']}"
+        for d in inv["duplicate_hooks"]
+    ]
+    live, want = set(inv["mcp_servers"]), set(setup.catalog)
+    out += [f"mcp {n} in the catalog, not live" for n in sorted(want - live)]
+    return out + [f"mcp {n} live only, not in the catalog" for n in sorted(live - want)]
+
+
+def hosts_section(setup: Setup) -> Section:
+    sec = Section(
+        "hosts", "Hosts", [setup.kit / ".install-state/current.json"] if setup.state else []
+    )
+    rows, drifted = [], 0
+    for host in HOSTS:
+        root, on = setup.roots[host], host in setup.configured
+        drift: list[str] = []
+        if on:
+            try:
+                drift = host_drift(setup, host)
+            except (Exception, SystemExit) as error:  # noqa: BLE001  one host's failure is one line
+                drift = [
+                    f"not checked: {type(error).__name__}: {str(error).splitlines()[0] if str(error) else ''}"
+                ]
+        drifted += bool(drift)
+        detail: Any = Badge.state("clean") if on else Muted("-")
+        if drift:
+            detail = Fold(Badge(f"{len(drift)} drift", "warn"), (Lines(tuple(drift)),))
+            sec.attention.append(
+                Action(
+                    f"{host}: {len(drift)} drift ({drift[0]}{', ...' if len(drift) > 1 else ''})",
+                    kit_command(setup, "render", "--host", host),
+                )
+            )
+        rows.append(
+            (
+                Strong(host),
+                Badge("configured", "ok") if on else Badge("not configured"),
+                root,
+                root / RULES_FILES[host],
+                when(last_render(setup, host)),
+                detail,
+            )
+        )
+        if on:
+            sec.actions.append(
+                Action(f"Render {host}", kit_command(setup, "render", "--host", host))
+            )
+            sec.actions.append(
+                Action(f"Doctor {host}", kit_command(setup, "doctor", "--host", host))
+            )
+    sec.blocks.append(
+        Table(("Host", "State", "Config dir", "Rules file", "Last render", "Drift"), rows)
+    )
+    claude = setup.roots["claude"].resolve()
+    extra = [d for d in account_dirs(setup.kit_bin("claude-account")) if d.resolve() != claude]
+    if extra:
+        rows = []
+        for d in extra:
+            settings = d / "settings.json"
+            linked = f"link to {os.readlink(settings)}" if settings.is_symlink() else None
+            skills = len(list((d / "skills").iterdir())) if (d / "skills").is_dir() else 0
+            rows.append((d, linked or ("own file" if settings.exists() else "missing"), skills))
+        sec.blocks.append(Table(("Config dir", "settings.json", "Skills"), rows, "Claude accounts"))
+    sec.tile = Tile(
+        "Hosts",
+        f"{len(setup.configured)} configured",
+        f"{drifted} with drift" if drifted else "no drift",
+        "warn" if drifted else "",
+    )
+    return sec
+
+
+def mcp_section(setup: Setup) -> Section:
+    sources = [setup.catalog_path] + ([setup.catalog_input] if setup.catalog_input else [])
+    sec = Section("mcp", "MCP servers", sources, alerts=list(setup.alerts))
+    live = {h: setup.live_servers(h) for h in setup.configured}
+    rows = []
+    for name in sorted(setup.filled):
+        spec = setup.filled[name] if isinstance(setup.filled[name], dict) else {}
+        if "url" in spec:
+            transport, target = "http", show_url(str(spec["url"])).text
+        else:
+            transport = "stdio"
+            target = show_args([spec.get("command", ""), *(spec.get("args") or [])]).text
+        env: dict[str, Any] = spec["env"] if isinstance(spec.get("env"), dict) else {}
+        headers: dict[str, Any] = spec["headers"] if isinstance(spec.get("headers"), dict) else {}
+        creds: list[Any] = [
+            credential_cell(setup, service, account, f"MCP {name}")
+            for service, account in declared_credentials(setup.catalog.get(name))
+        ]
+        inline = [
+            k
+            for k, v in {**env, **headers}.items()
+            if credential_name(k) and not declared_credentials(v)
+        ]
+        if inline:
+            creds.append(f"inline in the catalog: {', '.join(sorted(inline))} (values not shown)")
+        if not creds and transport == "http" and not headers:
+            creds.append("OAuth: the host signs in (not checked)")
+        on = tuple(
+            Badge(h, "ok" if name in (live[h] or set()) else "bad") for h in setup.configured
+        )
+        rows.append(
+            (
+                Strong(name),
+                transport,
+                Code(target),
+                ", ".join(sorted({*env, *headers})) or "-",
+                Lines(tuple(creds)) if creds else "none",
+                on or "-",
+            )
+        )
+    sec.blocks.append(
+        Table(
+            ("Server", "Transport", "Command / URL", "Env / header names", "Credential", "Live on"),
+            rows,
+            empty="The installed catalog has no servers.",
+        )
+    )
+    others = [
+        (h, Strong(n), "added outside the kit catalog (values not shown)")
+        for h, names in live.items()
+        for n in sorted((names or set()) - set(setup.filled))
+    ]
+    sec.blocks.append(Table(("Host", "Server", "Note"), others, "Live servers outside the catalog"))
+    example = {
+        "<name>": {
+            "command": "{{KIT_DIR}}/bin/<wrapper>",
+            "args": [],
+            "credentials": [{"keychain": "<service>", "account": "<account>"}],
+        }
+    }
+    sec.blocks += [
+        Para(
+            (
+                "Add a server to the catalog the install was made from, keep its credential in a Keychain "
+                "item its wrapper reads, declare that item under credentials (names only; the render "
+                "drops the field), then re-run agent-setup or render each host.",
+            )
+        ),
+        Pre(json.dumps(example, indent=2)),
+    ]
+    for host in setup.configured:
+        sec.actions.append(Action(f"Render {host}", kit_command(setup, "render", "--host", host)))
+    sec.tile = Tile(
+        "MCP servers",
+        str(len(setup.filled)),
+        f"{len(others)} outside the catalog" if others else "all from the catalog",
+        "warn" if others or setup.alerts else "",
+    )
+    return sec
+
+
+def skills_section(setup: Setup) -> Section:
+    """Every skill the source checkout ships (and the pack's), per configured host: linked, off, or
+    left out by its own hosts: line."""
+    source = setup.source()
+    pack = {p.name: p for p in sorted((setup.kit / "pack/skills").glob("*/SKILL.md"))}
+    found = {p.parent.name: p for p in sorted((source / "skills").glob("*/SKILL.md"))}
+    found.update({name: path for name, path in pack.items() if name not in found})
+    selected = setup.config.get("skills")
+    if selected is not None:
+        selected = [n for n in selected if n not in pack]
+    sec = Section("skills", "Skills", [source / "skills"])
+    rows = []
+    for name, md in sorted(found.items()):
+        text = md.read_text(errors="replace")
+        try:
+            allowed = skill_hosts(md, text)
+            allowed_text = ", ".join(sorted(allowed))
+        except ValueError:
+            allowed, allowed_text = set(), "invalid hosts: line"
+        chips, changes = [], []
+        for host in setup.configured:
+            if host not in allowed:
+                chips.append(Badge(host, "off"))
+                changes.append(Muted(f"{host}: left out by its hosts: line"))
+                continue
+            on = any((d / name).exists() for d in skill_dirs(host, setup.roots[host]))
+            chips.append(Badge(host, "ok" if on else "off"))
+            change = skill_toggle(setup, host, name, on, selected, name in pack)
+            if change not in changes:
+                changes.append(change)
+        desc = frontmatter(text).get("description", "")
+        rows.append(
+            (
+                Strong(name),
+                Badge("pack" if name in pack else "kit"),
+                tuple(chips) or "-",
+                Fold("change", (Lines(tuple(changes)),)) if changes else "-",
+                allowed_text,
+                desc[:220] + ("..." if len(desc) > 220 else ""),
+                md,
+            )
+        )
+    sec.blocks.append(
+        Table(("Skill", "Source", "Hosts", "Change", "hosts:", "Description", "File"), rows)
+    )
+    sec.blocks.append(
+        Para((Muted("Skills made by hand in a host folder are listed under Unmanaged sources."),))
+    )
+    sec.tile = Tile("Skills", str(len(found)), f"{len(pack)} pack")
+    return sec
+
+
+def skill_toggle(
+    setup: Setup, host: str, name: str, on: bool, selected: list[str] | None, in_pack: bool
+) -> Any:
+    """What changes the skill on host: a command with its label, or a note. A setup selection is
+    one command for every host."""
+    link = setup.roots[host] / "skills" / name
+    if on and not (link.exists() or link.is_symlink()):
+        return Muted(f"{host}: read from the shared skills folder")
+    if in_pack:
+        return Muted("the team pack's; change it in the preset")
+    if setup.config.get("source_checkout"):
+        source = setup.source()
+        setup_cmd = [str(source / "bin/agent-setup"), "--source", str(source)]
+        if selected is None:
+            if on:
+                return Muted(
+                    "the saved selection is every skill: to drop one, re-run agent-setup "
+                    "with --skills naming the ones to keep"
+                )
+            return ("re-apply:", Command(shlex.join([*setup_cmd, "--apply"])))
+        names = [n for n in selected if n != name] if on else [*selected, name]
+        label = "drop it from every host:" if on else "select it:"
+        return (label, Command(shlex.join([*setup_cmd, "--skills", *names, "--apply"])))
+    if on:
+        return (f"{host}: disable", Command(shlex.join(["rm", str(link)])))
+    target = str(setup.kit / "skills" / name)
+    return (f"{host}: enable", Command(shlex.join(["ln", "-s", target, str(link)])))
+
+
+def roles_section(setup: Setup) -> Section:
+    roles, roles_file = setup.roles, Path(setup.api.ROLES)
+    sec = Section("roles", "Roles and agents", [roles_file, setup.kit / "agents"])
+    if roles is None:
+        sec.blocks.append(Para((Muted(setup.roles_error or "This kit has no roles.toml."),)))
+        if setup.roles_error:
+            sec.alerts.append(setup.roles_error)
+        return sec
+    hosts = [h for h in roles.hosts if h in HOSTS]
+    rows = []
+    for name, role in roles.roles.items():
+        src = setup.kit / "agents" / f"{name}.md"
+        cells = []
+        for host in hosts:
+            try:
+                cells.append(f"{host}: {roles.invoke(role, host)}")
+            except SystemExit:
+                cells.append(f"{host}: ?")
+        rendered = setup.roots["claude"] / "agents" / f"{name}.md"
+        rows.append(
+            (
+                Strong(name),
+                f"{role.provider}:{role.model}",
+                role.effort,
+                role.prefix or "-",
+                role.fallback or "-",
+                Lines(tuple(cells)),
+                src if src.is_file() else Muted("none (main)"),
+                Badge("rendered", "ok") if rendered.is_file() else Muted("-"),
+            )
+        )
+    sec.blocks.append(
+        Table(
+            (
+                "Role",
+                "Model",
+                "Effort",
+                "Review prefix",
+                "Fallback",
+                "Runs as",
+                "Agent file",
+                "Claude agent",
+            ),
+            rows,
+        )
+    )
+    sec.blocks.append(
+        Table(
+            ("Round", "Roles"),
+            [(k, ", ".join(v)) for k, v in roles.review.items()],
+            "Review rounds",
+        )
+    )
+    reviewers = sum(bool(r.prefix) for r in roles.roles.values())
+    sec.tile = Tile("Roles", str(len(roles.roles)), f"{reviewers} review roles")
+    return sec
+
+
+def hooks_section(setup: Setup) -> Section:
+    registry_path = setup.kit / "hooks/registry.json"
+    registry = read_json(registry_path) or []
+    sec = Section("hooks", "Hooks", [registry_path])
+    rows, blocking = [], 0
+    for entry in registry if isinstance(registry, list) else []:
+        command = str(entry.get("command", ""))
+        name = Path(command.split()[0]).name if command.split() else "?"
+        script = setup.kit / "hooks" / name
+        blocking += name in BLOCKING
+        rows.append(
+            (
+                entry.get("event", ""),
+                entry.get("matcher") or "*",
+                Strong(name),
+                Badge("blocking", "warn") if name in BLOCKING else Badge("advisory"),
+                tuple(Badge(h) for h in entry.get("hosts", [])),
+                f"{entry.get('timeout', '-')}{' async' if entry.get('async') else ''}",
+                script if script.is_file() else Code(command),
+            )
+        )
+    if setup.state:
+        state = "on" if setup.config.get("blocking_hooks") else "off"
+        sec.blocks.append(
+            Para(
+                (
+                    "Blocking hooks in this install:",
+                    Strong(state),
+                    "(agent-setup --blocking-hooks).",
+                )
+            )
+        )
+    sec.blocks.append(
+        Table(("Event", "Matcher", "Hook", "Kind", "Hosts", "Timeout", "Script"), rows)
+    )
+    sec.tile = Tile("Hooks", str(len(rows)), f"{blocking} blocking")
+    return sec
+
+
+def documented_keys(setup: Setup) -> set[str]:
+    """The keys kit.env.example documents: the overlay's settings, none of them a credential."""
+    for example in (setup.kit / "kit.env.example", ENGINE / "kit.env.example"):
+        try:
+            text = example.read_text()
+        except OSError:
+            continue
+        return {m.group(1) for m in re.finditer(r"^([A-Z][A-Z0-9_]*)=", text, re.M)}
+    return set()
+
+
+def overlay_section(setup: Setup) -> Section:
+    """The overlay as kit_env reads it: the same layers, lowest first, a later one winning a key."""
+    files = layers()
+    values: dict[str, tuple[str, Path, list[str]]] = {}
+    for layer in files:
+        try:
+            text = layer.read_text()
+        except OSError:
+            continue
+        for key, value in parse(text).items():
+            seen = values[key][2] if key in values else []
+            values[key] = (value, layer, seen if layer.name in seen else [*seen, layer.name])
+    documented = documented_keys(setup)
+    sec = Section("overlay", "Overlay settings", [p for p in files if p.exists()])
+    rows, hidden = [], 0
+    for key in sorted(set(values) | (documented & set(KEYS))):
+        value, layer, seen = values.get(key, ("", None, []))
+        if key in documented and not credential_name(key) and not holds_secret(value):
+            shown: Any = Code(value) if value else Muted("unset")
+        else:
+            shown, hidden = Badge("•••• hidden", "warn"), hidden + 1
+        note = "" if key in KEYS else Muted("(not a key this kit reads)")
+        rows.append(
+            ((Strong(key), note), shown, layer.name if layer else "-", " < ".join(seen) or "-")
+        )
+    sec.blocks.append(
+        Para(("Values show only for keys kit.env.example documents; every other key is hidden.",))
+    )
+    sec.blocks.append(Table(("Key", "Value", "From layer", "Layers that set it"), rows))
+    # agent-setup rewrites setup-paths.env, so a key the user sets goes in the layer under it; the
+    # label names the keys setup-paths.env still wins.
+    target, label = files[-1], f"Set an overlay key in {files[-1]} (a later line wins)"
+    if target.name == "setup-paths.env" and len(files) > 1:
+        target = files[-2]
+        won = sorted(k for k, v in values.items() if v[1] == files[-1])
+        label = (
+            f"Set an overlay key in {target}; setup-paths.env, which agent-setup rewrites, wins "
+            f"for {', '.join(won) or 'no key'}"
+        )
+    sec.actions.append(Action(label, f"printf '%s\\n' 'KEY=value' >> {shlex.quote(str(target))}"))
+    sec.tile = Tile(
+        "Overlay keys", str(sum(1 for v in values.values() if v[0])), f"{hidden} hidden"
+    )
+    return sec
+
+
+def git_line(folder: Path) -> str:
+    """HEAD, uncommitted files and commits behind the last fetched upstream: local refs only, and
+    no optional lock (a status refresh would write the index)."""
+    if not (folder / ".git").exists() or not shutil.which("git"):
+        return "not a git checkout"
+    git = ["git", "--no-optional-locks", "-C", str(folder)]
+    head = run([*git, "rev-parse", "--short=12", "HEAD"])
+    dirty = run([*git, "status", "--porcelain"])
+    behind = run([*git, "rev-list", "--count", "HEAD..@{u}"])
+    parts = [f"at {head.stdout.strip()}" if head and head.returncode == 0 else "no commit"]
+    if dirty and dirty.returncode == 0 and dirty.stdout.strip():
+        parts.append(f"{len(dirty.stdout.splitlines())} uncommitted")
+    if behind and behind.returncode == 0:
+        count = int(behind.stdout.strip() or 0)
+        parts.append(
+            f"{count} commit(s) behind its upstream as last fetched"
+            if count
+            else "up to date with its upstream as last fetched"
+        )
+    return ", ".join(parts)
+
+
+def pack_section(setup: Setup) -> Section:
+    from pack import git_head, pack_label
+
+    engine, pack_dir = setup.source(), setup.kit / "pack"
+    sources = [p for p in (pack_dir, setup.kit / ".install-state/current.json") if p.exists()]
+    sec = Section("pack", "Preset and pack", sources)
+    rows: list[tuple[Any, ...]] = [("Engine", engine, git_line(engine))]
+    record = setup.config.get("preset")
+    agent_setup = [str(engine / "bin/agent-setup"), "--source", str(engine)]
+    if record:
+        spec = str(record.get("source", ""))
+        if setup.check_updates:
+            from preset import source_status
+
+            status = source_status(record)["note"]
+        elif spec.startswith("gh:"):
+            status = "not checked (rerun with --check-updates; it asks GitHub)"
+        else:
+            local = Path(spec).expanduser()
+            head = git_head(local) if local.is_dir() else None
+            status = (
+                "not checked"
+                if head is None
+                else "unchanged"
+                if head == record.get("commit")
+                else f"new commit {head[:12]} since setup"
+            )
+        rows.append(
+            ("Preset", Code(spec), f"at {pack_label(record.get('commit'))}; update: {status}")
+        )
+        sec.actions.append(
+            Action("Preview the preset again", shlex.join([*agent_setup, "--preset", spec]))
+        )
+        sec.actions.append(
+            Action("Apply it", shlex.join([*agent_setup, "--preset", spec, "--apply"]))
+        )
+    else:
+        rows.append(("Preset", Muted("none"), ""))
+    skills = sorted(p.name for p in (pack_dir / "skills").glob("*") if p.is_dir())
+    rules = pack_dir / "rules.md"
+    if skills or rules.is_file():
+        rows.append(("Pack skills", ", ".join(skills) or "none", ""))
+        if rules.is_file():
+            words = len(rules.read_text(errors="replace").split())
+            rows.append(("Pack rules", rules, f"{words} words, {rules.stat().st_size} bytes"))
+    if setup.state:
+        sec.actions.append(
+            Action(
+                "Check the install",
+                shlex.join([str(engine / "bin/agent-setup"), "doctor", "--source", str(engine)]),
+            )
+        )
+    sec.blocks.append(Table(("What", "Where", "State"), rows))
+    sec.tile = Tile("Preset", "yes" if record else "none", f"{len(skills)} pack skills")
+    return sec
+
+
+def load_ro_mysql(setup: Setup) -> ModuleType | None:
+    """The kit's ro-mysql as a module, for its tunnel parser and cache reader: the engine's, else
+    the install's source checkout's. Running `ro-mysql --tunnels` instead would ask the MySQL
+    login-path store for unannotated tunnels."""
+    candidates = [ENGINE / "bin/ro-mysql", setup.source() / "bin/ro-mysql"]
+    path = next((p for p in candidates if p.is_file()), None)
+    if path is None:
+        return None
+    loader = importlib.machinery.SourceFileLoader("ro_mysql_for_dashboard", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    dont_write = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = dont_write
+    return module
+
+
+def data_section(setup: Setup) -> Section:
+    sec = Section("data", "Data wrappers", [Path.home() / ".ssh/config"])
+    rows = []
+    for name in ("ro-mysql", "bqro"):
+        kit_copy, found = setup.kit_bin(name), shutil.which(name)
+        note = "not on PATH"
+        if found:
+            note = "on PATH"
+            if kit_copy.is_file() and Path(found).resolve() != kit_copy.resolve():
+                same = Path(found).read_bytes() == kit_copy.read_bytes()
+                note = (
+                    "on PATH, same as the kit copy"
+                    if same
+                    else "on PATH, DIFFERS from the kit copy"
+                )
+        rows.append(
+            (
+                Strong(name),
+                Path(found) if found else "-",
+                kit_copy if kit_copy.is_file() else "-",
+                note,
+            )
+        )
+    sec.blocks.append(Table(("Wrapper", "On PATH", "Kit copy", "State"), rows))
+    module = load_ro_mysql(setup)
+    tunnels, staging = [], 0
+    if module is not None:
+        cache = module.read_cache()
+        found_tunnels = module.load_tunnels()
+        shared = module.multi_port_aliases(found_tunnels)
+        for t in found_tunnels:
+            cached = cache.get((t.alias, t.port), {})
+            via = cached.get("via", "")
+            login = via.removeprefix("via login path ") if via.startswith("via login path ") else ""
+            if t.user and t.alias not in shared:
+                account = module.keychain_account(t, t.user)
+                cred: Any = credential_cell(
+                    setup, module.KEYCHAIN_SERVICE, account, f"ro-mysql {t.name}"
+                )
+            else:
+                cred = Muted("no Keychain item (no annotated user, or a shared alias)")
+            staging += t.kind == "STAGING"
+            tunnels.append(
+                (
+                    Strong(t.name),
+                    t.port,
+                    Badge(t.kind, "warn" if t.kind == "PROD" else "ok"),
+                    t.user or "?",
+                    login or "-",
+                    cred,
+                    cached.get("databases", "not checked"),
+                    cached.get("checked", "-"),
+                )
+            )
+    sec.blocks.append(
+        Table(
+            (
+                "Tunnel",
+                "Port",
+                "Kind",
+                "DB user",
+                "Login path",
+                "Keychain item",
+                "Databases (cached)",
+                "Checked",
+            ),
+            tunnels,
+            "ro-mysql tunnels",
+            "No db-tunnel-* LocalForward in ~/.ssh/config.",
+        )
+    )
+    project = kit_env().get("BQRO_PROJECT", "")
+    gcloud = Path(os.environ.get("CLOUDSDK_CONFIG") or Path.home() / ".config/gcloud")
+    adc = gcloud / "application_default_credentials.json"
+    sec.blocks.append(
+        Table(
+            ("What", "State"),
+            [
+                ("Jobs project (BQRO_PROJECT)", Code(project) if project else Muted("unset")),
+                ("gcloud config folder", gcloud if gcloud.is_dir() else Badge("missing", "bad")),
+                (
+                    "Application default credentials",
+                    Badge.state("present" if adc.is_file() else "missing"),
+                ),
+            ],
+            "bqro",
+        )
+    )
+    sec.actions.append(Action("List tunnels (in your own terminal)", "ro-mysql --tunnels"))
+    sec.actions.append(Action("Store DB passwords (in your own terminal)", "ro-mysql --rotate"))
+    if not adc.is_file():
+        sec.actions.append(Action("Sign in for bqro", "gcloud auth application-default login"))
+    sec.tile = Tile("Data tunnels", str(len(tunnels)), f"{staging} staging")
+    return sec
+
+
+def work_section(setup: Setup) -> Section:
+    import agent_task
+
+    root = Path(agent_task.work_root())
+    bound: dict[str, int] = {}
+    bind_dir = agent_task.bind_dir()
+    if bind_dir.is_dir():
+        for f in bind_dir.iterdir():
+            if f.name.startswith("tab-") or not f.is_file():
+                continue
+            key = f.read_text(errors="replace").split("\n", 1)[0].strip()
+            if key:
+                bound[key] = bound.get(key, 0) + 1
+    rows, open_total = [], 0
+    for project in agent_task.projects(root):
+        key = project.name if project.legacy else f"project:{project.name}"
+        sessions = sum(n for k, n in bound.items() if k == key or k.startswith(key + "/"))
+        items = []
+        for item in project.items():
+            touched = max(
+                (s for s in [mtime(item), *(mtime(c) for c in item.iterdir())] if s), default=None
+            )
+            items.append(
+                (
+                    item.name,
+                    agent_task._item_status(item),
+                    touched,
+                    bound.get(f"{key}/{item.name}", 0),
+                )
+            )
+        open_items = [i for i in items if i[1] not in agent_task.DONE_STATUSES]
+        open_total += len(open_items)
+        touched = max([mtime(project.path) or 0] + [i[2] or 0 for i in items]) or None
+        detail: Any = Muted("-")
+        if items:
+            detail = Fold(
+                f"{len(open_items)} open of {len(items)}",
+                (
+                    Table(
+                        ("Item", "Status", "Last touched", "Bound sessions"),
+                        [(project.path / "items" / n, s, when(t), b) for n, s, t, b in items],
+                    ),
+                ),
+            )
+        name: Any = (
+            (Strong(project.name), Badge("legacy")) if project.legacy else Strong(project.name)
+        )
+        rows.append(
+            (
+                touched or 0,
+                (
+                    name,
+                    project.meta.get("status", "-"),
+                    detail,
+                    when(touched),
+                    sessions,
+                    project.path,
+                ),
+            )
+        )
+    rows.sort(key=lambda r: r[0], reverse=True)
+    sec = Section("work", "Work root", [root])
+    sec.blocks.append(
+        Table(
+            ("Project", "Status", "Items", "Last touched", "Bound sessions", "Folder"),
+            [r for _, r in rows],
+            empty=f"No projects under {root}.",
+        )
+    )
+    sec.tile = Tile("Projects", str(len(rows)), f"{open_total} open items")
+    return sec
