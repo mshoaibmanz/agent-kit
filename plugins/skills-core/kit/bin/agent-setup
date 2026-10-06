@@ -59,7 +59,7 @@ from kit_env import kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
                        server_runtime)
-from pack import PACK_DIR, PACK_SKILLS, StalePack, installed_pack  # noqa: E402
+from pack import PACK_DIR, PACK_SKILLS, installed_pack  # noqa: E402
 from preset import Preset, apply_preset, kit_skills, source_status, validate_catalog  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
 MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
@@ -1248,7 +1248,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--collision', choices=('refuse', 'backup', 'skip'), default=None,
                         help='Where you already have content: refuse (default), backup it, or skip that path')
     result.add_argument('--preset', help='Team defaults and pack: a local folder or TOML file, or gh:owner/repo[/path] '
-                        '(agent-kit-preset.toml or the path, skills/ and rules.md beside it, at its head commit)')
+                        '(default path agent-kit-preset.toml); skills/ and rules.md beside a folder\'s or an '
+                        'agent-kit-preset.toml are its team pack')
     result.add_argument('--yes', action='store_true', help='Take every default and detected value; no prompts')
     result.add_argument('--verbose', action='store_true', help='List every planned path under the summary')
     result.add_argument('--json', action='store_true', help='Print the full plan as JSON instead of the summary')
@@ -1321,13 +1322,8 @@ def main() -> int:
         else:
             args.source = str(SOURCE)
     given = {key for key in DEFAULTS if getattr(args, key) is not None}
-    preset = Preset()
-    if setup_run:
-        try:
-            kept, stale = installed_pack(root.absolute(), state, managed_drift), None
-        except StalePack as error:
-            kept, stale = None, error
-        preset = apply_preset(args.preset, saved, Path(args.source), args.interactive, kept, stale)
+    preset = (apply_preset(args.preset, saved, Path(args.source), args.interactive,
+                           installed_pack(root.absolute(), state, managed_drift)) if setup_run else Preset())
     guided = setup_run and (args.interactive or args.yes or bool(args.preset))
     detected_hosts = detect_hosts()
     # --host-root names one host's root; with no --hosts that host is claude.

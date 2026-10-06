@@ -61,8 +61,8 @@ class TeamPackTests(InstallerUxFixture):
         return repository, first
 
     def gh_fixture(self, repository: Path) -> None:
-        """gh that serves repository as example-org/team-pack: the head commit and its tarball. Each
-        call's endpoint is logged to gh.log in the fake home."""
+        """gh that serves repository as example-org/team-pack: the head commit, its tarball and a file
+        at a commit. Each call's endpoint is logged to gh.log in the fake home."""
         self.gh_script(f'''repo={json.dumps(str(repository))}
 echo "$2" >> {json.dumps(str(self.home / 'gh.log'))}
 case "$1 $2" in
@@ -70,6 +70,9 @@ case "$1 $2" in
   "api repos/example-org/team-pack/tarball/"*)
     sha=${{2##*/}}
     exec git -C "$repo" archive --format=tar --prefix="example-org-team-pack-$sha/" "$sha" ;;
+  "api repos/example-org/team-pack/contents/"*)
+    path=${{2#*/contents/}}
+    exec git -C "$repo" show "${{path##*\\?ref=}}:${{path%\\?ref=*}}" ;;
 esac
 echo "gh: not served by the fixture: $*" >&2
 exit 1''')
@@ -350,7 +353,7 @@ exit 1''')
     def test_only_skills_rules_and_the_preset_of_the_preset_folder_are_read(self) -> None:
         repository = self.home / 'served'
         (repository / 'agent/skills/team-a').mkdir(parents=True)
-        (repository / 'agent/preset.toml').write_text('[kit]\nREVIEW_BASE = "main"\n')
+        (repository / 'agent/agent-kit-preset.toml').write_text('[kit]\nREVIEW_BASE = "main"\n')
         (repository / 'agent/skills/team-a/SKILL.md').write_bytes(SKILL)
         (repository / 'agent/notes.md').write_text(TOKEN + '\n')
         (repository / 'skills').mkdir()
@@ -363,17 +366,90 @@ exit 1''')
         self.git(repository, 'init', '-q')
         self.commit(repository, 'v1')
         self.gh_fixture(repository)
-        result = self.setup('--preset', GH + '/agent/preset.toml', *FLAGS, '--apply')
+        result = self.setup('--preset', GH + '/agent/agent-kit-preset.toml', *FLAGS, '--apply')
         self.assertIn('skills team-a', result.stdout)
         self.assertEqual(sorted(path.relative_to(self.root / 'pack').as_posix() for path in (self.root / 'pack').rglob('*')
                                 if path.is_file()), ['skills/team-a/SKILL.md'])
-        self.assertIn('no agent/missing.toml in the repository',
-                      self.setup('--preset', GH + '/agent/missing.toml', *FLAGS, code=2).stderr)
-        local = repository / 'agent/preset.toml'
+        self.assertIn('no agent/missing/agent-kit-preset.toml in the repository',
+                      self.setup('--preset', GH + '/agent/missing/agent-kit-preset.toml', *FLAGS, code=2).stderr)
+        local = repository / 'agent/agent-kit-preset.toml'
         self.assertIn(f'pack {local} at its working tree: content unchanged since the install',
                       self.setup('--preset', str(local), *FLAGS, '--apply').stdout)
         self.assertEqual(self.state()['configuration']['preset']['source'], str(local))
-        self.assertIn('no such file or folder', self.setup('--preset', str(repository / 'agent/missing.toml'), *FLAGS, code=2).stderr)
+
+    def test_a_preset_file_of_another_name_is_read_alone(self) -> None:
+        repository = self.home / 'served'
+        (repository / 'team/skills/team-a').mkdir(parents=True)
+        (repository / 'team/skills/team-a/SKILL.md').write_bytes(SKILL)
+        (repository / 'team/rules.md').write_text(RULES)
+        text = '[kit]\nREVIEW_BASE = "main"\n'
+        (repository / 'team/preset.toml').write_text(text)
+        self.git(repository, 'init', '-q')
+        first = self.commit(repository, 'v1')
+        self.gh_fixture(repository)
+        spec = GH + '/team/preset.toml'
+        result = self.setup('--preset', spec, *FLAGS, '--apply')
+        self.assertNotIn(f'pack {spec}', result.stdout)
+        self.assertFalse((self.root / 'pack').exists() or (self.home / '.claude/skills/team-a').exists())
+        self.assertEqual(self.state()['configuration']['preset'],
+                         {'source': spec, 'sha256': hashlib.sha256(text.encode()).hexdigest(), 'commit': first})
+        self.assertEqual([call.split('?')[0] for call in (self.home / 'gh.log').read_text().split() if 'team-pack' in call],
+                         ['repos/example-org/team-pack/commits/HEAD', 'repos/example-org/team-pack/contents/team/preset.toml'])
+        self.assertIn('REVIEW_BASE=main', (self.root / 'local/preset.env').read_text())
+        # A user's own folder: its skills/ links to installed skills (absolute paths), which is no pack.
+        claude = self.home / 'dotclaude'
+        (claude / 'skills').mkdir(parents=True)
+        (claude / 'skills/conventions').symlink_to(self.root / 'skills/conventions')
+        (claude / 'team.toml').write_text(text)
+        self.setup('--preset', str(claude / 'team.toml'), *FLAGS, '--apply')
+        self.assertEqual(self.state()['configuration']['preset'],
+                         {'source': str(claude / 'team.toml'), 'sha256': hashlib.sha256(text.encode()).hexdigest()})
+        self.assertFalse((self.root / 'pack').exists())
+
+    def test_a_link_to_a_preset_file_reads_the_pack_where_it_points(self) -> None:
+        pack = self.pack()
+        links = self.home / 'links'
+        links.mkdir()
+        for name, target in (('absolute.toml', pack / 'agent-kit-preset.toml'),
+                             ('relative.toml', Path('../team-pack/agent-kit-preset.toml'))):
+            with self.subTest(name):
+                (links / name).symlink_to(target)
+                result = self.setup('--preset', str(links / name), *FLAGS, '--apply')
+                self.assertIn(f'pack {links / name} at its working tree', result.stdout)
+                self.assertTrue((self.home / '.claude/skills/team-howto').is_symlink())
+                self.assertEqual(self.state()['configuration']['preset']['source'], str(links / name))
+
+    def test_a_preset_that_does_not_exist_is_refused_before_any_read(self) -> None:
+        folder = self.home / 'dotclaude'
+        (folder / 'skills').mkdir(parents=True)
+        (folder / 'skills/elsewhere').symlink_to('/')
+        for missing in (folder / 'team', folder / 'gone/agent-kit-preset.toml'):
+            with self.subTest(missing.name):
+                self.refused(str(missing), f'preset {missing}: no such file or folder')
+
+    def test_an_exclude_only_preset_follows_a_kit_update(self) -> None:
+        repository, _ = self.served()
+        (repository / 'agent-kit-preset.toml').write_text('[skills]\nexclude = ["process-doc"]\n')
+        self.commit(repository, 'Exclude')
+        kit = self.home / 'kit'
+        shutil.copytree(SOURCE, kit, ignore=shutil.ignore_patterns('.git', 'plugins', '__pycache__'))
+        flags = ('--source', str(kit), *FLAGS, '--apply')
+        self.setup('--preset', GH, *flags)
+        skills = self.home / '.claude/skills'
+        self.assertTrue((skills / 'unslop').is_symlink())
+        log = self.home / 'gh.log'
+        for name, removed, preset in (('kit-new', 'unslop', ('--preset', GH)), ('kit-newer', 'prototype', ())):
+            with self.subTest(preset=preset):
+                log.unlink(missing_ok=True)
+                (kit / 'skills' / name).mkdir()
+                (kit / 'skills' / name / 'SKILL.md').write_text(f'---\nname: {name}\ndescription: New.\n---\n')
+                shutil.rmtree(kit / 'skills' / removed)
+                self.setup(*preset, *flags)
+                self.assertTrue((skills / name).is_symlink(), 'a kit skill added since setup is not installed')
+                self.assertFalse((skills / removed).exists() or (skills / removed).is_symlink())
+                self.assertFalse((skills / 'process-doc').exists(), 'the excluded skill was installed')
+                self.assertTrue((skills / 'team-howto').is_symlink())
+                self.assertNotIn('tarball', log.read_text() if log.exists() else '')
 
     def test_links_in_skills_that_name_a_pack_file_install_as_that_file(self) -> None:
         pack = self.pack()

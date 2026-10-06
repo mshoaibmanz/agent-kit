@@ -4,7 +4,6 @@ repository may carry (pack.py), and the MCP catalog check they share with setup'
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import closing
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -17,7 +16,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from hosts import HOSTS, normalize_transport
 from pack import (PACK_SKILLS, PACK_TOML, Pack, PackFiles, PresetUnavailable, StalePack, build_pack, folder_entries,
-                  gh_entries, gh_head, git_head, holds_token, pack_files, pack_summary, utf8_text)
+                  gh_entries, gh_file, gh_head, git_head, holds_token, pack_files, pack_summary, utf8_text)
 
 # Preset [kit] keys: overlay keys (hooks/lib/README) a team shares. The first three also answer
 # setup's own questions, so its summary and checks see them.
@@ -126,39 +125,51 @@ class LoadedPreset(NamedTuple):
     commit: str | None
 
 
-def _pack_preset(files: PackFiles, toml: str, spec: str, commit: str | None) -> tuple[str, Pack | None]:
+def _pack_preset(files: PackFiles, spec: str, commit: str | None) -> tuple[str, Pack | None]:
     """(the preset text, the pack) of a pack's files. The text's line endings are normalized, as a
     text read of the file does, so its sha256 does not depend on how it was fetched."""
-    text = utf8_text(files.pop(toml, (b'', 0))[0], toml, spec).replace('\r\n', '\n').replace('\r', '\n')
+    found = PACK_TOML in files
+    text = preset_text(files.pop(PACK_TOML, (b'', 0))[0], PACK_TOML, spec)
     pack = build_pack(files, spec, commit)
-    if not text and pack is None:
+    if not found and pack is None:
         raise ValueError(f'preset {spec}: holds no {PACK_TOML}, {PACK_SKILLS}/ or rules.md')
     return text, pack
 
 
+def preset_text(data: bytes, name: str, spec: str) -> str:
+    return utf8_text(data, name, spec).replace('\r\n', '\n').replace('\r', '\n')
+
+
 def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
-    """The preset of spec and the team pack rooted at its folder: the preset (a folder's or a
-    repository's agent-kit-preset.toml, or the TOML file spec names), skills/ and rules.md, each
-    optional; nothing else there is read. gh:owner/repo[/path] is read at head, the commit at the
-    head of the default branch (resolved here unless given), with the user's own gh login.
-    PresetUnavailable when a gh: fetch fails; ValueError when the preset or pack is invalid or holds a
-    secret."""
+    """The preset of spec and, when it is a pack root, its team pack. A pack root is a folder, or
+    the folder of a file named agent-kit-preset.toml (gh:owner/repo reads the repository's): that
+    preset, skills/ and rules.md, each optional, and nothing else there is read. A TOML file of any
+    other name is read alone. gh:owner/repo[/path] is read at head, the commit at the head of the
+    default branch (resolved here unless given), with the user's own gh login. PresetUnavailable when
+    a gh: fetch fails; ValueError when the preset or pack is invalid or holds a secret."""
     if spec.startswith('gh:'):
         repo, path = _gh_repo(spec)
         root, _, toml = (path or PACK_TOML).rpartition('/')
-        commit = head or gh_head(repo)
-        with closing(gh_entries(repo, commit, root, toml, spec)) as entries:
-            files = pack_files(entries, spec)
-        missing = f'no {path} in the repository' if path and toml not in files else None
+        commit: str | None = head or gh_head(repo)
+        if toml == PACK_TOML:
+            files = pack_files(gh_entries(repo, commit, root, spec), spec)
+            if path and PACK_TOML not in files:
+                raise ValueError(f'preset {spec}: no {path} in the repository')
+            text, pack = _pack_preset(files, spec, commit)
+        else:
+            text, pack = preset_text(gh_file(repo, commit, path or toml), toml, spec), None
     else:
         local = Path(spec).expanduser()
-        folder, toml = (local, PACK_TOML) if local.is_dir() else (local.parent, local.name)
-        commit = git_head(folder)
-        files = pack_files(folder_entries(folder, toml), spec)
-        missing = 'no such file or folder' if not local.is_dir() and toml not in files else None
-    if missing:
-        raise ValueError(f'preset {spec}: {missing}')
-    text, pack = _pack_preset(files, toml, spec, commit)
+        if not local.exists():
+            raise ValueError(f'preset {spec}: no such file or folder')
+        # A link to a preset file is read where it points: its folder there is the pack root.
+        file = local.resolve()
+        if local.is_dir() or file.name == PACK_TOML:
+            folder = local if local.is_dir() else file.parent
+            commit = git_head(folder)
+            text, pack = _pack_preset(pack_files(folder_entries(folder), spec), spec, commit)
+        else:
+            text, pack, commit = preset_text(file.read_bytes(), file.name, spec), None, None
     try:
         preset = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
@@ -206,7 +217,8 @@ class Preset:
     """A preset as setup uses it. kit: its [kit] values as local/preset.env lines hold them, the
     layer under the user's kit.env. answers: the setup answers it supplies, under the user's own.
     pack: a team pack's skills and rules block; pack_skills: its skills this install selects, on top
-    of the kit skills the answers select."""
+    of the kit skills the answers select. table: the validated preset these were derived from, which
+    a later run derives them from again, against the kit skills it finds."""
     kit: dict[str, str] = field(default_factory=dict)
     servers: dict[str, Any] = field(default_factory=dict)
     record: dict[str, Any] | None = None
@@ -215,11 +227,13 @@ class Preset:
     notes: list[tuple[str, str]] = field(default_factory=list)
     pack: Pack | None = None
     pack_skills: list[str] = field(default_factory=list)
+    table: dict[str, Any] | None = None
 
     def saved(self) -> dict[str, Any]:
         """What current.json keeps, so a later run without --preset applies the same values."""
-        return {'kit': self.kit, 'servers': self.servers, 'answers': self.answers,
-                'recommended_hosts': self.recommended_hosts, 'pack_skills': self.pack_skills}
+        values = {'kit': self.kit, 'servers': self.servers, 'answers': self.answers,
+                  'recommended_hosts': self.recommended_hosts, 'pack_skills': self.pack_skills}
+        return values if self.table is None else {**values, 'table': self.table}
 
     def env_text(self) -> str:
         return ''.join(f'{key}={value}\n' for key, value in self.kit.items())
@@ -255,31 +269,43 @@ def _loaded_preset(spec: str, loaded: LoadedPreset, kept: Pack | None, kit_names
         record['commit'] = loaded.commit
     return Preset(kit=kit, servers=preset.get('mcp', {}).get('servers', {}), record=record, answers=answers,
                   recommended_hosts=preset.get('hosts', {}).get('recommended', []), notes=_notes(record, pack, kept),
-                  pack=pack, pack_skills=[name for name in pack_names if name not in exclude])
+                  pack=pack, pack_skills=[name for name in pack_names if name not in exclude], table=preset)
 
 
-def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interactive: bool, kept: Pack | None,
-                 stale: StalePack | None = None) -> Preset:
-    """--preset loaded, else the preset an earlier install saved (configuration preset and
-    preset_values, and kept, the pack it kept), else none. A gh: preset still at the commit of that
-    install reuses what it saved, without a download. A pack skill named like a kit skill refuses the
-    run, the kept one too: a kit update may add a skill of the same name. So does stale, a kept pack
-    that changed since setup, unless --preset loads a new one."""
+def _earlier(saved: dict[str, Any], kept: Pack | None, kit_names: list[str]) -> Preset:
+    """The preset an earlier install saved (configuration preset and preset_values) with kept, the pack
+    it kept: derived again from its table, so a [skills] exclude follows the kit skills of this run.
+    An install from before the table was saved has its values as saved."""
     values = saved.get('preset_values', {})
     record = saved.get('preset')
-    earlier = Preset(kit=dict(values.get('kit', {})), servers=dict(values.get('servers', {})), record=record,
-                     answers=dict(values.get('answers', {})), recommended_hosts=list(values.get('recommended_hosts', [])),
-                     pack=kept, pack_skills=list(values.get('pack_skills', kept.skills if kept is not None else [])))
+    if record and 'table' in values:
+        loaded = LoadedPreset(values['table'], record['sha256'], kept, record.get('commit'))
+        return _loaded_preset(record['source'], loaded, kept, kit_names)
+    return Preset(kit=dict(values.get('kit', {})), servers=dict(values.get('servers', {})), record=record,
+                  answers=dict(values.get('answers', {})), recommended_hosts=list(values.get('recommended_hosts', [])),
+                  pack=kept, pack_skills=list(values.get('pack_skills', kept.skills if kept is not None else [])))
+
+
+def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interactive: bool,
+                 installed: Pack | StalePack | None) -> Preset:
+    """--preset loaded, else the preset an earlier install saved, else none. installed is the pack
+    that install kept, or a StalePack when it changed since: that refuses the run unless --preset
+    loads a new one. A gh: preset still at the commit of that install is not downloaded again. A pack
+    skill named like a kit skill refuses the run, the kept one too: a kit update may add a skill of
+    the same name."""
+    kept = installed if isinstance(installed, Pack) else None
+    stale = installed if isinstance(installed, StalePack) else None
     kit_names = kit_skills(source)
+    earlier = _earlier(saved, kept, kit_names)
     if not spec:
         if stale is not None:
             raise stale
-        result = earlier
+        result = replace(earlier, notes=[])
     else:
         try:
-            head, unmoved = recorded_head(record, spec)
-            if unmoved and record and stale is None:
-                result = replace(earlier, notes=_notes(record, kept, kept))
+            head, unmoved = recorded_head(earlier.record, spec)
+            if unmoved and earlier.table is not None and stale is None:
+                result = earlier
             else:
                 result = _loaded_preset(spec, load_preset(spec, head), kept, kit_names)
         except PresetUnavailable as error:

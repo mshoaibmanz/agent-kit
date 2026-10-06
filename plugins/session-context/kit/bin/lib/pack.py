@@ -12,9 +12,10 @@ import re
 import shutil
 import subprocess
 import tarfile
-import threading
-from typing import Any, Literal, NamedTuple
+import tempfile
+from typing import IO, Any, Literal, NamedTuple
 import unicodedata
+from urllib.parse import quote
 import zlib
 
 from hosts import skill_hosts
@@ -68,8 +69,8 @@ def holds_token(text: str) -> bool:
     return any(not TOKEN_PLACEHOLDER.search(match.group()) for match in TOKEN.finditer(text))
 
 
-def in_pack(path: str, toml: str) -> bool:
-    return (path in (PACK_RULES, toml, PACK_SKILLS) or path.startswith(PACK_SKILLS + '/')) and not any(
+def in_pack(path: str) -> bool:
+    return (path in (PACK_RULES, PACK_TOML, PACK_SKILLS) or path.startswith(PACK_SKILLS + '/')) and not any(
         NOT_PACK.fullmatch(part) for part in path.split('/'))
 
 
@@ -78,26 +79,20 @@ def normal_mode(mode: int) -> int:
     return 0o755 if mode & 0o111 else 0o644
 
 
-def _require_gh() -> None:
+def gh_api(arguments: list[str], repo: str, timeout: int, spool: IO[bytes] | None = None) -> bytes:
+    """`gh api` output with the user's own login (written to spool instead when given);
+    PresetUnavailable when it cannot answer."""
     if not shutil.which('gh'):
         raise PresetUnavailable(f'gh is not installed ({install_hint("gh")})')
-
-
-def _gh_failure(stderr: bytes, repo: str) -> PresetUnavailable:
-    reason = (stderr.decode(errors='replace').strip().splitlines() or ['gh api failed'])[0]
-    return PresetUnavailable(f'{reason} (check `gh auth status` and your access to {repo})')
-
-
-def gh_api(arguments: list[str], repo: str, timeout: int) -> bytes:
-    """`gh api` output with the user's own login; PresetUnavailable when it cannot answer."""
-    _require_gh()
     try:
-        result = subprocess.run(['gh', 'api', *arguments], capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        result = subprocess.run(['gh', 'api', *arguments], stdout=subprocess.PIPE if spool is None else spool,
+                                stderr=subprocess.PIPE, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PresetUnavailable(str(error)) from None
     if result.returncode:
-        raise _gh_failure(result.stderr, repo)
-    return result.stdout
+        reason = (result.stderr.decode(errors='replace').strip().splitlines() or ['gh api failed'])[0]
+        raise PresetUnavailable(f'{reason} (check `gh auth status` and your access to {repo})')
+    return result.stdout or b''
 
 
 def gh_head(repo: str) -> str:
@@ -108,7 +103,13 @@ def gh_head(repo: str) -> str:
     return commit
 
 
-def _archive_entry(tar: tarfile.TarFile, member: tarfile.TarInfo, root: str, toml: str, spec: str) -> Entry | None:
+def gh_file(repo: str, commit: str, path: str) -> bytes:
+    """The file at path of repo at commit."""
+    return gh_api([f'repos/{repo}/contents/{quote(path)}?ref={commit}', '-H', 'Accept: application/vnd.github.raw'],
+                  repo, 20)
+
+
+def _archive_entry(tar: tarfile.TarFile, member: tarfile.TarInfo, root: str, spec: str) -> Entry | None:
     if member.name.startswith('/') or '..' in PurePosixPath(member.name).parts:
         raise ValueError(f'preset {spec}: archive path {member.name} leaves the pack')
     # GitHub's archive holds the tree under one <owner>-<repo>-<sha> folder.
@@ -117,7 +118,7 @@ def _archive_entry(tar: tarfile.TarFile, member: tarfile.TarInfo, root: str, tom
         if not relative.startswith(root + '/'):
             return None
         relative = relative[len(root) + 1:]
-    if member.isdir() or not in_pack(relative, toml):
+    if member.isdir() or not in_pack(relative):
         return None
     if member.issym():
         return Entry(relative, 'link', member.linkname.encode(), 0)
@@ -129,53 +130,23 @@ def _archive_entry(tar: tarfile.TarFile, member: tarfile.TarInfo, root: str, tom
     return Entry(relative, 'file', handle.read() if handle else b'', normal_mode(member.mode))
 
 
-def gh_entries(repo: str, commit: str, root: str, toml: str, spec: str) -> Iterator[Entry]:
+def gh_entries(repo: str, commit: str, root: str, spec: str) -> Iterator[Entry]:
     """The pack at commit of repo, rooted at root (a folder of the repository, '' for its top), read
-    from the archive as gh streams it: only the pack's files are held. Close it when done early."""
-    _require_gh()
-    try:
-        process = subprocess.Popen(['gh', 'api', f'repos/{repo}/tarball/{commit}'], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError as error:
-        raise PresetUnavailable(str(error)) from None
-    expired = threading.Event()
-
-    def expire() -> None:
-        expired.set()
-        process.kill()
-
-    timer = threading.Timer(GH_ARCHIVE_TIMEOUT, expire)
-    timer.daemon = True
-    timer.start()
-    with process:
+    from the archive gh downloads to a temporary file: only the pack's files are held."""
+    with tempfile.TemporaryFile() as spool:
+        gh_api([f'repos/{repo}/tarball/{commit}'], repo, GH_ARCHIVE_TIMEOUT, spool)
+        spool.seek(0)
         try:
-            unreadable = None
-            try:
-                with tarfile.open(fileobj=process.stdout, mode='r|*') as tar:
-                    for member in tar:
-                        if found := _archive_entry(tar, member, root, toml, spec):
-                            yield found
-            except (tarfile.TarError, EOFError, zlib.error) as error:
-                unreadable = error
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            if expired.is_set():
-                raise PresetUnavailable(f'gh api took over {GH_ARCHIVE_TIMEOUT}s to download {repo}')
-            if process.returncode:
-                raise _gh_failure(process.stderr.read() if process.stderr else b'', repo)
-            if unreadable is not None:
-                raise PresetUnavailable(f'gh api returned no readable archive of {repo} ({unreadable})')
-        finally:
-            timer.cancel()
-            if process.poll() is None:
-                process.kill()
+            with tarfile.open(fileobj=spool, mode='r:*') as tar:
+                for member in tar:
+                    if found := _archive_entry(tar, member, root, spec):
+                        yield found
+        except (tarfile.TarError, EOFError, zlib.error) as error:
+            raise PresetUnavailable(f'gh api returned no readable archive of {repo} ({error})') from None
 
 
-def folder_entries(folder: Path, toml: str) -> Iterator[Entry]:
-    """The pack in a local folder: its skills/, rules.md and toml, nothing else of it."""
+def folder_entries(folder: Path) -> Iterator[Entry]:
+    """The pack in a local folder: its skills/, rules.md and agent-kit-preset.toml, nothing else of it."""
     def entry(path: Path) -> Entry | None:
         relative = path.relative_to(folder).as_posix()
         if path.is_symlink():
@@ -184,7 +155,7 @@ def folder_entries(folder: Path, toml: str) -> Iterator[Entry]:
             return Entry(relative, 'file', path.read_bytes(), normal_mode(path.stat().st_mode))
         return None if path.is_dir() else Entry(relative, 'other', b'', 0)
 
-    for name in (PACK_RULES, toml, PACK_SKILLS):
+    for name in (PACK_RULES, PACK_TOML, PACK_SKILLS):
         if os.path.lexists(folder / name) and (found := entry(folder / name)):
             yield found
     skills = folder / PACK_SKILLS
@@ -318,17 +289,17 @@ def kept_records(root: Path, managed: dict[str, Any]) -> dict[str, dict[str, Any
 
 
 def installed_pack(root: Path, state: dict[str, Any],
-                   drift: Callable[[Iterable[dict[str, Any]]], Collection[str]]) -> Pack | None:
+                   drift: Callable[[Iterable[dict[str, Any]]], Collection[str]]) -> Pack | StalePack | None:
     """The pack an earlier install kept under <root>/pack: the files it recorded, read back (a file
-    added there since is not part of it). StalePack when drift (setup's check of managed records)
-    finds one of them changed: reinstalling an edited copy would spread the edit."""
+    added there since is not part of it). A StalePack (to raise) when drift (setup's check of managed
+    records) finds one of them changed: reinstalling an edited copy would spread the edit."""
     kept = kept_records(root, state.get('managed', {}))
     if not kept:
         return None
     record = state.get('configuration', {}).get('preset') or {}
     stale = sorted(drift(kept.values()))
     if stale:
-        raise StalePack(f'{len(stale)} file(s) of the team pack kept under {root / PACK_DIR} changed since setup '
+        return StalePack(f'{len(stale)} file(s) of the team pack kept under {root / PACK_DIR} changed since setup '
                         f'({", ".join(stale[:3])}): rerun agent-setup with --preset {record.get("source", "<its source>")} '
                         '--collision backup to restore it')
     folder = root / PACK_DIR
