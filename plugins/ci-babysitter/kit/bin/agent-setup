@@ -58,7 +58,8 @@ from kit_env import kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
                        server_runtime)
-from preset import PACK_DIR, PACK_RULES, Preset, apply_preset, pack_status, validate_catalog  # noqa: E402
+from pack import PACK_DIR, PACK_SKILLS, installed_pack  # noqa: E402
+from preset import Preset, apply_preset, kit_skills, source_status, validate_catalog  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
 MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
 # The answers a run saves and the next one starts from, with their defaults before detection. A
@@ -298,7 +299,7 @@ def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view:
 
 
 def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, overlays: dict[str, str],
-                 resume: int) -> list[Change]:
+                 resume: int, preset: Preset) -> list[Change]:
     root = Path(args.root_dir).expanduser().absolute()
     target = host_target(args, host, home)
     components = set(args.components)
@@ -408,7 +409,7 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                         text = toml_text(resolve_values(tomllib.loads(text), view, root, host_view, target)) if path.suffix == '.toml' else resolve_values(text, view, root, host_view, target)
                         changes.append(Change('file', target / relative, text.encode()))
     if 'skills' in components:
-        for name in selected_skills(args):
+        for name in selected_skills(args, preset):
             if not (view / 'skills' / name / 'SKILL.md').is_file():
                 raise ValueError(f'Unknown selected skill: {name}')
             if host not in skill_hosts(view / 'skills' / name / 'SKILL.md'):
@@ -448,11 +449,10 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
     return changes
 
 
-def selected_skills(args: argparse.Namespace) -> list[str]:
+def selected_skills(args: argparse.Namespace, preset: Preset) -> list[str]:
     """The skills this install selects: --skills (every kit skill when unset) and the team pack's."""
-    names = args.skills if args.skills is not None else [
-        path.name for path in sorted((Path(args.source).expanduser().resolve() / 'skills').iterdir()) if path.is_dir()]
-    return [*names, *(name for name in getattr(args, 'pack_skills', []) if name not in names)]
+    names = args.skills if args.skills is not None else kit_skills(Path(args.source).expanduser().resolve())
+    return [*names, *(name for name in preset.pack_skills if name not in names)]
 
 
 def copy_source_code(source: str | Path, destination: str | Path) -> str:
@@ -474,12 +474,10 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
             shutil.copytree(path, view / name, copy_function=copy_source_code, ignore=shutil.ignore_patterns('local', 'state', '.git', '__pycache__', '*.env', *SECRET_NAMES))
     for name in ('roles.toml', 'kit.env.example'):
         copy_source_code(source / name, view / name)
-    if preset.pack:
-        # Installed like the kit's own skills, its rules.md as rules/team.md (every host's rules end
-        # with it), and kept as fetched under pack/ for a later run without --preset.
-        team_rules = kit_api(view).TEAM_RULES
+    if preset.pack is not None:
         for relative, (data, mode) in preset.pack.files.items():
-            for path in (view / PACK_DIR / relative, team_rules if relative == PACK_RULES else view / relative):
+            skill = relative.startswith(PACK_SKILLS + '/')
+            for path in (view / PACK_DIR / relative, *([view / relative] if skill else [])):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
                 path.chmod(0o755 if mode & 0o111 else 0o644)
@@ -511,7 +509,8 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
     root = Path(args.root_dir).expanduser().absolute()
     home = Path.home()
     changes = []
-    selected = selected_skills(args)
+    selected = selected_skills(args, preset)
+    pack_skills = preset.pack.skills if preset.pack is not None else []
     for path in sorted(view.rglob('*')):
         if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
             continue
@@ -532,7 +531,8 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
                 continue
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.suffix == '.md':
-                content = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md').encode()
+                content = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
+                                       strict=relative.parts[1] not in pack_skills).encode()
             changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
     # The preset's layer is written when it has values or an earlier install wrote one.
     overlays = {'preset.env': preset.env_text(), 'setup-paths.env': overlay_text(args, from_preset)}
@@ -547,13 +547,13 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         changes.append(Change('file', root / 'state/rendered' / ('roles-' + host + '.sh'), api.roles_sh(roles, host).replace(str(view), str(root)).encode()))
     resume = setup_resume(root, overlays) if args.hosts else 0
     for host in args.hosts:
-        changes.extend(host_changes(args, view, host, home, overlays, resume))
+        changes.extend(host_changes(args, view, host, home, overlays, resume, preset))
     previous = load_json(root / '.install-state/current.json', {})
     for record in previous.get('managed', {}).values():
         target = Path(record['target'])
         if record['kind'] == 'file' and root in target.parents and ('__pycache__' in target.relative_to(root).parts or target.suffix in ('.pyc', '.pyo')):
             changes.append(Change('remove', target, record['hash']))
-    changes.extend(retirements(args, view, home, changes))
+    changes.extend(retirements(args, view, home, changes, preset))
     unique = {}
     for change in changes:
         identity = (change.kind, str(change.target))
@@ -563,7 +563,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
     return list(unique.values())
 
 
-def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change]) -> list[Change]:
+def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change], preset: Preset) -> list[Change]:
     """Removals for what an earlier install managed and this plan no longer produces: kit files gone
     from the source, a deselected skill's files, the selected hosts' agent files for renamed roles
     (when this plan renders that agents folder or selects roles), and skill links that are deselected or no longer
@@ -574,7 +574,7 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
     planned_dirs = {change.target.parent for change in changes}
     hosts = {host_target(args, host, home) for host in args.hosts}
     skills = 'skills' in args.components
-    selected = set(selected_skills(args))
+    selected = set(selected_skills(args, preset))
     removals = []
     for record in load_json(root / '.install-state/current.json', {}).get('managed', {}).values():
         target = Path(record['target'])
@@ -1057,10 +1057,9 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
     journal.mkdir(parents=True, exist_ok=False)
     previous = load_json(root / '.install-state/current.json', {})
     records = []
-    # The preset this run installs (a pack's commit and digest); previous holds the one rollback restores.
     def write_journal() -> None:
-        atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'preset': preset.record, 'records': records,
-                                                      'previous': previous}, indent=2) + '\n').encode())
+        atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous},
+                                                     indent=2) + '\n').encode())
     write_journal()
     atomic(root / '.install-state/pending.json', (json.dumps({'id': identifier, 'previous_id': previous.get('id')}) + '\n').encode())
     try:
@@ -1161,11 +1160,10 @@ def rollback(args: argparse.Namespace) -> int:
     return 0
 
 
-def doctor(args: argparse.Namespace) -> int:
-    root = Path(args.root_dir).expanduser().absolute()
-    state = load_json(root / '.install-state/current.json', {})
+def managed_drift(state: dict[str, Any]) -> list[str]:
+    """Every installed path whose managed content changed since the install that recorded it."""
     drift = []
-    for identity, record in state.get('managed', {}).items():
+    for record in state.get('managed', {}).values():
         target = Path(record['target'])
         if record['kind'] in ('file', 'link', 'remove'):
             actual = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
@@ -1186,6 +1184,13 @@ def doctor(args: argparse.Namespace) -> int:
                 if mismatch:
                     drift.append(str(target))
                     break
+    return drift
+
+
+def doctor(args: argparse.Namespace) -> int:
+    root = Path(args.root_dir).expanduser().absolute()
+    state = load_json(root / '.install-state/current.json', {})
+    drift = managed_drift(state)
     deps = dependencies(args, mcp_servers(args, state.get('configuration', {}).get('preset_values', {}).get('servers', {})))
     problems = []
     if not state:
@@ -1197,12 +1202,8 @@ def doctor(args: argparse.Namespace) -> int:
                         '--collision skip to keep your edits, or --collision backup to replace them (the install '
                         'journal keeps your version)')
     preset = state.get('configuration', {}).get('preset')
-    if preset and not preset['source'].startswith('gh:') and Path(preset['source']).expanduser().is_file():
-        preset['current'] = 'unchanged' if digest(Path(preset['source']).expanduser().read_bytes()) == preset['sha256'] else 'changed since setup: rerun with --preset to apply it'
-    if preset and 'pack' in preset:
-        preset['pack_status'] = pack_status(root, preset)
-        if not preset['pack_status']['installed'].startswith('unchanged'):
-            problems.append(f'team pack under {root / PACK_DIR}: {preset["pack_status"]["installed"]}')
+    if preset:
+        preset['source_status'] = source_status(preset)
     logins = {}
     for host in args.hosts:
         logged, how = host_login(host, getattr(args, host + '_bin'), host_target(args, host, Path.home()))
@@ -1303,7 +1304,8 @@ def main() -> int:
         if entered:
             args.root_dir = entered
     root = Path(args.root_dir).expanduser()
-    saved = load_json(root / '.install-state/current.json', {}).get('configuration', {})
+    state = load_json(root / '.install-state/current.json', {})
+    saved = state.get('configuration', {})
     if args.interactive and setup_run:
         # The answers of an interactive run that stopped before apply: a rerun starts from them.
         saved = {**saved, **load_json(root / '.install-state/answers.json', {})}
@@ -1317,8 +1319,8 @@ def main() -> int:
         else:
             args.source = str(SOURCE)
     given = {key for key in DEFAULTS if getattr(args, key) is not None}
-    preset = apply_preset(args.preset, saved, Path(args.source), args.interactive, root.absolute()) if setup_run else Preset()
-    args.pack_skills = preset.pack_skills
+    preset = apply_preset(args.preset, saved, Path(args.source), args.interactive,
+                          lambda: installed_pack(root.absolute(), state, managed_drift)) if setup_run else Preset()
     guided = setup_run and (args.interactive or args.yes or bool(args.preset))
     detected_hosts = detect_hosts()
     # --host-root names one host's root; with no --hosts that host is claude.

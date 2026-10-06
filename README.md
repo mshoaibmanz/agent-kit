@@ -50,7 +50,7 @@ A preset is a TOML file of non-secret team defaults: `[kit]` overlay keys (`CODE
 
 ### Team packs
 
-A team pack is a preset repository that also carries content. Each part is optional:
+A team pack is a preset repository that also carries skills and a rules block. Each part is optional, and the pack is these three paths in the preset's folder (the repository root, or `team/` for `gh:<org>/<repo>/team/preset.toml`); setup reads nothing else of the repository:
 
 ```text
 agent-kit-preset.toml      the preset above
@@ -58,14 +58,20 @@ skills/<name>/SKILL.md     team skills, with references/ or scripts beside them
 rules.md                   a short team rules block, at most 300 words
 ```
 
-`--preset gh:owner/repo` resolves the head commit of the default branch, downloads that commit's tree with your own `gh` login and records the commit in the install journal. A local folder works the same way for testing a pack before you push it; its git `HEAD`, when it has one, is recorded with a content digest.
+Install or update a teammate's kit with one command:
 
-- **Skills** install for each selected host exactly like the kit's own skills, and a skill's `hosts:` frontmatter limits it the same way. They install whenever the `skills` component is selected, alongside whichever kit skills you select; the preset's `[skills] exclude` can leave one out. A pack skill named like a kit skill refuses the run with one line: kit skills win, so rename the pack's.
-- **Rules**: `rules.md` is installed as `rules/team.md` and appended to every host's rendered rules (the Claude host rules file, Codex `AGENTS.md`, the Cursor rule), after the kit's rules. A block over 300 words is refused: put the detail in a pack skill and keep the rule as a pointer to it.
+```sh
+python3 bin/agent-setup --preset gh:<org>/<repo> --apply
+```
+
+Setup resolves the head commit of the default branch, downloads it with your own `gh` login, and shows what the pack installs (or, on an update, the old and new commit and which skills were added, changed or removed and whether the rules changed) before it writes anything; without `--apply` it only previews. To try a pack before you push it, point at its folder: `python3 bin/agent-setup --preset ./my-pack`. A folder's git commit is recorded when it has no uncommitted changes. A repository holding only the preset installs no pack.
+
+- **Skills** install for each selected host exactly like the kit's own skills, and a skill's `hosts:` frontmatter limits it the same way. They install whenever the `skills` component is selected, alongside whichever kit skills you select; the preset's `[skills] exclude` can leave one out. A pack skill named like a kit skill refuses the run; rename the pack's skill. A `{{...}}` in pack text that is not a kit placeholder (a CI or template example) is installed as written.
+- **Rules**: `rules.md` is appended to every host's rendered rules (the Claude host rules file, Codex `AGENTS.md`, the Cursor rule), after the kit's rules. A block over 300 words is refused: put the detail in a pack skill and keep the rule as a pointer to it.
 - **Precedence**: kit files come from your checkout and are never replaced by a pack; the preset's values sit under your own (`local/kit.env`, flags, earlier answers), as above.
-- **Refused packs**: setup scans every file of the pack before any write and refuses one that holds a credential file (`.env*` other than `.env.example`, `*.pem`, `*.key`, `id_rsa` and the like), a token format the preset check knows, a private key, a symlink that leaves the pack or names a folder, or anything that is not a file or a link.
-
-**Updating.** Rerun with the same `--preset`: the preview names the old and new commit and which skills were added, changed or removed, and whether the rules changed, before `--apply`. A run without `--preset` reinstalls the pack setup keeps under `<kit root>/pack`, so an offline update never drops it; a kept copy edited since setup refuses that run instead (rerun with `--preset` and `--collision backup` to restore it), and so does a kept pack skill that a newer kit now ships under the same name. `agent-setup rollback <journal>` restores the previous commit's skills, rules and record. `agent-setup doctor` (in `preset.pack_status`) and `agent-kit doctor` report the installed commit, whether the kept copy still matches it, and whether the pack has a newer commit or changed content since setup.
+- **Refused packs**: setup scans the pack's files before any write and refuses one that holds a credential file (`.env*` other than `.env.example`, `.envrc`, `*.tfvars`, `.pgpass`, `secrets.yml`, `id_rsa` and the like), a token format the preset check knows (one written as a run of `X` is a placeholder), a private key, a symlink that leaves the pack or names a folder, two paths that differ only in case, or anything that is not a file or a link.
+- **Offline**: a run without `--preset`, or one whose `gh` fetch fails, reinstalls the copy setup keeps under `<kit root>/pack`, so it never drops the pack. If a file of that copy was edited since setup, the run refuses instead: rerun with `--preset` and `--collision backup` to restore it.
+- **Rollback and doctor**: `agent-setup rollback <journal>` restores the previous commit's skills and rules. `agent-setup doctor` and `agent-kit doctor` report the installed commit and whether the pack's source has moved on since; `agent-setup doctor` also lists an edited kept file with every other changed path.
 
 ### Opinionated defaults
 
