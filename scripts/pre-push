@@ -1,6 +1,6 @@
 #!/bin/bash
-# The hook moved to .githooks/pre-push. This stays for clones that installed the old way
-# (`ln -sf ../../scripts/pre-push .git/hooks/pre-push`): without it that link dangles and git skips it.
+# The install the README recommends (`ln -sf ../../scripts/pre-push .git/hooks/pre-push`) runs this shim;
+# the hook itself is .githooks/pre-push. Without the shim that link dangles and git skips it.
 # git runs the link from every worktree of the clone, so the hook run is the pushing worktree's own.
 # The old install's list settings still apply: LEAK_TERMS_FILE here, ~/.config/claude-kit/leak-terms.txt
 # in scripts/leak-check.sh.

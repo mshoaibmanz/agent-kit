@@ -178,8 +178,8 @@ bash scripts/scan.sh
 
 The repo is public. A pre-push hook runs the history steps of the CI leak scan (`scripts/scan.sh`, which needs `gitleaks`) over what each push adds: its commits (messages, authors, added lines) and annotated tags. The tree is CI's; `bash scripts/scan.sh` with no arguments checks the whole repo.
 
-- Enable it once per clone: `git config core.hooksPath .githooks`.
-- A clone that followed the old install (`.git/hooks/pre-push` linking to `scripts/pre-push`) still works through a shim, which keeps the old `LEAK_TERMS_FILE` setting. Switch anyway: run the line above, then `rm .git/hooks/pre-push`.
+- Enable it once per clone, from the main checkout: `ln -sf ../../scripts/pre-push .git/hooks/pre-push`. git runs that link from every worktree, and the shim behind it runs the pushing worktree's own hook, so worktrees and branches from before `.githooks/` existed stay covered. A clone that already has the link needs nothing more; it keeps the old `LEAK_TERMS_FILE` setting.
+- `git config core.hooksPath .githooks` suits only a fresh clone with no older branches or worktrees: the relative path resolves in each worktree, and git silently skips the hook in one that has no `.githooks/pre-push`.
 - The denylist is a file outside the repo, never committed. Point `AGENT_KIT_LEAK_TERMS` at it, or keep it at `<kit root>/local/leak-terms.txt`. The kit root is `$AGENT_KIT_DIR`, default `~/.local/share/agent-kit`; the old default, `~/.config/claude-kit/leak-terms.txt`, is read last. Sources and format: `scripts/leak-check.sh`. With no list the hook refuses the push; `AGENT_KIT_LEAK_TERMS=none git push` pushes without the denylist check, which CI still runs with its `LEAK_TERMS` secret.
 - Reading a hit: `term #N` is line N of your list (`sed -n Np <list>`); `commit <sha>` and `tag <sha>` are objects to `git show`; `file #K` and `file name #K` are line K of `git ls-files --cached --others --exclude-standard`. The text itself is never printed.
 - After a hit, fix the unpushed commits (amend, or rebase to reword), then push again. `git push --no-verify` only moves the failure to CI, after the commits are public.

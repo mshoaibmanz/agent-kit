@@ -204,6 +204,38 @@ class LeakCheckTests(unittest.TestCase):
                 result = self.leak_check("--", "--no-walk", sha)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_an_anchored_ere_sees_an_added_line_as_written(self) -> None:
+        self.terms.write_text("^vandelay$\n")
+        added = self.commit("add a line", {"a.txt": "vandelay\n"})
+        inside = self.commit("add a longer line", {"b.txt": "xvandelay\n"})
+        self.git("checkout", "-q", "-b", "side")
+        self.commit("side", {"side.txt": "neutral\n"})
+        self.git("checkout", "-q", "main")
+        self.commit("main", {"main.txt": "neutral\n"})
+        self.git("merge", "-q", "--no-ff", "--no-commit", "side")
+        # The line is only in the merge commit: its combined diff shows it as `++vandelay`.
+        merge = self.commit("merge side", {"evil.txt": "vandelay\n"})
+        for sha, expected in ((added, 1), (inside, 0), (merge, 1)):
+            with self.subTest(sha):
+                result = self.leak_check("--", "--no-walk", sha)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def test_deleting_or_renaming_a_file_named_with_a_term_passes(self) -> None:
+        self.commit("add notes", {"hooli-notes.md": "plain\n", "old-globex-corp.md": "plain two\n"})
+        deleted = self.commit("drop the notes", {"hooli-notes.md": None})
+        self.git("mv", "old-globex-corp.md", "renamed.md")
+        self.git("commit", "-qm", "rename it")
+        renamed = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("mv", "renamed.md", "initech-again.md")
+        self.git("commit", "-qm", "rename it back")
+        renamed_to = self.git("rev-parse", "HEAD").stdout.strip()
+        # An empty new file has no +++ line: its name is only in the diff --git line.
+        empty = self.commit("an empty file", {"hooli-empty.txt": ""})
+        for sha, expected in ((deleted, 0), (renamed, 0), (renamed_to, 1), (empty, 1)):
+            with self.subTest(sha):
+                result = self.leak_check("--", "--no-walk", sha)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
     def test_annotated_tags_are_checked(self) -> None:
         head = self.git("rev-parse", "HEAD").stdout.strip()
         self.git("tag", "-a", "v1", "-m", "release for hooli")
@@ -386,6 +418,41 @@ class LeakCheckTests(unittest.TestCase):
         refused = self.git("push", "-q", "origin", "main", check=False)
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertIn(f"term #2 in commit {sha[:12]}", refused.stdout + refused.stderr)
+
+    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
+    def test_pre_push_trusts_a_tracking_ref_only_while_the_destination_advertises_it(self) -> None:
+        self.bare_remote("origin")
+        self.git("config", "core.hooksPath", ".githooks")
+        sha = self.commit("wire the hooli client", {"a.txt": "neutral\n"})
+        self.git("push", "-q", "--no-verify", "origin", "main")
+        # origin/main came from the private URL; after set-url it says nothing about the public one.
+        public = self.root / "public.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(public)], env=self.env, check=True)
+        self.git("remote", "set-url", "origin", str(public))
+        refused = self.git("push", "-q", "origin", "main", check=False)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn(f"term #2 in commit {sha[:12]}", refused.stdout + refused.stderr)
+        self.assertEqual(self.git("ls-remote", str(public)).stdout, "")
+        # An ls-remote that fails trusts no tracking ref.
+        missing = str(self.root / "missing.git")
+        self.git("remote", "set-url", "origin", missing)
+        direct = subprocess.run(
+            [BASH, str(self.repo / ".githooks/pre-push"), "origin", missing],
+            input=f"refs/heads/main {sha} refs/heads/main {'0' * 40}\n",
+            cwd=self.repo,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(direct.returncode, 1, direct.stdout + direct.stderr)
+        self.assertIn(f"term #2 in commit {sha[:12]}", direct.stdout + direct.stderr)
+        # Once the destination has the commit, the fetched ref counts again.
+        self.git("remote", "set-url", "origin", str(public))
+        self.git("push", "-q", "--no-verify", "origin", "main")
+        self.git("fetch", "-q", "origin")
+        passed = self.git("push", "-q", "origin", "main:feature", check=False)
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
 
     @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
     def test_pre_push_checks_commits_another_remote_already_has(self) -> None:

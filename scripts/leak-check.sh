@@ -9,7 +9,8 @@
 #                   not add (CI: the PR's base or the previous main), so a change cannot exempt its own
 #                   commits. Empty or unknown REV: no exceptions.
 #     -- ARGS       a `git rev-list` range. Each commit's message, author, committer and added diff lines
-#                   (binary content as text; removed lines, context and hunk headers are not) are
+#                   (binary content as text, without the + prefix; removed lines, the old name of a
+#                   deleted or renamed file, context and hunk headers are not) are
 #                   checked, plus the annotated tags ARGS names (every tag for --all or --tags) and any
 #                   tag those tags point to.
 #
@@ -109,11 +110,21 @@ if [ "$history" = 1 ]; then
     fi
     ncommits=$((ncommits + 1))
     g log -1 --format='%an <%ae>%n%cn <%ce>%n%B' "$c" > "$TMP/h/$c.commit" \
-      && g show -U0 --format= --text --no-color --no-ext-diff "$c" > "$TMP/diff" \
+      && g show -U0 --cc --format= --text --no-color --no-ext-diff "$c" > "$TMP/diff" \
+      && parents=$(g show -s --format=%P "$c") \
       || die "cannot read commit $c"
     # Only what the commit adds: a removed line (and the --- header) takes away text an ancestor added,
-    # which is checked or already public; a hunk header repeats a nearby unchanged line.
-    grep -avE '^(-|@@)' "$TMP/diff" >> "$TMP/h/$c.commit"
+    # which is checked or already public; a hunk header repeats a nearby unchanged line. So do the old
+    # names in `diff --git` and `rename from`/`copy from`, or deleting or renaming a file could never
+    # pass; the new name is in `+++ b/` and `rename to`, and an empty new file, which has no +++ line,
+    # keeps its `diff` line. An added line loses its prefix, one column per parent (`+`, or `++`, `+ `
+    # and ` +` in a merge's combined diff), so an anchored ERE sees the line as written. sed, not awk:
+    # macOS awk drops everything after a NUL byte.
+    np=0
+    for p in $parents; do np=$((np + 1)); done
+    if [ "$np" -le 1 ]; then strip='s/^\+//'; else strip="s/^[+ ]{$np}//"; fi
+    LC_ALL=C sed -E -e '/^diff /{h;d;}' -e '/^new file mode /{x;p;x;}' \
+      -e '/^(-|@@|(rename|copy) from )/d' -e "$strip" "$TMP/diff" >> "$TMP/h/$c.commit"
   done < "$TMP/revs"
   # The tag objects ARGS names (rev-parse expands --all and --tags), then any tag they point to: a tag
   # of a tag publishes both messages even when the inner one has no ref.
