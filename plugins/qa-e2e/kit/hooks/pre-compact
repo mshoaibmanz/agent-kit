@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "li
 try:
     import agent_task as at
 except ImportError as e:
-    print(json.dumps({"systemMessage": f"pre-compact is off: hooks/lib/agent_task.py failed to import ({e}). Restore it: git -C ~/.agents checkout -- hooks/lib"}))
+    print(json.dumps({"systemMessage": f"pre-compact is off: hooks/lib/agent_task.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
     sys.exit(0)
 
 PROMPTS = 5

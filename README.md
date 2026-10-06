@@ -41,6 +41,8 @@ The default source root is `~/.local/share/agent-kit`, outside shared skill disc
 | `commands` | Optional Claude workflow commands under the selected host directory | `gh` and provider login when invoked; Jira actions need an authorized connector |
 | `data-wrappers` | Read-only `ro-mysql` and `bqro` commands | macOS/Homebrew `mysql-client` and SSH/Keychain for `ro-mysql`; `bq` and native Google auth for `bqro`; no connections during setup |
 
+For Codex, `mcp` also names the work root in `[sandbox_workspace_write]` writable roots and creates it; an existing table of your own is kept and setup prints the roots to add. `--codex-gcloud on` (or the guided prompt) adds gcloud's config directory, which holds credentials, so `bq` works inside the sandbox; it is off by default, and setup's choice overrides `CODEX_SANDBOX_GCLOUD` in `local/kit.env`.
+
 Rules and skills are the default. Hooks start with advisory events. To enable blocking safety and review gates, explicitly choose `--components hooks --blocking-hooks`. That selection also installs the Git dispatcher environment into the model's shell. Setup never adjusts the host's permission policy.
 
 Codex command hooks require a local runtime exposing `hooks` in `codex features list`. Cloud command hooks are refused. Review the installed hook commands through `/hooks` and trust their current hash yourself. Cursor hook support must be checked in the installed app and confirmed with `--confirm-hook-support cursor`.
@@ -55,18 +57,18 @@ python3 bin/agent-setup \
   --root-dir "$HOME/Agent tools" \
   --host-root "$HOME/Codex configuration" \
   --codex-bin /path/to/codex \
-  --role-model review-cross=openai:your-model \
-  --role-effort review-cross=high
+  --role-model cross-reviewer=openai:your-model \
+  --role-effort cross-reviewer=high
 ```
 
-Use `--claude-bin`, `--codex-bin` and `--cursor-bin` for alternate CLI paths. `--host-root` requires one host. Model values use `anthropic:model` or `openai:model`; the renderer validates the provider's effort scale. Omitted model, path and provider choices are inherited on later component upgrades. Installed `KIT/bin/agent-setup --root-dir KIT` previews from its recorded original source checkout. A directly invoked newer checkout uses itself; explicit `--source` wins. If the origin moved or an older install lacks provenance, supply `--source /path/to/checkout`. Doctor and rollback use installed state and work without the origin. Use `--skills all` to return to every bundled skill after saving a subset; `--skills` with no values selects none. Interactive setup accepts `all` and `none` too. Edited deselected skills stay in place and block retirement by default. After reviewing the preview, `--collision backup --apply` saves those edits in the journal before retiring the skill; rolling that journal back restores them. Unchanged Cursor rules from earlier setup versions upgrade from managed text blocks to full-file ownership, with rollback preserving the original format.
+Use `--claude-bin`, `--codex-bin` and `--cursor-bin` for alternate CLI paths. `--host-root` requires one host. Model values use `anthropic:model` or `openai:model`; the renderer validates the provider's effort scale. Omitted model, path and provider choices are inherited on later component upgrades. An update that selects some components or hosts leaves what the others installed in place. Installed `KIT/bin/agent-setup --root-dir KIT` previews from its recorded original source checkout. A directly invoked newer checkout uses itself; explicit `--source` wins. If the origin moved or an older install lacks provenance, supply `--source /path/to/checkout`. Doctor and rollback use installed state and work without the origin. Use `--skills all` to return to every bundled skill after saving a subset; `--skills` with no values selects none. Interactive setup accepts `all` and `none` too. Edited deselected skills stay in place and block retirement by default. After reviewing the preview, `--collision backup --apply` saves those edits in the journal before retiring the skill; rolling that journal back restores them. Unchanged Cursor rules from earlier setup versions upgrade from managed text blocks to full-file ownership, with rollback preserving the original format.
 
 When selecting `data-wrappers`, setup prints a shell-quoted `shell_activation` command that adds the chosen root’s `bin` directory to `PATH`. Run that command once in the terminal, or invoke the printed executable paths directly. Restart an app that captured an older `PATH`. Setup leaves shell startup files to you. `ro-mysql` currently uses macOS Keychain and a Homebrew `mysql-client` installation at `/opt/homebrew/opt/mysql-client/bin/mysql` or `/usr/local/opt/mysql-client/bin/mysql`; configure SSH transport and credential access locally before running a query. A missing-or-denied credential diagnostic calls for retrying from a trusted terminal or approved wrapper before considering rotation.
 
 Host selection chooses configuration outputs. Each role independently chooses its provider, model and effort; preview shows that routing, provider CLI availability and fallback. Login status is not checked. The default review roles include both Anthropic and OpenAI providers. For a Claude-only review setup, override the OpenAI review role:
 
 ```sh
-python3 bin/agent-setup --hosts claude --components roles --role-model review-cross=anthropic:inherit
+python3 bin/agent-setup --hosts claude --components roles --role-model cross-reviewer=anthropic:inherit
 ```
 
 For a Codex-only review setup, choose an OpenAI model for all Anthropic roles:
@@ -74,15 +76,15 @@ For a Codex-only review setup, choose an OpenAI model for all Anthropic roles:
 ```sh
 python3 bin/agent-setup --hosts codex --components roles \
   --role-model main=openai:your-model \
-  --role-model worker=openai:your-model \
-  --role-model scout=openai:your-model \
-  --role-model reviewer=openai:your-model \
-  --role-model adversary=openai:your-model \
-  --role-model thermo-bugs=openai:your-model \
-  --role-model thermo-quality=openai:your-model
+  --role-model engineer=openai:your-model \
+  --role-model researcher=openai:your-model \
+  --role-model task-reviewer=openai:your-model \
+  --role-model second-opinion=openai:your-model \
+  --role-model bug-reviewer=openai:your-model \
+  --role-model quality-reviewer=openai:your-model
 ```
 
-Keep review prefixes and rounds; existing high effort is valid for both providers. Codex named role activation remains unverified. Roles without a review prefix, such as worker/scout/adversary, are unavailable through `agent-run` when native invocation is disabled; preview labels those routes. Setup does not enable native role support automatically. Role overrides route review CLIs and supported native agents. The active main-session model for Codex and Cursor stays in that provider's own settings; the `main` catalog entry describes inherited review routing.
+Keep review prefixes and rounds; existing high effort is valid for both providers. Codex named role activation remains unverified. Roles without a review prefix, such as engineer/researcher/second-opinion, are unavailable through `agent-run` when native invocation is disabled; preview labels those routes. Setup does not enable native role support automatically. Role overrides route review CLIs and supported native agents. The active main-session model for Codex and Cursor stays in that provider's own settings; the `main` catalog entry describes inherited review routing.
 
 Keep user workflow values in `local/kit.env`; generated path choices live in `local/setup-paths.env`. The shared parser loads the user layer first, then the generated path layer. Setup never reads or copies the user's values into its journal. `kit.env.example` describes optional, non-secret settings. There is no default commit author override; Git's existing identity is used.
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tests for hooks/read-streak: one scout nudge per streak of 8 read-only tool calls in the main session.
+# Tests for hooks/read-streak: one researcher nudge per streak of 8 read-only tool calls in the main session.
 #
 #   bash ~/.claude/hooks/tests/read-streak.test.sh
 #   HOOKS_DIR=<dir> bash ~/.claude/hooks/tests/read-streak.test.sh   # another copy of the hooks
@@ -27,7 +27,7 @@ fires "$out" && bad "7 reads are silent" "$out" || ok "7 reads are silent"
 out=$(rs "$(tool a Grep)")
 one=$(printf '%s' "$out" | tr -d '\n')
 check "the 8th read injects additionalContext on PostToolUse" "$one" '"hookEventName": "PostToolUse".*"additionalContext": "8 read-only calls'
-check "the nudge names scout and the 300-word contract" "$one" 'scout.*at most 300 words'
+check "the nudge names researcher and the 300-word contract" "$one" 'researcher.*at most 300 words'
 check "the nudge exits 0" "$out" '<rc 0>$'
 out=$(rs "$(tool a Glob)")
 fires "$out" && bad "the 9th read is silent" "$out" || ok "the 9th read is silent (once per streak)"
@@ -55,7 +55,7 @@ out=$(rs "$(tool c Read)")
 fires "$out" && bad "a prompt resets the streak" "$out" || ok "a prompt resets the streak"
 
 echo "--- read-streak: main session only ---"
-sub=$(jq -cn '{agent_id:"agent-1",agent_type:"scout"}')
+sub=$(jq -cn '{agent_id:"agent-1",agent_type:"researcher"}')
 for ((i = 0; i < 12; i++)); do out=$(rs "$(tool d Read "$sub")"); fires "$out" && break; done
 fires "$out" && bad "a subagent's reads never nudge" "$out" || ok "a subagent's reads never nudge"
 ls "$CLAUDE_STATE_DIR/read-streak/" 2>/dev/null | grep -qE '^d(\.|$)' && bad "a subagent leaves no streak state" || ok "a subagent leaves no streak state"

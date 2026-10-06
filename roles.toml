@@ -9,7 +9,7 @@
 #   - [review] -> state/rendered/roles-claude.sh, the rounds lib/review-state asks for at push.
 #   The Codex host (phase 20) renders openai roles to ~/.codex/agents/<role>.toml from the same
 #   bodies; [hosts.codex] is its seam. agent-run runs REVIEW roles only (a role with a prefix): on a
-#   host whose provider is not a non-review role's (worker on Codex), that role has no runner yet.
+#   host whose provider is not a non-review role's (engineer on Codex), that role has no runner yet.
 #
 # model = "<provider>:<model>". "anthropic:inherit" is the parent session's model (no `model:` line).
 # effort uses the provider's own scale, which render validates:
@@ -19,8 +19,8 @@
 # fallback: the role that takes a run role's place when its provider CLI is missing or fails.
 # timeout: seconds agent-run gives a run role (default 900).
 #
-# Turning Codex off: set review-cross's model to an anthropic one (round 1 is then two Agent spawns),
-# or replace it in the [review] lists with thermo-bugs: round1 and later must each name a
+# Turning Codex off: set cross-reviewer's model to an anthropic one (round 1 is then two Agent spawns),
+# or replace it in the [review] lists with bug-reviewer: round1 and later must each name a
 # correctness reviewer (a role not in once), which render checks.
 #
 # Every role but main needs agents/<role>.md, its prompt on every host; render checks that too.
@@ -29,45 +29,49 @@
 model = "anthropic:opus[1m]"
 effort = "high"
 
-[roles.worker]
-model = "anthropic:opus"
+[roles.engineer]
+model = "anthropic:claude-opus-5-5"
 effort = "high"
 
-[roles.scout]
+[roles.researcher]
 model = "anthropic:sonnet"
 effort = "medium"
 
-[roles.adversary]
+[roles.web-browser]
+model = "anthropic:sonnet"
+effort = "medium"
+
+[roles.second-opinion]
 model = "anthropic:fable"
 effort = "high"
 
-[roles.reviewer]
+[roles.task-reviewer]
 model = "anthropic:opus"
 effort = "high"
 prefix = "R"
 
-[roles.thermo-bugs]
+[roles.bug-reviewer]
 model = "anthropic:inherit"
 effort = "high"
 prefix = "B"
 
-[roles.thermo-quality]
+[roles.quality-reviewer]
 model = "anthropic:opus"
 effort = "high"
 prefix = "Q"
 
-[roles.review-cross]
+[roles.cross-reviewer]
 model = "openai:gpt-6.1-sol"
 effort = "high"
 prefix = "CX"
-fallback = "thermo-bugs"
+fallback = "bug-reviewer"
 timeout = 900
 
 [review]
-round1 = ["thermo-bugs", "review-cross"]
-later = ["review-cross"]
-once = ["thermo-quality"]
-sensitive_adds = ["thermo-bugs"]
+round1 = ["bug-reviewer", "cross-reviewer"]
+later = ["cross-reviewer"]
+once = ["quality-reviewer"]
+sensitive_adds = ["bug-reviewer"]
 
 [hosts.claude]
 provider = "anthropic"

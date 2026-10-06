@@ -51,7 +51,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - the old signature fails here; that is the finding
         got, lines = {"error": repr(exc)}, 0
     check("RC-CX-5: the same outcome in two rounds counts twice (2 FIXED, 1 NOT_REPRODUCED)",
-          got.get("review-cross") == {"FIXED": 2, "NOT_REPRODUCED": 1} and lines == 3, got)
+          got.get("cross-reviewer") == {"FIXED": 2, "NOT_REPRODUCED": 1} and lines == 3, got)
 
     # A worker's TALLY restated by the main session in the same round counts once.
     same_round = [("t1", "round", ""), ("t2", "tally", "B-1=FIXED Q-1=OPTION"),
@@ -61,7 +61,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         got, lines = {"error": repr(exc)}, 0
     check("a line restated within one round counts once",
-          got == {"thermo-bugs": {"FIXED": 1}, "thermo-quality": {"OPTION": 1}} and lines == 1, got)
+          got == {"bug-reviewer": {"FIXED": 1}, "quality-reviewer": {"OPTION": 1}} and lines == 1, got)
 
     # Events arrive per transcript (main session, then worker files): order is by timestamp.
     shuffled = [("t4", "tally", "CX-2=SKIPPED"), ("t1", "round", ""), ("t3", "round", ""),
@@ -70,7 +70,7 @@ def main() -> int:
         got, lines = outcomes(rp, shuffled)
     except Exception as exc:  # noqa: BLE001
         got, lines = {"error": repr(exc)}, 0
-    check("events are ordered by time before rounds split them", got.get("review-cross") == {"SKIPPED": 2}, got)
+    check("events are ordered by time before rounds split them", got.get("cross-reviewer") == {"SKIPPED": 2}, got)
 
     # CX-4 / B-6: only a real runner invocation opens a round. Reading the script, grepping it or a
     # dry run between a fixer's TALLY and its restatement used to count the outcome twice.
@@ -95,22 +95,24 @@ def main() -> int:
         return {"type": "assistant", "timestamp": ts, "message": {"content": [{"type": "text", "text": text}]}}
 
     got, lines = collect([
-        bash("t1", '/Users/u/.agents/bin/agent-run review-cross /r --objective "x"'), say("t2", "TALLY CX-1=FIXED"),
+        bash("t1", '/Users/u/.agents/bin/agent-run cross-reviewer /r --objective "x"'), say("t2", "TALLY CX-1=FIXED"),
         bash("t3", "cat ~/.agents/bin/agent-run"), bash("t4", "grep -n fail /Users/u/.agents/bin/agent-run"),
-        bash("t5", "~/.agents/bin/agent-run review-cross /r --dry-run"), bash("t6", "~/.agents/bin/codex-review-old /r"),
+        bash("t5", "~/.agents/bin/agent-run cross-reviewer /r --dry-run"), bash("t6", "~/.agents/bin/codex-review-old /r"),
         say("t7", "TALLY CX-1=FIXED"),
     ])
     check("CX-4: inspecting or dry-running the runner opens no round: a restated TALLY counts once",
-          got == {"review-cross": {"FIXED": 1}} and lines == 1, got)
+          got == {"cross-reviewer": {"FIXED": 1}} and lines == 1, got)
     got, lines = collect([
-        bash("t1", "$HOME/.agents/bin/agent-run review-cross /r"), say("t2", "TALLY CX-1=FIXED"),
-        bash("t3", "cd /r && CODEX_BIN=x ~/.agents/bin/agent-run review-cross . --since abc"), say("t4", "TALLY CX-1=FIXED"),
+        bash("t1", "$HOME/.agents/bin/agent-run cross-reviewer /r"), say("t2", "TALLY CX-1=FIXED"),
+        bash("t3", "cd /r && CODEX_BIN=x ~/.agents/bin/agent-run cross-reviewer . --since abc"), say("t4", "TALLY CX-1=FIXED"),
     ])
-    check("...a real run after `cd ... &&` with an env prefix opens the next round", got == {"review-cross": {"FIXED": 2}}, got)
+    check("...a real run after `cd ... &&` with an env prefix opens the next round", got == {"cross-reviewer": {"FIXED": 2}}, got)
     got, lines = outcomes(rp, [("", "tally", "B-1=FIXED"), ("t1", "round", ""), ("t2", "tally", "B-1=FIXED")])
-    check("B-6: an event with no timestamp is skipped, not counted before every round", got == {"thermo-bugs": {"FIXED": 1}}, got)
+    check("B-6: an event with no timestamp is skipped, not counted before every round", got == {"bug-reviewer": {"FIXED": 1}}, got)
 
-    check("CX- is attributed to the review-cross role", rp.TALLY_PREFIX.get("CX") == "review-cross", rp.TALLY_PREFIX)
+    check("Q-6: a fix agent's TALLY counts under its old name too (worker before 2026-10-05)",
+          {"engineer", "worker"} <= rp.FIXER_AGENTS, rp.FIXER_AGENTS)
+    check("CX- is attributed to the cross-reviewer role", rp.TALLY_PREFIX.get("CX") == "cross-reviewer", rp.TALLY_PREFIX)
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "roles.toml"
         p.write_text('[roles.main]\nmodel = "anthropic:opus"\neffort = "high"\n'

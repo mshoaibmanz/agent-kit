@@ -12,6 +12,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'bin/lib'))
+from hosts import install_text  # noqa: E402
 MATRIX = json.loads((ROOT / '.claude-plugin/components.json').read_text())
 HOOKS = {name: set(hooks) for name, hooks in MATRIX['hook_plugins'].items()}
 SKILLS = MATRIX['skill_plugins']
@@ -100,13 +102,13 @@ def build(destination: Path) -> None:
             shutil.copytree(ROOT / 'skills' / skill, plugin / 'skills' / skill, copy_function=copy_source_code,
                 ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
             doc = plugin / 'skills' / skill / 'SKILL.md'
-            body = doc.read_text().replace('```sh\n', '```sh\nexport AGENT_KIT_DIR="${CLAUDE_PLUGIN_ROOT}/kit"\n')
+            body = install_text(doc.read_text(), '${CLAUDE_PLUGIN_ROOT}/kit')
             doc.write_text(body)
         if name == 'auto-review':
             for filename, text in api.expected_agents(api.load_roles(), 'claude').items():
                 path = plugin / 'agents' / filename
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(text.replace('{{AGENT_KIT_DIR}}', '${CLAUDE_PLUGIN_ROOT}/kit'))
+                path.write_text(install_text(text, '${CLAUDE_PLUGIN_ROOT}/kit', export=False))
         if name == 'workflow':
             shutil.copytree(ROOT / 'commands', plugin / 'commands', copy_function=copy_source_code)
             for command in (plugin / 'commands').glob('*.md'):

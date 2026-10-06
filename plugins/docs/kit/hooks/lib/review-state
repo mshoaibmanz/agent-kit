@@ -25,10 +25,10 @@
 #     pending.<rk>               1 until that round's review agent returns
 #     ragents.<rk>               the roles that round asked for (Agent spawns and agent-run roles)
 #     late.<rk>                  those still out after the first return closed the round: their
-#                                findings still owe the tally, and thermo-quality's marks it done
+#                                findings still owe the tally, and quality-reviewer's marks it done
 #     reviewed.<rk>, rhead.<rk>  tree and commit of the last COMPLETED review
 #     rounds                     agent rounds completed this session: the churn budget
-#     qdone                      thermo-quality returned this session
+#     qdone                      quality-reviewer returned this session
 #     chain                      review-trigger started the current Stop chain
 #     tally                      the review agents whose findings still owe a TALLY line
 #     agent.<id>                 a review agent's subagent_type, recorded at its spawn
@@ -48,13 +48,15 @@ _RV_NL=$'\n'
 
 # Instruction fragments: every tier's text is built from these, and review-trigger's tally
 # reminder reuses RV_VERIFY.
-_RV_VERIFY_T="REPRODUCE, THEN FIX: hand every report's findings VERBATIM with their ids (B-, Q-, R-, CX-) to whoever fixes: you, or one subagent_type \"worker\" for a large round. Every report in the round counts (round 1: @ROUND1@). Reproduce each finding before fixing it, with a failing test or a concrete trace; fix what reproduces, plus small items under the fix policy. One that does not reproduce is NOT_REPRODUCED, with a line saying what was tried; a dismissal cites the code line that disproves it. End your final message with ONE line covering every finding: TALLY <id>=FIXED|NOT_REPRODUCED|OPTION|SKIPPED:<reason> ... Zero findings: say so, no TALLY."
-_RV_R1="thermo-bugs' AND Codex's"   # the default roles' round 1; _rv_verify rebuilds it from roles.toml
+_RV_VERIFY_T="REPRODUCE, THEN FIX: hand every report's findings VERBATIM with their ids (B-, Q-, R-, CX-) to whoever fixes: you, or @FIXER@ for a large round. Every report in the round counts (round 1: @ROUND1@). Reproduce each finding before fixing it, with a failing test or a concrete trace; fix what reproduces, plus small items under the fix policy. One that does not reproduce is NOT_REPRODUCED, with a line saying what was tried; a dismissal cites the code line that disproves it. End your final message with ONE line covering every finding: TALLY <id>=FIXED|NOT_REPRODUCED|OPTION|SKIPPED:<reason> ... Zero findings: say so, no TALLY."
+_RV_R1="bug-reviewer's AND Codex's"   # the default roles' round 1; _rv_verify rebuilds it from roles.toml
+. "${BASH_SOURCE[0]%/*}/host-words"
+_RV_VERIFY_T=${_RV_VERIFY_T/@FIXER@/$(host_noun fixer)}
 RV_VERIFY=${_RV_VERIFY_T/@ROUND1@/$_RV_R1}
 # A TALLY line as review-trigger and review-agent-mark match it (grep -E): `TALLY B-1=FIXED ...`,
 # after any markdown bullet or emphasis. The critic's old `TALLY: 12 confirmed` summary is not one.
 RV_TALLY_RE='^[[:space:]>*_`-]*TALLY[[:space:]]+[A-Za-z][A-Za-z0-9_-]*='
-# The fix policy is one text, skills/review-rubric/references/fix-policy.md, which thermo-quality.md
+# The fix policy is one text, skills/review-rubric/references/fix-policy.md, which quality-reviewer.md
 # and commands/address-review.md cite by path; review instructions inline it. A missing file keeps
 # the fallback sentence rather than an empty instruction. Read only when an instruction is built:
 # this file is sourced on every Bash and Edit call, and a top-level $(cat) cost a process on each.
@@ -66,8 +68,8 @@ _rv_discipline() {
   _rv_verify
 }
 # _rv_verify: RV_VERIFY with its round-1 clause naming the correctness reviewers roles.toml puts in
-# round 1 (a run role by its provider's label: "thermo-bugs' AND Codex's" by default), not a fixed
-# "Codex" that stayed after review-cross moved to Claude.
+# round 1 (a run role by its provider's label: "bug-reviewer's AND Codex's" by default), not a fixed
+# "Codex" that stayed after cross-reviewer moved to Claude.
 _rv_verify() {
   local w o=''
   rv_roles
@@ -81,8 +83,7 @@ _rv_verify() {
   RV_VERIFY=${_RV_VERIFY_T/@ROUND1@/$o}
 }
 RV_NOANCHOR="NO ANCHORING: give the agents ONLY the objective and the diff scope: no list of deliberate changes, no provenance of who wrote what, no invariant you already checked. Everything you pre-declare gets lighter scrutiny."
-RV_MAIN="YOU are the main session: spawn the agents yourself; a subagent has no Agent tool."
-[ "${AGENT_HOST:-claude}" = claude ] || RV_MAIN="YOU are the main session: dispatch the configured roles yourself; a subagent must not delegate."
+RV_MAIN="YOU are the main session: $(host_noun main)"
 _RV_SELF="yourself for NEW blocking correctness/security issues: no subagents, no re-litigating reviewed structure, style or comments. Fix verified defects only, report in one short list."
 
 rv_is_code() {
@@ -92,12 +93,13 @@ rv_is_code() {
   esac
 }
 
-# rv_review_agent <agent_type>: its return feeds a review round. A fix worker or adversary is not
-# one: its return must not close a round.
+# rv_review_agent <agent_type>: its return feeds a review round. An engineer fixing findings, or a
+# second-opinion, is not one: its return must not close a round.
 rv_review_agent() {
   case "$1" in auto-review:*) set -- "${1#auto-review:}" ;; esac
+  set -- "$(rv_role_name "$1")"
   case "$1" in
-    reviewer|thermo-bugs|thermo-quality|thermos:thermo-nuclear-review-subagent|thermos:thermo-nuclear-code-quality-review-subagent) return 0 ;;
+    task-reviewer|bug-reviewer|quality-reviewer|thermos:thermo-nuclear-review-subagent|thermos:thermo-nuclear-code-quality-review-subagent) return 0 ;;
     '') return 1 ;;
   esac
   rv_roles
@@ -105,12 +107,12 @@ rv_review_agent() {
   return 1
 }
 
-# --- roles: ~/.agents/roles.toml, as `agent-kit render` writes it for this host ---
+# --- roles: <kit>/roles.toml, as `agent-kit render` writes it for this host ---
 # rv_roles sets RV_ROUND1, RV_LATER, RV_ONCE, RV_SENSITIVE_ADDS (role names) and RV_ROLE_TABLE (one
 # row per role: name provider model effort invoke prefix fallback timeout; `-` is none), once per
 # process. invoke is `agent` (an Agent spawn on this host) or `run` (bin/agent-run through Bash).
 # AGENT_ROLES_SH names another rendered file (the suites). A kit never rendered asks agent-kit for
-# the same text; with no agent-kit either, round 1 is thermo-bugs (a review still happens).
+# the same text; with no agent-kit either, round 1 is bug-reviewer (a review still happens).
 # Phase 20: the host (claude here) picks roles-<host>.sh.
 rv_roles() {
   [ -z "${RV_ROLES_LOADED:-}" ] || return 0
@@ -120,7 +122,7 @@ rv_roles() {
   if [ -r "$f" ] && . "$f"; then :
   elif out=$("$kit/bin/agent-kit" roles --host "$host" --format sh 2>/dev/null) && eval "$out"; then :
   else
-    RV_ROUND1=thermo-bugs; RV_LATER=thermo-bugs; RV_ONCE=thermo-quality; RV_SENSITIVE_ADDS=thermo-bugs; RV_ROLE_TABLE=''
+    RV_ROUND1=bug-reviewer; RV_LATER=bug-reviewer; RV_ONCE=quality-reviewer; RV_SENSITIVE_ADDS=bug-reviewer; RV_ROLE_TABLE=''
   fi
   : "${RV_ROUND1=}" "${RV_LATER=}" "${RV_ONCE=}" "${RV_SENSITIVE_ADDS=}" "${RV_ROLE_TABLE=}"
   RV_ROLES_LOADED=1
@@ -167,8 +169,8 @@ rv_available() {
     elif [ "$native" != claude ]; then return 1
     fi
     if [ "$native" != claude ] && [ "${RV_R_INVOKE:-}" != agent ]; then return 1; fi
-    case $role in thermo-*)
-      grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null || { role=reviewer; continue; } ;;
+    case $role in bug-reviewer|quality-reviewer)
+      _rv_thermos || { role=task-reviewer; continue; } ;;
     esac
     RV_AVAILABLE=$role
     return 0
@@ -176,14 +178,23 @@ rv_available() {
   return 1
 }
 
-# _rv_once <role>: a once-per-PR role (thermo-quality): its return marks quality_done, completes
+# _rv_once <role>: a once-per-PR role (quality-reviewer): its return marks quality_done, completes
 # no round, and the round's correctness reviewers do not wait for it.
 _rv_once() { rv_roles; case " $RV_ONCE " in *" $1 "*) return 0 ;; esac; return 1; }
-# reviewer codex (session state) or codex-review (branch record); both are review-cross now.
+# _rv_thermos: the thermos plugin is enabled, so bug-reviewer and quality-reviewer have their rubric.
+_rv_thermos() { grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null; }
+# Role names from before the renames (old:new), as session state and branch records may still hold
+# them: codex (session state) and codex-review (branch record) before review-cross, then the
+# pre-2026-10-05 names. Both live at most a pending TTL (2h) or a branch's life: delete after 2026-10-19.
+_RV_ALIASES='codex:cross-reviewer codex-review:cross-reviewer review-cross:cross-reviewer thermo-bugs:bug-reviewer thermo-quality:quality-reviewer reviewer:task-reviewer'
+# rv_role_name <role>: today's name for an old one.
+rv_role_name() { local p; for p in $_RV_ALIASES; do [ "$1" = "${p%%:*}" ] && { printf '%s' "${p#*:}"; return; }; done; printf '%s' "$1"; }
+# rv_role_drop <role>: a JSON list of the role and its old names, for removing it from a record.
+rv_role_drop() { local p o="\"$1\""; for p in $_RV_ALIASES; do [ "${p#*:}" = "$1" ] && o="$o,\"${p%%:*}\""; done; printf '[%s]' "$o"; }
 _rv_legacy() {
   local w o=''
   for w in ${!1}; do
-    case $w in codex|codex-review) w=review-cross ;; esac
+    w=$(rv_role_name "$w")
     case " $o " in *" $w "*) ;; *) o="${o:+$o }$w" ;; esac
   done
   printf -v "$1" '%s' "$o"
@@ -486,8 +497,8 @@ _rv_sensitive() {
 # review agent returns (rv_complete).
 #   tree unchanged since the last round issued -> none
 #   delta <  RV_MIN (40)                       -> tier 0, self-check (none under the 10-line floor)
-#   delta <  RV_HEAVY (150)                    -> tier 1, ONE `reviewer`
-#   delta >= RV_HEAVY                          -> tier 2, thermo-bugs (+ thermo-quality until one
+#   delta <  RV_HEAVY (150)                    -> tier 1, ONE `task-reviewer`
+#   delta >= RV_HEAVY                          -> tier 2, bug-reviewer (+ quality-reviewer until one
 #                                                 has returned this session)
 # Either agent tier ends in RV_VERIFY: the fixer reproduces each finding and closes with a TALLY.
 #   agent budget spent                         -> self-review of the delta (churn brake)
@@ -525,7 +536,7 @@ rv_decide() {
 
   # One budget of agent rounds per session, spent when a round's review agent RETURNS: counting
   # Stop blocks used it up while the model waited on its own edit agents and spawned nothing.
-  # Measured 2026-08-13..09-11: the fix-up escalation spawned a `reviewer` for 1-7 line deltas ~40
+  # Measured 2026-08-13..09-11: the fix-up escalation spawned a `task-reviewer` for 1-7 line deltas ~40
   # times, and 17 sessions ran 6-13 review agents.
   if [ "$mode" = self ]; then
     [ "$tier" = 0 ] || return 0
@@ -565,22 +576,22 @@ rv_decide() {
 
   if [ "$tier" = 1 ]; then
     lead="Code changed since the last review"; what="ONE light review pass"
-    spawn="Spawn ONE subagent_type \"reviewer\" Agent with (1) the task objective and (2) a summary of the files in that diff and what changed in each (a fresh agent cannot see what changed)."
-  elif ! grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null; then
-    # The local thermo-bugs / thermo-quality agents Read the thermos rubric themselves (the
+    spawn="Spawn ONE subagent_type \"task-reviewer\" Agent with (1) the task objective and (2) a summary of the files in that diff and what changed in each (a fresh agent cannot see what changed)."
+  elif ! _rv_thermos; then
+    # The local bug-reviewer / quality-reviewer agents Read the thermos rubric themselves (the
     # plugin's own agents call the Skill tool, which a subagent cannot: 34 of 34 such calls failed
     # in 30 days). Kit installs without the thermos plugin fall back to one reviewer.
     lead="A large change since the last review"
     what="DEEP single-agent review (thermos plugin not installed, so the two-agent audit is unavailable)"
-    spawn="Spawn ONE subagent_type \"reviewer\" Agent with the objective and a file-by-file summary of that diff; tell it to cover correctness/security AND structure."
+    spawn="Spawn ONE subagent_type \"task-reviewer\" Agent with the objective and a file-by-file summary of that diff; tell it to cover correctness/security AND structure."
   elif [ "$qdone" = 0 ]; then
-    # thermo-quality runs once per session: 58% of its graded verdicts were OPINION, and a second
+    # quality-reviewer runs once per session: 58% of its graded verdicts were OPINION, and a second
     # pass over fix-ups re-raised the same structure points.
     lead="A large change since the last review"; what="FULL review"
-    spawn="State the task OBJECTIVE in one line, then spawn BOTH agents IN PARALLEL (one message, two Agent calls): subagent_type \"thermo-bugs\" and subagent_type \"thermo-quality\", each given the objective and the diff scope (they load their own rubric and run in the working tree); merge and dedupe what they return. $RV_NOANCHOR $RV_MAIN"
+    spawn="State the task OBJECTIVE in one line, then spawn BOTH agents IN PARALLEL (one message, two Agent calls): subagent_type \"bug-reviewer\" and subagent_type \"quality-reviewer\", each given the objective and the diff scope (they load their own rubric and run in the working tree); merge and dedupe what they return. $RV_NOANCHOR $RV_MAIN"
   else
     lead="A large change since the last review"; what="correctness review"
-    spawn="State the task OBJECTIVE in one line, then spawn ONE subagent_type \"thermo-bugs\" Agent with the objective and the diff scope (it loads its own rubric and runs in the working tree); thermo-quality already ran this session, do not spawn it again. $RV_NOANCHOR $RV_MAIN"
+    spawn="State the task OBJECTIVE in one line, then spawn ONE subagent_type \"bug-reviewer\" Agent with the objective and the diff scope (it loads its own rubric and runs in the working tree); quality-reviewer already ran this session, do not spawn it again. $RV_NOANCHOR $RV_MAIN"
   fi
   _rv_discipline
   _rv_round "$sid" "$rk" agents "$tier" "$lead ($size): $what.$esc $spawn $RV_VERIFY $RV_DISCIPLINE"
@@ -616,7 +627,7 @@ _rv_drop() { local w o=''; for w in $1; do [ "$w" = "$2" ] || o="${o:+$o }$w"; d
 # root than its round's). Closing every pending round let one return mark another worktree's
 # unreviewed round reviewed. With <tree> (agent-run passes the snapshot it reviewed), a round
 # issued for another tree is not its round: a Codex run on T1 that outlived its round closed T2.
-# A round asked for several correctness reviewers (ragents.<rk>: thermo-bugs and review-cross in
+# A round asked for several correctness reviewers (ragents.<rk>: bug-reviewer and cross-reviewer in
 # round 1) completes when the last of them returns: completing on the first let a push pass that
 # Codex never reviewed. Who is still out is the branch record's list when the record has this
 # round pending (every session and host drops its returns there), else the session's.
@@ -626,7 +637,7 @@ _rv_drop() { local w o=''; for w in $1; do [ "$w" = "$2" ] || o="${o:+$o }$w"; d
 # the newer round and spend its budget. The root's edit marker is cleared only if nothing changed
 # since that round's snapshot (edits made while a background review ran are unreviewed). Every
 # return with findings owes a TALLY (its final message does not say it found nothing), whether or
-# not it completes the round, the once-per-PR role's (thermo-quality) included. Agents still out at
+# not it completes the round, the once-per-PR role's (quality-reviewer) included. Agents still out at
 # completion go into late.<rk>: one returning after it adds no round but owes the same TALLY. A
 # once-per-PR return only marks it done, for the session and the branch, in any order and from any
 # cwd. An agent with no round of its own, pending or late (spawned for unrelated work), records
@@ -656,10 +667,10 @@ _rv_complete() {
   RV_COMPLETED=''; RV_CONSUMED=''; RV_CLEAR_ROOT=''; RV_CLEAR_TREE=''
   case $at in
     auto-review:*) ag=${at#auto-review:} ;;
-    thermos:thermo-nuclear-review-subagent) ag=thermo-bugs ;;
-    thermos:thermo-nuclear-code-quality-review-subagent) ag=thermo-quality ;;
-    codex|codex-review) ag=review-cross ;;
+    thermos:thermo-nuclear-review-subagent) ag=bug-reviewer ;;
+    thermos:thermo-nuclear-code-quality-review-subagent) ag=quality-reviewer ;;
   esac
+  ag=$(rv_role_name "$ag")
   _rv_load "$sid"
   # Counted once: a foreground agent fires PostToolUse and SubagentStop.
   if [ -n "$aid" ] && _rv_get d "done.$aid" && [ "$d" = 1 ]; then return 0; fi
@@ -684,7 +695,7 @@ _rv_complete() {
     case " $l " in *" $ag "*) lrk=$rk; late=$(_rv_drop "$l" "$ag"); break ;; esac
   done
   if _rv_once "$ag"; then
-    # Its round may have closed already (thermo-bugs returned first): late.<rk> names that round,
+    # Its round may have closed already (bug-reviewer returned first): late.<rk> names that round,
     # whatever root the agent returned from, and the cwd root's tier counts too.
     for rk in $sel $lrk $own; do
       _rv_get p "tier.$rk"
@@ -715,7 +726,7 @@ _rv_complete() {
   [ -n "$p" ] || [ "$sel" != "$own" ] || p=$root
   _rv_get br "branch.$sel"
   if [ -n "$p" ]; then
-    rdrop="[\"$ag\"]"; [ "$ag" != review-cross ] || rdrop='["review-cross","codex-review"]'
+    rdrop=$(rv_role_drop "$ag")
     if _rv_rec_mark "$sid" "$sel" "$p" 'if (.pending_tree // "") == $t then .agents = ((.agents // []) - $d) else . end' \
          --arg t "$tree" --argjson d "$rdrop" \
        && rv_rec_read "$RV_MARK_ROOT" "$RV_MARK_BR"; then
@@ -829,15 +840,24 @@ _rv_rec_mark() {
   rv_rec_update "$p" "$br" "$@"
 }
 
-# _rv_bases <root> [merge]: the base branches that exist, REVIEW_BASE (kit.env or env) first.
+# _rv_review_base: REVIEW_BASE from kit.env, else as exported when this lib loaded. kit_env unsets
+# every declared key, so the exported value is kept here, and kit_env runs in a subshell.
+_RV_BASE_ENV=${REVIEW_BASE:-}
+_rv_review_base() {
+  local f lib=${BASH_SOURCE[0]%/*}
+  f=$(command -v kit_env >/dev/null 2>&1 || . "$lib/hook-io" 2>/dev/null; kit_env 2>/dev/null; printf '%s' "${REVIEW_BASE:-}")
+  printf '%s' "${f:-${_RV_BASE_ENV:-${REVIEW_BASE:-}}}"
+}
+
+# _rv_bases <root> [merge]: the base branches that exist, REVIEW_BASE (kit.env or exported) first.
 # `merge` lists only where a branch merges for good (REVIEW_BASE, origin/HEAD, main, master): a
-# feature merged into origin/staging or origin/develop to test it (sc-stms-api does this before its
-# master PR) has not merged, and reading that as a merge reset its rounds and re-asked thermo-quality.
+# feature merged into origin/staging or origin/develop to test it (some repos do this before the
+# master PR) has not merged, and reading that as a merge reset its rounds and re-asked quality-reviewer.
 _rv_bases() {
   local r h more='origin/develop origin/staging'
   [ "${2:-}" != merge ] || more=''
   h=$(git -C "$1" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
-  for r in ${REVIEW_BASE:-} $h origin/main origin/master $more; do
+  for r in $(_rv_review_base) $h origin/main origin/master $more; do
     git -C "$1" rev-parse -q --verify "$r^{commit}" >/dev/null 2>&1 && printf '%s\n' "$r"
   done | awk '!seen[$0]++'
 }
@@ -933,7 +953,7 @@ rv_round_swap() {
   ra=$(_rv_drop "$ra" "$3")
   case " $ra " in *" $4 "*) ;; *) ra="${ra:+$ra }$4" ;; esac
   _rv_set "$1" "ragents.$rk=$ra"
-  d="[\"$3\"]"; [ "$3" != review-cross ] || d='["review-cross","codex-review"]'
+  d=$(rv_role_drop "$3")
   _rv_rec_mark "$1" "$rk" "$2" 'if .agents then .agents = ((.agents - $d) + [$n] | unique) else . end' --argjson d "$d" --arg n "$4"
 }
 
@@ -948,14 +968,14 @@ rv_round_swap() {
 #   budget   the branch spent REVIEW_MAX_ROUNDS (3) agent rounds: allowed with a warning
 #   wait     a round issued for this branch has not returned (for up to REVIEW_PENDING_TTL, 2h)
 #   agents   refused with the review instruction; the round is recorded as pending
-# The roles are data (rv_roles, from ~/.agents/roles.toml [review]): round 1 RV_ROUND1 (thermo-bugs
-# and review-cross in parallel), later rounds RV_LATER (review-cross on the delta), plus
-# RV_SENSITIVE_ADDS (thermo-bugs) when the delta is _rv_sensitive, plus RV_ONCE (thermo-quality) in
+# The roles are data (rv_roles, from <kit>/roles.toml [review]): round 1 RV_ROUND1 (bug-reviewer
+# and cross-reviewer in parallel), later rounds RV_LATER (cross-reviewer on the delta), plus
+# RV_SENSITIVE_ADDS (bug-reviewer) when the delta is _rv_sensitive, plus RV_ONCE (quality-reviewer) in
 # every round until one has returned on the branch. A role on this host's provider is an Agent
-# spawn; one on another provider (invoke `run`: review-cross on gpt-6.1-sol) is bin/agent-run
+# spawn; one on another provider (invoke `run`: cross-reviewer on gpt-6.1-sol) is bin/agent-run
 # through Bash, which writes its own round into the record, and without its provider's CLI
-# (CODEX_BIN, default codex) its fallback role (thermo-bugs) takes its place. Without the thermos
-# plugin the thermo agents become one reviewer.
+# (CODEX_BIN, default codex) its fallback role (bug-reviewer) takes its place. Without the thermos
+# plugin bug-reviewer and quality-reviewer become one task-reviewer.
 rv_push_decide() {
   local sid=$1 root=$2 br=$3 rsha=${4:-} cur=$RV_TREE budget=${REVIEW_MAX_ROUNDS:-3}
   local from rhead up b sens=0 now list a w spawn='' n=0 rk scope since anchor
@@ -994,10 +1014,10 @@ rv_push_decide() {
       _rv_set "$sid" "issued.$rk=$RV_REC_PTREE" "ihead.$rk=$RV_REC_PHEAD" "tier.$rk=2" "pending.$rk=1" \
         "proot.$rk=$root" "branch.$rk=$br" "ragents.$rk=$RV_REC_AGENTS"
     fi
-    RV_TEXT="the review round issued for this branch $(( (now - RV_REC_PSINCE) / 60 )) min ago has not returned. Wait for its agents (spawn them now if you never did: ${RV_REC_AGENTS:-thermo-bugs}, in ONE message, in the foreground), reproduce and fix their findings, end with the TALLY line, then push."
+    RV_TEXT="the review round issued for this branch $(( (now - RV_REC_PSINCE) / 60 )) min ago has not returned. Wait for its agents (spawn them now if you never did: ${RV_REC_AGENTS:-bug-reviewer}, in ONE message, in the foreground), reproduce and fix their findings, end with the TALLY line, then push."
     for a in $RV_REC_AGENTS; do
       rv_role "$a" && [ "$RV_R_INVOKE" = run ] || continue
-      RV_TEXT="$RV_TEXT $a is not an Agent: run \`$(printf '%q' "${AGENT_KIT_DIR:-${BASH_SOURCE[0]%/*}/../..}/bin/agent-run") $a $(printf '%q' "$root")${RV_REC_TREE:+ --since $RV_REC_TREE}\` through Bash with run_in_background: true."
+      RV_TEXT="$RV_TEXT $a is not an Agent: run \`$(printf '%q' "${AGENT_KIT_DIR:-${BASH_SOURCE[0]%/*}/../..}/bin/agent-run") $a $(printf '%q' "$root")${RV_REC_TREE:+ --since $RV_REC_TREE}\` $(host_noun bg)."
     done
     return 0
   fi
@@ -1017,13 +1037,13 @@ rv_push_decide() {
       case " $agents " in *" $a "*) ;; *) agents="${agents:+$agents }$a" ;; esac
     fi
   done
-  # A round needs a correctness reviewer: only a once-per-PR role's return (thermo-quality) never
+  # A round needs a correctness reviewer: only a once-per-PR role's return (quality-reviewer) never
   # completes one, and an empty round asked for nothing and stayed pending (a [review] list emptied
-  # by turning Codex off, a run role whose CLI is missing with no fallback). thermo-bugs takes it.
+  # by turning Codex off, a run role whose CLI is missing with no fallback). bug-reviewer takes it.
   a=''
   for w in $agents $runs; do _rv_once "$w" || a=1; done
   if [ -z "$a" ]; then
-    if rv_available thermo-bugs; then
+    if rv_available bug-reviewer; then
       a=$RV_AVAILABLE
       if rv_role "$a" && [ "$RV_R_INVOKE" = run ]; then runs="$a${runs:+ $runs}"
       else agents="$a${agents:+ $agents}"; fi
@@ -1036,13 +1056,13 @@ rv_push_decide() {
   for a in $agents; do n=$((n + 1)); spawn="${spawn:+$spawn and }subagent_type \"$a\""; done
   list="$agents${runs:+ $runs}"
   [ "$n" = 0 ] || run="in the FOREGROUND (no run_in_background), spawn $n Agent call(s): $spawn, each given the objective and the diff scope (they load their own rubric and run in the working tree)"
-  if [ "${AGENT_HOST:-claude}" != claude ] && [ "$n" != 0 ]; then
+  if ! host_agent_tool && [ "$n" != 0 ]; then
     run="select the named native agent(s): $agents, each given the objective, worktree and diff scope, and wait for their results"
   fi
   for a in $runs; do
     rv_role "$a"
     # The same scope as the agents: the whole PR in round 1, the delta since the reviewed tree after.
-    run="${run:+$run; and }run $(_rv_label "$RV_R_PROVIDER") through Bash with run_in_background: true (up to ~$(( (RV_R_TIMEOUT + 59) / 60 )) min; it records its own round, and on failure says so and records nothing): \`$(printf '%q' "${AGENT_KIT_DIR:-${BASH_SOURCE[0]%/*}/../..}/bin/agent-run") $a $(printf '%q' "$root")${since:+ --since $since} --objective \"<the one-line objective>\"\`, and wait for it to exit"
+    run="${run:+$run; and }run $(_rv_label "$RV_R_PROVIDER") $(host_noun bg) (up to ~$(( (RV_R_TIMEOUT + 59) / 60 )) min; it records its own round, and on failure says so and records nothing): \`$(printf '%q' "${AGENT_KIT_DIR:-${BASH_SOURCE[0]%/*}/../..}/bin/agent-run") $a $(printf '%q' "$root")${since:+ --since $since} --objective \"<the one-line objective>\"\`, and wait for it to exit"
   done
   _rv_discipline
   RV_KIND=agents

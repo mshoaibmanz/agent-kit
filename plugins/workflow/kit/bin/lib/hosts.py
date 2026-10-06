@@ -7,10 +7,16 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import tomllib
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
+from kit_env import kit_env, work_root  # noqa: E402
+
+HOSTS = ("claude", "codex", "cursor")
 
 EVENTS = {
     "PreToolUse": "preToolUse",
@@ -59,6 +65,47 @@ def block(existing: str, managed: str, begin: str = BEGIN, end: str = END) -> st
                 break
         return existing[:start] + new + existing[stop:]
     return existing + ("\n" if existing and not existing.endswith("\n") else "") + new + "\n"
+
+
+# The top-level tables a kit block writes: MCP servers, the sandbox roots, and (agent-setup's outer
+# block) the shell policy.
+OWNED_TABLES = frozenset({"mcp_servers", "sandbox_workspace_write", "shell_environment_policy"})
+
+
+def _table_name(chunk: str) -> str:
+    """The top-level key of a chunk's table header, quoted or bare."""
+    try:
+        return next(iter(tomllib.loads(chunk.split("\n", 1)[0])), "")
+    except tomllib.TOMLDecodeError:
+        return ""
+
+
+def keep_host_tables(existing: str, begin: str = BEGIN, end: str = END) -> str:
+    """Move tables the host wrote inside a kit block (hook trust, project trust) past its END.
+
+    Codex appends `[hooks.state.*]` and `[projects.*]` before the file's trailing comment, which is
+    our END marker, so replacing the block would silently revoke that trust.
+    """
+    if begin not in existing or end not in existing:
+        return existing
+    start = existing.index(begin) + len(begin)
+    stop = existing.index(end)
+    owned, host = [], []
+    for chunk in re.split(r"(?m)^(?=\[)", existing[start:stop]):
+        (owned if not chunk.startswith("[") or _table_name(chunk) in OWNED_TABLES else host).append(chunk)
+    if not host:
+        return existing
+    tail = existing[stop + len(end) :].lstrip("\n")
+    moved = "".join(host).rstrip() + "\n"
+    return (
+        existing[:start]
+        + "".join(owned).rstrip()
+        + "\n"
+        + end
+        + "\n\n"
+        + moved
+        + ("\n" + tail if tail else "")
+    )
 
 
 def shell_without_owned(existing: str) -> str:
@@ -242,6 +289,38 @@ def safe_servers(kit: Path) -> dict[str, Any]:
                 raise SystemExit(f"agent-kit: {name} needs a runtime credential wrapper")
             out[name] = spec
     return out
+
+
+def sandbox_roots() -> list[str]:
+    """Paths a workspace-write Codex session must write outside the repo: the work root (task
+    folders hold TMPDIR and evidence), named even before it exists because agent-setup creates it
+    after rendering; and, when the overlay sets CODEX_SANDBOX_GCLOUD=1, gcloud's config dir, which
+    bq rewrites on every call (it holds credentials, so it is opt-in)."""
+    roots = [work_root()]
+    gcloud = os.environ.get("CLOUDSDK_CONFIG") or str(Path.home() / ".config/gcloud")
+    if kit_env()["CODEX_SANDBOX_GCLOUD"] == "1" and Path(gcloud).is_dir():
+        roots.append(gcloud)
+    return roots
+
+
+def install_text(text: str, kit: str, skill: str | None = None, export: bool = True) -> str:
+    """A kit markdown file as installed with its kit at <kit>: {{AGENT_KIT_DIR}} names the kit, each
+    ```sh block first exports AGENT_KIT_DIR (with export), and ${CLAUDE_SKILL_DIR}, which only Claude
+    Code expands, names <kit>/skills/<skill> as one shell word. A kit given as a shell expression
+    (${CLAUDE_PLUGIN_ROOT}/kit) is double-quoted so it still expands."""
+    word = f'"{kit}"' if "$" in kit else shlex.quote(kit)
+    text = text.replace("{{AGENT_KIT_DIR}}", kit)
+    if export:
+        text = text.replace("```sh\n", f"```sh\nexport AGENT_KIT_DIR={word}\n")
+    if skill:
+        text = text.replace("${CLAUDE_SKILL_DIR}", shlex.quote(f"{kit}/skills/{skill}"))
+    return text
+
+
+def toml_sandbox(roots: list[str]) -> str:
+    if not roots:
+        return ""
+    return f"[sandbox_workspace_write]\nwritable_roots = {json.dumps(roots)}\n"
 
 
 def toml_servers(servers: dict[str, Any]) -> str:
@@ -454,7 +533,17 @@ def render(api: Any, args: Any) -> int:
             ownership[shell_key] = values
             new_config = shell_config(new_config, values, versions(shell_key))
         if "mcp" in components:
-            new_config = block(new_config, toml_servers(servers))
+            roots = sandbox_roots()
+            if "sandbox_workspace_write" in config:
+                # The user's own table stands; a second one would make the file invalid TOML.
+                print(
+                    "agent-kit: note: your [sandbox_workspace_write] is kept; add these to its "
+                    f"writable_roots for task folders: {json.dumps(roots)}",
+                    file=sys.stderr,
+                )
+                roots = []
+            managed = toml_servers(servers) + toml_sandbox(roots)
+            new_config = block(keep_host_tables(new_config), managed)
         tomllib.loads(new_config)
         plans.append((config_path, new_config))
     if host == "codex" and "roles" in components:
@@ -484,6 +573,10 @@ def render(api: Any, args: Any) -> int:
         mcp_path = root / "mcp.json"
         mcp = json.loads(api.read_or_empty(mcp_path) or "{}")
         old_servers = mcp.get("mcpServers", {})
+        # Cursor keys are case-sensitive, so a hand-added "Sentry" plus the catalog's "sentry"
+        # would register the same server twice. Render under the live spelling instead.
+        live_names = {name.lower(): name for name in old_servers}
+        servers = {live_names.get(name.lower(), name): spec for name, spec in servers.items()}
         mcp_key = api.state_name("cursor-mcp", mcp_path)
         mcp_versions = versions(mcp_key)
         previous_mcp = {name: spec for version in mcp_versions for name, spec in version.items()}

@@ -7,7 +7,7 @@ Repo specifics (the runner and its setup, factory names, helpers, a worked examp
 
 ## Bring the backend up
 
-Run tests the way the repo's testing doc and the SessionStart TESTS line say; a `test-exec-gate`
+Run tests the way the repo's testing doc says; a `test-exec-gate`
 hook may refuse any other runner.
 
 ```

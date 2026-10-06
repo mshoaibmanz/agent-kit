@@ -14,7 +14,7 @@ set -uo pipefail
 
 . "${0%/*}/lib/hook-io" 2>/dev/null || {
   case "$(cat)" in *'git push'*)
-    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pre-push-gate: hooks/lib/hook-io is missing, so the push gate cannot run and refuses the push. Restore it: git -C ~/.agents checkout -- hooks/lib"}}' ;;
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pre-push-gate: hooks/lib/hook-io is missing, so the push gate cannot run and refuses the push. Restore it: git -C %s checkout -- hooks/lib"}}\n' "${0%/*}/.." ;;
   esac
   exit 0
 }
@@ -115,4 +115,4 @@ if tr_ran "$sid" "$top"; then
   exit 0
 fi
 
-decide ask "Pushing without a recorded local test run this session. CLAUDE.md requires a representative local test subset before pushing, or, if infra is down, watching CI to a green/red verdict in this session. Proceed with the push?" "$ctx"
+confirm "Pushing without a recorded local test run this session. $(host_noun rules) requires a representative local test subset before pushing, or, if infra is down, watching CI to a green/red verdict in this session." "$ctx"

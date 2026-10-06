@@ -20,6 +20,8 @@ import tomllib
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1]
+# The last release before the role renames: upgrade tests install it first, then this checkout.
+BASE = '2b07c10017f87e354d8dc1aa8b578a7b041b385b'
 
 
 class SetupTests(unittest.TestCase):
@@ -59,6 +61,127 @@ class SetupTests(unittest.TestCase):
     def state(self) -> dict:
         return json.loads((self.root / '.install-state/current.json').read_text())
 
+    def test_skills_honor_hosts_and_keep_user_folders(self) -> None:
+        user = self.host / 'skills/debug'
+        user.mkdir(parents=True)
+        (user / 'SKILL.md').write_text('user-owned fixture\n')
+        result = self.run_setup('--hosts', 'cursor', '--components', 'skills', '--apply')
+        self.assertFalse((self.host / 'skills/pr-study').exists(), 'a hosts: [claude] skill reached cursor')
+        self.assertTrue((self.host / 'skills/review-rubric').is_symlink())
+        self.assertTrue((self.host / 'skills/grilling').is_symlink())
+        self.assertFalse(user.is_symlink())
+        self.assertEqual((user / 'SKILL.md').read_text(), 'user-owned fixture\n')
+        self.assertIn('not a kit link', result.stderr)
+        installed = (self.root / 'skills/process-doc/SKILL.md').read_text()
+        self.assertNotIn('${CLAUDE_SKILL_DIR}', installed)
+        command = re.search(r'`(uv run [^`]*catalog\.py[^`]*)`', installed).group(1)
+        self.assertEqual(shlex.split(command)[2], str(self.root / 'skills/process-doc/scripts/catalog.py'),
+                         'CX-3: the installed path is one shell word even with spaces')
+
+    def run_base_setup(self, *flags: str) -> None:
+        """Install with the base release, so an upgrade test starts from the state it really leaves."""
+        if subprocess.run(['git', '-C', str(SOURCE), 'cat-file', '-e', BASE + '^{commit}'], capture_output=True).returncode:
+            self.skipTest(f'base commit {BASE[:7]} is not in this clone (CI fetches full history)')
+        base = Path(self.temporary.name) / 'base source'
+        base.mkdir()
+        archive = subprocess.run(['git', '-C', str(SOURCE), 'archive', BASE], capture_output=True, check=True)
+        subprocess.run(['tar', '-x', '-C', str(base)], input=archive.stdout, check=True)
+        result = subprocess.run([sys.executable, str(base / 'bin/agent-setup'), '--source', str(base), '--root-dir', str(self.root),
+                                 '--host-root', str(self.host), *flags], capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_upgrade_canonicalizes_saved_role_overrides(self) -> None:
+        self.run_base_setup('--components', 'roles', '--role-model', 'review-cross=openai:chosen-model',
+                            '--role-effort', 'worker=low', '--apply')
+        self.run_setup('--components', 'rules', '--apply')
+        roles = tomllib.loads((self.root / 'roles.toml').read_text())['roles']
+        self.assertEqual(roles['cross-reviewer']['model'], 'openai:chosen-model')
+        self.assertEqual(roles['engineer']['effort'], 'low')
+        saved = self.state()['configuration']
+        self.assertEqual(saved['role_model'], ['cross-reviewer=openai:chosen-model'])
+        self.assertEqual(saved['role_effort'], ['engineer=low'])
+
+    def test_upgrade_retires_codex_skills_and_agents_no_longer_produced(self) -> None:
+        self.run_base_setup('--hosts', 'codex', '--components', 'skills', 'roles', '--apply')
+        self.assertTrue((self.host / 'skills/pr-study').is_symlink())
+        self.assertTrue((self.host / 'agents/review-cross.toml').is_file())
+        (self.host / 'agents/mine.toml').write_text('name = "mine"\n')
+        self.run_setup('--hosts', 'codex', '--components', 'skills', 'roles', '--apply')
+        self.assertFalse((self.host / 'skills/pr-study').exists(), 'a hosts: [claude] skill stayed linked for codex')
+        self.assertFalse((self.host / 'skills/session-review').exists())
+        self.assertTrue((self.host / 'skills/grilling').is_symlink())
+        self.assertFalse((self.host / 'agents/review-cross.toml').exists())
+        self.assertTrue((self.host / 'agents/cross-reviewer.toml').is_file())
+        self.assertEqual((self.host / 'agents/mine.toml').read_text(), 'name = "mine"\n')
+        self.assertFalse((self.root / 'agents/thermo-bugs.md').exists())
+        managed = self.state()['managed']
+        self.assertFalse([key for key in managed if 'pr-study' in key and key.startswith('link:')])
+        self.run_setup('doctor')
+
+    def test_upgrade_retires_claude_agents_for_renamed_roles(self) -> None:
+        self.run_base_setup('--hosts', 'claude', '--components', 'roles', '--apply')
+        self.assertTrue((self.host / 'agents/thermo-bugs.md').is_file())
+        self.run_setup('--hosts', 'claude', '--components', 'roles', '--apply')
+        agents = sorted(path.name for path in (self.host / 'agents').iterdir())
+        for old in ('thermo-bugs.md', 'thermo-quality.md', 'reviewer.md', 'worker.md', 'scout.md', 'adversary.md'):
+            self.assertNotIn(old, agents)
+        self.assertIn('bug-reviewer.md', agents)
+
+    def test_codex_sandbox_names_a_fresh_work_root_and_gcloud_only_on_opt_in(self) -> None:
+        work = self.home / 'fresh work root'
+        gcloud = self.home / '.config/gcloud'
+        gcloud.mkdir(parents=True)
+        env = dict(self.env, CLAUDE_OUT_ROOT=str(self.home / 'not the work root'))
+        self.run_setup('--hosts', 'codex', '--components', 'mcp', '--work-root', str(work), '--apply', env=env)
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work)], 'CX-4 / Q-10 / B-10')
+        self.assertTrue(work.is_dir(), 'CX-4: the work root the sandbox names exists after the install')
+        self.run_setup('--hosts', 'codex', '--components', 'mcp', '--codex-gcloud', 'on', '--apply')
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work), str(gcloud)])
+
+    def test_user_sandbox_table_is_kept_not_duplicated(self) -> None:
+        self.host.mkdir()
+        (self.host / 'config.toml').write_text('model = "x"\n\n[sandbox_workspace_write]\nnetwork_access = true\n')
+        result = self.run_setup('--hosts', 'codex', '--components', 'mcp', '--apply')
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write'], {'network_access': True})
+        self.assertIn('agent-kit: note: your [sandbox_workspace_write] is kept', result.stderr)
+
+    def test_codex_tables_appended_inside_the_setup_block_survive_a_rerun(self) -> None:
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', 'mcp', '--apply')
+        path = self.host / 'config.toml'
+        text = path.read_text()
+        end = text.rindex('# END agent-kit setup')
+        path.write_text(text[:end] + '[hooks.state."abc"]\ntrusted_hash = "sha256:x"\n\n[projects."/p"]\ntrust_level = "trusted"\n\n' + text[end:])
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', 'mcp', '--apply')
+        config = tomllib.loads(path.read_text())
+        self.assertEqual(config['hooks']['state']['abc']['trusted_hash'], 'sha256:x')
+        self.assertEqual(config['projects']['/p']['trust_level'], 'trusted')
+        self.run_setup('doctor')
+
+    def test_cursor_hand_added_server_spelling_is_not_registered_twice(self) -> None:
+        self.host.mkdir()
+        config = self.host / 'mcp.json'
+        config.write_text(json.dumps({'mcpServers': {'Sentry': {'command': 'user-choice'}}}))
+        catalog = self.home / 'catalog.json'
+        catalog.write_text(json.dumps({'mcpServers': {'sentry': {'command': 'true'}}}))
+        result = self.run_setup('--hosts', 'cursor', '--components', 'mcp', '--mcp-catalog', str(catalog), '--apply', success=False)
+        self.assertIn('Sentry', result.stderr)
+        self.assertEqual(json.loads(config.read_text())['mcpServers'], {'Sentry': {'command': 'user-choice'}})
+
+    def test_skill_hosts_rejects_what_would_install_nowhere(self) -> None:
+        module = self.module()
+        skill = self.home / 'SKILL.md'
+        for front, expected in (('hosts: ["claude"]', {'claude'}), ('hosts: [claude, cursor]', {'claude', 'cursor'}),
+                                ('name: x', {'claude', 'codex', 'cursor'})):
+            skill.write_text(f'---\n{front}\n---\nbody\n')
+            self.assertEqual(module.skill_hosts(skill), expected, front)
+        for front in ('hosts: [claud]', 'hosts:\n  - claude', 'hosts: []'):
+            skill.write_text(f'---\n{front}\n---\nbody\n')
+            with self.assertRaises(ValueError, msg=front):
+                module.skill_hosts(skill)
+
     def test_default_is_preview(self) -> None:
         result = self.run_setup()
         self.assertEqual(json.loads(result.stdout)['mode'], 'preview')
@@ -96,12 +219,12 @@ class SetupTests(unittest.TestCase):
     def test_partial_upgrade_preserves_model_paths_and_registry(self) -> None:
         repo = str(self.home / 'repository roots with spaces')
         work = str(self.home / 'work root with spaces')
-        self.run_setup('--components', 'roles', '--role-model', 'reviewer=openai:chosen-model',
+        self.run_setup('--components', 'roles', '--role-model', 'task-reviewer=openai:chosen-model',
                        '--repo-roots', repo, '--work-root', work, '--apply')
         registry = (self.root / 'hooks/registry.json').read_bytes()
         self.run_setup('--components', 'rules', '--apply')
         roles = tomllib.loads((self.root / 'roles.toml').read_text())
-        self.assertEqual(roles['roles']['reviewer']['model'], 'openai:chosen-model')
+        self.assertEqual(roles['roles']['task-reviewer']['model'], 'openai:chosen-model')
         self.assertEqual((self.root / 'hooks/registry.json').read_bytes(), registry)
         overlay = (self.root / 'local/setup-paths.env').read_text()
         self.assertIn('CODE_DIRS_JSON=' + json.dumps([repo]), overlay)
@@ -276,7 +399,7 @@ class SetupTests(unittest.TestCase):
         for command in ('codex', 'claude'):
             (self.commands / command).write_text('#!/bin/sh\ntouch "' + str(marker) + '"\nexit 97\n')
         out = self.home / 'review output.json'
-        result = subprocess.run([str(self.root / 'bin/agent-run'), 'review-cross', str(repo),
+        result = subprocess.run([str(self.root / 'bin/agent-run'), 'cross-reviewer', str(repo),
                                  '--base', 'HEAD', '--out', str(out), '--dry-run'], env=self.env,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -321,10 +444,10 @@ class SetupTests(unittest.TestCase):
 
     def test_blocking_hooks_also_render_required_native_agents(self) -> None:
         self.run_setup('--components', 'hooks', '--blocking-hooks', '--apply')
-        self.assertTrue((self.host / 'agents/worker.md').exists())
-        self.assertTrue((self.host / 'agents/reviewer.md').exists())
+        self.assertTrue((self.host / 'agents/engineer.md').exists())
+        self.assertTrue((self.host / 'agents/task-reviewer.md').exists())
         self.assertTrue((self.root / 'references/conventions.md').exists())
-        for name in ('worker.md', 'reviewer.md', 'thermo-quality.md'):
+        for name in ('engineer.md', 'task-reviewer.md', 'quality-reviewer.md'):
             text = (self.host / 'agents' / name).read_text()
             self.assertNotIn('/skills/conventions/SKILL.md', text)
             self.assertNotIn('/skills/debug/SKILL.md', text)
@@ -437,7 +560,7 @@ class SetupTests(unittest.TestCase):
 
     def test_plugin_scoped_review_agent_is_recognized(self) -> None:
         helper = SOURCE / 'plugins/auto-review/kit/hooks/lib/review-state'
-        script = '. "$1"; rv_review_agent auto-review:thermo-bugs'
+        script = '. "$1"; rv_review_agent auto-review:bug-reviewer'
         result = subprocess.run(['bash', '-c', script, 'probe', str(helper)], env=self.env,
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -487,6 +610,112 @@ class SetupTests(unittest.TestCase):
         for name in ('review-output.schema.json', 'references/correctness.md', 'references/fix-policy.md'):
             self.assertTrue((self.root / 'skills/review-rubric' / name).exists())
         self.assertEqual(list((self.root / 'skills').glob('*/SKILL.md')), [])
+
+    def snapshot(self, *hosts: Path) -> dict[str, str]:
+        """Every file and link under the kit root (install state aside) and the host roots, by content."""
+        files = {}
+        for base in (self.root, *(hosts or [self.host])):
+            for path in sorted(base.rglob('*')):
+                if '.install-state' in path.relative_to(base).parts:
+                    continue
+                if path.is_symlink():
+                    files[str(path)] = 'link:' + os.readlink(path)
+                elif path.is_file():
+                    files[str(path)] = path.read_text(errors='replace')
+        return files
+
+    def test_cursor_rules_or_hooks_update_keeps_installed_mcp(self) -> None:
+        self.host.mkdir()
+        config = self.host / 'mcp.json'
+        config.write_text(json.dumps({'mcpServers': {'user': {'command': 'user-choice'}}}))
+        catalog = self.home / 'catalog.json'
+        catalog.write_text(json.dumps({'mcpServers': {'owned': {'command': 'true'}}}))
+        self.run_setup('--hosts', 'cursor', '--components', 'rules', 'hooks', 'mcp', '--mcp-catalog', str(catalog),
+                       '--confirm-hook-support', 'cursor', '--apply')
+        servers = json.loads(config.read_text())['mcpServers']
+        self.assertEqual(set(servers), {'user', 'owned'})
+        record = self.state()['managed']['servers:' + str(config)]
+        for components in (['rules'], ['hooks']):
+            self.run_setup('--hosts', 'cursor', '--components', *components, '--confirm-hook-support', 'cursor', '--apply')
+            self.assertEqual(json.loads(config.read_text())['mcpServers'], servers, f'R2-CX-1: {components} only')
+            self.assertEqual(self.state()['managed']['servers:' + str(config)], record, f'R2-CX-1: {components} only')
+        self.run_setup('doctor')
+
+    def test_explicit_gcloud_off_overrides_the_user_overlay(self) -> None:
+        gcloud = self.home / '.config/gcloud'
+        gcloud.mkdir(parents=True)
+        work = self.home / 'work'
+        self.run_setup('--hosts', 'codex', '--components', 'rules', 'hooks', 'mcp', '--work-root', str(work),
+                       '--codex-gcloud', 'on', '--apply')
+        config = self.host / 'config.toml'
+        self.assertEqual(tomllib.loads(config.read_text())['sandbox_workspace_write']['writable_roots'], [str(work), str(gcloud)])
+        (self.root / 'local/kit.env').write_text('CODEX_SANDBOX_GCLOUD=1\n')
+        self.run_setup('--hosts', 'codex', '--components', 'mcp', '--codex-gcloud', 'off', '--apply')
+        self.assertEqual(tomllib.loads(config.read_text())['sandbox_workspace_write']['writable_roots'], [str(work)],
+                         'R2-CX-2: an explicit off loses to kit.env')
+        self.assertEqual(self.state()['configuration']['codex_gcloud'], 'off')
+        env = dict(self.env, KIT_ENV=str(self.root / 'local/setup-paths.env'))
+        result = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); from kit_env import kit_env; print(kit_env()["CODEX_SANDBOX_GCLOUD"])',
+                                 str(self.root / 'hooks/lib')], capture_output=True, text=True, env=env, check=True)
+        self.assertEqual(result.stdout.strip(), '0', 'R2-CX-2: hooks resolve the setup choice, not the user layer')
+
+    def test_partial_update_keeps_the_installed_custom_mcp_catalog(self) -> None:
+        catalog = self.home / 'catalog.json'
+        catalog.write_text(json.dumps({'mcpServers': {'custom': {'command': 'true'}}}))
+        self.run_setup('--components', 'rules', 'skills', 'mcp', '--mcp-catalog', str(catalog), '--apply')
+        installed = self.root / 'mcp/servers.json'
+        content = installed.read_text()
+        self.assertIn('custom', content)
+        for components in (['rules'], ['skills']):
+            self.run_setup('--components', *components, '--apply')
+            self.assertEqual(installed.read_text() if installed.is_file() else None, content, f'R2-CX-3: {components} only')
+            self.assertIn('file:' + str(installed), self.state()['managed'])
+        self.run_setup('doctor')
+
+    def test_single_component_updates_leave_every_other_component_alone(self) -> None:
+        """Install every component, then select one at a time: nothing installed may change or lose its record."""
+        everything = ['rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands']
+        for host in ('claude', 'codex', 'cursor'):
+            with self.subTest(host=host):
+                shutil.rmtree(self.root, ignore_errors=True)
+                shutil.rmtree(self.host, ignore_errors=True)
+                self.host.mkdir()
+                (self.host / 'mcp.json' if host != 'codex' else self.host / 'config.toml').write_text(
+                    json.dumps({'mcpServers': {'user': {'command': 'user-choice'}}}) if host != 'codex' else 'model = "user"\n')
+                flags = ['--hosts', host, '--confirm-hook-support', 'cursor']
+                self.run_setup(*flags, '--components', *everything, '--apply')
+                before = self.snapshot()
+                managed = self.state()['managed']
+                for component in everything:
+                    self.run_setup(*flags, '--components', component, '--apply')
+                    after = self.snapshot()
+                    changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+                    self.assertEqual(changed, [], f'{host}: selecting only {component}')
+                    current = self.state()['managed']
+                    self.assertEqual(sorted(managed.keys() - current.keys()), [], f'{host}: selecting only {component}')
+                self.run_setup('doctor')
+
+    def test_single_host_updates_leave_the_other_hosts_alone(self) -> None:
+        hosts = {'claude': self.home / 'claude config', 'codex': self.home / 'codex home', 'cursor': self.home / '.cursor'}
+        env = dict(self.env, CLAUDE_CONFIG_DIR=str(hosts['claude']), CODEX_HOME=str(hosts['codex']))
+        everything = ['rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands']
+
+        def setup(*flags: str) -> None:
+            result = subprocess.run([sys.executable, str(SOURCE / 'bin/agent-setup'), '--source', str(SOURCE), '--root-dir', str(self.root),
+                                     *flags, '--confirm-hook-support', 'cursor'], capture_output=True, text=True, env=env, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        setup('--hosts', *hosts, '--components', *everything, '--apply')
+        before = self.snapshot(*hosts.values())
+        managed = self.state()['managed']
+        for host in hosts:
+            for components in (everything, ['rules']):
+                setup('--hosts', host, '--components', *components, '--apply')
+                after = self.snapshot(*hosts.values())
+                changed = sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+                self.assertEqual(changed, [], f'selecting only {host} with {components}')
+                self.assertEqual(sorted(managed.keys() - self.state()['managed'].keys()), [], f'selecting only {host}')
+        setup('doctor')
 
 
 if __name__ == '__main__':

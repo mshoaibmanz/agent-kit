@@ -40,9 +40,10 @@ else is noise the next reader skims past.
 - Type hints on every public function (args + return); no mutable default args.
 - Logging via `logging` or `structlog` — never `print()`.
 - Imports: stdlib → third-party → local; no wildcards.
-- Formatter `ruff format` (line length 100); linter `ruff check --fix`. The `python-format`
-  PostToolUse hook already runs both on every Edit/Write, so treat this as the standard to
-  write to, not a command to run.
+- Formatter `ruff format` (line length 100); linter `ruff check --fix`. On Claude Code the
+  `python-format` hook runs both after every edit, so there treat this as the standard to write
+  to. Other hosts have no such hook: run `ruff format <file>` and `ruff check --fix <file>`
+  yourself after editing Python.
 - Avoid N+1 — bulk-query, loop in code.
 - **Never put a non-printing character in a source literal** — write `\uXXXX`, or match by
   Unicode category. A raw zero-width/bidi char renders as mojibake in a diff and cannot be

@@ -70,12 +70,12 @@ class HostTests(unittest.TestCase):
         shell = tomllib.loads(text)["shell_environment_policy"]["set"]
         self.assertEqual(shell["AGENT_HOST"], "codex")
         self.assertEqual(shell["GIT_CONFIG_VALUE_0"], str(self.kit / "git-hooks"))
-        role = tomllib.loads((root / "agents/review-cross.toml").read_text())
+        role = tomllib.loads((root / "agents/cross-reviewer.toml").read_text())
         self.assertEqual(role["model"], "gpt-6.1-sol")
         self.assertEqual(role["model_reasoning_effort"], "high")
         self.assertEqual(role["sandbox_mode"], "read-only")
         self.assertIn("cross-model reviewer", role["developer_instructions"])
-        self.assertFalse((root / "agents/worker.toml").exists())
+        self.assertFalse((root / "agents/engineer.toml").exists())
         hooks = json.loads((root / "hooks.json").read_text())["hooks"]
         for event in ("PreToolUse", "PostToolUse"):
             edits = [
@@ -97,7 +97,7 @@ class HostTests(unittest.TestCase):
         )
         self.assertIn(
             "run",
-            next(line for line in roles.stdout.splitlines() if line.startswith("review-cross")),
+            next(line for line in roles.stdout.splitlines() if line.startswith("cross-reviewer")),
         )
         self.assertEqual(self.run_kit("codex").returncode, 0)
         self.assertEqual(text, (root / "config.toml").read_text())
@@ -152,7 +152,7 @@ class HostTests(unittest.TestCase):
     def test_agent_user_edit_refuses_partial_render(self) -> None:
         root = self.root / ".codex"
         (root / "agents").mkdir(parents=True)
-        (root / "agents/review-cross.toml").write_text('name = "user-owned"\n')
+        (root / "agents/cross-reviewer.toml").write_text('name = "user-owned"\n')
         result = self.run_kit("codex")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((root / "hooks.json").exists())

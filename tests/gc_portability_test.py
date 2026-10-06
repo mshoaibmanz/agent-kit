@@ -32,7 +32,7 @@ class GCPortabilityTests(unittest.TestCase):
         (self.kit / "bin").mkdir(parents=True)
         (self.kit / "hooks/lib").mkdir(parents=True)
         (self.kit / "local").mkdir()
-        for relative in ("bin/claude-gc", "hooks/lib/gc-lock.py", "hooks/lib/hook-io"):
+        for relative in ("bin/claude-gc", "hooks/lib/gc-lock.py", "hooks/lib/hook-io", "hooks/lib/host-words"):
             shutil.copy2(SOURCE / relative, self.kit / relative)
         self.env = {
             "HOME": str(self.home),
@@ -94,7 +94,8 @@ class GCPortabilityTests(unittest.TestCase):
     def legacy_hook(self) -> None:
         lib = self.home / ".claude/hooks/lib"
         lib.mkdir(parents=True)
-        shutil.copyfile(self.kit / "hooks/lib/hook-io", lib / "hook-io")
+        for name in ("hook-io", "host-words"):
+            shutil.copyfile(self.kit / "hooks/lib" / name, lib / name)
 
     def create_worktree(
         self, directory: str = "configured repositories with spaces"

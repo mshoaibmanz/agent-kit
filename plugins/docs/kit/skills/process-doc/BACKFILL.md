@@ -17,7 +17,7 @@ hashing, and indexing.
    their curated screenshot folder first; loose root screenshots are a messier second pass (filter out
    non-process images: photos, gifs, query-result exports).
 2. **Download + decode without flooding context.** `download_file_content` returns base64. For more than
-   a couple of images, delegate the download/decode/classify to a subagent (Agent tool) so the base64
+   a couple of images, delegate the download/decode/classify to a subagent, where your host has them, so the base64
    never enters the main context — have it write each PNG to a staging dir and return only compact
    classifications. For a couple, inline is fine: write the base64 to a `.b64` file, then
    `base64 -d in.b64 > out.png` (macOS) or `python3 -c "import base64,pathlib;pathlib.Path('out.png').write_bytes(base64.b64decode(pathlib.Path('in.b64').read_text()))"`.

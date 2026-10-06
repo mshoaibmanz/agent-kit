@@ -253,6 +253,10 @@ def toml_tables_changed(before: str, after: str, blocks: list[str]) -> bool:
         for name in owned.get("mcp_servers", {}):
             if old.get("mcp_servers", {}).get(name) != new.get("mcp_servers", {}).get(name):
                 return True
+        if "sandbox_workspace_write" in owned and old.get("sandbox_workspace_write") != new.get(
+            "sandbox_workspace_write"
+        ):
+            return True
         for key in owned.get("shell_environment_policy", {}).get("set", {}):
             if old.get("shell_environment_policy", {}).get("set", {}).get(
                 key

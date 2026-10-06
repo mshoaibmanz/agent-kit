@@ -7,6 +7,9 @@
 # A silent exit 0 reads as a working guard, which is how a missing lib stayed unnoticed.
 HOOK_LIB=${BASH_SOURCE[0]%/*}
 HOOK_NAME=${0##*/}
+# Host nouns (host_noun, host_trailer, host_can_ask) for every deny/ask text that names a tool or file.
+# Missing, it fails this source like a missing hook-io, so each hook's own missing-lib branch runs.
+. "$HOOK_LIB/host-words" || return 1
 # Every Stop hook that blocks touches <sid> here first; stop-chime (same Stop array, no view of the
 # decision) reads it to skip a false "done" chime.
 STOP_BLOCK_DIR="${TMPDIR:-/tmp}/claude-stop-block"
@@ -26,8 +29,8 @@ hook_lib() {
   fi
   for l in "$@"; do
     [ -r "$HOOK_LIB/$l" ] && . "$HOOK_LIB/$l" 2>/dev/null && continue
-    [ "$mode" = closed ] && _hook_refuse "hooks/lib/$l, or a file it reads, is missing or broken" "Restore hooks/lib from your kit source checkout, then retry"
-    jq -n --arg m "$HOOK_NAME is off: hooks/lib/$l, or a file it reads, is missing or broken. Restore hooks/lib from your kit source checkout, then retry" '{systemMessage:$m}'
+    [ "$mode" = closed ] && _hook_refuse "hooks/lib/$l, or a file it reads, is missing or broken" "Restore it: git -C ${HOOK_LIB%/hooks/lib} checkout -- hooks/lib, then retry"
+    jq -n --arg m "$HOOK_NAME is off: hooks/lib/$l, or a file it reads, is missing or broken. Restore it: git -C ${HOOK_LIB%/hooks/lib} checkout -- hooks/lib, then retry" '{systemMessage:$m}'
     exit 0
   done
   [ -z "$errexit" ] || set -e
@@ -52,8 +55,8 @@ _hook_refuse() {
 }
 
 # The overlay's declared keys, the only names it can set. The one list: hooks/lib/kit_env.py reads
-# this line, and README and ~/.claude/kit.env.example document the same keys.
-KIT_KEYS="GIT_AUTHOR RELEASE_BRANCH_RE TEST_GATE_FILE TEST_RUNNER TEST_RUNNER_RE TEST_REFUSED_CMDS TEST_NOTE PROTOTYPE_DIRS CODE_DIRS CODE_DIRS_JSON BQRO_PROJECT AGENT_WORK_ROOT CONTEXT_HANDOFF_AT CODE_SEARCH_ZOEKT_URL CODE_SEARCH_SSO_COOKIE CODE_SEARCH_GH_OWNER CODE_SEARCH_CHROME_PROFILE"
+# this line, and README and the kit's kit.env.example document the same keys.
+KIT_KEYS="GIT_AUTHOR RELEASE_BRANCH_RE REVIEW_BASE TEST_GATE_FILE TEST_RUNNER TEST_RUNNER_RE TEST_REFUSED_CMDS TEST_NOTE PROTOTYPE_DIRS CODE_DIRS CODE_DIRS_JSON BQRO_PROJECT AGENT_WORK_ROOT CODEX_SANDBOX_GCLOUD CONTEXT_HANDOFF_AT CODE_SEARCH_ZOEKT_URL CODE_SEARCH_SSO_COOKIE CODE_SEARCH_GH_OWNER CODE_SEARCH_CHROME_PROFILE"
 
 # kit_env: load the per-user overlay once ($KIT_ENV, else <config dir>/local/kit.env; KIT_ENV=/dev/null
 # runs with none). Company values live there, never in a hook: an absent key is empty and the check
@@ -92,6 +95,18 @@ kit_env() {
   return 0
 }
 
+# kit_work_root: the one work-root resolver for bash; hooks/lib/kit_env.py work_root() is its twin.
+# CLAUDE_OUT_ROOT (tests), else the overlay's AGENT_WORK_ROOT, else ~/agent-work, else
+# ~/claude-scratch (its old name) when only that exists.
+kit_work_root() {
+  kit_env
+  local r=${CLAUDE_OUT_ROOT:-${AGENT_WORK_ROOT:-}}
+  if [ -n "$r" ]; then r=${r/#\~/$HOME}
+  elif [ ! -e "$HOME/agent-work" ] && [ -d "$HOME/claude-scratch" ]; then r=$HOME/claude-scratch
+  else r=$HOME/agent-work; fi
+  printf '%s' "$r"
+}
+
 unset HOOK_INPUT
 # hook_input: read the payload on stdin into HOOK_INPUT, once. A hook that fires on every Bash
 # call matches the raw JSON against a word its command must contain before paying for jq.
@@ -118,6 +133,14 @@ decide() {
 }
 deny() { decide deny "$1"; }
 ask()  { decide ask "$1"; }
+
+# confirm <reason> [context]: a destructive op only the user approves. Claude pauses on `ask`; the adapter
+# turns `ask` into `deny` on other hosts, so there the reason says who runs it instead.
+# An optional context goes to the model as additionalContext either way.
+confirm() {
+  if host_can_ask; then decide ask "$1 Confirm only if that is deliberate." "${2:-}"; fi
+  decide deny "$1 Refused on this host, which cannot pause for approval: give the user the exact command to run themselves." "${2:-}"
+}
 
 # add_context <event> <text>: additionalContext for the model with no permissionDecision (an
 # explicit allow would bypass the user's own permission rules). Does not exit.

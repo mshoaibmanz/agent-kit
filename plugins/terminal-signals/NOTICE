@@ -46,9 +46,9 @@ Each item keeps its own copyright and licence.
    MIT License (text below)
 
    Adapted:
-   - agents/thermo-bugs.md, from
+   - agents/bug-reviewer.md, from
      agents/thermo-nuclear-review-subagent.md
-   - agents/thermo-quality.md, from
+   - agents/quality-reviewer.md, from
      agents/thermo-nuclear-code-quality-review-subagent.md
    The thermos rubric skills are not redistributed. These agents read the
    bundled review rubric under skills/review-rubric/references/.

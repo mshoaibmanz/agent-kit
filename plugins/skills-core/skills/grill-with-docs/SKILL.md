@@ -4,4 +4,5 @@ description: Interview the user relentlessly about a plan or design, one questio
 disable-model-invocation: true
 ---
 
-Call the Skill tool twice, for "grilling" and "domain-modeling".
+Load the `grilling` and `domain-modeling` skills and follow both (on Claude Code, call the Skill
+tool once for each).

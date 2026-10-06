@@ -1,6 +1,6 @@
 # Optional shell functions; account routing remains in the shared account helper.
 claude() {
-  local helper="${AGENT_KIT_DIR:-$HOME/.agents}/bin/claude-account"
+  local helper="${AGENT_KIT_DIR:-$HOME/.local/share/agent-kit}/bin/claude-account"
   [[ -x "$helper" ]] || helper="$HOME/.claude/bin/claude-account"
   local target cli=${CLAUDE_BIN:-claude}
   target=$("$helper" launch "$PWD") || return $?

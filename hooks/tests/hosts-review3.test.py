@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -18,9 +19,21 @@ loader = importlib.machinery.SourceFileLoader(
 spec = importlib.util.spec_from_loader(loader.name, loader)
 base = importlib.util.module_from_spec(spec)
 loader.exec_module(base)
-NATIVE = Path(
-    "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
-)
+BEGIN, END = "# BEGIN agent-kit managed", "# END agent-kit managed"
+
+
+def native_codex() -> Path:
+    """The native Codex binary behind the npm `codex` on PATH (CODEX_NATIVE_BIN overrides)."""
+    if os.environ.get("CODEX_NATIVE_BIN"):
+        return Path(os.environ["CODEX_NATIVE_BIN"])
+    found = shutil.which("codex")
+    if not found:
+        return Path("/nonexistent/codex")
+    package = Path(found).resolve().parents[1]
+    return next(iter(sorted((package / "node_modules/@openai").glob("codex-*/vendor/*/bin/codex"))), Path("/nonexistent/codex"))
+
+
+NATIVE = native_codex()
 
 
 class RoundThree(base.ReviewTests):
@@ -78,7 +91,7 @@ class RoundThree(base.ReviewTests):
         cases = (
             self.root / ".codex/CONFIG.TOML",
             self.root / ".codex/Hooks.json",
-            self.root / ".CoDeX/AgEnTs/REVIEW-CROSS.TOML",
+            self.root / ".CoDeX/AgEnTs/CROSS-REVIEWER.TOML",
             self.root / ".cursor/Mcp.json",
             self.root / ".cursor/rules/AGENT-KIT.MDC",
         )
@@ -98,6 +111,66 @@ class RoundThree(base.ReviewTests):
                 self.assertEqual(
                     result.get("hookSpecificOutput", {}).get("permissionDecision"), "deny"
                 )
+
+    def test_cursor_mcp_reuses_live_case_spelling(self):
+        self.catalog = {"mcpServers": {"demo": {"command": "true", "args": []}}}
+        self.catalog_write()
+        mcp = self.root / ".cursor/mcp.json"
+        mcp.parent.mkdir()
+        mcp.write_text(json.dumps({"mcpServers": {"Demo": {"command": "true", "args": []}}}))
+        result = self.render("cursor", ("--components", "mcp"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(json.loads(mcp.read_text())["mcpServers"]), ["Demo"])
+
+    def test_codex_mcp_render_keeps_hook_trust(self):
+        config = self.root / ".codex/config.toml"
+        config.parent.mkdir()
+        trust = (
+            '[hooks.state."/x/hooks.json:stop:0:0"]\ntrusted_hash = "sha256:fixture"\n\n'
+            '[projects."/p"]\ntrust_level = "trusted"\n'
+        )
+        config.write_text(
+            f'model = "m"\n\n{BEGIN}\n[mcp_servers."old"]\ncommand = "true"\n\n'
+            f"{trust}\n{END}\n"
+        )
+        for _ in range(2):
+            result = self.render("codex", ("--components", "mcp"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        text = config.read_text()
+        parsed = base.tomllib.loads(text)
+        self.assertEqual(parsed["hooks"]["state"]["/x/hooks.json:stop:0:0"]["trusted_hash"], "sha256:fixture")
+        self.assertEqual(parsed["projects"]["/p"]["trust_level"], "trusted", "B-8: any host table survives")
+        self.assertEqual(set(parsed["mcp_servers"]), {"demo"})
+        self.assertEqual(text.count(trust), 1)
+        self.assertGreater(text.index(trust), text.index(END))
+
+    def test_codex_sandbox_writes_work_root_and_gcloud_only_on_opt_in(self):
+        work, gcloud = self.root / "work", self.root / "gcloud"
+        gcloud.mkdir()
+        overlay = self.root / "kit.env"
+        env = {
+            **self.env,
+            "AGENT_KIT_HOST_ROOT": str(self.root / ".codex"),
+            "CLAUDE_OUT_ROOT": str(work),
+            "CLOUDSDK_CONFIG": str(gcloud),
+            "KIT_ENV": str(overlay),
+        }
+        for setting, roots in (("", [str(work)]), ("CODEX_SANDBOX_GCLOUD=1\n", [str(work), str(gcloud)])):
+            overlay.write_text(setting)
+            result = self.render("codex", ("--components", "mcp"), env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            parsed = base.tomllib.loads((self.root / ".codex/config.toml").read_text())
+            self.assertEqual(parsed["sandbox_workspace_write"]["writable_roots"], roots, setting)
+
+    def test_codex_sandbox_keeps_the_users_table(self):
+        config = self.root / ".codex/config.toml"
+        config.parent.mkdir()
+        config.write_text('[sandbox_workspace_write]\nwritable_roots = ["/x"]\n')
+        result = self.render("codex", ("--components", "mcp"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("your [sandbox_workspace_write] is kept", result.stderr)
+        parsed = base.tomllib.loads(config.read_text())
+        self.assertEqual(parsed["sandbox_workspace_write"], {"writable_roots": ["/x"]})
 
     def test_B3_toml_owned_tables_extend_beyond_markers(self):
         self.assertEqual(self.render().returncode, 0)

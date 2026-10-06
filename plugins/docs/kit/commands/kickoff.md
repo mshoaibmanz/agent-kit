@@ -6,7 +6,7 @@ argument-hint: "<work description> | takeover <PR|handoff-path> | sync <branch> 
 Pick the mode from the first word of the arguments: `takeover`, `sync`, or anything else (build).
 Definition of DONE for build and takeover is phase 5: CI green AND review comments addressed.
 
-Standing rules for every mode (on top of CLAUDE.md's one-PR-per-ticket, handoff and `worker` rules):
+Standing rules for every mode (on top of CLAUDE.md's one-PR-per-ticket, handoff and `engineer` rules):
 - Never split a ticket into PRs per lib or phase; if it is too big for one, say so in the report.
 - The ticket is an item of a project under the work root (`~/agent-work/projects/<p>/items/<TICKET>/`,
   or a legacy `tasks/<TICKET>-*/`); the injected PROJECT or TASK DIR line names it, and
@@ -39,7 +39,7 @@ ticket key `<KEY>-N` and its title. Transition it to In Progress and assign it t
   regression test fails on the pre-fix code.
 - ONE commit, subject `<KEY>-N: <imperative>`, required trailers. Do not push yet.
 - The review happens at push: the first `git push` refuses with the review instruction (round 1:
-  thermo-bugs plus Codex, and thermo-quality once, in one message). Reproduce each finding before
+  bug-reviewer plus Codex, and quality-reviewer once, in one message). Reproduce each finding before
   fixing it, end with the `TALLY` line, fold every fix into the same commit with `--amend`, then
   push again. A Stop only self-checks small deltas.
 

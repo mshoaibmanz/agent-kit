@@ -3,7 +3,7 @@
 #   PostToolUse(Agent)     a review type's spawn records agent_id -> subagent_type in the session's
 #                          review state (SubagentStop payloads have carried agent_type "" since about
 #                          2026-09-29). A FOREGROUND review agent's tool result already holds its
-#                          report, so the round completes here. Any other agent (a fix worker)
+#                          report, so the round completes here. Any other agent (an engineer)
 #                          whose report holds a TALLY line settles the tally review-trigger owes.
 #   SubagentStop           fires when any subagent returns, foreground or background. The type comes
 #                          from the payload, else the agent map above, else the transcript's
@@ -14,12 +14,12 @@
 #                          report with a TALLY line settles the tally owed, as above.
 # Completion, not spawn: a background review has reviewed nothing yet. Each agent completes once
 # (done.<agent_id>), since a foreground agent fires both events.
-# REVIEW_DEBUG=1 appends every payload to ~/.agents/state/review-debug.log.
+# REVIEW_DEBUG=1 appends every payload to <kit>/state/review-debug.log.
 . "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
 hook_lib open review-state
 hook_input
 if [ "${REVIEW_DEBUG:-}" = 1 ]; then
-  _dbg="${AGENT_STATE_DIR:-$HOME/.agents/state}"
+  _dbg="${AGENT_STATE_DIR:-${AGENT_KIT_DIR:-${0%/*}/..}/state}"
   mkdir -p "$_dbg" 2>/dev/null && printf '%s %s\n' "$(date -u +%FT%TZ)" "$HOOK_INPUT" >> "$_dbg/review-debug.log" 2>/dev/null
 fi
 hook_read event='.hook_event_name // ""' sid='.session_id // ""' cwd='.cwd // ""' \

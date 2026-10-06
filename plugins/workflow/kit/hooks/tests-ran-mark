@@ -13,7 +13,7 @@ set -uo pipefail
 hook_lib open cmd-view state test-run cmd-repo review-state
 kit_env 2>/dev/null
 # The work root (kit.env AGENT_WORK_ROOT); ~/claude-scratch is its old name, kept as a link to it.
-_wr=${CLAUDE_OUT_ROOT:-${AGENT_WORK_ROOT:-$HOME/agent-work}}; _wr=${_wr/#\~/$HOME}; _wrt="~${_wr#"$HOME"}"
+_wr=$(kit_work_root); _wrt="~${_wr#"$HOME"}"
 hook_read tool='.tool_name // ""' sid='.session_id // "nosession"' cwd='.cwd // ""' \
   files='(.tool_input.file_paths // [(.tool_input.file_path // "")]) | join("\n")' cmd='.tool_input.command // ""' aid='.agent_id // ""'
 [ -n "$cwd" ] || cwd="$PWD"

@@ -22,7 +22,7 @@ set -uo pipefail
 
 . "${0%/*}/lib/hook-io" 2>/dev/null || {
   case "$(cat)" in *commit*)
-    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"commit-cohesion: hooks/lib/hook-io is missing, so the commit gate cannot run and refuses the commit. Restore it: git -C ~/.agents checkout -- hooks/lib"}}' ;;
+    printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"commit-cohesion: hooks/lib/hook-io is missing, so the commit gate cannot run and refuses the commit. Restore it: git -C %s checkout -- hooks/lib"}}\n' "${0%/*}/.." ;;
   esac
   exit 0
 }
