@@ -1540,9 +1540,21 @@ if [ "$bg" != true ] && [ "${AGENT_HOST:-claude}" = claude ] \
   # $( ) and backtick body is code on its own line (so "$(gh run watch 1)" is), escapes and
   # nesting follow bash. Joined onto one line so a multi-line loop pairs `until` with its sleep;
   # a line ending in the keyword joins with a space, since `while<newline>cond` is valid bash. The
-  # keyword is in command position after a separator or a compound keyword (`then while`).
+  # keyword counts only in command position: drop compound keywords before it (`then`, `do`, `!`)
+  # one at a time, and what is left must be empty or end in a separator. `echo do while` is text.
   code_view
-  _ptext=$(printf '%s\n' "$CV_CODE" | awk '{ printf "%s%s", (NR == 1 ? "" : (p ~ /(^|[;&|({!]|(^|[[:space:]])(then|else|elif|do|if|time))[[:space:]]*(while|until)[[:space:]]*$/ ? " " : ";")), $0; p = $0 }')
+  _ptext=$(printf '%s\n' "$CV_CODE" | awk '
+    function loop_head(s) {
+      if (s !~ /(^|[;&|({[:space:]])(while|until)[[:space:]]*$/) return 0
+      sub(/(while|until)[[:space:]]*$/, "", s)
+      while (1) {
+        sub(/[[:space:]]+$/, "", s)
+        if (s == "" || s ~ /[;&|({]$/) return 1
+        if (s !~ /(^|[;&|({[:space:]])(then|else|elif|do|if|time|!)$/) return 0
+        sub(/(then|else|elif|do|if|time|!)$/, "", s)
+      }
+    }
+    { printf "%s%s", (NR == 1 ? "" : (loop_head(p) ? " " : ";")), $0; p = $0 }')
   _poll=$(printf '%s' "$_ptext" | grep -Eo '(^|[;&|({[:space:]])(until|while)[[:space:]].*[;&|[:space:]]sleep[[:space:]]+([5-9]|[1-9][0-9]+)|(^|[;&|([:space:]])gh[[:space:]]+(run[[:space:]]+watch|pr[[:space:]]+checks[^|;&]*--watch)' | head -1)
   [ -z "$_poll" ] || deny "Append \`# fg-wait\` only for a wait under a minute. Otherwise rerun this with run_in_background: true; you are notified when it exits. Foreground polling blocks this agent with no output for up to 10 minutes."
 fi
