@@ -2,10 +2,30 @@
 # Credentials enter only the server's environment, never rendered config or argv.
 set +x
 set -eu
-SENTRY_ACCESS_TOKEN=$(/usr/bin/security find-generic-password -s agent-kit/mcp/sentry -a sentry -w 2>/dev/null) || {
-  echo 'Could not access the Sentry Keychain item (missing or denied). Check access in your trusted terminal before importing or rotating a credential.' >&2
+# The macOS Keychain, else libsecret's secret-tool (Linux; ro-mysql's SECRET_TOOL_PATHS, never one
+# from PATH), else SENTRY_ACCESS_TOKEN already in the environment, which is also the fallback when a
+# store has no item.
+store_token= store_fix=
+if [ -x /usr/bin/security ]; then
+  store_token=$(/usr/bin/security find-generic-password -s agent-kit/mcp/sentry -a sentry -w 2>/dev/null) ||
+    store_fix='could not access the Keychain item agent-kit/mcp/sentry (missing or denied). Fix: security add-generic-password -s agent-kit/mcp/sentry -a sentry -w (in your own terminal)'
+else
+  for secret_tool in /usr/bin/secret-tool /usr/local/bin/secret-tool; do
+    [ -x "$secret_tool" ] || continue
+    store_token=$("$secret_tool" lookup service agent-kit/mcp/sentry account sentry 2>/dev/null) ||
+      store_fix='no secret-tool item service=agent-kit/mcp/sentry account=sentry. Fix: secret-tool store --label=sentry service agent-kit/mcp/sentry account sentry'
+    break
+  done
+fi
+SENTRY_ACCESS_TOKEN=${store_token:-${SENTRY_ACCESS_TOKEN:-}}
+if [ -z "$SENTRY_ACCESS_TOKEN" ]; then
+  echo "Sentry MCP off: ${store_fix:-no Keychain or secret-tool here, and SENTRY_ACCESS_TOKEN is unset. Fix: export it in your shell profile}" >&2
+  exit 1
+fi
+[ -n "$SENTRY_ACCESS_TOKEN" ] || exit 1
+command -v npx >/dev/null 2>&1 || {
+  echo "Sentry MCP off: npx is missing. Fix: $(sh "${0%/*}/../hooks/lib/install-hint" npx 2>/dev/null || echo 'install Node.js')" >&2
   exit 1
 }
-[ -n "$SENTRY_ACCESS_TOKEN" ] || exit 1
 export SENTRY_ACCESS_TOKEN
 exec npx -y @sentry/mcp-server@0.37.0 "$@"

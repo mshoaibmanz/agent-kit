@@ -361,7 +361,8 @@ rm -f "$M/edit-$SID" "$T/kit-aw.env"; rm -rf "$T/aw"
 
 echo "--- lib/cmd-repo: the repo a command acts in ---"
 CR="$T/cr-repo"; rm -rf "$CR"; git init -q -b cr "$CR"; mkdir -p "$CR/sub"
-printf 'x = 1\n' > "$CR/a.py"; git -C "$CR" add a.py; git -C "$CR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm init
+git -C "$CR" config core.trustctime false   # the racy-git case below must not depend on timing
+printf 'x = 1\n' > "$CR/a.py"; touch -t 202601010000.00 "$CR/a.py"; git -C "$CR" add a.py; git -C "$CR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm init
 crr() { ( . "$H/lib/cmd-repo" && cmd_repo "$@" && printf '%s' "$CMD_DIR" ); }
 crk() { ( . "$H/lib/state" && path_key "$1" ); }
 crcase() { [ "$(crr "${@:3}")" = "$2" ] && ok "cmd-repo: $1" || bad "cmd-repo: $1" "got $(crr "${@:3}")"; }
@@ -389,9 +390,12 @@ rm -f "$M/$SID-cr" "$M/wt-$(crk "$CR")" "$M/wt-$(crk "$T")" "$M/lastrun-$SID" "$
 HC="$T/hooks-cr"; rm -rf "$HC"; cp -RH "$H" "$HC"
 printf '#!/bin/sh\necho "$1" > "%s/ci-watch.arg"\n' "$T" > "$HC/ci-watch.new"; chmod +x "$HC/ci-watch.new"; mv "$HC/ci-watch.new" "$HC/ci-watch"
 rm -f "$T/ci-watch.arg"
-printf '%s' "$(post "git -C \"$CR\" push -u origin HEAD" $SID-cr /)" | env -u CI_WATCH_ACTIVE "$HC/ci-watch-on-push"
+# Its own repo: what the push hook leaves running in the background must not race the review-state
+# cases below on $CR (seen once in CI as a lost "review edit marked").
+CRP="$T/cr-push-repo"; rm -rf "$CRP"; git init -q -b cr "$CRP"
+printf '%s' "$(post "git -C \"$CRP\" push -u origin HEAD" $SID-crp /)" | env -u CI_WATCH_ACTIVE "$HC/ci-watch-on-push"
 n=0; until [ -f "$T/ci-watch.arg" ] || [ "$n" -ge 20 ]; do sleep 0.1; n=$((n+1)); done
-[ "$(cat "$T/ci-watch.arg" 2>/dev/null)" = "$CR" ] && ok "ci-watch-on-push: git -C <wt> push watches <wt>" \
+[ "$(cat "$T/ci-watch.arg" 2>/dev/null)" = "$CRP" ] && ok "ci-watch-on-push: git -C <wt> push watches <wt>" \
   || bad "ci-watch-on-push: git -C <wt> push watches <wt>" "$(cat "$T/ci-watch.arg" 2>/dev/null)"
 rm -rf "$HC" "$T/ci-watch.arg"
 
@@ -399,6 +403,9 @@ echo "--- tests-ran-mark: a Bash-written source edit marks the review ---"
 rvk() { ( . "$H/lib/review-state" 2>/dev/null && "$@" ); }
 rvk rv_clear_edits $SID-rv "$CR"
 printf 'x = 2\n' > "$CR/a.py"
+# Same size as the committed `x = 1` and pinned to the index's own second: git's racy-clean
+# window, which a plain copy of the index closes (the edit then reads as unchanged).
+touch -t 202601010000.00 "$CR/a.py" "$CR/.git/index"
 printf '%s' "$(post "python3 - <<PY
 open(\"a.py\", \"w\").write(\"x = 2\")
 PY" $SID-rv "$CR")" | "$H/tests-ran-mark" >/dev/null
@@ -530,7 +537,7 @@ printf '{"session_id":"%s"}' "$SID-chime" | "$H/stop-chime"
 sleep 3
 [ ! -f "$SB/$SID-chime" ] && ok "stop-chime consumes the block marker without the env" || bad "stop-chime control: marker not consumed"
 rm -f "$SB/$SID-chime"
-# retro-extract replaced session-digest at SessionEnd.
+# retro-extract at SessionEnd.
 TR=$T/hooktestdigest.jsonl; DG=$T/retro-root
 printf '%s\n' '{"type":"system","subtype":"compact_boundary"}' > "$TR"
 rm -rf "$DG"

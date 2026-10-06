@@ -14,7 +14,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/kit/skills/review-rubric/references/architecture.md`
 
 ## Context you do not automatically have
 
-You inherit the kit's shared rules (your host's instructions file) but not the session-start context. Read `${CLAUDE_PLUGIN_ROOT}/kit/references/conventions.md` for Python/SQL house style and, if present, `${CLAUDE_PLUGIN_ROOT}/kit/local/<repo>-rules.md` and `<repo>-invariants.md`.
+You inherit the kit's shared rules (`~/.claude/CLAUDE.md`) but not the session-start context. Read `${CLAUDE_PLUGIN_ROOT}/kit/references/conventions.md` for Python/SQL house style and, if present, `${CLAUDE_PLUGIN_ROOT}/kit/local/<repo>-rules.md` and `<repo>-invariants.md`.
 
 ## Apply on top of the rubric
 

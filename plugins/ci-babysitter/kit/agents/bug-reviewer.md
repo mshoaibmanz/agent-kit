@@ -8,11 +8,11 @@ You are the bugs half of a two-agent thermo-nuclear review. The main session giv
 
 ## Rubric
 
-Read `{{AGENT_KIT_DIR}}/skills/review-rubric/references/correctness.md` in full. Cite the applicable check, mechanism and evidence for each finding.
+Read `{{SKILLS_DIR}}/review-rubric/references/correctness.md` in full. Cite the applicable check, mechanism and evidence for each finding.
 
 ## Context you do not automatically have
 
-You inherit the kit's shared rules (your host's instructions file) but not the session-start context. Before judging conventions read the repo root `CONTEXT-MAP.md` and, if present, `{{AGENT_KIT_DIR}}/local/<repo>-invariants.md` and `<repo>-rules.md` (known false positives are recorded there; never blocking).
+You inherit the kit's shared rules (`{{RULES_FILE}}`) but not the session-start context. Before judging conventions read the repo root `CONTEXT-MAP.md` and, if present, `{{OVERLAY_DIR}}/<repo>-invariants.md` and `<repo>-rules.md` (known false positives are recorded there; never blocking).
 
 ## Apply on top of the rubric
 

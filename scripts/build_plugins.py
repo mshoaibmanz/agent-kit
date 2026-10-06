@@ -13,7 +13,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'bin/lib'))
-from hosts import install_text  # noqa: E402
+from hosts import SUBAGENT_RESUME_MAX, install_text  # noqa: E402
 MATRIX = json.loads((ROOT / '.claude-plugin/components.json').read_text())
 HOOKS = {name: set(hooks) for name, hooks in MATRIX['hook_plugins'].items()}
 SKILLS = MATRIX['skill_plugins']
@@ -105,7 +105,10 @@ def build(destination: Path) -> None:
             body = install_text(doc.read_text(), '${CLAUDE_PLUGIN_ROOT}/kit')
             doc.write_text(body)
         if name == 'auto-review':
-            for filename, text in api.expected_agents(api.load_roles(), 'claude').items():
+            # Filled for the plugin's own kit; the default resume limit, never this machine's kit.env.
+            agents = api.expected_agents(api.load_roles(), 'claude', kit='${CLAUDE_PLUGIN_ROOT}/kit',
+                                         host_root='~/.claude', resume=SUBAGENT_RESUME_MAX)
+            for filename, text in agents.items():
                 path = plugin / 'agents' / filename
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(install_text(text, '${CLAUDE_PLUGIN_ROOT}/kit', export=False))

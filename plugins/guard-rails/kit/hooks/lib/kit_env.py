@@ -46,17 +46,18 @@ def work_root() -> str:
     return old if not os.path.exists(new) and os.path.isdir(old) else new
 
 
-def kit_env() -> dict[str, str]:
-    """Every declared key: its value in kit_env_path(), else empty."""
+def kit_env(path: str | None = None) -> dict[str, str]:
+    """Every declared key: its value in path (default kit_env_path()), else empty."""
     out = dict.fromkeys(KEYS, "")
-    path = kit_env_path()
+    path = path or kit_env_path()
     paths = [path]
     if Path(path).name == "setup-paths.env":
         user_layer = Path(path).with_name("kit.env")
         if not user_layer.is_file():
             config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
             user_layer = Path(config) / "local/kit.env"
-        paths = [str(user_layer), path]
+        # A team preset's values sit under the user's own kit.env, which sits under setup's answers.
+        paths = [str(Path(path).with_name("preset.env")), str(user_layer), path]
     # split("\n"), not splitlines(): that also breaks on \x0b, \x85 and others, which bash's read does not.
     for overlay in paths:
         try:

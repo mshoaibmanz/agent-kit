@@ -9,6 +9,9 @@ from typing import Any
 
 from session import resolve
 
+# The hosts the kit installs into: agent-setup, agent-kit and bin/lib/hosts.py import this one list.
+HOSTS = ("claude", "codex", "cursor")
+
 EVENTS = {
     "preToolUse": "PreToolUse",
     "postToolUse": "PostToolUse",
@@ -25,7 +28,7 @@ def detect_host(payload: dict[str, Any], env: dict[str, str] | None = None) -> s
         return "cursor"
     if "turn_id" in payload or payload.get("tool_name") == "apply_patch":
         return "codex"
-    if env.get("AGENT_HOST") in ("claude", "codex", "cursor"):
+    if env.get("AGENT_HOST") in HOSTS:
         return env["AGENT_HOST"]
     if env.get("CODEX_THREAD_ID") or env.get("CODEX_HOME"):
         return "codex"

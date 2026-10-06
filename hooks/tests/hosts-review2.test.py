@@ -157,7 +157,7 @@ class RoundTwo(base.ReviewTests):
         self.assertEqual(self.render("claude").returncode, 0)
         self.assertTrue(path.read_text().startswith("User rule stays.\n"))
         path.write_text(
-            path.read_text().replace("rules/hosts/claude.md", "rules/hosts/user-edited.md")
+            path.read_text().replace("state/rendered/claude-host-rules.md", "rules/hosts/user-edited.md")
         )
         self.assertNotEqual(self.render("claude").returncode, 0)
 
@@ -202,6 +202,7 @@ class RoundTwo(base.ReviewTests):
                     self.assertEqual(result.returncode, expected)
 
     def test_B4_user_native_fields_and_owned_content(self):
+        self.native_agents_on()
         self.assertEqual(self.render().returncode, 0)
         root = self.root / ".codex"
         config = root / "config.toml"

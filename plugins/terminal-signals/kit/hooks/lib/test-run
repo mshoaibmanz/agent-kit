@@ -1,10 +1,10 @@
 # Test-run detection and the markers test-exec-gate (PreToolUse), tests-ran-mark (PostToolUse) and
-# pre-push-gate share. Sourced after hook-io (kit_env), cmd-view (CMD_BARE, cmd_invokes) and state
+# lib/push-gate (git pre-push) share. Sourced after hook-io (kit_env), cmd-view (CMD_BARE, cmd_invokes) and state
 # (path_key). The repo's own runner comes from the overlay: TEST_RUNNER_RE, else TEST_RUNNER.
 #
 # Markers in TR_DIR, swept by tests-ran-mark after ~48h (BSD `find -mtime +1` truncates the day
 # count, so it is two days, not one):
-#   <sid>, wt-<key>          a test run finished in this session / worktree (pre-push-gate)
+#   <sid>, wt-<key>          a test run finished in this session / worktree (lib/push-gate)
 #   edit-<sid>, edit-wt-<key> a source file changed
 #   lastrun-<rk>[.scope]     the agent's last run, and the scope the runs since the last edit covered
 TR_DIR="$HOME/.claude/tmp/claude-tests"

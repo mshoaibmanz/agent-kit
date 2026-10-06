@@ -452,8 +452,6 @@ a=1" | KIT_ENV=/dev/null cg); check "no overlay: the same path nudges" "$out" 'a
 rm -f "$C/lib/kit_env.py"
 out=$(cedit "$REPO/m.py" "a=1" "$six
 a=1" | python3 "$C/comment-guard"); check "comment-guard without lib/kit_env.py: tells the user it is off" "$out" 'systemMessage.*comment-guard is off'
-out=$(jq -cn --arg p "$FX/no-transcript.jsonl" '{transcript_path:$p}' | python3 "$C/session-digest")
-check "session-digest without lib/kit_env.py: tells the user it is off" "$out" 'systemMessage.*session-digest is off'
 
 echo "--- python-format ---"
 PY="$REPO/fmt.py"; echo "x=1" > "$PY"
@@ -789,27 +787,24 @@ sstopin "$RX4" "$SX4" quality-reviewer "Q-1 a.py:3 the retry charges twice"
   && ok "RC-CX-4: quality-reviewer findings owe the TALLY" || bad "RC-CX-4: quality-reviewer findings owe the TALLY"
 
 echo "--- roles review findings (B-1, B-2, B-7, B-9, CX-1) ---"
-# ppre <repo> <sid>: pre-push-gate's PreToolUse answer to a plain `git push`: decision, then reason.
-ppre() { jq -cn --arg s "$2" --arg d "$1" '{hook_event_name:"PreToolUse",tool_name:"Bash",session_id:$s,cwd:$d,tool_input:{command:"git push"}}' \
-  | "$H/pre-push-gate" | jq -r '(.hookSpecificOutput.permissionDecision // "allow") + ": " + (.hookSpecificOutput.permissionDecisionReason // "")' | tr '\n' ' '; }
-# B-1: pre-push-gate's deny issues a session round; its completion must reach the branch record, or
-# the git pre-push asks for round 1 again.
+# B-1: the git pre-push's refusal issues round 1; its completion in the session must reach the
+# branch record, or the next push asks for round 1 again.
 RB1="$FX/b1"; SB1="$SID-b1"; mkfeat "$RB1" fb1
 workin "$RB1" "$SB1" a 300; g1() { git -C "$RB1" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
 g1 add -A; g1 commit -qm w1
-out=$(ppre "$RB1" "$SB1"); check "B-1 fixture: pre-push-gate denies with the review trigger" "$out" '^deny: .*review trigger'
+out=$(issue "$RB1" "$SB1"); check "B-1 fixture: the git pre-push issues round 1" "$out" 'This refusal is the review trigger'
 sstopin "$RB1" "$SB1" bug-reviewer "No findings."; sstopin "$RB1" "$SB1" quality-reviewer "No findings."
 [ "$(rec "$RB1" fb1 .rounds)" = 1 ] && ok "B-1: the session round's completion counts in the branch record" || bad "B-1: the session round's completion counts in the branch record" "$(rec "$RB1" fb1 .)"
 out=$(gpush "$SB1" "$RB1"); check "B-1: ...so the git pre-push asks for no second round 1" "$out" 'Review round|review trigger' absent
 # B-2: bug-reviewer returns in session A, cross-reviewer runs in another session: the record completes,
-# and A's copy of the round must not stay pending (pre-push-gate denied every push from A).
+# and A's copy of the round must not stay pending (it would refuse every push from A).
 RB2="$FX/b2"; SB2="$SID-b2"; mkfeat "$RB2" fb2
 workin "$RB2" "$SB2" a 60; out=$(issue "$RB2" "$SB2" CODEX_BIN="$FK"); check "B-2 fixture: round 1 with cross-reviewer" "$out" 'agent-run cross-reviewer'
 sstopin "$RB2" "$SB2" bug-reviewer "No findings."; sstopin "$RB2" "$SB2" quality-reviewer "No findings."
 out=$(RC="$RB2" cxr "$SID-b2-other" FAKE_JSON="$FX/cx0.json")
 [ "$(rec "$RB2" fb2 '"\(.rounds) \(.pending_tree)"')" = "1 null" ] && ok "B-2 fixture: another session's cross-reviewer completes the record" || bad "B-2 fixture: another session's cross-reviewer completes the record" "$(rec "$RB2" fb2 .)"
 rs rv_pending "$SB2" "$RB2" && bad "B-2: session A's copy of the round is no longer pending" || ok "B-2: session A's copy of the round is no longer pending"
-out=$(ppre "$RB2" "$SB2"); check "B-2: ...and pre-push-gate does not deny A's push as not returned" "$out" 'has not returned' absent
+out=$(gpush "$SB2" "$RB2"); check "B-2: ...and the git pre-push does not refuse A's push as not returned" "$out" 'has not returned' absent
 # B-9: the CLI gone when agent-run runs: its fallback takes its place, so the round can complete.
 RB9="$FX/b9"; SB9="$SID-b9"; mkfeat "$RB9" fb9
 workin "$RB9" "$SB9" a 60; issue "$RB9" "$SB9" CODEX_BIN="$FK" >/dev/null

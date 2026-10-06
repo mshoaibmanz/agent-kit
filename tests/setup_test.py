@@ -22,6 +22,8 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[1]
 # The last release before the role renames: upgrade tests install it first, then this checkout.
 BASE = '2b07c10017f87e354d8dc1aa8b578a7b041b385b'
+# The last release whose Codex sandbox roots sat in the mcp block.
+SANDBOX_IN_MCP_BLOCK = 'c7738b427f876470281cc642a89ee4ee67933c5d'
 
 
 class SetupTests(unittest.TestCase):
@@ -49,8 +51,9 @@ class SetupTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def run_setup(self, *flags: str, success: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+        # --json: these tests read the plan and the apply result as data, not the summary.
         result = subprocess.run([sys.executable, str(SOURCE / 'bin/agent-setup'), '--source', str(SOURCE),
-                                 '--root-dir', str(self.root), '--host-root', str(self.host), *flags],
+                                 '--root-dir', str(self.root), '--host-root', str(self.host), '--json', *flags],
                                 capture_output=True, text=True, env=env or self.env, timeout=60)
         if success:
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -78,13 +81,13 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(shlex.split(command)[2], str(self.root / 'skills/process-doc/scripts/catalog.py'),
                          'CX-3: the installed path is one shell word even with spaces')
 
-    def run_base_setup(self, *flags: str) -> None:
+    def run_base_setup(self, *flags: str, commit: str = BASE) -> None:
         """Install with the base release, so an upgrade test starts from the state it really leaves."""
-        if subprocess.run(['git', '-C', str(SOURCE), 'cat-file', '-e', BASE + '^{commit}'], capture_output=True).returncode:
-            self.skipTest(f'base commit {BASE[:7]} is not in this clone (CI fetches full history)')
+        if subprocess.run(['git', '-C', str(SOURCE), 'cat-file', '-e', commit + '^{commit}'], capture_output=True).returncode:
+            self.skipTest(f'base commit {commit[:7]} is not in this clone (CI fetches full history)')
         base = Path(self.temporary.name) / 'base source'
         base.mkdir()
-        archive = subprocess.run(['git', '-C', str(SOURCE), 'archive', BASE], capture_output=True, check=True)
+        archive = subprocess.run(['git', '-C', str(SOURCE), 'archive', commit], capture_output=True, check=True)
         subprocess.run(['tar', '-x', '-C', str(base)], input=archive.stdout, check=True)
         result = subprocess.run([sys.executable, str(base / 'bin/agent-setup'), '--source', str(base), '--root-dir', str(self.root),
                                  '--host-root', str(self.host), *flags], capture_output=True, text=True, env=self.env, timeout=60)
@@ -111,7 +114,8 @@ class SetupTests(unittest.TestCase):
         self.assertFalse((self.host / 'skills/session-review').exists())
         self.assertTrue((self.host / 'skills/grilling').is_symlink())
         self.assertFalse((self.host / 'agents/review-cross.toml').exists())
-        self.assertTrue((self.host / 'agents/cross-reviewer.toml').is_file())
+        # roles.toml sets native_agents = false for codex: every role runs through agent-run.
+        self.assertFalse((self.host / 'agents/cross-reviewer.toml').exists())
         self.assertEqual((self.host / 'agents/mine.toml').read_text(), 'name = "mine"\n')
         self.assertFalse((self.root / 'agents/thermo-bugs.md').exists())
         managed = self.state()['managed']
@@ -139,6 +143,34 @@ class SetupTests(unittest.TestCase):
         self.run_setup('--hosts', 'codex', '--components', 'mcp', '--codex-gcloud', 'on', '--apply')
         config = tomllib.loads((self.host / 'config.toml').read_text())
         self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work), str(gcloud)])
+
+    def test_codex_sandbox_has_its_own_block_gated_on_hooks_too(self) -> None:
+        """Hooks alone name the work root; the sandbox block is its own, and an update without mcp
+        keeps it without a second [sandbox_workspace_write] from an install before the split."""
+        work = self.home / 'work'
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', '--work-root', str(work), '--apply')
+        text = (self.host / 'config.toml').read_text()
+        self.assertEqual(tomllib.loads(text)['sandbox_workspace_write']['writable_roots'], [str(work)], 'hooks only')
+        self.assertIn('# BEGIN agent-kit sandbox', text)
+        self.assertTrue(work.is_dir())
+        shutil.rmtree(self.root)
+        shutil.rmtree(self.host)
+        self.run_base_setup('--hosts', 'codex', '--components', 'mcp', '--work-root', str(work), '--apply')
+        self.run_setup('--hosts', 'codex', '--components', 'hooks', '--work-root', str(work), '--apply')
+        config = tomllib.loads((self.host / 'config.toml').read_text())
+        self.assertEqual(config['sandbox_workspace_write']['writable_roots'], [str(work)])
+        self.run_setup('--hosts', 'codex', '--components', 'rules', '--apply')
+        self.assertEqual(tomllib.loads((self.host / 'config.toml').read_text()), config, 'rules alone leave config.toml')
+        self.run_setup('doctor')
+
+    def test_rules_only_update_moves_a_legacy_install_s_sandbox_roots(self) -> None:
+        work = self.home / 'work'
+        self.run_base_setup('--hosts', 'codex', '--components', 'rules', 'mcp', '--work-root', str(work), '--apply',
+                            commit=SANDBOX_IN_MCP_BLOCK)
+        self.run_setup('--hosts', 'codex', '--components', 'rules', '--apply')
+        text = (self.host / 'config.toml').read_text()
+        self.assertEqual(tomllib.loads(text)['sandbox_workspace_write']['writable_roots'], [str(work)])
+        self.assertIn('# BEGIN agent-kit sandbox', text)
 
     def test_user_sandbox_table_is_kept_not_duplicated(self) -> None:
         self.host.mkdir()
@@ -169,6 +201,52 @@ class SetupTests(unittest.TestCase):
         result = self.run_setup('--hosts', 'cursor', '--components', 'mcp', '--mcp-catalog', str(catalog), '--apply', success=False)
         self.assertIn('Sentry', result.stderr)
         self.assertEqual(json.loads(config.read_text())['mcpServers'], {'Sentry': {'command': 'user-choice'}})
+
+    def test_a_preset_server_command_names_the_installed_kit_on_every_host(self) -> None:
+        preset = self.home / 'preset.toml'
+        preset.write_text('[mcp.servers.sentry]\ncommand = "{{KIT_DIR}}/bin/sentry-mcp"\n'
+                          'args = ["--host=sentry.example.com", "--config={{KIT_DIR}}/local/sentry.conf"]\n\n'
+                          '[mcp.servers.wrapped]\ncommand = "{{AGENT_KIT_DIR}}/bin/sentry-mcp"\nargs = ["--root={{KIT_DIR}}"]\n')
+        for host in ('claude', 'codex', 'cursor'):
+            with self.subTest(host=host):
+                self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
+                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--apply')
+                text = (self.host / ('config.toml' if host == 'codex' else 'mcp.json')).read_text()
+                servers = tomllib.loads(text)['mcp_servers'] if host == 'codex' else json.loads(text)['mcpServers']
+                self.assertEqual(servers['sentry']['command'], str(self.root / 'bin/sentry-mcp'))
+                self.assertEqual(servers['sentry']['args'], ['--host=sentry.example.com', f'--config={self.root}/local/sentry.conf'])
+                self.assertEqual((servers['wrapped']['command'], servers['wrapped']['args']),
+                                 (str(self.root / 'bin/sentry-mcp'), [f'--root={self.root}']))
+                self.assertNotIn('{{', text)
+        preset.write_text('[mcp.servers.docs]\ncommand = "{{NOPE}}/bin/server"\n')
+        self.root, self.host = self.home / 'kit refused', self.home / 'host refused'
+        result = self.run_setup('--preset', str(preset), '--hosts', 'claude', '--components', 'mcp', '--apply', success=False)
+        self.assertIn('unknown placeholder {{NOPE}}', result.stderr)
+        self.assertFalse(self.root.exists() or self.host.exists(), 'a refused placeholder wrote nothing')
+
+    def test_a_later_render_fills_the_installed_catalog_from_the_installed_kit(self) -> None:
+        preset = self.home / 'preset.toml'
+        preset.write_text('[mcp.servers.own-sentry]\ncommand = "{{KIT_DIR}}/bin/sentry-mcp"\n'
+                          'args = ["--config={{KIT_DIR}}/local/sentry.conf"]\n')
+        for host in ('claude', 'codex', 'cursor'):
+            with self.subTest(host=host):
+                self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
+                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--apply')
+                catalog = (self.root / 'mcp/servers.json').read_text()
+                self.assertNotIn('agent-kit-install-view-', catalog, 'the installed catalog names the deleted preview')
+                self.assertEqual(json.loads(catalog)['mcpServers']['own-sentry']['command'], '{{KIT_DIR}}/bin/sentry-mcp')
+                config = self.host / ('config.toml' if host == 'codex' else 'mcp.json')
+                config.unlink()
+                subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'render', '--host', host, '--components', 'mcp'],
+                               capture_output=True, text=True, env=self.env, check=True, timeout=60)
+                text = config.read_text()
+                servers = tomllib.loads(text)['mcp_servers'] if host == 'codex' else json.loads(text)['mcpServers']
+                self.assertEqual((servers['own-sentry']['command'], servers['own-sentry']['args']),
+                                 (str(self.root / 'bin/sentry-mcp'), [f'--config={self.root}/local/sentry.conf']))
+                if host == 'claude':
+                    doctor = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'doctor'], capture_output=True,
+                                            text=True, env=dict(self.env, AGENT_KIT_MCP=str(config)), timeout=60)
+                    self.assertIn('mcp: in sync with the catalog', doctor.stdout)
 
     def test_skill_hosts_rejects_what_would_install_nowhere(self) -> None:
         module = self.module()
@@ -320,6 +398,10 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(config['env']['GIT_CONFIG_VALUE_0'], str(self.root / 'git-hooks'))
         self.run_setup('--components', 'hooks', '--apply')
         config = json.loads((self.host / 'settings.json').read_text())
+        self.assertEqual(config['env']['GIT_CONFIG_VALUE_0'], str(self.root / 'git-hooks'),
+                         '4c: reselecting hooks without the flag keeps the saved blocking choice')
+        self.run_setup('--components', 'hooks', '--no-blocking-hooks', '--apply')
+        config = json.loads((self.host / 'settings.json').read_text())
         self.assertNotIn('GIT_CONFIG_VALUE_0', config['env'])
         self.assertEqual(config['env']['AGENT_GIT_HOOKS'], 'off')
 
@@ -441,6 +523,20 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout), [str(repo_parent)])
         helper = self.root / 'skills/code-search/scripts/code_search.py'
         subprocess.run([str(helper), '--help'], env=self.env, capture_output=True, check=True)
+
+    def test_the_retired_pre_push_gate_is_not_rendered(self) -> None:
+        # The git pre-push hook gates a push (it honors AGENT_PUSH_NOW); the old PreToolUse gate did not.
+        # Its file stays a no-op: a session started before an update still runs it on every Bash call.
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'git push origin HEAD'}})
+        for flags in (('--blocking-hooks',), ()):
+            self.run_setup('--components', 'hooks', *flags, '--apply')
+            settings = (self.host / 'settings.json').read_text()
+            self.assertIn('bash-guards', settings)
+            self.assertNotIn('pre-push-gate', settings, f'rendered with {flags or "default hooks"}')
+            stub = self.root / 'hooks/pre-push-gate'
+            self.assertTrue(os.access(stub, os.X_OK), 'the installed stub is executable')
+            result = subprocess.run([str(stub)], input=payload, capture_output=True, text=True, env=self.env, timeout=10)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
 
     def test_blocking_hooks_also_render_required_native_agents(self) -> None:
         self.run_setup('--components', 'hooks', '--blocking-hooks', '--apply')
@@ -683,7 +779,10 @@ class SetupTests(unittest.TestCase):
                 (self.host / 'mcp.json' if host != 'codex' else self.host / 'config.toml').write_text(
                     json.dumps({'mcpServers': {'user': {'command': 'user-choice'}}}) if host != 'codex' else 'model = "user"\n')
                 flags = ['--hosts', host, '--confirm-hook-support', 'cursor']
-                self.run_setup(*flags, '--components', *everything, '--apply')
+                # 4c: blocking hooks and a custom catalog, given only here, must survive every reselection.
+                catalog = self.home / 'custom catalog.json'
+                catalog.write_text(json.dumps({'mcpServers': {'custom': {'command': 'true'}}}))
+                self.run_setup(*flags, '--components', *everything, '--blocking-hooks', '--mcp-catalog', str(catalog), '--apply')
                 before = self.snapshot()
                 managed = self.state()['managed']
                 for component in everything:

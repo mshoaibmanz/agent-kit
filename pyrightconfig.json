@@ -1,0 +1,23 @@
+{
+  "extraPaths": ["bin/lib", "hooks/lib", "tests"],
+  "typeCheckingMode": "basic",
+  "reportPossiblyUnboundVariable": "none",
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalSubscript": "none",
+  "reportArgumentType": "none",
+  "executionEnvironments": [
+    {
+      "root": "tests",
+      "reportAttributeAccessIssue": "none",
+      "reportOptionalMemberAccess": "none",
+      "reportArgumentType": "none"
+    },
+    {
+      "root": "hooks/tests",
+      "reportAttributeAccessIssue": "none",
+      "reportOptionalMemberAccess": "none",
+      "reportArgumentType": "none"
+    }
+  ],
+  "exclude": ["plugins/**/kit", ".claude/worktrees", "state"]
+}

@@ -6,28 +6,53 @@ Python 3.11 or newer and Git are required. Hooks also need `jq` and the selected
 
 ## Setup
 
-Clone this repository to a directory you choose, then run the guided preview:
+Clone this repository to a directory you choose, then take one of three paths:
 
-```sh
-python3 bin/agent-setup --interactive
-```
+1. **Team preset**, one command for a teammate whose team keeps a preset (see below):
 
-For a scripted setup, start with rules and a few skills:
+   ```sh
+   python3 bin/agent-setup --preset gh:your-org/agent-kit-preset --apply
+   ```
 
-```sh
-python3 bin/agent-setup \
-  --hosts claude \
-  --components rules skills \
-  --skills conventions unslop code-search \
-  --root-dir "$HOME/.local/share/agent-kit" \
-  --repo-roots "$HOME/Code" "$HOME/Work projects" \
-  --github-owner your-org \
-  --work-root "$HOME/agent-work"
-```
+2. **Guided**: asks only what it cannot detect, previews, then asks before it applies:
 
-The guided setup asks for kit, repository, work and host paths, GitHub owner, CLI paths and selected role choices. Repository paths use a JSON array so spaces stay intact. Fresh scripted setup has no local repository roots; supply `--repo-roots` to search local clones, or pass that flag with no values to clear saved roots and use scoped remote search. This prints the component selection, dependencies and destination paths. Add `--apply` to install the previewed selection. Existing unrelated skills, rules, hooks and MCP entries are preserved. A conflicting file stops the entire preflight; choose a different destination or explicitly use `--collision backup` to move that file into the local rollback journal.
+   ```sh
+   python3 bin/agent-setup --interactive
+   ```
 
-The default source root is `~/.local/share/agent-kit`, outside shared skill discovery. `AGENT_KIT_DIR` or `--root-dir` chooses another root; the shared renderer accepts the same variable. Only selected skills receive `SKILL.md` files and host links. Paths containing spaces are supported. Repository roots are stored as a JSON array in `CODE_DIRS_JSON`.
+3. **Scripted**: name everything, preview, then add `--apply`:
+
+   ```sh
+   python3 bin/agent-setup \
+     --components rules skills \
+     --skills conventions unslop code-search \
+     --root-dir "$HOME/.local/share/agent-kit" \
+     --repo-roots "$HOME/Code" "$HOME/Work projects" \
+     --github-owner your-org \
+     --work-root "$HOME/agent-work"
+   ```
+
+Setup detects before it asks. Hosts default to the ones installed (the CLI on `PATH` under any name its installer uses, or a config directory, honouring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`); with none, kit files install now, and a later run that finds a host sets it up. The guided setup (and `--yes` or `--preset`) also finds repository parents under `~/Code`, `~/src`, `~/dev` and `~/projects`, and the GitHub owner from your only org in `gh api user/orgs` or the origin remotes it finds. `--yes` takes every default and detected value without a prompt, `--interactive` included; without a terminal setup never waits for input. Repository paths use a JSON array so spaces stay intact. Fresh scripted setup has no local repository roots; pass `--repo-roots` with no values to clear saved roots and use scoped remote search.
+
+### What setup checks
+
+Every run prints a short summary, one line per item with the fix command for this OS, then the change count by kind (`--verbose` adds every path, `--json` prints the plan as data):
+
+- **Ready**: found and working, such as a host CLI that is signed in.
+- **Needs attention**: something to fix. Lines marked "blocks apply" stop `--apply` up front: a missing hard requirement (Python 3.11+, `git`, `jq` for hooks), unconfirmed host hooks, an enabled plugin with the same hooks, or a path that holds your own content.
+- **Skipped**: a missing soft requirement (`gh` or its login, `uv` or `npx` for an MCP server, `gcloud` or `bq`) turns off only the feature that needs it. An MCP server whose runtime is missing is not registered; a rerun after you install it adds the server.
+
+Your own content is never overwritten silently: an existing file, link, MCP server or edited managed block of yours blocks apply. The guided setup asks whether to back it up, skip it or abort, and keeps your answers for the rerun when it stops. In scripts choose `--collision backup` (replace it; the local rollback journal keeps yours) or `--collision skip` (leave it and install around it). Unrelated skills, rules, hooks and MCP entries are preserved.
+
+### Team presets
+
+A preset is a TOML file of non-secret team defaults: `[kit]` overlay keys (`CODE_SEARCH_GH_OWNER`, `CODE_DIRS_JSON`, `CODE_SEARCH_ZOEKT_URL`, `REVIEW_BASE`, `RELEASE_BRANCH_RE`, `BQRO_PROJECT`, `GIT_AUTHOR`, `SUBAGENT_RESUME_MAX`; [`hooks/lib/README`](hooks/lib/README) gives their meanings), `[mcp.servers.<name>]` descriptors that name credential wrappers (`{{KIT_DIR}}/bin/sentry-mcp`, filled with each user's kit root) or native OAuth, `[hosts] recommended`, `[roles.<role>]` model and effort, and `[skills]` include or exclude. `gh:owner/repo[/path]` fetches `agent-kit-preset.toml` (or the path) with your own `gh` login; a failed fetch prints one line and continues on the plain defaults. A local path works too. Setup checks that your login is a member of the preset's GitHub org. It refuses a preset holding a token format (`ghp_`, `sk-`, `xox*-`, `AKIA` and the like) or credentials in a URL. Its `[kit]` values go in `local/preset.env`, under your own `local/kit.env`, and its answers sit under yours (flags and the choices of an earlier install or prompt). A changed preset applies on the next run with `--preset`; `doctor` reports its source and hash. [`presets/example.toml`](presets/example.toml) shows every table with placeholders; keep your team's real preset in a private repository of your organization, never in this public one.
+
+### Opinionated defaults
+
+The kit root is `~/.local/share/agent-kit`, the work root `~/agent-work`. Components default to `rules skills`; hooks are advisory until `--blocking-hooks`, which later updates keep until `--no-blocking-hooks`. Collisions refuse, Codex's sandbox does not get gcloud's credentials (`--codex-gcloud on`), and a finished subagent is resumed only below 300K context (`SUBAGENT_RESUME_MAX` in `local/kit.env`). Hooks keep their small state files under the host's config directory (`~/.claude/state` for Claude). Every choice is saved with the install, so an update that names only some components or flags keeps the rest, including `--mcp-catalog` and a preset's values.
+
+The kit root sits outside shared skill discovery. `AGENT_KIT_DIR` or `--root-dir` chooses another root; the shared renderer accepts the same variable. Only selected skills receive `SKILL.md` files and host links. Paths containing spaces are supported. Repository roots are stored as a JSON array in `CODE_DIRS_JSON`.
 
 ## Choose components
 
@@ -39,13 +64,13 @@ The default source root is `~/.local/share/agent-kit`, outside shared skill disc
 | `hooks` | Selected host events and shared logic | `jq`, provider CLI and a supported local runtime; manual host trust |
 | `mcp` | Token-free server descriptors from the empty default or `--mcp-catalog file.json` | Configure each server's runtime dependency; use native OAuth or a secret-store wrapper |
 | `commands` | Optional Claude workflow commands under the selected host directory | `gh` and provider login when invoked; Jira actions need an authorized connector |
-| `data-wrappers` | Read-only `ro-mysql` and `bqro` commands | macOS/Homebrew `mysql-client` and SSH/Keychain for `ro-mysql`; `bq` and native Google auth for `bqro`; no connections during setup |
+| `data-wrappers` | Read-only `ro-mysql` and `bqro` commands | `mysql-client` (Homebrew, or the distribution package at `/usr/bin/mysql` on Linux) and SSH for `ro-mysql`, with passwords in the macOS Keychain, `secret-tool` on Linux, else (and when a store has no item) `RO_MYSQL_PASSWORD_<account>` environment variables, the account with letters and digits kept and every other byte as `_XX` hex (the summary says which store); `bq` and native Google auth for `bqro`; no connections during setup |
 
-For Codex, `mcp` also names the work root in `[sandbox_workspace_write]` writable roots and creates it; an existing table of your own is kept and setup prints the roots to add. `--codex-gcloud on` (or the guided prompt) adds gcloud's config directory, which holds credentials, so `bq` works inside the sandbox; it is off by default, and setup's choice overrides `CODEX_SANDBOX_GCLOUD` in `local/kit.env`.
+For Codex, `hooks` or `mcp` also names the work root in `[sandbox_workspace_write]` writable roots (its own managed block in `config.toml`) and creates it; an existing table of your own is kept and setup prints the roots to add. `--codex-gcloud on` (or the guided prompt) adds gcloud's config directory, which holds credentials, so `bq` works inside the sandbox; it is off by default, and setup's choice overrides `CODEX_SANDBOX_GCLOUD` in `local/kit.env`.
 
-Rules and skills are the default. Hooks start with advisory events. To enable blocking safety and review gates, explicitly choose `--components hooks --blocking-hooks`. That selection also installs the Git dispatcher environment into the model's shell. Setup never adjusts the host's permission policy.
+Rules and skills are the default. Hooks start with advisory events. To enable blocking safety and review gates, explicitly choose `--components hooks --blocking-hooks`; later updates keep that choice until `--no-blocking-hooks`. That selection also installs the Git dispatcher environment into the model's shell. Setup never adjusts the host's permission policy.
 
-Codex command hooks require a local runtime exposing `hooks` in `codex features list`. Cloud command hooks are refused. Review the installed hook commands through `/hooks` and trust their current hash yourself. Cursor hook support must be checked in the installed app and confirmed with `--confirm-hook-support cursor`.
+Codex command hooks require a local runtime exposing `hooks` in `codex features list`. Cloud command hooks are refused. Review the installed hook commands through `/hooks` and trust their current hash yourself. Cursor hook support must be checked in the installed app and confirmed with `--confirm-hook-support cursor`; the guided setup asks this question.
 
 Cursor project rules use `--project-root /path/to/project` and are written to that project's `.cursor/rules/`. Without this flag, setup exports the rule file under the Cursor configuration directory; activate it through **Customize → Rules**. The doctor reports configuration and file drift, not proof that a model loaded the rules.
 
@@ -63,9 +88,9 @@ python3 bin/agent-setup \
 
 Use `--claude-bin`, `--codex-bin` and `--cursor-bin` for alternate CLI paths. `--host-root` requires one host. Model values use `anthropic:model` or `openai:model`; the renderer validates the provider's effort scale. Omitted model, path and provider choices are inherited on later component upgrades. An update that selects some components or hosts leaves what the others installed in place. Installed `KIT/bin/agent-setup --root-dir KIT` previews from its recorded original source checkout. A directly invoked newer checkout uses itself; explicit `--source` wins. If the origin moved or an older install lacks provenance, supply `--source /path/to/checkout`. Doctor and rollback use installed state and work without the origin. Use `--skills all` to return to every bundled skill after saving a subset; `--skills` with no values selects none. Interactive setup accepts `all` and `none` too. Edited deselected skills stay in place and block retirement by default. After reviewing the preview, `--collision backup --apply` saves those edits in the journal before retiring the skill; rolling that journal back restores them. Unchanged Cursor rules from earlier setup versions upgrade from managed text blocks to full-file ownership, with rollback preserving the original format.
 
-When selecting `data-wrappers`, setup prints a shell-quoted `shell_activation` command that adds the chosen root’s `bin` directory to `PATH`. Run that command once in the terminal, or invoke the printed executable paths directly. Restart an app that captured an older `PATH`. Setup leaves shell startup files to you. `ro-mysql` currently uses macOS Keychain and a Homebrew `mysql-client` installation at `/opt/homebrew/opt/mysql-client/bin/mysql` or `/usr/local/opt/mysql-client/bin/mysql`; configure SSH transport and credential access locally before running a query. A missing-or-denied credential diagnostic calls for retrying from a trusted terminal or approved wrapper before considering rotation.
+When selecting `data-wrappers`, setup prints a shell-quoted `shell_activation` command that adds the chosen root’s `bin` directory to `PATH`. Run that command once in the terminal, or invoke the printed executable paths directly. Restart an app that captured an older `PATH`. Setup leaves shell startup files to you. `ro-mysql` reads passwords from the macOS Keychain, `secret-tool` on Linux, else environment variables, and runs only a client at `/opt/homebrew/opt/mysql-client/bin/mysql`, `/usr/local/opt/mysql-client/bin/mysql` or `/usr/bin/mysql`; configure SSH transport and credential access locally before running a query. A missing-or-denied credential diagnostic calls for retrying from a trusted terminal or approved wrapper before considering rotation.
 
-Host selection chooses configuration outputs. Each role independently chooses its provider, model and effort; preview shows that routing, provider CLI availability and fallback. Login status is not checked. The default review roles include both Anthropic and OpenAI providers. For a Claude-only review setup, override the OpenAI review role:
+Host selection chooses configuration outputs. Each role independently chooses its provider, model and effort; preview shows that routing, provider CLI availability and fallback; preflight and `doctor` check each host login. The default review roles include both Anthropic and OpenAI providers. For a Claude-only review setup, override the OpenAI review role:
 
 ```sh
 python3 bin/agent-setup --hosts claude --components roles --role-model cross-reviewer=anthropic:inherit
@@ -86,7 +111,7 @@ python3 bin/agent-setup --hosts codex --components roles \
 
 Keep review prefixes and rounds; existing high effort is valid for both providers. Codex named role activation remains unverified. Roles without a review prefix, such as engineer/researcher/second-opinion, are unavailable through `agent-run` when native invocation is disabled; preview labels those routes. Setup does not enable native role support automatically. Role overrides route review CLIs and supported native agents. The active main-session model for Codex and Cursor stays in that provider's own settings; the `main` catalog entry describes inherited review routing.
 
-Keep user workflow values in `local/kit.env`; generated path choices live in `local/setup-paths.env`. The shared parser loads the user layer first, then the generated path layer. Setup never reads or copies the user's values into its journal. `kit.env.example` describes optional, non-secret settings. There is no default commit author override; Git's existing identity is used.
+Keep user workflow values in `local/kit.env`; generated path choices live in `local/setup-paths.env`, and a team preset's values in `local/preset.env`. The shared parser loads the preset layer first, then the user layer, then the generated path layer, so each later one wins. Setup never reads or copies the user's values into its journal. `kit.env.example` describes optional, non-secret settings. There is no default commit author override; Git's existing identity is used.
 
 ## Search code
 

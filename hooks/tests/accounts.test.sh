@@ -39,7 +39,7 @@ exit 0
 EOF
 chmod +x "$FAKE/claude"
 
-run_env() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_ACCOUNT -u KIT_ENV HOME="$FH" PATH="$FAKE:$PATH" FAKE_LOG="$LOG" "$@"; }
+run_env() { env -u CLAUDE_CONFIG_DIR -u CLAUDE_ACCOUNT -u KIT_ENV -u AGENT_KIT_DIR HOME="$FH" PATH="$FAKE:$PATH" FAKE_LOG="$LOG" "$@"; }
 ca() { run_env "$B/bin/claude-account" "$@"; }
 # launch_in <dir> [env assignment]: the launcher starting `claude --version` there; its status.
 launch_in() { ( cd "$1" && run_env ${2:+"$2"} zsh -fc 'source "$1"; claude --version' _ "$LAUNCHER" ) >/dev/null 2>&1; }
@@ -128,7 +128,7 @@ ca sync-mcp work 2>/dev/null
 echo "--- check: project-scope MCP servers ---"
 out=$(ca check 2>&1); rc=$?
 check "check names project-scope servers another account lacks" "$out" "^personal: project-scope MCP servers in $REPO that work lacks: bigquery, github\."
-check "...and the fix" "$out" 'Move them to ~/.agents/mcp/servers.json and run `agent-kit render --host claude` \(every account\), or remove them'
+check "...and the fix, naming the kit without AGENT_KIT_DIR set" "$out" "Move them to $(cd -P "$B" && pwd)/mcp/servers.json and run \`agent-kit render --host claude\` \\(every account\\), or remove them"
 [ "$rc" != 0 ] && ok "...and fails" || bad "check passed with a project-scope gap"
 out=$(ca launch "$REPO" 2>"$FH/err"); rc=$?
 check "launch reports the gap on stderr" "$(cat "$FH/err")" "^personal: project-scope MCP servers in $REPO that work lacks"

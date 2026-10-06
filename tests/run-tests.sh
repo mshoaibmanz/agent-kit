@@ -16,6 +16,7 @@ export TMPDIR
 python3 "$ROOT/tests/verify_release.py"
 python3 "$ROOT/tests/setup_test.py"
 python3 "$ROOT/tests/setup_review_test.py"
+python3 "$ROOT/tests/installer_ux_test.py"
 python3 "$ROOT/tests/plugin_portability_test.py"
 python3 "$ROOT/tests/installed_guard_test.py"
 python3 "$ROOT/tests/gc_portability_test.py"

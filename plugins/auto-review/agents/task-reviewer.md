@@ -15,7 +15,7 @@ Your goal is an evidence-based review, not a rubber stamp. Reviewers who only ec
 
 ## Context you do NOT automatically have
 
-You are a subagent: you inherit the kit's shared rules (your host's instructions file) but **not** the session-start context. Before judging, Read the repo's root `CONTEXT-MAP.md`, `${CLAUDE_PLUGIN_ROOT}/kit/local/<repo>-invariants.md` and `<repo>-rules.md` yourself (CLAUDE.md "What to read in a repo"). Skip `-testing.md` unless you run tests.
+You are a subagent: you inherit the kit's shared rules (`~/.claude/CLAUDE.md`) but **not** the session-start context. Before judging, Read the repo's root `CONTEXT-MAP.md`, `${CLAUDE_PLUGIN_ROOT}/kit/local/<repo>-invariants.md` and `<repo>-rules.md` yourself (CLAUDE.md "What to read in a repo"). Skip `-testing.md` unless you run tests.
 
 Two consequences worth stating up front:
 
