@@ -89,6 +89,8 @@ ROLE_SETTINGS = ("model", "effortLevel", "modelSettings")
 ROLE_NAME = re.compile(r"[a-z][a-z0-9-]*")
 # Claude imports rules/AGENTS.md as is, and this filled copy of rules/hosts/claude.md.
 CLAUDE_HOST_RULES = STATE / "claude-host-rules.md"
+# A team pack's rules block (its rules.md, which agent-setup installs here), after each host's rules.
+TEAM_RULES = KIT / "rules/team.md"
 
 
 def expand(path: str) -> Path:
@@ -905,8 +907,14 @@ def claude_host_rules(path: Path | None = None, resume: int | None = None) -> st
             "placeholder; put host-specific text in rules/hosts/<host>.md"
         )
     host_root = str(path.parent) if path else None
-    return fill_for_host((KIT / "rules/hosts/claude.md").read_text(), host="claude", host_root=host_root,
-                         what="rules/hosts/claude.md", resume=resume)
+    return fill_for_host(with_team_rules((KIT / "rules/hosts/claude.md").read_text()), host="claude",
+                         host_root=host_root, what="rules/hosts/claude.md", resume=resume)
+
+
+def with_team_rules(host_rules: str) -> str:
+    """host_rules with the team pack's rules block appended, when a pack installed one."""
+    team = read_or_empty(TEAM_RULES).strip()
+    return host_rules.rstrip("\n") + "\n\n" + team + "\n" if team else host_rules
 
 
 def plan_claude_rules() -> tuple[Path, str, str, str]:
@@ -1086,9 +1094,25 @@ def broken_links(root: Path) -> list[str]:
     return found
 
 
+def team_pack_status() -> dict[str, str] | None:
+    """The team pack the agent-setup install of this kit recorded, with its checks (preset.pack_status)."""
+    record = json.loads(read_or_empty(KIT / ".install-state/current.json") or "{}").get("configuration", {}).get("preset")
+    if not record or "pack" not in record:
+        return None
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from preset import pack_status
+
+    return pack_status(KIT, record)
+
+
 def cmd_doctor_claude(_args: argparse.Namespace) -> int:
     host = load_host()
     problems = 0
+    pack = team_pack_status()
+    if pack:
+        print(f"pack: {pack['source']} at {(pack['commit'] or pack['digest'])[:12]}; installed copy "
+              f"{pack['installed']}; source {pack['upstream']}")
+        problems += not pack["installed"].startswith("unchanged")
     _text, live = read_live(host["settings_path"])
     if not live:
         print(f"settings: {host['settings_path']} is missing or empty; run `agent-kit render --host claude`")

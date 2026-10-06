@@ -58,7 +58,7 @@ from kit_env import kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
                        server_runtime)
-from preset import Preset, apply_preset, validate_catalog  # noqa: E402
+from preset import PACK_DIR, PACK_RULES, Preset, apply_preset, pack_status, validate_catalog  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
 MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
 # The answers a run saves and the next one starts from, with their defaults before detection. A
@@ -408,8 +408,7 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                         text = toml_text(resolve_values(tomllib.loads(text), view, root, host_view, target)) if path.suffix == '.toml' else resolve_values(text, view, root, host_view, target)
                         changes.append(Change('file', target / relative, text.encode()))
     if 'skills' in components:
-        names = args.skills if args.skills is not None else [path.name for path in sorted((view / 'skills').iterdir()) if path.is_dir()]
-        for name in names:
+        for name in selected_skills(args):
             if not (view / 'skills' / name / 'SKILL.md').is_file():
                 raise ValueError(f'Unknown selected skill: {name}')
             if host not in skill_hosts(view / 'skills' / name / 'SKILL.md'):
@@ -449,6 +448,13 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
     return changes
 
 
+def selected_skills(args: argparse.Namespace) -> list[str]:
+    """The skills this install selects: --skills (every kit skill when unset) and the team pack's."""
+    names = args.skills if args.skills is not None else [
+        path.name for path in sorted((Path(args.source).expanduser().resolve() / 'skills').iterdir()) if path.is_dir()]
+    return [*names, *(name for name in getattr(args, 'pack_skills', []) if name not in names)]
+
+
 def copy_source_code(source: str | Path, destination: str | Path) -> str:
     shutil.copyfile(source, destination)
     source_mode = Path(source).stat().st_mode & 0o777
@@ -468,6 +474,15 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
             shutil.copytree(path, view / name, copy_function=copy_source_code, ignore=shutil.ignore_patterns('local', 'state', '.git', '__pycache__', '*.env', *SECRET_NAMES))
     for name in ('roles.toml', 'kit.env.example'):
         copy_source_code(source / name, view / name)
+    if preset.pack:
+        # Installed like the kit's own skills, its rules.md as rules/team.md (every host's rules end
+        # with it), and kept as fetched under pack/ for a later run without --preset.
+        team_rules = kit_api(view).TEAM_RULES
+        for relative, (data, mode) in preset.pack.files.items():
+            for path in (view / PACK_DIR / relative, team_rules if relative == PACK_RULES else view / relative):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                path.chmod(0o755 if mode & 0o111 else 0o644)
     copy_source_code(source / 'hooks/lib/state', view / 'hooks/lib/state')
     matrix = source / '.claude-plugin/components.json'
     if matrix.is_file():
@@ -496,13 +511,14 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
     root = Path(args.root_dir).expanduser().absolute()
     home = Path.home()
     changes = []
+    selected = selected_skills(args)
     for path in sorted(view.rglob('*')):
         if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
             continue
         if path.is_file():
             relative = path.relative_to(view)
             if relative.parts[0] == 'skills':
-                selected_skill = 'skills' in args.components and (args.skills is None or relative.parts[1] in args.skills)
+                selected_skill = 'skills' in args.components and relative.parts[1] in selected
                 reference_asset = relative.parts[1] == 'review-rubric' and path.name != 'SKILL.md'
                 if not selected_skill and not reference_asset:
                     continue
@@ -558,7 +574,7 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
     planned_dirs = {change.target.parent for change in changes}
     hosts = {host_target(args, host, home) for host in args.hosts}
     skills = 'skills' in args.components
-    selected = set(args.skills if args.skills is not None else [path.name for path in (view / 'skills').iterdir() if path.is_dir()])
+    selected = set(selected_skills(args))
     removals = []
     for record in load_json(root / '.install-state/current.json', {}).get('managed', {}).values():
         target = Path(record['target'])
@@ -1041,17 +1057,21 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
     journal.mkdir(parents=True, exist_ok=False)
     previous = load_json(root / '.install-state/current.json', {})
     records = []
-    atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+    # The preset this run installs (a pack's commit and digest); previous holds the one rollback restores.
+    def write_journal() -> None:
+        atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'preset': preset.record, 'records': records,
+                                                      'previous': previous}, indent=2) + '\n').encode())
+    write_journal()
     atomic(root / '.install-state/pending.json', (json.dumps({'id': identifier, 'previous_id': previous.get('id')}) + '\n').encode())
     try:
         for number, (change, record) in enumerate(planned.prepared):
             if record['kind'] in ('file', 'link', 'remove') and record['present']:
                 record['backup'] = str(journal / 'backups' / str(number))
             records.append(record)
-            atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+            write_journal()
             apply_change(change, record, journal, number)
             record['status'] = 'completed'
-            atomic(journal / 'journal.json', (json.dumps({'id': identifier, 'records': records, 'previous': previous}, indent=2) + '\n').encode())
+            write_journal()
         managed = dict(previous.get('managed', {}))
         for change, record in planned.records:
             if record['kind'] == 'remove':
@@ -1179,6 +1199,10 @@ def doctor(args: argparse.Namespace) -> int:
     preset = state.get('configuration', {}).get('preset')
     if preset and not preset['source'].startswith('gh:') and Path(preset['source']).expanduser().is_file():
         preset['current'] = 'unchanged' if digest(Path(preset['source']).expanduser().read_bytes()) == preset['sha256'] else 'changed since setup: rerun with --preset to apply it'
+    if preset and 'pack' in preset:
+        preset['pack_status'] = pack_status(root, preset)
+        if not preset['pack_status']['installed'].startswith('unchanged'):
+            problems.append(f'team pack under {root / PACK_DIR}: {preset["pack_status"]["installed"]}')
     logins = {}
     for host in args.hosts:
         logged, how = host_login(host, getattr(args, host + '_bin'), host_target(args, host, Path.home()))
@@ -1220,7 +1244,8 @@ def parser() -> argparse.ArgumentParser:
                         help='Confirm native Cursor hook support after checking the installed host.')
     result.add_argument('--collision', choices=('refuse', 'backup', 'skip'), default=None,
                         help='Where you already have content: refuse (default), backup it, or skip that path')
-    result.add_argument('--preset', help='Team defaults: a TOML path or gh:owner/repo[/path] (default path agent-kit-preset.toml)')
+    result.add_argument('--preset', help='Team defaults: a TOML path, or a team pack: a local folder or gh:owner/repo[/path] '
+                        '(agent-kit-preset.toml, skills/ and rules.md at its head commit)')
     result.add_argument('--yes', action='store_true', help='Take every default and detected value; no prompts')
     result.add_argument('--verbose', action='store_true', help='List every planned path under the summary')
     result.add_argument('--json', action='store_true', help='Print the full plan as JSON instead of the summary')
@@ -1292,7 +1317,8 @@ def main() -> int:
         else:
             args.source = str(SOURCE)
     given = {key for key in DEFAULTS if getattr(args, key) is not None}
-    preset = apply_preset(args.preset, saved, Path(args.source), args.interactive) if setup_run else Preset()
+    preset = apply_preset(args.preset, saved, Path(args.source), args.interactive, root.absolute()) if setup_run else Preset()
+    args.pack_skills = preset.pack_skills
     guided = setup_run and (args.interactive or args.yes or bool(args.preset))
     detected_hosts = detect_hosts()
     # --host-root names one host's root; with no --hosts that host is claude.

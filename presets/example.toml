@@ -1,7 +1,9 @@
 # agent-kit team preset: non-secret defaults a team shares, so a teammate runs one command:
 #   agent-setup --preset gh:example-org/agent-kit-preset --apply
-# Keep the real preset in a private repository of your organization (agent-setup fetches
-# agent-kit-preset.toml from it with each user's own gh login), never in the public kit.
+# Keep the real preset in a private repository of your organization (agent-setup fetches the
+# repository at its head commit with each user's own gh login), never in the public kit. That
+# repository is a team pack: beside agent-kit-preset.toml it may hold skills/<name>/SKILL.md and a
+# rules.md of at most 300 words (README "Team packs").
 # Your own answers (flags, an earlier install's choices, the guided prompts) and your own
 # local/kit.env win over every value here; a changed preset applies on the next run.
 # Secrets never go here: setup refuses token formats (ghp_, sk-, xox*-, AKIA and the like) and

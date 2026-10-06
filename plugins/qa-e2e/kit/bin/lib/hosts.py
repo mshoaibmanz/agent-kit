@@ -41,11 +41,12 @@ RULES_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "cursor": "rules/age
 HOST_HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 
 
-def skill_hosts(skill_md: Path) -> set[str]:
+def skill_hosts(skill_md: Path, text: str | None = None) -> set[str]:
     """The hosts a skill's `hosts:` frontmatter names, as an inline list; every host when it has none.
     The installer links a skill by this rule and the doctor checks by it. Any other form, or an
-    unknown name, is an error: either would install the skill nowhere."""
-    text = skill_md.read_text()
+    unknown name, is an error: either would install the skill nowhere. text: the SKILL.md content
+    when it is not on disk (a team pack's, checked before install)."""
+    text = skill_md.read_text() if text is None else text
     if text.startswith("---\n"):
         for line in text[4 : text.find("\n---", 4)].splitlines():
             key, _, value = line.partition(":")
@@ -622,7 +623,7 @@ def render(api: Any, args: Any) -> int:
         rules = fill(
             (api.KIT / "rules/AGENTS.md").read_text()
             + "\n"
-            + (api.KIT / f"rules/hosts/{host}.md").read_text(),
+            + api.with_team_rules((api.KIT / f"rules/hosts/{host}.md").read_text()),
             str(api.KIT),
             host,
             str(root),

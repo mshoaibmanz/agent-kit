@@ -46,7 +46,26 @@ Your own content is never overwritten silently: an existing file, link, MCP serv
 
 ### Team presets
 
-A preset is a TOML file of non-secret team defaults: `[kit]` overlay keys (`CODE_SEARCH_GH_OWNER`, `CODE_DIRS_JSON`, `CODE_SEARCH_ZOEKT_URL`, `REVIEW_BASE`, `RELEASE_BRANCH_RE`, `BQRO_PROJECT`, `GIT_AUTHOR`, `SUBAGENT_RESUME_MAX`; [`hooks/lib/README`](hooks/lib/README) gives their meanings), `[mcp.servers.<name>]` descriptors that name credential wrappers (`{{KIT_DIR}}/bin/sentry-mcp`, filled with each user's kit root) or native OAuth, `[hosts] recommended`, `[roles.<role>]` model and effort, and `[skills]` include or exclude. `gh:owner/repo[/path]` fetches `agent-kit-preset.toml` (or the path) with your own `gh` login; a failed fetch prints one line and continues on the plain defaults. A local path works too. Setup checks that your login is a member of the preset's GitHub org. It refuses a preset holding a token format (`ghp_`, `sk-`, `xox*-`, `AKIA` and the like) or credentials in a URL. Its `[kit]` values go in `local/preset.env`, under your own `local/kit.env`, and its answers sit under yours (flags and the choices of an earlier install or prompt). A changed preset applies on the next run with `--preset`; `doctor` reports its source and hash. [`presets/example.toml`](presets/example.toml) shows every table with placeholders; keep your team's real preset in a private repository of your organization, never in this public one.
+A preset is a TOML file of non-secret team defaults: `[kit]` overlay keys (`CODE_SEARCH_GH_OWNER`, `CODE_DIRS_JSON`, `CODE_SEARCH_ZOEKT_URL`, `REVIEW_BASE`, `RELEASE_BRANCH_RE`, `BQRO_PROJECT`, `GIT_AUTHOR`, `SUBAGENT_RESUME_MAX`; [`hooks/lib/README`](hooks/lib/README) gives their meanings), `[mcp.servers.<name>]` descriptors that name credential wrappers (`{{KIT_DIR}}/bin/sentry-mcp`, filled with each user's kit root) or native OAuth, `[hosts] recommended`, `[roles.<role>]` model and effort, and `[skills]` include or exclude. `gh:owner/repo[/path]` fetches the repository as a team pack (below), with `agent-kit-preset.toml` (or the path) as its preset, using your own `gh` login; a failed fetch prints one line and continues on the plain defaults. A local TOML file or pack folder works too. Setup checks that your login is a member of the preset's GitHub org. It refuses a preset holding a token format (`ghp_`, `sk-`, `xox*-`, `AKIA` and the like) or credentials in a URL. Its `[kit]` values go in `local/preset.env`, under your own `local/kit.env`, and its answers sit under yours (flags and the choices of an earlier install or prompt). A changed preset applies on the next run with `--preset`; `doctor` reports its source and hash. [`presets/example.toml`](presets/example.toml) shows every table with placeholders; keep your team's real preset in a private repository of your organization, never in this public one.
+
+### Team packs
+
+A team pack is a preset repository that also carries content. Each part is optional:
+
+```text
+agent-kit-preset.toml      the preset above
+skills/<name>/SKILL.md     team skills, with references/ or scripts beside them
+rules.md                   a short team rules block, at most 300 words
+```
+
+`--preset gh:owner/repo` resolves the head commit of the default branch, downloads that commit's tree with your own `gh` login and records the commit in the install journal. A local folder works the same way for testing a pack before you push it; its git `HEAD`, when it has one, is recorded with a content digest.
+
+- **Skills** install for each selected host exactly like the kit's own skills, and a skill's `hosts:` frontmatter limits it the same way. They install whenever the `skills` component is selected, alongside whichever kit skills you select; the preset's `[skills] exclude` can leave one out. A pack skill named like a kit skill refuses the run with one line: kit skills win, so rename the pack's.
+- **Rules**: `rules.md` is installed as `rules/team.md` and appended to every host's rendered rules (the Claude host rules file, Codex `AGENTS.md`, the Cursor rule), after the kit's rules. A block over 300 words is refused: put the detail in a pack skill and keep the rule as a pointer to it.
+- **Precedence**: kit files come from your checkout and are never replaced by a pack; the preset's values sit under your own (`local/kit.env`, flags, earlier answers), as above.
+- **Refused packs**: setup scans every file of the pack before any write and refuses one that holds a credential file (`.env*` other than `.env.example`, `*.pem`, `*.key`, `id_rsa` and the like), a token format the preset check knows, a private key, a symlink that leaves the pack or names a folder, or anything that is not a file or a link.
+
+**Updating.** Rerun with the same `--preset`: the preview names the old and new commit and which skills were added, changed or removed, and whether the rules changed, before `--apply`. A run without `--preset` reinstalls the pack setup keeps under `<kit root>/pack`, so an offline update never drops it; a kept copy edited since setup refuses that run instead (rerun with `--preset` and `--collision backup` to restore it), and so does a kept pack skill that a newer kit now ships under the same name. `agent-setup rollback <journal>` restores the previous commit's skills, rules and record. `agent-setup doctor` (in `preset.pack_status`) and `agent-kit doctor` report the installed commit, whether the kept copy still matches it, and whether the pack has a newer commit or changed content since setup.
 
 ### Opinionated defaults
 
