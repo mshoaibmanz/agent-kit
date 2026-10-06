@@ -50,6 +50,9 @@ PLANTED = {
     'license key': 'licVALUE' + '22',
     'json value': 'jsonVALUE' + '33',
     'passphrase': 'ppVALUE' + '44',
+    'numeric password': '8392' + '01576',
+    'path-shaped secret': '/hunter' + 'TWO',
+    'dot-shaped secret': '.s3cr3t' + 'val',
 }
 TOKEN = 'gh' + 'p_' + 'A1b2C3d4E5f6G7h8I9j0'
 SSH_CONFIG = '''Host db-tunnel-orders
@@ -102,7 +105,7 @@ def commands(page: str) -> list[str]:
 class Fixture(InstallerUxFixture):
     """The fake home with an install, and the dashboard run through an audit-hook launcher."""
 
-    def install(self, *flags: str) -> Path:
+    def install(self, *flags: str, components: tuple[str, ...] = ('rules', 'skills', 'hooks', 'mcp')) -> Path:
         catalog = self.home / 'catalog.json'
         catalog.write_text(json.dumps({'mcpServers': {
             'docs': {'command': 'npx', 'args': ['-y', 'example-docs-server']},
@@ -112,9 +115,14 @@ class Fixture(InstallerUxFixture):
             (self.shim / tool).chmod(0o755)
         self.link('jq')
         (self.home / 'code').mkdir(exist_ok=True)
-        self.setup('--hosts', 'claude', *flags, '--components', 'rules', 'skills', 'hooks', 'mcp',
-                   '--mcp-catalog', str(catalog), '--repo-roots', str(self.home / 'code'), '--apply')
+        self.setup('--hosts', 'claude', *flags, '--components', *components,
+                   *(['--mcp-catalog', str(catalog)] if 'mcp' in components else []),
+                   '--repo-roots', str(self.home / 'code'), '--apply')
         return catalog
+
+    def doctor(self, *flags: str, kit: Path | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'doctor', *flags], capture_output=True,
+                              text=True, env=self.env(kit=kit), timeout=120, stdin=subprocess.DEVNULL)
 
     def keychain(self) -> Path:
         keychain = self.home / 'security'
@@ -138,7 +146,9 @@ class Fixture(InstallerUxFixture):
                         'credentials': [{'service': 'example/wrapped', 'account': 'me'}]},
             'shortflags': {'command': 'uvx', 'args': [
                 'db-mcp', '-p', PLANTED['short flag value'], '--license-key', PLANTED['license key'],
-                '{"apiKey":"' + PLANTED['json value'] + '"}', '--passphrase', PLANTED['passphrase']]},
+                '{"apiKey":"' + PLANTED['json value'] + '"}', '--passphrase', PLANTED['passphrase'],
+                '--password=' + PLANTED['numeric password'], 'DB_PASSWORD=' + PLANTED['numeric password'],
+                '--token', PLANTED['path-shaped secret'], '--secret', PLANTED['dot-shaped secret']]},
             'notes': {'url': 'https://notes.example.com/mcp?token=' + PLANTED['url token']},
             'pathkey': {'url': 'https://mcp.example.com/v1/' + PLANTED['url path key'] + '/sse'},
             'longkey': {'url': 'https://mcp.example.com/' + PLANTED['long path key'] + '/mcp'},
@@ -468,6 +478,41 @@ class DashboardScenarioTests(Fixture):
                                 text=True, env=self.env(kit=self.root), timeout=120, stdin=subprocess.DEVNULL)
         self.assertIn('settings: agent-setup writes them', doctor.stdout)
         self.assertIn('mcp: in sync with the catalog', doctor.stdout)
+        every = [c for c in commands(page) if c.endswith('doctor --host all')]
+        self.assertTrue(every, commands(page))
+        result = subprocess.run([sys.executable, *shlex.split(every[0])], capture_output=True, text=True,
+                                env=self.env(kit=self.root), timeout=120, stdin=subprocess.DEVNULL)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertEqual({'claude', 'codex', 'cursor'}, {r['host'] for r in json.loads(result.stdout)}, result.stdout)
+
+    def test_doctor_reports_a_hook_removed_since_setup(self) -> None:
+        self.install()
+        settings = self.home / '.claude/settings.json'
+        data = json.loads(settings.read_text())
+        event = next(iter(data['hooks']))
+        data['hooks'][event] = data['hooks'][event][1:]
+        settings.write_text(json.dumps(data))
+        doctor = self.doctor(kit=self.root)
+        self.assertIn(f'changed since setup: {settings}', doctor.stdout)
+        self.assertEqual(doctor.returncode, 1, doctor.stdout + doctor.stderr)
+
+    def test_an_install_without_the_mcp_component_is_clean(self) -> None:
+        self.install(components=('rules', 'skills'))
+        self.assertFalse((self.root / 'mcp/servers.json').exists())
+        doctor = self.doctor()
+        self.assertNotIn('Traceback', doctor.stderr)
+        self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        page, _ = self.dashboard()
+        self.assertIn('Nothing needs attention.', section(page, 'attention'), page_text(section(page, 'attention')))
+
+    def test_a_host_not_checked_offers_doctor_not_a_fix(self) -> None:
+        self.install()
+        (self.root / 'mcp/servers.json').write_text('{not json')
+        page, _ = self.dashboard()
+        items = [i for i in section(page, 'attention').split('<li>') if 'claude: not checked' in page_text(i)]
+        self.assertEqual(len(items), 1, page_text(section(page, 'attention')))
+        self.assertIn('JSONDecodeError', page_text(items[0]))
+        self.assertEqual([c.split(' ', 1)[1] for c in commands(items[0])], ['doctor'])
 
     def test_a_named_skill_selection_offers_select_and_drop_commands(self) -> None:
         self.install('--skills', 'code-search', 'review-rubric')
@@ -501,7 +546,7 @@ class DashboardScenarioTests(Fixture):
         self.install('--root-dir', str(kit))
         page, _ = self.dashboard(kit=kit)
         quoted = [c for c in commands(page) if 'my kit' in c]
-        self.assertTrue([c for c in quoted if c.endswith('doctor')], quoted)
+        self.assertTrue([c for c in quoted if c.endswith('doctor --host all')], quoted)
         self.assertTrue([c for c in quoted if 'agent-setup' in c], quoted)
         for command in quoted:
             self.assertTrue(any('my kit' in token for token in shlex.split(command)), command)
@@ -547,6 +592,22 @@ class CredentialClassifierTests(unittest.TestCase):
         'sentry token': {'command': 'npx', 'args': [PLANTED['sentry token']]},
         'atlassian token': {'command': 'npx', 'args': [PLANTED['atlassian token']]},
         'google token': {'command': 'npx', 'args': [PLANTED['google token']]},
+        'number after --password': {'command': 'npx', 'args': ['--password', PLANTED['numeric password']]},
+        'number in --password=': {'command': 'npx', 'args': ['--password=' + PLANTED['numeric password']]},
+        'number in a password assignment': {'command': 'npx', 'args': ['DB_PASSWORD=' + PLANTED['numeric password']]},
+        'path-shaped after --token': {'command': 'npx', 'args': ['--token', PLANTED['path-shaped secret']]},
+        'dot-shaped after --secret': {'command': 'npx', 'args': ['--secret', PLANTED['dot-shaped secret']]},
+        'negative number in --api-key=': {'command': 'npx', 'args': ['--api-key=-' + PLANTED['numeric password']]},
+    }
+    # A credential-ish name that does not hold the secret itself: the install takes the value (as
+    # before the classifier split), and the page shows it or masks it, never refuses.
+    INSTALLS = {
+        'oauth=true': ['--oauth=true'], 'auth=none': ['--auth=none'], 'session=default': ['--session=default'],
+        'sort-key=name': ['--sort-key=name'], 'token-limit=4k': ['--token-limit=4k'], 'USE_OAUTH': ['USE_OAUTH=true'],
+        'auth-provider=github': ['--auth-provider=github'], 'cookie-domain': ['--cookie-domain=example.com'],
+        'header Accept': ['--header', 'Accept: application/json'], 'header= Accept': ['--header=Accept: text/plain'],
+        'key file': ['--key', '/etc/x/key.pem'], 'api-key env': ['--api-key', '${API_KEY}'],
+        'password env': ['--password=${DB_PASSWORD}'], 'password assignment env': ['DB_PASSWORD=$DB_PASSWORD'],
     }
     # Not certain enough to refuse an install, so masked on the page only.
     MASKED = {
@@ -586,6 +647,14 @@ class CredentialClassifierTests(unittest.TestCase):
                 validate_catalog({'mcpServers': {'x': spec}})
                 self.assertIn(MASK, self.shown(spec))
                 self.assertFalse([v for v in PLANTED.values() if v in self.shown(spec)], self.shown(spec))
+
+    def test_a_credential_ish_name_without_a_secret_installs(self) -> None:
+        for name, args in self.INSTALLS.items():
+            with self.subTest(name):
+                validate_catalog({'mcpServers': {'x': {'command': 'npx', 'args': ['-y', 'pkg', *args]}}})
+        self.assertEqual(show_args(['--max-tokens', '4096', '--token-limit', '10']).text, '--max-tokens 4096 --token-limit 10')
+        refs = ['--key', '/etc/x/key.pem', 'DB_PASSWORD=$DB_PASSWORD', '--token=${GITHUB_TOKEN}']
+        self.assertEqual(show_args(refs).text, shlex.join(refs))
 
     def test_plain_arguments_pass_and_show_as_written(self) -> None:
         for name, argv in self.PLAIN.items():

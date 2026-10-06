@@ -23,10 +23,15 @@ CREDENTIAL_NAME = re.compile(
 REFERENCE_NAME = re.compile(
     r"[-_](?:file|path|dir|url|uri|type|mode|method|port|env|var|id|name)$", re.I
 )
-# Flags whose next argument is a secret whatever it looks like (the install refuses a literal one).
-SECRET_FLAGS = re.compile(
-    r"^--(?:key|api[-_]?key|token|access[-_]token|auth[-_]token|pat|password|passphrase|secret)$", re.I
+# A flag (dashes stripped) or variable whose value is the secret itself, whatever it looks like:
+# after one, only a $VAR reference is a reference (or a path, for a key-file name), and the install
+# refuses anything else. `--max-tokens` and `--token-limit` are not secret names.
+SECRET_NAME = re.compile(
+    r"(?:^|[-_])(?:password|passwd|passphrase|pwd|secret|token|pat|api[-_]?key|access[-_]?key)$"
+    r"|^(?:(?:private|ssh|tls|client)[-_]?)?key$",
+    re.I,
 )
+KEY_FILE_NAME = re.compile(r"^(?:(?:private|ssh|tls|client)[-_]?)?key$", re.I)
 SHORT_SECRET_FLAGS = ("-p",)
 HEADER_FLAGS = ("--header", "-H")
 HEADER = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):\s*(\S.*)$")
@@ -72,6 +77,15 @@ def credential_name(name: str) -> bool:
     return bool(CREDENTIAL_NAME.search(name)) and not REFERENCE_NAME.search(name)
 
 
+def secret_name(name: str) -> bool:
+    return bool(SECRET_NAME.search(name.lstrip("-")))
+
+
+def secret_reference(name: str, value: str) -> bool:
+    """What may follow a secret name: a $VAR reference, or a path when the name takes a key file."""
+    return bool(ENV_REF.match(value) or (PATH.match(value) and KEY_FILE_NAME.match(name.lstrip("-"))))
+
+
 def key_shaped(text: str) -> bool:
     """A run (split at - _ . ~ @ /) shaped like a key: long with letters and digits, or shorter in
     every case. A UUID or a slug has no such run."""
@@ -110,11 +124,15 @@ def show_value(value: str) -> str:
     return MASK
 
 
-def show_secret_value(value: str) -> str:
-    """A value after a credential-named flag: shown only when it is a reference or a URL."""
-    if not holds_secret(value) and "://" in value:
+def show_secret_value(value: str, name: str) -> str:
+    """A value after a credential-named flag or variable: shown only when it is a URL or a reference,
+    and after a secret name only when it is a secret_reference."""
+    if holds_secret(value):
+        return MASK
+    if "://" in value:
         return show_url(value).text
-    return value if reference(value) and not holds_secret(value) else MASK
+    shown = secret_reference(name, value) if secret_name(name) else reference(value)
+    return value if shown else MASK
 
 
 def show_url(url: str) -> Shown:
@@ -140,7 +158,8 @@ def show_url(url: str) -> Shown:
 
 def show_header(text: str, flag: str, found: list[str]) -> str:
     """A header argument: its name, and its value only when that is a ${VAR} reference. A literal
-    after a header flag, or under a credential name, is a credential."""
+    under a credential name, a key-shaped literal, or a non-header after a header flag is a
+    credential; `--header Accept: application/json` is not."""
     header = HEADER.match(text)
     if header is None:
         if flag and not ENV_REF.match(text):
@@ -149,7 +168,7 @@ def show_header(text: str, flag: str, found: list[str]) -> str:
     name, value = header.groups()
     if HEADER_REF.match(value):
         return f"{name}: {value}"
-    if flag or credential_name(name) or name.casefold() == "authorization":
+    if credential_name(name) or name.casefold() == "authorization" or key_shaped(value) or holds_secret(value):
         found.append(f"header {name}" + (f" after {flag}" if flag else ""))
     return f"{name}: {MASK}"
 
@@ -170,9 +189,9 @@ def show_args(args: Sequence[object]) -> Shown:
             if flag in HEADER_FLAGS:
                 out.append(show_header(arg, flag, found))
                 continue
-            if SECRET_FLAGS.match(flag) and not reference(arg) and "://" not in arg:
+            if secret_name(flag) and not secret_reference(flag, arg) and "://" not in arg:
                 found.append(f"value after {flag}")
-            out.append(show_secret_value(arg))
+            out.append(show_secret_value(arg, flag))
             continue
         if holds_secret(arg):
             out.append(MASK)
@@ -181,22 +200,22 @@ def show_args(args: Sequence[object]) -> Shown:
             name, sep, value = arg.partition("=")
             if not sep:
                 out.append(arg)
-                if arg in HEADER_FLAGS or arg in SHORT_SECRET_FLAGS or credential_name(arg):
+                if arg in HEADER_FLAGS or arg in SHORT_SECRET_FLAGS or credential_name(arg) or secret_name(arg):
                     after = arg
             elif name in HEADER_FLAGS:
                 out.append(f"{name}={show_header(value, name, found)}")
-            elif credential_name(name):
-                if value and not reference(value) and "://" not in value:
+            elif credential_name(name) or secret_name(name):
+                if value and secret_name(name) and not secret_reference(name, value) and "://" not in value:
                     found.append(f"value of {name}")
-                out.append(f"{name}={show_secret_value(value)}")
+                out.append(f"{name}={show_secret_value(value, name)}")
             else:
                 out.append(f"{name}={show_value(value)}")
         elif (assignment := ASSIGNMENT.match(arg)) is not None:
             name, value = assignment.groups()
-            if credential_name(name):
-                if value and not reference(value):
+            if credential_name(name) or secret_name(name):
+                if value and secret_name(name) and not secret_reference(name, value):
                     found.append(f"value of {name}")
-                out.append(f"{name}={show_secret_value(value)}")
+                out.append(f"{name}={show_secret_value(value, name)}")
             else:
                 out.append(f"{name}={show_value(value)}")
         elif HEADER.match(arg) and "://" not in arg and not HOST_PORT.match(arg):

@@ -279,11 +279,16 @@ def hosts_section(setup: Setup, sec: Section) -> None:
         row = anchor("host", host)
         if drift:
             detail = Fold(Badge(f"{len(drift)} drift", "warn"), (Lines(tuple(lines)),))
-            why, command = host_fix(setup, host, {kind for kind, _ in drift})
+            kinds = {kind for kind, _ in drift}
             more = ", ..." if len(drift) > 1 else ""
-            sec.attention.append(
-                Action(f"{host}: {len(drift)} drift ({lines[0]}{more}). {why}", command, sec.key, row)
-            )
+            if "error" in kinds:
+                # Not checked, so nothing to fix: re-applying or rendering would not touch the cause.
+                what = f"{host}: {lines[0]}. Doctor shows the whole error"
+                command = kit_command(setup, "doctor", *([] if host == "claude" else ["--host", host]))
+            else:
+                why, command = host_fix(setup, host, kinds)
+                what = f"{host}: {len(drift)} drift ({lines[0]}{more}). {why}"
+            sec.attention.append(Action(what, command, sec.key, row))
         rows.append(
             Row(
                 (
@@ -306,7 +311,7 @@ def hosts_section(setup: Setup, sec: Section) -> None:
         sec.attention.append(
             Action(f"{len(elsewhere)} installed path(s) changed since setup: {elsewhere[0]}", command, sec.key)
         )
-    sec.actions.append(Action("Check every host", kit_command(setup, "doctor")))
+    sec.actions.append(Action("Check every host", kit_command(setup, "doctor", "--host", "all")))
     if setup.state:
         sec.actions.append(Action("Re-apply the install", setup_command(setup, "--apply")))
         sec.actions.append(Action("Check the install", setup_command(setup, action="doctor")))

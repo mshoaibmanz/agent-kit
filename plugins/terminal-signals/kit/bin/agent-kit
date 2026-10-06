@@ -785,7 +785,10 @@ def render_settings(
 
 def mcp_catalog() -> dict[str, Any]:
     """The catalog as the host gets it: kit placeholders ({{KIT_DIR}}) filled for this kit and the
-    `credentials` declarations dropped (hosts.fill_servers)."""
+    `credentials` declarations dropped (hosts.fill_servers). An install without the mcp component
+    has no catalog: an empty one."""
+    if not SERVERS.is_file():
+        return {"mcpServers": {}}
     catalog = json.loads(SERVERS.read_text())
     servers = catalog.get("mcpServers")
     # A kit copied without bin/lib (a bare agent-kit) renders a plain catalog as is.
@@ -1141,7 +1144,7 @@ def same_but_refs(src: Any, live: Any) -> bool:
 class Finding(NamedTuple):
     """One way the live Claude config differs from the kit's sources; line is what doctor prints."""
 
-    kind: Literal["settings", "mcp", "agents", "roles", "rules"]
+    kind: Literal["settings", "mcp", "agents", "roles", "rules", "setup"]
     line: str
 
 
@@ -1159,6 +1162,29 @@ def written_by_setup() -> bool:
     with their own env prefix and only the components it was asked for, so the render's sources are
     not what those files should hold, and `agent-setup doctor` checks them."""
     return (KIT / ".install-state/current.json").is_file()
+
+
+def setup_drift() -> list[str]:
+    """Each path agent-setup installed into this kit's hosts that changed since (its own
+    managed_drift over the install record): a removed hook, an edited agent."""
+    import importlib.machinery
+    import importlib.util
+
+    script = KIT / "bin/agent-setup"
+    script = script if script.is_file() else Path(__file__).resolve().parent / "agent-setup"
+    loader = importlib.machinery.SourceFileLoader("agent_setup_for_doctor", str(script))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise SystemExit(f"agent-kit: cannot load {script}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # a dataclass in the script looks its module up there
+    dont_write, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = dont_write
+    state = json.loads((KIT / ".install-state/current.json").read_text())
+    return list(module.managed_drift(state.get("managed", {}).values()))
 
 
 def claude_findings(mcp: Literal["values", "names"] = "values", host: dict[str, Any] | None = None) -> list[Finding]:
@@ -1230,7 +1256,11 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
     for finding in findings:
         print(finding.line)
     if written_by_setup():
-        print("settings: agent-setup writes them (and the agents) for this kit; `agent-setup doctor` checks them")
+        changed = setup_drift()
+        for path in changed:
+            print(f"changed since setup: {path}")
+        print(f"settings: agent-setup writes them (and the agents) for this kit; {len(changed)} installed path(s) changed since")
+        findings += [Finding("setup", f"changed since setup: {path}") for path in changed]
     else:
         drifted = sum(finding.kind == "settings" for finding in findings)
         print(f"settings: {drifted} kit-owned key(s) differ from the source")
@@ -1249,8 +1279,12 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
         for link in links:
             print(f"broken link: {link}")
         problems += bool(links)
+    account = Path.home() / ".claude/bin/claude-account"
+    if not account.is_file():
+        print(f"claude-account: not checked ({account} is not installed)")
+        return 1 if problems else 0
     check = subprocess.run(
-        [str(Path.home() / ".claude/bin/claude-account"), "check"],
+        [str(account), "check"],
         capture_output=True,
         text=True,
         check=False,
