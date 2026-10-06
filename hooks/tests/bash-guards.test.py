@@ -587,6 +587,10 @@ CASES = [
     ("deny",  "while\ntrue; do sleep 20; done",              "a newline right after while"),
     ("deny",  "until\n! test -f x; do sleep 10; done",       "a newline right after until"),
     ("allow", "echo while\nsleep 10",                        "the word while as an argument, then a bare sleep"),
+    ("deny",  "if true; then while\ntrue; do sleep 20; done; fi", "a newline after while, nested under then"),
+    ("deny",  "if a; then :; else until\nb; do sleep 9; done; fi", "a newline after until, nested under else"),
+    ("deny",  "for i in 1; do while\ntrue; do sleep 30; done; done", "a newline after while, nested under do"),
+    ("deny",  "! while\ntrue; do sleep 15; done",                "a newline after while, after !"),
     # --- zsh-modifier ------------------------------------------------------------
     ("deny",  'git fetch origin "+refs/heads/$b:refs/remotes/origin/$b"', "refspec eaten by :r"),
     ("deny",  "echo $f:h",                         ":h on an unbraced var"),
