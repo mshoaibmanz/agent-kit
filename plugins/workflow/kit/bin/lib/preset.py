@@ -4,6 +4,7 @@ repository may carry (pack.py), and the MCP catalog check they share with setup'
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
@@ -11,12 +12,12 @@ from pathlib import Path
 import re
 import sys
 import tomllib
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 
 from hosts import HOSTS, normalize_transport
 from pack import (PACK_SKILLS, PACK_TOML, Pack, PackFiles, PresetUnavailable, StalePack, build_pack, folder_entries,
-                  gh_entries, gh_head, git_head, holds_token, pack_files)
+                  gh_entries, gh_head, git_head, holds_token, pack_files, pack_summary, utf8_text)
 
 # Preset [kit] keys: overlay keys (hooks/lib/README) a team shares. The first three also answer
 # setup's own questions, so its summary and checks see them.
@@ -116,85 +117,88 @@ def _gh_repo(spec: str) -> tuple[str, str | None]:
     return f'{parts[0]}/{parts[1]}', parts[2].strip('/') if len(parts) == 3 else None
 
 
+class LoadedPreset(NamedTuple):
+    """A validated preset, its sha256 (over the pack's files too), its team pack, and the commit it
+    was read at (every gh: preset; a local folder that is a clean git repository)."""
+    preset: dict[str, Any]
+    sha256: str
+    pack: Pack | None
+    commit: str | None
+
+
 def _pack_preset(files: PackFiles, toml: str, spec: str, commit: str | None) -> tuple[str, Pack | None]:
-    """(the preset text, the pack) of a pack's files."""
-    text = files.pop(toml, (b'', 0))[0].decode()
+    """(the preset text, the pack) of a pack's files. The text's line endings are normalized, as a
+    text read of the file does, so its sha256 does not depend on how it was fetched."""
+    text = utf8_text(files.pop(toml, (b'', 0))[0], toml, spec).replace('\r\n', '\n').replace('\r', '\n')
     pack = build_pack(files, spec, commit)
     if not text and pack is None:
         raise ValueError(f'preset {spec}: holds no {PACK_TOML}, {PACK_SKILLS}/ or rules.md')
     return text, pack
 
 
-def load_preset(spec: str) -> tuple[dict[str, Any], str, Pack | None]:
-    """(validated preset, its sha256, its team pack). A local TOML file is a preset alone. gh:owner/repo[/path]
-    (fetched at the head commit of the default branch with the user's own gh login) and a local folder
-    are a team pack rooted at the preset's folder: the preset (default agent-kit-preset.toml), skills/
-    and rules.md, each optional; nothing else there is read. The sha256 covers the pack's files too.
+def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
+    """The preset of spec and the team pack rooted at its folder: the preset (a folder's or a
+    repository's agent-kit-preset.toml, or the TOML file spec names), skills/ and rules.md, each
+    optional; nothing else there is read. gh:owner/repo[/path] is read at head, the commit at the
+    head of the default branch (resolved here unless given), with the user's own gh login.
     PresetUnavailable when a gh: fetch fails; ValueError when the preset or pack is invalid or holds a
     secret."""
     if spec.startswith('gh:'):
         repo, path = _gh_repo(spec)
-        commit = gh_head(repo)
-        files = pack_files(gh_entries(repo, commit, path or PACK_TOML, spec), spec)
-        toml = (path or PACK_TOML).rpartition('/')[2]
-        if path and toml not in files:
-            raise ValueError(f'preset {spec}: no {path} in the repository')
-        text, pack = _pack_preset(files, toml, spec, commit)
-    elif Path(spec).expanduser().is_dir():
-        folder = Path(spec).expanduser()
-        text, pack = _pack_preset(pack_files(folder_entries(folder), spec), PACK_TOML, spec, git_head(folder))
+        root, _, toml = (path or PACK_TOML).rpartition('/')
+        commit = head or gh_head(repo)
+        with closing(gh_entries(repo, commit, root, toml, spec)) as entries:
+            files = pack_files(entries, spec)
+        missing = f'no {path} in the repository' if path and toml not in files else None
     else:
-        text, pack = Path(spec).expanduser().read_text(), None
+        local = Path(spec).expanduser()
+        folder, toml = (local, PACK_TOML) if local.is_dir() else (local.parent, local.name)
+        commit = git_head(folder)
+        files = pack_files(folder_entries(folder, toml), spec)
+        missing = 'no such file or folder' if not local.is_dir() and toml not in files else None
+    if missing:
+        raise ValueError(f'preset {spec}: {missing}')
+    text, pack = _pack_preset(files, toml, spec, commit)
     try:
         preset = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise ValueError(f'preset {spec}: not valid TOML: {error}') from None
     validate_preset(preset, spec)
     total = hashlib.sha256(text.encode())
-    for path, (data, mode) in sorted(pack.files.items() if pack else []):
-        total.update(f'\0{path}\0{int(bool(mode & 0o111))}\0{len(data)}\0'.encode() + data)
-    return preset, total.hexdigest(), pack
+    for relative, (data, mode) in sorted(pack.files.items() if pack else []):
+        total.update(f'\0{relative}\0{int(bool(mode & 0o111))}\0{len(data)}\0'.encode() + data)
+    return LoadedPreset(preset, total.hexdigest(), pack, commit)
+
+
+def recorded_head(record: dict[str, Any] | None, spec: str) -> tuple[str | None, bool]:
+    """(the head commit of a gh: spec, whether it is the commit record was installed from). None and
+    False for a local spec."""
+    if not spec.startswith('gh:'):
+        return None, False
+    head = gh_head(_gh_repo(spec)[0])
+    return head, bool(record) and record.get('source') == spec and record.get('commit') == head
 
 
 def source_status(record: dict[str, Any]) -> dict[str, Any]:
     """For doctor: whether the preset's source (a TOML file, a pack folder or gh:) moved on since setup.
-    changed is None when it could not be checked."""
+    A gh: source still at the recorded commit is unchanged without a download. changed is None when it
+    could not be checked."""
     try:
-        _, sha, pack = load_preset(record['source'])
+        head, unmoved = recorded_head(record, record['source'])
+        if unmoved:
+            return {'changed': False, 'note': 'unchanged'}
+        loaded = load_preset(record['source'], head)
     except (PresetUnavailable, OSError, ValueError) as error:
         return {'changed': None, 'note': f'not checked: {error}'}
-    if sha == record['sha256']:
+    if loaded.sha256 == record['sha256']:
         return {'changed': False, 'note': 'unchanged'}
-    moved = f'new commit {pack.commit[:12]}' if pack and pack.commit and pack.commit != record.get('commit') else 'changed'
+    moved = f'new commit {loaded.commit[:12]}' if loaded.commit and loaded.commit != record.get('commit') else 'changed'
     return {'changed': True, 'note': f'{moved} since setup: rerun with --preset {record["source"]} to apply it'}
 
 
 def kit_skills(source: Path) -> list[str]:
     """The skills a kit checkout ships."""
     return [path.name for path in sorted((source / 'skills').iterdir()) if path.is_dir()]
-
-
-def _label(pack: Pack) -> str:
-    return pack.commit[:12] if pack.commit else 'its working tree'
-
-
-def pack_summary(source: str, before: Pack | None, after: Pack) -> str:
-    """The preview line for a pack: what it installs, or what changed since the installed one."""
-    if before is None:
-        rules = f'; rules block of {len(after.rules.split())} words' if after.rules.strip() else ''
-        return f'pack {source} at {_label(after)}: skills {", ".join(after.skills) or "none"}{rules}'
-    if before.files == after.files:
-        return f'pack {source} at {_label(after)}: content unchanged since the install ({_label(before)})'
-    changes = []
-    for verb, names in (('added', sorted(set(after.skills) - set(before.skills))),
-                        ('changed', sorted(name for name in set(after.skills) & set(before.skills)
-                                           if after.skill_files(name) != before.skill_files(name))),
-                        ('removed', sorted(set(before.skills) - set(after.skills)))):
-        if names:
-            changes.append(f'skills {verb} {", ".join(names)}')
-    if before.rules != after.rules:
-        changes.append('rules ' + ('removed' if not after.rules.strip() else 'added' if not before.rules.strip() else 'changed'))
-    return f'pack {source}: {_label(before)} -> {_label(after)}: {"; ".join(changes)}'
 
 
 @dataclass(frozen=True)
@@ -221,8 +225,15 @@ class Preset:
         return ''.join(f'{key}={value}\n' for key, value in self.kit.items())
 
 
-def _loaded_preset(spec: str, preset: dict[str, Any], sha: str, pack: Pack | None, kept: Pack | None,
-                   kit_names: list[str]) -> Preset:
+def _notes(record: dict[str, Any], pack: Pack | None, kept: Pack | None) -> list[tuple[str, str]]:
+    notes = [('Ready', f'preset {record["source"]} (sha256 {record["sha256"][:12]})')]
+    if pack is not None:
+        notes.append(('Ready', pack_summary(record['source'], kept, pack)))
+    return notes
+
+
+def _loaded_preset(spec: str, loaded: LoadedPreset, kept: Pack | None, kit_names: list[str]) -> Preset:
+    preset, pack = loaded.preset, loaded.pack
     table = preset.get('kit', {})
     kit = {key: json.dumps(value) if isinstance(value, list) else value for key, value in table.items()}
     answers: dict[str, Any] = {answer: table[key] for key, answer in PRESET_ANSWERS.items() if key in table}
@@ -239,29 +250,24 @@ def _loaded_preset(spec: str, preset: dict[str, Any], sha: str, pack: Pack | Non
         if values:
             answers['role_' + flag] = values
     record: dict[str, Any] = {'source': spec if spec.startswith('gh:') else str(Path(spec).expanduser().absolute()),
-                              'sha256': sha}
-    notes = [('Ready', f'preset {record["source"]} (sha256 {sha[:12]})')]
-    if pack is not None:
-        if pack.commit:
-            record['commit'] = pack.commit
-        notes.append(('Ready', pack_summary(record['source'], kept, pack)))
+                              'sha256': loaded.sha256}
+    if loaded.commit:
+        record['commit'] = loaded.commit
     return Preset(kit=kit, servers=preset.get('mcp', {}).get('servers', {}), record=record, answers=answers,
-                  recommended_hosts=preset.get('hosts', {}).get('recommended', []), notes=notes, pack=pack,
-                  pack_skills=[name for name in pack_names if name not in exclude])
+                  recommended_hosts=preset.get('hosts', {}).get('recommended', []), notes=_notes(record, pack, kept),
+                  pack=pack, pack_skills=[name for name in pack_names if name not in exclude])
 
 
-def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interactive: bool,
-                 kept_pack: Callable[[], Pack | None]) -> Preset:
+def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interactive: bool, kept: Pack | None,
+                 stale: StalePack | None = None) -> Preset:
     """--preset loaded, else the preset an earlier install saved (configuration preset and
-    preset_values, and the pack kept_pack reads back from that install), else none. A pack skill
-    named like a kit skill refuses the run, the kept one too: a kit update may add a skill of the
-    same name. So does a kept pack that changed since setup, unless --preset loads a new one."""
+    preset_values, and kept, the pack it kept), else none. A gh: preset still at the commit of that
+    install reuses what it saved, without a download. A pack skill named like a kit skill refuses the
+    run, the kept one too: a kit update may add a skill of the same name. So does stale, a kept pack
+    that changed since setup, unless --preset loads a new one."""
     values = saved.get('preset_values', {})
-    try:
-        kept, stale = kept_pack(), None
-    except StalePack as error:
-        kept, stale = None, error
-    earlier = Preset(kit=dict(values.get('kit', {})), servers=dict(values.get('servers', {})), record=saved.get('preset'),
+    record = saved.get('preset')
+    earlier = Preset(kit=dict(values.get('kit', {})), servers=dict(values.get('servers', {})), record=record,
                      answers=dict(values.get('answers', {})), recommended_hosts=list(values.get('recommended_hosts', [])),
                      pack=kept, pack_skills=list(values.get('pack_skills', kept.skills if kept is not None else [])))
     kit_names = kit_skills(source)
@@ -271,7 +277,11 @@ def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interact
         result = earlier
     else:
         try:
-            result = _loaded_preset(spec, *load_preset(spec), kept, kit_names)
+            head, unmoved = recorded_head(record, spec)
+            if unmoved and record and stale is None:
+                result = replace(earlier, notes=_notes(record, kept, kept))
+            else:
+                result = _loaded_preset(spec, load_preset(spec, head), kept, kit_names)
         except PresetUnavailable as error:
             if stale is not None:
                 raise ValueError(f'preset {spec} unavailable: {error}; the pack it installed cannot be reinstalled '

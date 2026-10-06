@@ -6,14 +6,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass
-import io
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
 import tarfile
+import threading
 from typing import Any, Literal, NamedTuple
+import unicodedata
+import zlib
 
 from hosts import skill_hosts
 from preflight import install_hint
@@ -24,7 +26,7 @@ TOKEN_FORMATS = (r'gh[opsur]_[A-Za-z0-9]{8,}|github_pat_\w{8,}|sk-(?:ant-)?[\w-]
 TOKEN = re.compile(rf'(?<![A-Za-z0-9])(?:{TOKEN_FORMATS})')
 # Documentation writes a token's shape with a run of X (ghp_XXXXXXXXXXXXXXXXXXXX); a real token is random.
 TOKEN_PLACEHOLDER = re.compile(r'[Xx]{4}')
-PRIVATE_KEY = re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----')
+PRIVATE_KEY = re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|PuTTY-User-Key-File-')
 # By name: files that hold a credential whatever their content. A .pem or .key may hold a public
 # certificate, so those are refused by the private key check on their content.
 SECRET_FILE = re.compile(
@@ -38,6 +40,9 @@ PACK_RULES_WORDS = 300
 PACK_MAX_BYTES = 20 * 1024 * 1024
 PACK_SKILL_NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 PACK_DIR = 'pack'
+# Never part of a pack: git's own folder and the files macOS and Windows leave in folders.
+NOT_PACK = re.compile(r'\.git|\.DS_Store|Thumbs\.db|\._.*')
+GH_ARCHIVE_TIMEOUT = 120
 
 PackFiles = dict[str, tuple[bytes, int]]
 
@@ -64,20 +69,34 @@ def holds_token(text: str) -> bool:
 
 
 def in_pack(path: str, toml: str) -> bool:
-    return path in (PACK_RULES, toml, PACK_SKILLS) or path.startswith(PACK_SKILLS + '/')
+    return (path in (PACK_RULES, toml, PACK_SKILLS) or path.startswith(PACK_SKILLS + '/')) and not any(
+        NOT_PACK.fullmatch(part) for part in path.split('/'))
+
+
+def normal_mode(mode: int) -> int:
+    """The mode setup installs a file with: executable or not, whatever the umask that wrote it."""
+    return 0o755 if mode & 0o111 else 0o644
+
+
+def _require_gh() -> None:
+    if not shutil.which('gh'):
+        raise PresetUnavailable(f'gh is not installed ({install_hint("gh")})')
+
+
+def _gh_failure(stderr: bytes, repo: str) -> PresetUnavailable:
+    reason = (stderr.decode(errors='replace').strip().splitlines() or ['gh api failed'])[0]
+    return PresetUnavailable(f'{reason} (check `gh auth status` and your access to {repo})')
 
 
 def gh_api(arguments: list[str], repo: str, timeout: int) -> bytes:
     """`gh api` output with the user's own login; PresetUnavailable when it cannot answer."""
-    if not shutil.which('gh'):
-        raise PresetUnavailable(f'gh is not installed ({install_hint("gh")})')
+    _require_gh()
     try:
         result = subprocess.run(['gh', 'api', *arguments], capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PresetUnavailable(str(error)) from None
     if result.returncode:
-        reason = (result.stderr.decode(errors='replace').strip().splitlines() or ['gh api failed'])[0]
-        raise PresetUnavailable(f'{reason} (check `gh auth status` and your access to {repo})')
+        raise _gh_failure(result.stderr, repo)
     return result.stdout
 
 
@@ -89,39 +108,80 @@ def gh_head(repo: str) -> str:
     return commit
 
 
-def gh_entries(repo: str, commit: str, toml: str, spec: str) -> Iterator[Entry]:
-    """The pack at commit of repo: rooted at the folder of toml (a path in the repository)."""
-    archive = gh_api([f'repos/{repo}/tarball/{commit}'], repo, 120)
-    root, _, name = toml.rpartition('/')
-    with tarfile.open(fileobj=io.BytesIO(archive), mode='r:*') as tar:
-        for member in tar:
-            if member.name.startswith('/') or '..' in PurePosixPath(member.name).parts:
-                raise ValueError(f'preset {spec}: archive path {member.name} leaves the pack')
-            # GitHub's archive holds the tree under one <owner>-<repo>-<sha> folder.
-            relative = '/'.join(PurePosixPath(member.name).parts[1:])
-            if root:
-                if not relative.startswith(root + '/'):
-                    continue
-                relative = relative[len(root) + 1:]
-            if member.isdir() or not in_pack(relative, name):
-                continue
-            if member.issym():
-                yield Entry(relative, 'link', member.linkname.encode(), 0)
-            elif member.isfile():
-                handle = tar.extractfile(member)
-                yield Entry(relative, 'file', handle.read() if handle else b'', member.mode & 0o777)
-            else:
-                yield Entry(relative, 'other', b'', 0)
+def _archive_entry(tar: tarfile.TarFile, member: tarfile.TarInfo, root: str, toml: str, spec: str) -> Entry | None:
+    if member.name.startswith('/') or '..' in PurePosixPath(member.name).parts:
+        raise ValueError(f'preset {spec}: archive path {member.name} leaves the pack')
+    # GitHub's archive holds the tree under one <owner>-<repo>-<sha> folder.
+    relative = '/'.join(PurePosixPath(member.name).parts[1:])
+    if root:
+        if not relative.startswith(root + '/'):
+            return None
+        relative = relative[len(root) + 1:]
+    if member.isdir() or not in_pack(relative, toml):
+        return None
+    if member.issym():
+        return Entry(relative, 'link', member.linkname.encode(), 0)
+    if not member.isfile():
+        return Entry(relative, 'other', b'', 0)
+    if member.size > PACK_MAX_BYTES:
+        raise ValueError(f'preset {spec}: the pack is over {PACK_MAX_BYTES >> 20} MB')
+    handle = tar.extractfile(member)
+    return Entry(relative, 'file', handle.read() if handle else b'', normal_mode(member.mode))
 
 
-def folder_entries(folder: Path, toml: str = PACK_TOML) -> Iterator[Entry]:
+def gh_entries(repo: str, commit: str, root: str, toml: str, spec: str) -> Iterator[Entry]:
+    """The pack at commit of repo, rooted at root (a folder of the repository, '' for its top), read
+    from the archive as gh streams it: only the pack's files are held. Close it when done early."""
+    _require_gh()
+    try:
+        process = subprocess.Popen(['gh', 'api', f'repos/{repo}/tarball/{commit}'], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as error:
+        raise PresetUnavailable(str(error)) from None
+    expired = threading.Event()
+
+    def expire() -> None:
+        expired.set()
+        process.kill()
+
+    timer = threading.Timer(GH_ARCHIVE_TIMEOUT, expire)
+    timer.daemon = True
+    timer.start()
+    with process:
+        try:
+            unreadable = None
+            try:
+                with tarfile.open(fileobj=process.stdout, mode='r|*') as tar:
+                    for member in tar:
+                        if found := _archive_entry(tar, member, root, toml, spec):
+                            yield found
+            except (tarfile.TarError, EOFError, zlib.error) as error:
+                unreadable = error
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            if expired.is_set():
+                raise PresetUnavailable(f'gh api took over {GH_ARCHIVE_TIMEOUT}s to download {repo}')
+            if process.returncode:
+                raise _gh_failure(process.stderr.read() if process.stderr else b'', repo)
+            if unreadable is not None:
+                raise PresetUnavailable(f'gh api returned no readable archive of {repo} ({unreadable})')
+        finally:
+            timer.cancel()
+            if process.poll() is None:
+                process.kill()
+
+
+def folder_entries(folder: Path, toml: str) -> Iterator[Entry]:
     """The pack in a local folder: its skills/, rules.md and toml, nothing else of it."""
     def entry(path: Path) -> Entry | None:
         relative = path.relative_to(folder).as_posix()
         if path.is_symlink():
             return Entry(relative, 'link', os.readlink(path).encode(), 0)
         if path.is_file():
-            return Entry(relative, 'file', path.read_bytes(), path.stat().st_mode & 0o777)
+            return Entry(relative, 'file', path.read_bytes(), normal_mode(path.stat().st_mode))
         return None if path.is_dir() else Entry(relative, 'other', b'', 0)
 
     for name in (PACK_RULES, toml, PACK_SKILLS):
@@ -131,8 +191,8 @@ def folder_entries(folder: Path, toml: str = PACK_TOML) -> Iterator[Entry]:
     if skills.is_symlink():
         return
     for directory, folders, names in os.walk(skills):
-        folders[:] = sorted(name for name in folders if name != '.git')
-        for name in [*folders, *sorted(names)]:
+        folders[:] = sorted(name for name in folders if not NOT_PACK.fullmatch(name))
+        for name in [*folders, *sorted(name for name in names if not NOT_PACK.fullmatch(name))]:
             if found := entry(Path(directory) / name):
                 yield found
 
@@ -140,7 +200,7 @@ def folder_entries(folder: Path, toml: str = PACK_TOML) -> Iterator[Entry]:
 def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
     """Every file of a pack (path -> content, mode). A link that names a file in the pack reads as
     that file; a link out of the pack or to a folder, a special file, or two paths that differ only
-    in case (one file on macOS) refuses."""
+    in case or Unicode normalization (one file on macOS) refuses."""
     files: PackFiles = {}
     links: dict[str, str] = {}
     folded: dict[str, str] = {}
@@ -149,9 +209,9 @@ def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
         parts = relative.split('/')
         for depth in range(1, len(parts) + 1):
             path = '/'.join(parts[:depth])
-            other = folded.setdefault(path.casefold(), path)
+            other = folded.setdefault(unicodedata.normalize('NFC', path).casefold(), path)
             if other != path:
-                raise ValueError(f'preset {spec}: {other} and {path} differ only in case')
+                raise ValueError(f'preset {spec}: {other} and {path} differ only in case or Unicode form')
         if kind == 'other':
             raise ValueError(f'preset {spec}: {relative} is not a regular file or link')
         if kind == 'link':
@@ -195,6 +255,14 @@ class Pack:
         return {path: value for path, value in self.files.items() if path.startswith(f'{PACK_SKILLS}/{name}/')}
 
 
+def utf8_text(data: bytes, relative: str, spec: str) -> str:
+    """data of a pack text file (Markdown, the preset), which setup reads as UTF-8."""
+    try:
+        return data.decode()
+    except UnicodeDecodeError:
+        raise ValueError(f'preset {spec}: {relative} is not UTF-8 text') from None
+
+
 def build_pack(files: PackFiles, spec: str, commit: str | None) -> Pack | None:
     """The pack in files (skills/ and rules.md), None when it has neither. Refused when a file looks
     like a credential (by name, a token format or a private key), a skill is malformed, or rules.md is
@@ -203,6 +271,8 @@ def build_pack(files: PackFiles, spec: str, commit: str | None) -> Pack | None:
         return None
     for relative, (data, _) in sorted(files.items()):
         name = relative.rsplit('/', 1)[-1]
+        if name.endswith('.md'):
+            utf8_text(data, relative, spec)
         if SECRET_FILE.fullmatch(name) and not SECRET_FILE_EXAMPLE.fullmatch(name):
             raise ValueError(f'preset {spec}: {relative} looks like a credential file; a pack holds no secrets')
         text = data.decode('latin-1')
@@ -247,19 +317,44 @@ def kept_records(root: Path, managed: dict[str, Any]) -> dict[str, dict[str, Any
     return kept
 
 
-def installed_pack(root: Path, state: dict[str, Any], drift: Callable[[dict[str, Any]], Collection[str]]) -> Pack | None:
+def installed_pack(root: Path, state: dict[str, Any],
+                   drift: Callable[[Iterable[dict[str, Any]]], Collection[str]]) -> Pack | None:
     """The pack an earlier install kept under <root>/pack: the files it recorded, read back (a file
-    added there since is not part of it). StalePack when drift (setup's check of a state's managed
-    records) finds one of them changed: reinstalling an edited copy would spread the edit."""
+    added there since is not part of it). StalePack when drift (setup's check of managed records)
+    finds one of them changed: reinstalling an edited copy would spread the edit."""
     kept = kept_records(root, state.get('managed', {}))
     if not kept:
         return None
     record = state.get('configuration', {}).get('preset') or {}
-    stale = sorted(drift({'managed': kept}))
+    stale = sorted(drift(kept.values()))
     if stale:
         raise StalePack(f'{len(stale)} file(s) of the team pack kept under {root / PACK_DIR} changed since setup '
                         f'({", ".join(stale[:3])}): rerun agent-setup with --preset {record.get("source", "<its source>")} '
                         '--collision backup to restore it')
     folder = root / PACK_DIR
-    return Pack({path: ((folder / path).read_bytes(), entry['mode'] or 0o644) for path, entry in kept.items()},
+    return Pack({path: ((folder / path).read_bytes(), normal_mode(entry['mode'] or 0)) for path, entry in kept.items()},
                 record.get('commit'))
+
+
+def pack_label(commit: str | None) -> str:
+    return commit[:12] if commit else 'its working tree'
+
+
+def pack_summary(source: str, before: Pack | None, after: Pack) -> str:
+    """The preview line for a pack: what it installs, or what changed since the installed one."""
+    if before is None:
+        rules = f'; rules block of {len(after.rules.split())} words' if after.rules.strip() else ''
+        return f'pack {source} at {pack_label(after.commit)}: skills {", ".join(after.skills) or "none"}{rules}'
+    if before.files == after.files:
+        return (f'pack {source} at {pack_label(after.commit)}: content unchanged since the install '
+                f'({pack_label(before.commit)})')
+    changes = []
+    for verb, names in (('added', sorted(set(after.skills) - set(before.skills))),
+                        ('changed', sorted(name for name in set(after.skills) & set(before.skills)
+                                           if after.skill_files(name) != before.skill_files(name))),
+                        ('removed', sorted(set(before.skills) - set(after.skills)))):
+        if names:
+            changes.append(f'skills {verb} {", ".join(names)}')
+    if before.rules != after.rules:
+        changes.append('rules ' + ('removed' if not after.rules.strip() else 'added' if not before.rules.strip() else 'changed'))
+    return f'pack {source}: {pack_label(before.commit)} -> {pack_label(after.commit)}: {"; ".join(changes)}'

@@ -19,6 +19,7 @@ if sys.version_info < (3, 11):
              f'Fix: {_FIX or "install Python 3.11 or newer"}, then rerun with it.')
 
 import argparse
+from collections.abc import Iterable
 from dataclasses import dataclass
 import hashlib
 import importlib.machinery
@@ -58,7 +59,7 @@ from kit_env import kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
                        server_runtime)
-from pack import PACK_DIR, PACK_SKILLS, installed_pack  # noqa: E402
+from pack import PACK_DIR, PACK_SKILLS, StalePack, installed_pack  # noqa: E402
 from preset import Preset, apply_preset, kit_skills, source_status, validate_catalog  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
 MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
@@ -1160,10 +1161,11 @@ def rollback(args: argparse.Namespace) -> int:
     return 0
 
 
-def managed_drift(state: dict[str, Any]) -> list[str]:
-    """Every installed path whose managed content changed since the install that recorded it."""
+def managed_drift(records: Iterable[dict[str, Any]]) -> list[str]:
+    """Every installed path of records (a state's managed records) whose content changed since the
+    install that recorded it."""
     drift = []
-    for record in state.get('managed', {}).values():
+    for record in records:
         target = Path(record['target'])
         if record['kind'] in ('file', 'link', 'remove'):
             actual = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
@@ -1190,7 +1192,7 @@ def managed_drift(state: dict[str, Any]) -> list[str]:
 def doctor(args: argparse.Namespace) -> int:
     root = Path(args.root_dir).expanduser().absolute()
     state = load_json(root / '.install-state/current.json', {})
-    drift = managed_drift(state)
+    drift = managed_drift(state.get('managed', {}).values())
     deps = dependencies(args, mcp_servers(args, state.get('configuration', {}).get('preset_values', {}).get('servers', {})))
     problems = []
     if not state:
@@ -1245,8 +1247,8 @@ def parser() -> argparse.ArgumentParser:
                         help='Confirm native Cursor hook support after checking the installed host.')
     result.add_argument('--collision', choices=('refuse', 'backup', 'skip'), default=None,
                         help='Where you already have content: refuse (default), backup it, or skip that path')
-    result.add_argument('--preset', help='Team defaults: a TOML path, or a team pack: a local folder or gh:owner/repo[/path] '
-                        '(agent-kit-preset.toml, skills/ and rules.md at its head commit)')
+    result.add_argument('--preset', help='Team defaults and pack: a local folder or TOML file, or gh:owner/repo[/path] '
+                        '(agent-kit-preset.toml or the path, skills/ and rules.md beside it, at its head commit)')
     result.add_argument('--yes', action='store_true', help='Take every default and detected value; no prompts')
     result.add_argument('--verbose', action='store_true', help='List every planned path under the summary')
     result.add_argument('--json', action='store_true', help='Print the full plan as JSON instead of the summary')
@@ -1319,8 +1321,13 @@ def main() -> int:
         else:
             args.source = str(SOURCE)
     given = {key for key in DEFAULTS if getattr(args, key) is not None}
-    preset = apply_preset(args.preset, saved, Path(args.source), args.interactive,
-                          lambda: installed_pack(root.absolute(), state, managed_drift)) if setup_run else Preset()
+    preset = Preset()
+    if setup_run:
+        try:
+            kept, stale = installed_pack(root.absolute(), state, managed_drift), None
+        except StalePack as error:
+            kept, stale = None, error
+        preset = apply_preset(args.preset, saved, Path(args.source), args.interactive, kept, stale)
     guided = setup_run and (args.interactive or args.yes or bool(args.preset))
     detected_hosts = detect_hosts()
     # --host-root names one host's root; with no --hosts that host is claude.

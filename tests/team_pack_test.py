@@ -5,6 +5,7 @@ head commit and the tarball, as GitHub does). No network or credential is used."
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -60,8 +61,10 @@ class TeamPackTests(InstallerUxFixture):
         return repository, first
 
     def gh_fixture(self, repository: Path) -> None:
-        """gh that serves repository as example-org/team-pack: the head commit and its tarball."""
+        """gh that serves repository as example-org/team-pack: the head commit and its tarball. Each
+        call's endpoint is logged to gh.log in the fake home."""
         self.gh_script(f'''repo={json.dumps(str(repository))}
+echo "$2" >> {json.dumps(str(self.home / 'gh.log'))}
 case "$1 $2" in
   "api repos/example-org/team-pack/commits/HEAD") exec git -C "$repo" rev-parse HEAD ;;
   "api repos/example-org/team-pack/tarball/"*)
@@ -183,6 +186,9 @@ exit 1''')
 
     def test_an_update_previews_its_diff_and_rollback_restores_the_previous_commit(self) -> None:
         pack = self.pack()
+        for path in pack.rglob('*'):
+            if path.is_file():
+                path.chmod(0o664)  # as written under a umask of 002
         self.git(pack, 'init', '-q')
         first = self.commit(pack, 'Pack v1')
         flags = ('--preset', str(pack), *FLAGS)
@@ -239,16 +245,72 @@ exit 1''')
         self.assertEqual(self.doctor()['preset']['source_status']['note'],
                          f'new commit {second[:12]} since setup: rerun with --preset {GH} to apply it')
 
-    def test_a_toml_only_gh_preset_records_no_pack(self) -> None:
+    def test_doctor_and_a_rerun_at_the_installed_commit_do_not_download_it(self) -> None:
+        _, first = self.served()
+        self.setup('--preset', GH, *FLAGS, '--apply')
+        log = self.home / 'gh.log'
+        log.unlink()
+        self.assertEqual(self.doctor()['preset']['source_status'], {'changed': False, 'note': 'unchanged'})
+        self.assertIn(f'pack {GH} at {first[:12]}: content unchanged since the install ({first[:12]})',
+                      self.setup('--preset', GH, *FLAGS).stdout)
+        self.assertIn('Installed 0 changes', self.setup('--preset', GH, *FLAGS, '--apply').stdout)
+        self.assertEqual([call for call in log.read_text().split() if 'team-pack' in call],
+                         ['repos/example-org/team-pack/commits/HEAD'] * 3)
+        self.assertTrue((self.home / '.claude/skills/team-howto').is_symlink())
+
+    def test_a_new_commit_outside_the_pack_previews_its_content_unchanged(self) -> None:
+        repository, first = self.served()
+        self.setup('--preset', GH, *FLAGS, '--apply')
+        (repository / 'README.md').write_text('# Team pack, v2\n')
+        second = self.commit(repository, 'Docs only')
+        # git archive, like GitHub's tarball, writes files 0664; setup installs them 0644.
+        self.assertIn(f'pack {GH} at {second[:12]}: content unchanged since the install ({first[:12]})',
+                      self.setup('--preset', GH, *FLAGS).stdout)
+
+    def test_a_gh_answer_that_is_no_archive_keeps_the_installed_pack(self) -> None:
+        self.served()
+        self.setup('--preset', GH, *FLAGS, '--apply')
+        answers = {'a proxy page': "echo '<html>proxy</html>'", 'a broken gzip stream': r"printf '\037\213\010\000\000\000\000\000\000\003broken'"}
+        for name, answer in answers.items():
+            with self.subTest(name):
+                self.gh_script(f'case "$2" in\n  *commits/HEAD) echo {"b" * 40} ;;\n  *tarball*) {answer} ;;\nesac')
+                result = self.setup('--preset', GH, *FLAGS, '--apply')
+                self.assertIn(f'preset {GH} unavailable: gh api returned no readable archive of example-org/team-pack',
+                              result.stderr)
+                self.assertIn('Installed 0 changes', result.stdout)
+                self.assertTrue((self.home / '.claude/skills/team-howto').is_symlink())
+                self.assertIsNone(self.doctor()['preset']['source_status']['changed'])
+
+    def test_os_files_in_a_pack_folder_are_not_part_of_it(self) -> None:
+        files = {'skills/.DS_Store': b'\x00\x00\x00\x01Bud1', 'skills/team-howto/._SKILL.md': b'\x00\x05\x16\x07\xff',
+                 'skills/team-howto/references/Thumbs.db': b'\xd0\xcf\x11\xe0'}
+        pack = self.pack()
+        for path, data in files.items():
+            (pack / path).write_bytes(data)
+        self.setup('--preset', str(pack), *FLAGS, '--apply')
+        repository, _ = self.served()
+        for path, data in files.items():
+            (repository / path).write_bytes(data)
+        self.commit(repository, 'OS files')
+        self.setup('--preset', GH, *FLAGS, '--apply')
+        self.assertEqual(sorted(path.relative_to(self.root / 'pack').as_posix() for path in (self.root / 'pack').rglob('*')
+                                if path.is_file()),
+                         ['rules.md', 'skills/team-claude/SKILL.md', 'skills/team-howto/SKILL.md',
+                          'skills/team-howto/references/deploys.md'])
+
+    def test_a_toml_only_gh_preset_records_its_commit_and_no_pack(self) -> None:
         repository = self.home / 'served'
         repository.mkdir()
-        (repository / 'agent-kit-preset.toml').write_text('[kit]\nREVIEW_BASE = "main"\n')
+        text = '[kit]\nREVIEW_BASE = "main"\n'
+        (repository / 'agent-kit-preset.toml').write_bytes(text.replace('\n', '\r\n').encode())
         self.git(repository, 'init', '-q')
-        self.commit(repository, 'Preset v1')
+        first = self.commit(repository, 'Preset v1')
         self.gh_fixture(repository)
         result = self.setup('--preset', GH, *FLAGS, '--apply')
         self.assertNotIn(f'pack {GH}', result.stdout)
-        self.assertEqual(set(self.state()['configuration']['preset']), {'source', 'sha256'})
+        # The sha256 an install before team packs recorded: of the text with its line endings normalized.
+        self.assertEqual(self.state()['configuration']['preset'],
+                         {'source': GH, 'sha256': hashlib.sha256(text.encode()).hexdigest(), 'commit': first})
         self.assertFalse((self.root / 'pack').exists())
         doctor = self.doctor()
         self.assertEqual((doctor['problems'], doctor['preset']['source_status']['changed']), ([], False))
@@ -307,6 +369,11 @@ exit 1''')
                                 if path.is_file()), ['skills/team-a/SKILL.md'])
         self.assertIn('no agent/missing.toml in the repository',
                       self.setup('--preset', GH + '/agent/missing.toml', *FLAGS, code=2).stderr)
+        local = repository / 'agent/preset.toml'
+        self.assertIn(f'pack {local} at its working tree: content unchanged since the install',
+                      self.setup('--preset', str(local), *FLAGS, '--apply').stdout)
+        self.assertEqual(self.state()['configuration']['preset']['source'], str(local))
+        self.assertIn('no such file or folder', self.setup('--preset', str(repository / 'agent/missing.toml'), *FLAGS, code=2).stderr)
 
     def test_links_in_skills_that_name_a_pack_file_install_as_that_file(self) -> None:
         pack = self.pack()
@@ -345,6 +412,11 @@ exit 1''')
             'a secrets file': (skill / 'secrets.yml', 'name: value\n', 'secrets.yml looks like a credential file'),
             'a private key': (skill / 'references/deploys.md', PRIVATE_KEY, 'deploys.md holds a token or private key'),
             'a key file': (skill / 'deploy.key', PRIVATE_KEY, 'deploy.key holds a token or private key'),
+            'a PGP key': (skill / 'references/signing.asc', '-----BEGIN PGP ' + 'PRIVATE KEY BLOCK-----\nlQOYBF\n',
+                          'signing.asc holds a token or private key'),
+            'a PuTTY key': (skill / 'deploy.ppk', 'PuTTY-User-' + 'Key-File-3: ssh-ed25519\n', 'deploy.ppk holds a token'),
+            'text that is not UTF-8': (skill / 'references/notes.md', b'caf\xe9\n',
+                                       'skills/team-howto/references/notes.md is not UTF-8 text'),
             'a token': (Path('rules.md'), TOKEN + '\n', 'rules.md holds a token or private key'),
             'a stripe key': (skill / 'pay.md', 'sk_' + 'live_' + 'A1b2C3d4E5f6G7h8I9j0\n', 'pay.md holds a token'),
             'a slack webhook': (skill / 'chat.md', 'https://hooks.slack.com/' + 'services/T0123ABCD/B0123ABCD/A1b2C3d4E5f6G7h8\n',
@@ -357,7 +429,7 @@ exit 1''')
             with self.subTest(name):
                 pack = self.pack(self.home / name.replace(' ', '-'))
                 (pack / path).parent.mkdir(parents=True, exist_ok=True)
-                (pack / path).write_text(text)
+                (pack / path).write_bytes(text if isinstance(text, bytes) else text.encode())
                 self.refused(str(pack), expected)
         links = {'a link out of the pack': ('../../../../secret.md', 'points outside the pack'),
                  'a link to a folder': ('..', 'must name a file in the pack'),
@@ -382,10 +454,12 @@ exit 1''')
                                    'example-org-team-pack-0/skills/team-a/SKILL.md'), 'hard.md is not a regular file or link'),
             'a FIFO': (member('example-org-team-pack-0/skills/team-a/pipe', tarfile.FIFOTYPE), 'pipe is not a regular file or link'),
             'names that differ in case': (('skills/team-a/notes.md', b'two\n'), 'skills/team-a/Notes.md and skills/team-a/notes.md differ only in case'),
+            'names that differ in Unicode form': (('skills/team-a/Nótes.md', b'two\n'),
+                                                  'skills/team-a/Nótes.md and skills/team-a/Nótes.md differ only in case or Unicode form'),
         }
         for name, (extra, expected) in cases.items():
             with self.subTest(name):
-                self.gh_archive([skill, ('skills/team-a/Notes.md', b'one\n'), extra])
+                self.gh_archive([skill, ('skills/team-a/Notes.md', b'one\n'), ('skills/team-a/Nótes.md', b'one\n'), extra])
                 self.refused(GH, expected)
 
 

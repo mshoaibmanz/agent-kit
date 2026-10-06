@@ -1107,13 +1107,12 @@ def team_pack_line() -> str | None:
     if not record:
         return None
     sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-    from pack import kept_records
+    from pack import kept_records, pack_label
     from preset import source_status
 
     if not kept_records(KIT, state.get("managed", {})):
         return None
-    commit = record.get("commit", "")[:12] or "its working tree"
-    return f"pack: {record['source']} at {commit}; source {source_status(record)['note']}"
+    return f"pack: {record['source']} at {pack_label(record.get('commit'))}; source {source_status(record)['note']}"
 
 
 def cmd_doctor_claude(_args: argparse.Namespace) -> int:
