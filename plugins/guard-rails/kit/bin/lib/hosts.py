@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tomllib
 from collections import Counter
@@ -37,6 +38,12 @@ PLACEHOLDER = re.compile(r"\{\{([^{}]*)\}\}")
 SUBAGENT_RESUME_MAX = 300000
 # Each host's global instructions file under its config root, the one the kit's rules reach.
 RULES_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "cursor": "rules/agent-kit.mdc"}
+# The files a render writes under each host's root.
+RENDERED_FILES = {
+    "claude": ("settings.json", "mcp.json", RULES_FILES["claude"]),
+    "codex": ("config.toml", "hooks.json", RULES_FILES["codex"]),
+    "cursor": ("mcp.json", "hooks.json", RULES_FILES["cursor"]),
+}
 # The variable each host reads for its config root, when it has one.
 HOST_HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 
@@ -64,6 +71,59 @@ def skill_hosts(skill_md: Path, text: str | None = None) -> set[str]:
                 )
             return names
     return set(HOSTS)
+
+
+def frontmatter(text: str) -> dict[str, str]:
+    """A markdown file's top-level frontmatter keys. A block scalar (`key: >` or `key: |`) is its
+    indented lines joined, by spaces for `>` and newlines for `|`."""
+    if not text.startswith("---\n"):
+        return {}
+    out: dict[str, str] = {}
+    block: tuple[str, str] | None = None
+    lines: list[str] = []
+    for line in text[4 : text.find("\n---", 4)].splitlines():
+        if block is not None and (line.startswith((" ", "\t")) or not line.strip()):
+            lines.append(line.strip())
+            continue
+        if block is not None:
+            out[block[0]] = (" " if block[1] == ">" else "\n").join(x for x in lines if x).strip()
+            block, lines = None, []
+        key, sep, value = line.partition(":")
+        if not sep or not key.strip() or key.startswith((" ", "\t")):
+            continue
+        value = value.strip()
+        if value[:1] in (">", "|"):
+            block = (key.strip(), value[0])
+        else:
+            out[key.strip()] = value.strip("'\"")
+    if block is not None:
+        out[block[0]] = (" " if block[1] == ">" else "\n").join(x for x in lines if x).strip()
+    return out
+
+
+def skill_dirs(host: str, root: Path) -> list[Path]:
+    """The folders host loads skills from: <root>/skills, and for Codex also ~/.agents/skills."""
+    return [root / "skills", *([Path.home() / ".agents/skills"] if host == "codex" else [])]
+
+
+def claude_state_file(root: Path) -> Path:
+    """Claude Code's own state file: ~/.claude.json for the default root, <root>/.claude.json else."""
+    default = Path.home() / ".claude"
+    return Path.home() / ".claude.json" if root.absolute() == default.absolute() else root / ".claude.json"
+
+
+def account_dirs(script: Path) -> list[Path]:
+    """The config dirs `claude-account dirs` lists; none when the script is missing or fails."""
+    try:
+        proc = subprocess.run(
+            [str(script), "dirs"], capture_output=True, text=True, check=False, timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [Path(line) for line in proc.stdout.splitlines() if line.strip()]
 
 
 def default_host_root(host: str) -> Path:
@@ -424,14 +484,15 @@ def fill(
 
 
 def fill_servers(servers: dict[str, Any], kit: str) -> dict[str, Any]:
-    """servers with each command and args filled (fill) for the kit at <kit>: a host starts an MCP
-    command as written, without expanding ~ or a variable, so a preset names a wrapper the kit ships
-    as {{KIT_DIR}}/bin/sentry-mcp."""
+    """servers as a host starts them: each command and args filled (fill) for the kit at <kit>, and
+    the catalog's `credentials` declaration (read by the dashboard only) dropped. A host starts an
+    MCP command as written, without expanding ~ or a variable, so a preset names a wrapper the kit
+    ships as {{KIT_DIR}}/bin/sentry-mcp."""
     out = {}
     for name, spec in servers.items():
         if isinstance(spec, dict):
             what = f"MCP server {name}"
-            spec = dict(spec)
+            spec = {key: value for key, value in spec.items() if key != "credentials"}
             if isinstance(spec.get("command"), str):
                 spec["command"] = fill(spec["command"], kit, what=what)
             if isinstance(spec.get("args"), list):
@@ -906,6 +967,8 @@ def inventory(
         "duplicate_hooks": duplicate_hooks,
         "skills": skills,
         "incompatible_skills": incompatible,
+        "skill_dirs": [str(path) for path in skill_dirs(host, root)],
+        "rendered_files": [name for name in RENDERED_FILES[host] if (root / name).is_file()],
         "mcp_servers": sorted(mcp),
         "model": config.get("model"),
         "cli_available": bool(shutil.which(host)),

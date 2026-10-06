@@ -40,9 +40,6 @@ from typing import Any
 sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parent.parent
 COMPONENTS = {'rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands'}
-BLOCKING = {'bash-guards', 'test-exec-gate', 'edit-guard',
-            'commit-cohesion', 'context-guard', 'review-trigger', 'unfinished-work',
-            'context-watch', 'read-streak', 'pre-compact', 'project-bind', 'ci-watch-on-push'}
 SECRET_NAMES = {'auth.json', 'credentials.json', 'kit.env', 'settings.local.json', '.env'}
 TEXT_BEGIN = '<!-- BEGIN agent-kit setup -->'
 TEXT_END = '<!-- END agent-kit setup -->'
@@ -53,6 +50,7 @@ ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'secon
                 'reviewer': 'task-reviewer', 'thermo-bugs': 'bug-reviewer',
                 'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
+from blocking import BLOCKING  # noqa: E402
 from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root, fill_servers,  # noqa: E402
                    install_text, keep_host_tables, resume_max, skill_hosts, strip_legacy_sandbox)
 from kit_env import kit_env  # noqa: E402

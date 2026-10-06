@@ -12,11 +12,11 @@ import re
 import sys
 import tomllib
 from typing import Any, NamedTuple
-from urllib.parse import parse_qsl, urlsplit
 
+from credentials import holds_secret, show_args, show_url, valid_declarations
 from hosts import HOSTS, normalize_transport
 from pack import (PACK_SKILLS, PACK_TOML, Pack, PackFiles, PresetUnavailable, StalePack, build_pack, folder_entries,
-                  gh_entries, gh_file, gh_head, git_head, holds_token, pack_files, pack_summary, utf8_text)
+                  gh_entries, gh_file, gh_head, git_head, pack_files, pack_summary, utf8_text)
 
 # Preset [kit] keys: overlay keys (hooks/lib/README) a team shares. The first three also answer
 # setup's own questions, so its summary and checks see them.
@@ -24,39 +24,32 @@ PRESET_ANSWERS = {'CODE_SEARCH_GH_OWNER': 'github_owner', 'CODE_DIRS_JSON': 'rep
                   'CODE_SEARCH_ZOEKT_URL': 'zoekt_url'}
 PRESET_KIT_KEYS = (*PRESET_ANSWERS, 'REVIEW_BASE', 'RELEASE_BRANCH_RE', 'BQRO_PROJECT', 'GIT_AUTHOR',
                    'SUBAGENT_RESUME_MAX')
-# Credentials in a URL and a bearer header, beside the token formats (pack.holds_token). Plain words
-# such as "secret" or "token" are not refused: they turn up in paths and names.
-INLINE_CREDENTIAL = re.compile(
-    r'://[^/\s@]+@|[?&](?:access[-_]?token|auth[-_]?token|token|api[-_]?key|key|password|secret)='
-    r'|\bbearer\s', re.I)
-CREDENTIAL_QUERY = {'apikey', 'key', 'accesskey', 'authkey', 'accesstoken', 'authtoken', 'token', 'password',
-                    'secret', 'authorization'}
-CREDENTIAL_ARGUMENT = re.compile(
-    r'^--(?:key|api[-_]?key|token|access[-_]token|auth[-_]token|pat|password|secret)(?:=|$)', re.I)
-
-
 def inline_secret(text: str) -> bool:
-    return holds_token(text) or bool(INLINE_CREDENTIAL.search(text))
+    return holds_secret(text)
 
 
 def validate_catalog(catalog: Any) -> dict[str, Any]:
     """An MCP catalog ({"mcpServers": {name: spec}}) with each spec normalized; refuses inline
-    credentials, which belong in a runtime wrapper or native OAuth."""
+    credentials (credentials.py decides), which belong in a runtime wrapper or native OAuth. A
+    spec may declare the Keychain items its wrapper reads (`credentials`), names only."""
     if not isinstance(catalog, dict) or not isinstance(catalog.get('mcpServers', {}), dict):
         raise ValueError('MCP catalog must map server names to objects')
     servers = {}
     for name, spec in catalog.get('mcpServers', {}).items():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', name) or not isinstance(spec, dict):
             raise ValueError('MCP catalog has an invalid server descriptor')
-        if set(spec) - {'command', 'args', 'url', 'type', 'description'}:
+        if set(spec) - {'command', 'args', 'url', 'type', 'description', 'credentials'}:
             raise ValueError(f'MCP {name}: use native OAuth or a runtime wrapper, not inline secrets')
+        if 'credentials' in spec and not valid_declarations(spec['credentials']):
+            raise ValueError(f'MCP {name}: credentials must list {{"service": <service>, "account": <account>}}')
         normalized = normalize_transport(spec)
-        query = {re.sub(r'[-_]', '', key).casefold() for key, _ in parse_qsl(urlsplit(normalized.get('url', '')).query)}
         arguments = normalized.get('args', [])
-        credential_argument = isinstance(arguments, list) and any(
-            isinstance(argument, str) and CREDENTIAL_ARGUMENT.match(argument) for argument in arguments)
-        if query & CREDENTIAL_QUERY or credential_argument or inline_secret(json.dumps(normalized)):
-            raise ValueError(f'MCP {name}: common inline credential patterns are refused; use a runtime wrapper')
+        found = [*show_url(normalized['url']).credentials] if 'url' in normalized else []
+        if isinstance(arguments, list):
+            found += show_args(arguments).credentials
+        if found or inline_secret(json.dumps(normalized)):
+            raise ValueError(f'MCP {name}: inline credential refused ({", ".join(found) or "a token shape"}); '
+                             'use a runtime wrapper that reads it from the Keychain')
         if 'args' in normalized and ('command' not in normalized or not isinstance(normalized['args'], list)
                                     or not all(isinstance(value, str) for value in normalized['args'])):
             raise ValueError('MCP args must be strings on a command transport')
