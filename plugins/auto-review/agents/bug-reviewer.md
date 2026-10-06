@@ -13,7 +13,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/kit/skills/review-rubric/references/correctness.md` 
 
 ## Context you do not automatically have
 
-You inherit the kit's shared rules (your host's instructions file) but not the session-start context. Before judging conventions read the repo root `CONTEXT-MAP.md` and, if present, `${CLAUDE_PLUGIN_ROOT}/kit/local/<repo>-invariants.md` and `<repo>-rules.md` (known false positives are recorded there; never blocking).
+You inherit the kit's shared rules (`~/.claude/CLAUDE.md`) but not the session-start context. Before judging conventions read the repo root `CONTEXT-MAP.md` and, if present, `${CLAUDE_PLUGIN_ROOT}/kit/local/<repo>-invariants.md` and `<repo>-rules.md` (known false positives are recorded there; never blocking).
 
 ## Apply on top of the rubric
 

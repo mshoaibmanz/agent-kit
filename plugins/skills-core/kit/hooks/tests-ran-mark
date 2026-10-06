@@ -4,7 +4,7 @@
 #   Bash                 -> a test command ran: the session/worktree run markers, and the agent's
 #                           lastrun marker plus the scope it covered
 #   Edit|Write|MultiEdit -> a source file changed: the edit markers, which unlock the next run
-# pre-push-gate reads the run markers ("were tests run at all?"); test-exec-gate reads lastrun
+# lib/push-gate (the git pre-push gate) reads the run markers ("were tests run at all?"); test-exec-gate reads lastrun
 # against the edit markers and the recorded scope to refuse a re-run that cannot tell us
 # anything new. Silent no-op otherwise.
 set -uo pipefail
@@ -81,7 +81,7 @@ if [ "$_writes" = 1 ] && [ "$_src" = 1 ]; then
 fi
 
 # A runner merely NAMED in a commit message or PR body must not mark tests as run, or
-# pre-push-gate waves through an untested push. A TEST_REFUSED_CMDS form is not counted —
+# the git pre-push gate waves through an untested push. A TEST_REFUSED_CMDS form is not counted —
 # test-exec-gate denies it outright.
 cmd_view "$cmd"
 cmd_tokens

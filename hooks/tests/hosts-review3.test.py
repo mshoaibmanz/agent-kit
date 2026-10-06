@@ -49,6 +49,16 @@ class RoundThree(base.ReviewTests):
             },
         )
 
+    def test_unknown_placeholder_is_refused(self):
+        hosts = base.load(SOURCE / "bin/lib/hosts.py", "hosts_placeholders")
+        self.assertEqual(hosts.fill("{{KIT_DIR}} {{OVERLAY_DIR}}", "/kit"), "/kit /kit/local")
+        self.assertEqual(hosts.fill("{{RULES_FILE}}", "/kit", "codex", "/codex"), "/codex/AGENTS.md")
+        with self.assertRaises(SystemExit) as raised:
+            hosts.fill("{{NO_SUCH_PATH}}", "/kit", "claude")
+        self.assertIn("unknown placeholder {{NO_SUCH_PATH}}", str(raised.exception))
+        with self.assertRaises(SystemExit):
+            hosts.fill("{{RULES_FILE}}", "/kit")  # host-neutral text cannot name a host's file
+
     def test_B1_CX1_native_patch_projection(self):
         self.assertEqual(self.render().returncode, 0)
         target = self.root / ".codex/AGENTS.md"
@@ -86,6 +96,7 @@ class RoundThree(base.ReviewTests):
     def test_B2_CX2_case_aliases(self):
         if sys.platform != "darwin":
             self.skipTest("Requires the user's case-insensitive filesystem")
+        self.native_agents_on()
         for host in ("codex", "cursor"):
             self.assertEqual(self.render(host).returncode, 0)
         cases = (

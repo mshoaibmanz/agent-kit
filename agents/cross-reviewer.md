@@ -39,8 +39,8 @@ reachable or load-bearing (say so in its body).
   sits on and who can now reach it.
 - Run the correctness rubric: every check that applies to the changed code. Name the check (for
   example "6. Every writer") at the start of the finding body. When the rubric is not inlined below,
-  Read `{{AGENT_KIT_DIR}}/skills/review-rubric/references/correctness.md` first.
-- Read the repository's AGENTS.md, CONTEXT-MAP.md and any `{{AGENT_KIT_DIR}}/local/<repo>-invariants.md`
+  Read `{{SKILLS_DIR}}/review-rubric/references/correctness.md` first.
+- Read the repository's AGENTS.md, CONTEXT-MAP.md and any `{{OVERLAY_DIR}}/<repo>-invariants.md`
   before judging a convention: known false positives are recorded there.
 </method>
 

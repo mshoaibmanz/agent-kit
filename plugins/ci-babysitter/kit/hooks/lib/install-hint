@@ -1,0 +1,54 @@
+#!/bin/sh
+# install-hint <tool>: one line, the command that installs <tool> on this OS, the kit's one source of
+# install advice. POSIX sh and no jq, since it runs when jq is the thing missing.
+tool=${1:-}
+[ -n "$tool" ] || { echo "usage: install-hint <tool>" >&2; exit 2; }
+os=$(uname -s 2>/dev/null)
+if [ "$os" = Darwin ]; then
+  pm="brew install"
+elif command -v apt-get >/dev/null 2>&1; then
+  pm="sudo apt-get install -y"
+elif command -v dnf >/dev/null 2>&1; then
+  pm="sudo dnf install -y"
+elif command -v pacman >/dev/null 2>&1; then
+  pm="sudo pacman -S"
+else
+  pm=""
+fi
+# Package names that differ from the command, per manager family.
+case $tool:$pm in
+  rg:*) pkg=ripgrep ;;
+  npx:"brew install" | node:"brew install") pkg=node ;;
+  npx:* | node:*) pkg="nodejs npm" ;;
+  mysql:"brew install") pkg=mysql-client ;;
+  mysql:*apt-get*) pkg=default-mysql-client ;;
+  mysql:*) pkg=mysql ;;
+  secret-tool:*apt-get*) pkg=libsecret-tools ;;
+  secret-tool:*) pkg=libsecret ;;
+  *) pkg=$tool ;;
+esac
+case $tool in
+  claude) echo "npm install -g @anthropic-ai/claude-code  (https://docs.anthropic.com/en/docs/claude-code)"; exit 0 ;;
+  codex) echo "npm install -g @openai/codex  (https://developers.openai.com/codex/cli)"; exit 0 ;;
+  cursor | cursor-agent) echo "download Cursor from https://cursor.com/downloads"; exit 0 ;;
+  python3)
+    # A distribution's python3 can be older than the 3.11 the kit needs (Ubuntu 22.04, Debian 11).
+    if [ "$os" = Darwin ]; then echo "brew install python@3.12"
+    else echo "uv python install 3.12  (uv: curl -LsSf https://astral.sh/uv/install.sh | sh; your distribution's python3 may be older than 3.11)"; fi
+    exit 0 ;;
+  uv | uvx) [ "$os" = Darwin ] && echo "brew install uv" || echo "curl -LsSf https://astral.sh/uv/install.sh | sh"; exit 0 ;;
+  gcloud | bq)
+    if [ "$os" = Darwin ]; then echo "brew install --cask google-cloud-sdk"
+    else echo "install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install"; fi
+    exit 0 ;;
+  gh)
+    if [ "$os" = Darwin ] || [ -z "$pm" ]; then :; else
+      echo "$pm gh  (if the package is missing: https://github.com/cli/cli/blob/trunk/docs/install_linux.md)"; exit 0
+    fi ;;
+  security) echo "security is macOS's Keychain CLI; on Linux use secret-tool ($(sh "$0" secret-tool))"; exit 0 ;;
+esac
+if [ -n "$pm" ]; then
+  echo "$pm $pkg"
+else
+  echo "install $pkg with your package manager"
+fi

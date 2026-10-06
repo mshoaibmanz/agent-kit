@@ -12,13 +12,11 @@
     ],
     "ci-babysitter": [
       "ci-watch-on-push",
-      "pre-push-gate",
       "test-exec-gate",
       "tests-ran-mark",
       "unfinished-work"
     ],
     "auto-review": [
-      "pre-push-gate",
       "review-agent-mark",
       "review-mark-changes",
       "review-trigger"

@@ -2,7 +2,7 @@
 """SessionEnd: append the session's mechanical learnings to the retro inbox
 (<work root>/retro/<YYYY-Www>.md), one `- [auto] ...` line each: denials by first line, hook
 blocks and hook errors, prompts that correct the model, repeated tool errors, compactions, and
-review rounds past budget. Replaces session-digest. No model cost.
+review rounds past budget. No model cost.
 
 Usage by hand:  retro-extract <transcript.jsonl> [--print]
 """
