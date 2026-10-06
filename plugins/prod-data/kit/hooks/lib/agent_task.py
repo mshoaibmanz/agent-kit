@@ -291,6 +291,23 @@ def bound_inherited(sid: str) -> bool:
         return False
 
 
+def binding_keys() -> list[str]:
+    """The project or item key of every session binding on record, one per session ever bound
+    (the tab files excluded)."""
+    folder = bind_dir()
+    keys = []
+    for f in sorted(folder.iterdir()) if folder.is_dir() else []:
+        if f.name.startswith(("tab-", ".")) or not f.is_file():
+            continue
+        try:
+            key = f.read_text(errors="replace").split("\n", 1)[0].strip()
+        except OSError:
+            continue
+        if key:
+            keys.append(key)
+    return keys
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")

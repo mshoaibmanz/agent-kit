@@ -70,7 +70,7 @@ import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, NamedTuple
 
 KIT = Path(os.environ.get("AGENT_KIT_DIR", str(Path(__file__).resolve().parent.parent)))
 HOST_DIR = KIT / "hosts/claude"
@@ -1138,21 +1138,52 @@ def same_but_refs(src: Any, live: Any) -> bool:
     return src == live
 
 
-def claude_findings(mcp: str = "values", host: dict[str, Any] | None = None) -> list[str]:
-    """Each way the live Claude config differs from the kit's sources, one line each. mcp="values"
-    compares each rendered server with its Keychain references resolved, which reads their values;
-    mcp="names" leaves the references unresolved and compares everything else, reading no
-    credential (the dashboard). The two agree unless a credential itself changed."""
+class Finding(NamedTuple):
+    """One way the live Claude config differs from the kit's sources; line is what doctor prints."""
+
+    kind: Literal["settings", "mcp", "agents", "roles", "rules"]
+    line: str
+
+
+def without_transport_type(spec: Any) -> Any:
+    """spec without a `type` naming the transport it already has: agent-setup writes one into
+    Claude's mcp.json, a render does not, and neither changes what the host starts."""
+    if not isinstance(spec, dict):
+        return spec
+    implied = "http" if "url" in spec else "stdio"
+    return {k: v for k, v in spec.items() if not (k == "type" and v == implied)}
+
+
+def written_by_setup() -> bool:
+    """agent-setup installed this kit, so it writes settings.json and the agents: it installs hooks
+    with their own env prefix and only the components it was asked for, so the render's sources are
+    not what those files should hold, and `agent-setup doctor` checks them."""
+    return (KIT / ".install-state/current.json").is_file()
+
+
+def claude_findings(mcp: Literal["values", "names"] = "values", host: dict[str, Any] | None = None) -> list[Finding]:
+    """Each way the live Claude config differs from the kit's sources. mcp="values" compares each
+    rendered server with its Keychain references resolved, which reads their values; mcp="names"
+    leaves the references unresolved and compares everything else, reading no credential (the
+    dashboard). The two agree unless a credential itself changed."""
     host = host or host_paths()
-    out: list[str] = []
-    _text, live = read_live(host["settings_path"])
-    owned_live = {k: v for k, v in live.items() if k not in host["uiOwned"]}
-    diffs: list[Drift] = []
-    source_diff(source_settings(host), owned_live, "", diffs)
-    out += [f"settings drift: {d.key} ({'absent live' if d.absent else 'source != live'})" for d in diffs]
+    out: list[Finding] = []
+    by_setup = written_by_setup()
+    if not by_setup:
+        _text, live = read_live(host["settings_path"])
+        owned_live = {k: v for k, v in live.items() if k not in host["uiOwned"]}
+        diffs: list[Drift] = []
+        source_diff(source_settings(host), owned_live, "", diffs)
+        out += [
+            Finding("settings", f"settings drift: {d.key} ({'absent live' if d.absent else 'source != live'})")
+            for d in diffs
+        ]
     live_text = read_or_empty(host["mcp_path"])
-    live_servers = (json.loads(live_text) if live_text.strip() else {}).get("mcpServers", {})
-    want = mcp_catalog().get("mcpServers", {})
+    live_servers = {
+        name: without_transport_type(spec)
+        for name, spec in (json.loads(live_text) if live_text.strip() else {}).get("mcpServers", {}).items()
+    }
+    want = {name: without_transport_type(spec) for name, spec in mcp_catalog().get("mcpServers", {}).items()}
     if mcp == "values":
         want = resolve(want)
         mdiff = sorted(n for n in set(want) | set(live_servers) if want.get(n) != live_servers.get(n))
@@ -1162,28 +1193,28 @@ def claude_findings(mcp: str = "values", host: dict[str, Any] | None = None) -> 
             if n not in want or n not in live_servers or not same_but_refs(want[n], live_servers[n])
         )
     if mdiff:
-        out.append(f"mcp: servers differ from the catalog: {', '.join(mdiff)}")
+        out.append(Finding("mcp", f"mcp: servers differ from the catalog: {', '.join(mdiff)}"))
     recorded = read_state(host["mcp_state"])
     if live_text and recorded is not None and sha(live_text) != recorded:
-        out.append(f"mcp: {host['mcp_path']} changed since the kit last rendered it")
+        out.append(Finding("mcp", f"mcp: {host['mcp_path']} changed since the kit last rendered it"))
     roles = load_roles()
     if roles is not None:
         target = host["agents_path"]
         want_agents = expected_agents(roles, "claude", host_root=rules_root("claude"))
-        if target.is_symlink():
-            out.append(f"agents: {target} is still a link; run `agent-kit render --host claude`")
-        else:
+        if not by_setup and target.is_symlink():
+            out.append(Finding("agents", f"agents: {target} is still a link; run `agent-kit render --host claude`"))
+        elif not by_setup:
             out += [
-                f"agents drift: {target / n} differs from agents/{n} + {ROLES.name}"
+                Finding("agents", f"agents drift: {target / n} differs from agents/{n} + {ROLES.name}")
                 for n, t in sorted(want_agents.items())
                 if read_or_empty(target / n) != t
             ]
         if read_or_empty(STATE / "roles-claude.sh") != roles_sh(roles, "claude"):
-            out.append(f"roles: {STATE / 'roles-claude.sh'} is stale; run `agent-kit render --host claude`")
+            out.append(Finding("roles", f"roles: {STATE / 'roles-claude.sh'} is stale; run `agent-kit render --host claude`"))
     rules_path = expand(os.environ.get("AGENT_KIT_RULES", "~/.claude/CLAUDE.md"))
     if (KIT / "rules/hosts/claude.md").exists() and str(CLAUDE_HOST_RULES) in read_or_empty(rules_path) \
             and read_or_empty(CLAUDE_HOST_RULES) != claude_host_rules(rules_path):
-        out.append(f"rules: {CLAUDE_HOST_RULES} is stale; run `agent-kit render --host claude`")
+        out.append(Finding("rules", f"rules: {CLAUDE_HOST_RULES} is stale; run `agent-kit render --host claude`"))
     return out
 
 
@@ -1196,15 +1227,18 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
     if not live:
         print(f"settings: {host['settings_path']} is missing or empty; run `agent-kit render --host claude`")
     findings = claude_findings("values", host)
-    for line in findings:
-        print(line)
-    drifted = sum(line.startswith("settings drift:") for line in findings)
-    print(f"settings: {drifted} kit-owned key(s) differ from the source")
-    extra: list[str] = []
-    live_only({k: v for k, v in live.items() if k not in host["uiOwned"]}, source_settings(host), "", extra)
-    for key in extra:
-        print(f"settings: live-only key, not in the source (render keeps it): {key}")
-    if not any(line.startswith("mcp:") for line in findings):
+    for finding in findings:
+        print(finding.line)
+    if written_by_setup():
+        print("settings: agent-setup writes them (and the agents) for this kit; `agent-setup doctor` checks them")
+    else:
+        drifted = sum(finding.kind == "settings" for finding in findings)
+        print(f"settings: {drifted} kit-owned key(s) differ from the source")
+        extra: list[str] = []
+        live_only({k: v for k, v in live.items() if k not in host["uiOwned"]}, source_settings(host), "", extra)
+        for key in extra:
+            print(f"settings: live-only key, not in the source (render keeps it): {key}")
+    if not any(finding.kind == "mcp" for finding in findings):
         print("mcp: in sync with the catalog")
     problems = len(findings)
     if "AGENT_KIT_DIR" in os.environ:

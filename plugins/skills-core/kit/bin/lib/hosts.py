@@ -378,8 +378,7 @@ def safe_servers(kit: Path) -> dict[str, Any]:
     if not isinstance(servers, dict):
         raise ValueError("MCP catalog must map server names to objects")
     for name, spec in fill_servers(servers, str(kit)).items():
-        allowed = {"command", "args", "url", "env", "type", "description", "credentials"}
-        if not isinstance(spec, dict) or set(spec) - allowed:
+        if not isinstance(spec, dict) or set(spec) - {"command", "args", "url", "env", "type", "description"}:
             raise ValueError("Unsupported MCP transport fields; nothing written")
         spec = normalize_transport(spec)
         if ("command" in spec) == ("url" in spec):

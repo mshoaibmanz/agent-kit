@@ -7,10 +7,8 @@ import json
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
-
-from dashboard_html import Action, Fold, Para, Section, Strong, Table, Tile
-from dashboard_sections import ENGINE, Setup, read_json
+from dashboard_html import Action, Fold, Para, Section, Strong, Table
+from dashboard_sections import ENGINE, Setup, TableRows, read_json
 from hosts import RENDERED_FILES, claude_state_file
 from kit_env import kit_env
 
@@ -71,7 +69,7 @@ def kit_owned(setup: Setup, host: str, path: Path, managed: set[Path]) -> bool:
     )
 
 
-def host_extras(setup: Setup, host: str) -> list[tuple[Any, ...]]:
+def host_extras(setup: Setup, host: str) -> TableRows:
     root, rows = setup.roots[host], []
     managed = {
         Path(r["target"])
@@ -96,7 +94,7 @@ def host_extras(setup: Setup, host: str) -> list[tuple[Any, ...]]:
                 (
                     host,
                     entry,
-                    (f"{len(found)} entries the kit does not own: {why}", Fold("names", (names,))),
+                    (f"{len(found)} entries the kit does not own: {why}", Fold("Names", (names,))),
                 )
             )
             continue
@@ -113,8 +111,8 @@ def host_extras(setup: Setup, host: str) -> list[tuple[Any, ...]]:
     return rows
 
 
-def plugin_rows(setup: Setup) -> list[tuple[Any, ...]]:
-    rows: list[tuple[Any, ...]] = []
+def plugin_rows(setup: Setup) -> TableRows:
+    rows: TableRows = []
     if "claude" in setup.configured:
         root = setup.roots["claude"]
         listing = root / "plugins/installed_plugins.json"
@@ -155,7 +153,7 @@ def plugin_rows(setup: Setup) -> list[tuple[Any, ...]]:
     return rows
 
 
-def claude_mcp_rows(setup: Setup) -> list[tuple[Any, ...]]:
+def claude_mcp_rows(setup: Setup) -> TableRows:
     """Servers Claude Code keeps in its own state file (`claude mcp add`, user and project scope)
     and the claude.ai connectors it has seen: names only, never their settings."""
     if "claude" not in setup.configured:
@@ -164,7 +162,7 @@ def claude_mcp_rows(setup: Setup) -> list[tuple[Any, ...]]:
     data = read_json(state)
     if not isinstance(data, dict):
         return []
-    rows: list[tuple[Any, ...]] = []
+    rows: TableRows = []
     servers = data.get("mcpServers")
     for name in sorted(servers if isinstance(servers, dict) else {}):
         same = "; the catalog has one of the same name" if name in setup.catalog else ""
@@ -217,9 +215,9 @@ def repo_roots(setup: Setup) -> list[Path]:
     return [Path(os.path.expanduser(str(r))) for r in roots if str(r).strip()]
 
 
-def repo_rows(setup: Setup) -> tuple[list[tuple[Any, ...]], bool]:
+def repo_rows(setup: Setup) -> tuple[TableRows, bool]:
     """Repositories under the repo roots, two levels deep, that carry their own agent config."""
-    rows: list[tuple[Any, ...]] = []
+    rows: TableRows = []
     seen = 0
     for root in repo_roots(setup):
         if not root.is_dir():
@@ -257,7 +255,7 @@ def repo_rows(setup: Setup) -> tuple[list[tuple[Any, ...]], bool]:
     return rows, False
 
 
-def path_rows(setup: Setup) -> list[tuple[Any, ...]]:
+def path_rows(setup: Setup) -> TableRows:
     """Kit commands found on PATH that are not the kit's own copy."""
     names = sorted(
         {
@@ -268,7 +266,7 @@ def path_rows(setup: Setup) -> list[tuple[Any, ...]]:
             if p.is_file() and not p.name.startswith(".")
         }
     )
-    rows: list[tuple[Any, ...]] = []
+    rows: TableRows = []
     for folder in dict.fromkeys(os.environ.get("PATH", "").split(os.pathsep)):
         if not folder or not Path(folder).is_dir():
             continue
@@ -291,20 +289,27 @@ def path_rows(setup: Setup) -> list[tuple[Any, ...]]:
     return rows
 
 
-def unmanaged_section(setup: Setup) -> Section:
+def unmanaged_section(setup: Setup, sec: Section) -> None:
     extras = [r for host in setup.configured for r in host_extras(setup, host)]
     repos, truncated = repo_rows(setup)
     tables = [
-        Table(("Host", "Path", "Why it matters"), extras, "Host config files outside the install"),
+        Table(
+            ("Host", "Path", "Why it matters"),
+            extras,
+            "Host config files outside the install",
+            anchor="unmanaged-host-files",
+        ),
         Table(
             ("Host", "Plugin", "State", "Recorded in", "Why it matters"),
             plugin_rows(setup),
             "Marketplace plugins",
+            anchor="unmanaged-plugins",
         ),
         Table(
             ("Name", "What", "Recorded in", "Why it matters"),
             claude_mcp_rows(setup),
             "Host-kept MCP servers and connectors",
+            anchor="unmanaged-host-mcp",
         ),
         Table(
             ("Repository", "Found", "Why it matters"),
@@ -312,14 +317,15 @@ def unmanaged_section(setup: Setup) -> Section:
             "Repositories with their own agent config",
             "None under the repo roots, or no repo roots set.",
             f"Scan stopped after {REPO_SCAN_MAX} folders." if truncated else "",
+            anchor="unmanaged-repos",
         ),
         Table(
             ("Command", "Path", "Why it matters"),
             path_rows(setup),
             "Kit commands elsewhere on PATH",
+            anchor="unmanaged-path",
         ),
     ]
-    sec = Section("unmanaged", "Unmanaged sources")
     sec.blocks.append(
         Para(
             (
@@ -329,9 +335,13 @@ def unmanaged_section(setup: Setup) -> Section:
         )
     )
     sec.blocks += tables
-    counts = [(t.title, len(t.rows)) for t in tables if t.rows]
-    for title, count in counts:
-        sec.attention.append(Action(f"Unmanaged: {count} in {title.lower()}"))
-    total = sum(c for _, c in counts)
-    sec.tile = Tile("Unmanaged", str(total), "sources outside the kit", "warn" if total else "")
-    return sec
+    total = 0
+    for table in tables:
+        if table.rows:
+            total += len(table.rows)
+            sec.attention.append(
+                Action(f"Unmanaged: {len(table.rows)} in {table.title.lower()}", "", sec.key, table.anchor)
+            )
+    sec.count = total
+    sec.summary = f"{total} sources outside the kit"
+    sec.level = "warn" if total else ""

@@ -41,7 +41,7 @@ def validate_catalog(catalog: Any) -> dict[str, Any]:
         if set(spec) - {'command', 'args', 'url', 'type', 'description', 'credentials'}:
             raise ValueError(f'MCP {name}: use native OAuth or a runtime wrapper, not inline secrets')
         if 'credentials' in spec and not valid_declarations(spec['credentials']):
-            raise ValueError(f'MCP {name}: credentials must list {{"keychain": <service>, "account": <account>}}')
+            raise ValueError(f'MCP {name}: credentials must list {{"service": <service>, "account": <account>}}')
         normalized = normalize_transport(spec)
         arguments = normalized.get('args', [])
         found = [*show_url(normalized['url']).credentials] if 'url' in normalized else []

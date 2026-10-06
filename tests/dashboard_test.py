@@ -5,6 +5,8 @@ real credential is used: the Keychain is a fixture script named by AGENT_KIT_SEC
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import json
 from pathlib import Path
@@ -44,6 +46,10 @@ PLANTED = {
     'sentry token': 'sntry' + 's_' + 'eyJpYXQiOjE3MDAwMDAw',
     'atlassian token': 'ATA' + 'TT3xFfGF0' + 'abcdefghij',
     'google token': 'ya' + '29.' + 'a0AfH6SMBx' + 'abcdefghij',
+    'short flag value': 'shortFlag' + 'VALUE1',
+    'license key': 'licVALUE' + '22',
+    'json value': 'jsonVALUE' + '33',
+    'passphrase': 'ppVALUE' + '44',
 }
 TOKEN = 'gh' + 'p_' + 'A1b2C3d4E5f6G7h8I9j0'
 SSH_CONFIG = '''Host db-tunnel-orders
@@ -76,6 +82,17 @@ def page_text(page: str) -> str:
 def section(page: str, key: str) -> str:
     start = page.index(f'<section id="{key}" class="card')
     return page[start:page.index('</section>', start)]
+
+
+def append_line(target: Path) -> str:
+    path = shlex.quote(str(target))
+    return f'{{ [ ! -s {path} ] || [ -z "$(tail -c1 {path})" ] || echo; printf \'%s\\n\' KEY=value; }} >> {path}'
+
+
+def nav(page: str, key: str) -> str:
+    found = re.search(rf'<a href="#{key}" data-k="{key}">.*?</a>', page)
+    assert found is not None, key
+    return found.group()
 
 
 def commands(page: str) -> list[str]:
@@ -118,7 +135,10 @@ class Fixture(InstallerUxFixture):
                 'VAULT_TOKEN': {'$keychain': {'service': 'example/vault', 'account': 'me'}},
                 'VAULT_ADDR': 'https://vault.example.com', 'API_SECRET': PLANTED['catalog env value']}},
             'wrapped': {'command': '{{KIT_DIR}}/bin/example-mcp',
-                        'credentials': [{'keychain': 'example/wrapped', 'account': 'me'}]},
+                        'credentials': [{'service': 'example/wrapped', 'account': 'me'}]},
+            'shortflags': {'command': 'uvx', 'args': [
+                'db-mcp', '-p', PLANTED['short flag value'], '--license-key', PLANTED['license key'],
+                '{"apiKey":"' + PLANTED['json value'] + '"}', '--passphrase', PLANTED['passphrase']]},
             'notes': {'url': 'https://notes.example.com/mcp?token=' + PLANTED['url token']},
             'pathkey': {'url': 'https://mcp.example.com/v1/' + PLANTED['url path key'] + '/sse'},
             'longkey': {'url': 'https://mcp.example.com/' + PLANTED['long path key'] + '/mcp'},
@@ -243,7 +263,33 @@ class DashboardPageTests(unittest.TestCase):
         self.assertEqual(tuple(nav), ('attention', *SECTIONS), 'one sidebar link per section, attention first')
         self.assertNotIn('not read:', self.page)
         self.assertEqual(stat.S_IMODE((self.fx.home / 'out/index.html').stat().st_mode), 0o600)
-        self.assertLess(self.page.index('Needs attention'), self.page.index('class="tiles"'))
+        self.assertNotIn('class="tiles"', self.page, 'the sidebar and card heads carry the numbers')
+        ids = re.findall(r'\sid="([^"]+)"', self.page)
+        self.assertEqual(len(ids), len(set(ids)), 'an element id twice')
+
+    def test_the_sidebar_counts_and_card_heads(self) -> None:
+        self.assertRegex(nav(self.page, 'hosts'), r'<span class="n">2</span>')
+        self.assertRegex(nav(self.page, 'unmanaged'), r'<i class="dot warn"')
+        self.assertIn('2 configured, 2 with drift', page_text(section(self.page, 'hosts')))
+        self.assertRegex(page_text(section(self.page, 'hooks')), r'Hooks\s+\d+ hooks, 0 blocking')
+        self.assertIn('2 tunnels, 1 staging', page_text(section(self.page, 'data')))
+
+    def test_csp_allows_only_the_pages_own_script_and_style(self) -> None:
+        policy = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', self.page)
+        assert policy is not None
+        self.assertNotIn('unsafe-inline', policy.group(1))
+        for tag in ('script', 'style'):
+            body = re.search(rf'<{tag}>(.*?)</{tag}>', self.page, re.S)
+            assert body is not None
+            digest = base64.b64encode(hashlib.sha256(body.group(1).encode()).digest()).decode()
+            self.assertIn(f"{tag}-src 'sha256-{digest}'", policy.group(1))
+
+    def test_each_attention_item_links_to_its_row(self) -> None:
+        targets = re.findall(r'<li><a href="#([^"]+)">', section(self.page, 'attention'))
+        for wanted in ('host-claude', 'mcp-wrapped', 'data-orders-stg', 'unmanaged-plugins'):
+            self.assertIn(wanted, targets)
+        for target in targets:
+            self.assertIn(f' id="{target}"', self.page, f'a Needs attention link to no element: {target}')
 
     def test_no_planted_secret_reaches_the_page(self) -> None:
         for what, value in PLANTED.items():
@@ -285,7 +331,9 @@ class DashboardPageTests(unittest.TestCase):
         self.assertRegex(mcp, r'Keychain example/wrapped / me\s+missing')
         self.assertIn('security add-generic-password -s example/wrapped -a me -w', mcp)
         self.assertIn('VAULT_ADDR', mcp)
-        self.assertIn('inline in the catalog: API_SECRET', mcp)
+        self.assertIn('Inline in the catalog: API_SECRET', mcp)
+        hidden = shlex.quote(MASK)
+        self.assertIn(f'uvx db-mcp -p {hidden} --license-key {hidden} {hidden} --passphrase {hidden}', mcp)
         self.assertIn('OAuth', mcp)
         self.assertIn('handmade', mcp, 'a live-only server is named')
         self.assertIn(f'https://notes.example.com/mcp?token={MASK}', mcp)
@@ -296,13 +344,13 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn(str(self.fx.root / 'mcp/servers.json'), mcp, 'the installed catalog is the source')
 
     def test_needs_attention_names_drift_credentials_and_unmanaged_counts(self) -> None:
-        block = page_text(self.page[self.page.index('Needs attention'):self.page.index('class="tiles"')])
+        block = page_text(section(self.page, 'attention'))
         self.assertRegex(block, r'claude: \d+ drift')
         self.assertIn('Missing Keychain item example/wrapped / me', block)
         self.assertIn('security add-generic-password -s ro-mysql -a reader@db-tunnel-orders-stg -w', block)
         self.assertIn('Unmanaged: 1 in marketplace plugins', block)
-        self.assertRegex(self.page, r'<div class="tile warn"><div class="k">Unmanaged')
-        self.assertRegex(self.page, r'<div class="tile bad"><div class="k">Credentials')
+        self.assertNotIn('render --host claude', block, 'render refuses files agent-setup wrote')
+        self.assertIn(f'--root-dir {self.fx.root} --apply --collision backup', block)
 
     def test_unmanaged(self) -> None:
         unmanaged = page_text(section(self.page, 'unmanaged'))
@@ -314,8 +362,17 @@ class DashboardPageTests(unittest.TestCase):
     def test_overlay_reads_kit_envs_layers_and_names_the_users_layer(self) -> None:
         overlay = page_text(section(self.page, 'overlay'))
         self.assertRegex(overlay, r'REVIEW_BASE\s+main\s+kit\.env\s+preset\.env < kit\.env')
-        set_key = [c for c in commands(self.page) if c.startswith("printf '%s\\n' 'KEY=value' >> ")]
-        self.assertEqual(set_key, [f"printf '%s\\n' 'KEY=value' >> {self.fx.root / 'local/kit.env'}"])
+        set_key = [c for c in commands(self.page) if 'KEY=value' in c]
+        self.assertEqual(set_key, [append_line(self.fx.root / 'local/kit.env')])
+
+    def test_the_set_key_command_starts_a_new_line(self) -> None:
+        target = self.fx.home / 'no newline.env'
+        shown = next(c for c in commands(self.page) if 'KEY=value' in c)
+        command = shown.replace(shlex.quote(str(self.fx.root / 'local/kit.env')), shlex.quote(str(target)))
+        for before, after in (('A=1', 'A=1\nKEY=value\n'), ('A=1\n', 'A=1\nKEY=value\n'), ('', 'KEY=value\n')):
+            target.write_text(before)
+            subprocess.run(['/bin/sh', '-c', command], check=True)
+            self.assertEqual(target.read_text(), after, repr(before))
 
     def test_data(self) -> None:
         data = page_text(section(self.page, 'data'))
@@ -327,14 +384,16 @@ class DashboardPageTests(unittest.TestCase):
     def test_skills_list_the_source_and_label_a_host_its_hosts_line_leaves_out(self) -> None:
         skills = page_text(section(self.page, 'skills'))
         self.assertIn('code-search', skills)
-        self.assertRegex(skills, r'pr-study\s+kit\s+claude\s+codex\s+change\b.*?codex: left out by its hosts: line')
-        self.assertIn('the saved selection is every skill', skills)
+        self.assertRegex(skills, r'pr-study\s+kit\s+claude\s+codex\s+Change\b.*?codex: left out by its hosts: line')
+        self.assertIn('The saved selection is every skill', skills)
         self.assertFalse([c for c in commands(self.page) if '--skills' in c], 'a command pins a skill list')
 
     def test_work_roles_hooks_pack(self) -> None:
-        self.assertIn('first-item', page_text(section(self.page, 'work')))
+        work = page_text(section(self.page, 'work'))
+        self.assertIn('first-item', work)
+        self.assertIn('Sessions bound (all time)', work)
+        self.assertRegex(work, r'first-item\s+copy\s+open\s+\d{4}-\d\d-\d\d \d\d:\d\d\s+1\s', 'the bound session')
         self.assertIn('vscode://file/', self.page)
-        self.assertIn('blocking', page_text(section(self.page, 'hooks')))
         self.assertIn('Engine', page_text(section(self.page, 'pack')))
         self.assertIn('Review rounds', page_text(section(self.page, 'roles')))
         actions = page_text(section(self.page, 'actions'))
@@ -352,7 +411,7 @@ class DashboardScenarioTests(Fixture):
         doctor = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'doctor'], capture_output=True,
                                 text=True, env=self.env(kit=self.root), timeout=120, stdin=subprocess.DEVNULL)
         page, _ = self.dashboard()
-        row = re.search(r'<tr><td><b>claude</b></td>.*?</tr>', page)
+        row = re.search(r'<tr id="host-claude"><td><b>claude</b></td>.*?</tr>', page)
         assert row is not None
         cell = re.search(r'</summary>(.*?)</details>', row.group())
         assert cell is not None
@@ -373,7 +432,7 @@ class DashboardScenarioTests(Fixture):
         overlay = page_text(section(page, 'overlay'))
         self.assertRegex(overlay, r'REVIEW_BASE\s+main\s+kit\.env\s+kit\.env\s')
         self.assertNotIn('TEAM_ONLY', overlay, 'a layer kit_env does not read')
-        self.assertIn(f"printf '%s\\n' 'KEY=value' >> {local / 'kit.env'}", commands(page))
+        self.assertIn(append_line(local / 'kit.env'), commands(page))
 
     def test_a_failing_collector_is_one_alert_and_the_rest_renders(self) -> None:
         self.install()
@@ -383,7 +442,7 @@ class DashboardScenarioTests(Fixture):
         page, _ = self.dashboard()
         self.assertIn('MCP catalog placeholders not filled', page_text(section(page, 'mcp')))
         self.assertIn('not read: AttributeError', page_text(section(page, 'hooks')))
-        self.assertIn('Hooks: not read: AttributeError', page_text(page[:page.index('class="tiles"')]))
+        self.assertIn('Hooks: not read: AttributeError', page_text(section(page, 'attention')))
         for key in SECTIONS:
             if key != 'hooks':
                 self.assertNotIn('not read:', section(page, key))
@@ -393,27 +452,57 @@ class DashboardScenarioTests(Fixture):
         installed = self.root / 'mcp/servers.json'
         servers = json.loads(installed.read_text())
         servers['mcpServers']['wrapped'] = {'command': 'example-mcp',
-                                            'credentials': [{'keychain': 'example/wrapped', 'account': 'me'}]}
+                                            'credentials': [{'service': 'example/wrapped', 'account': 'me'}]}
         installed.write_text(json.dumps(servers))
         page, _ = self.dashboard(security=self.home / 'absent')
         self.assertRegex(page_text(section(page, 'mcp')), r'Keychain example/wrapped / me\s+not checked')
         self.assertNotIn('add-generic-password', page)
-        self.assertIn('none missing', page)
+        self.assertNotIn('Missing Keychain item', page)
+
+    def test_a_fresh_install_needs_no_attention(self) -> None:
+        self.install()
+        page, _ = self.dashboard()
+        self.assertIn('Nothing needs attention.', section(page, 'attention'), page_text(section(page, 'attention')))
+        self.assertRegex(page_text(section(page, 'hosts')), r'claude\s+configured.*?clean')
+        doctor = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'doctor'], capture_output=True,
+                                text=True, env=self.env(kit=self.root), timeout=120, stdin=subprocess.DEVNULL)
+        self.assertIn('settings: agent-setup writes them', doctor.stdout)
+        self.assertIn('mcp: in sync with the catalog', doctor.stdout)
 
     def test_a_named_skill_selection_offers_select_and_drop_commands(self) -> None:
         self.install('--skills', 'code-search', 'review-rubric')
         page, _ = self.dashboard()
-        setup = [str(SOURCE / 'bin/agent-setup'), '--source', str(SOURCE), '--skills']
+        setup = [str(SOURCE / 'bin/agent-setup'), '--source', str(SOURCE), '--root-dir', str(self.root), '--skills']
         found = commands(page)
         self.assertIn(shlex.join([*setup, 'review-rubric', '--apply']), found, 'drop code-search')
         self.assertIn(shlex.join([*setup, 'code-search', 'review-rubric', 'debug', '--apply']), found, 'select debug')
+
+    def test_every_setup_command_targets_a_kit_outside_the_default_root(self) -> None:
+        kit = self.home / 'kits/alt'
+        self.install('--root-dir', str(kit), '--skills', 'code-search', 'review-rubric')
+        page, _ = self.dashboard(kit=kit)
+        found = [c for c in commands(page) if 'agent-setup' in c]
+        self.assertTrue(found)
+        for command in found:
+            tokens = shlex.split(command)
+            self.assertIn('--root-dir', tokens, command)
+            self.assertEqual(tokens[tokens.index('--root-dir') + 1], str(kit), command)
+        select = next(c for c in found if ' debug ' in c)
+        preview = [a for a in shlex.split(select) if a != '--apply']
+        env = {k: v for k, v in self.env().items() if k != 'AGENT_KIT_DIR'}
+        result = subprocess.run([sys.executable, *preview], capture_output=True, text=True, env=env, timeout=120,
+                                stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(kit), result.stdout)
+        self.assertNotIn('.local/share/agent-kit', result.stdout + result.stderr, 'the default root')
 
     def test_every_command_quotes_a_path_with_a_space(self) -> None:
         kit = self.home / 'my kit'
         self.install('--root-dir', str(kit))
         page, _ = self.dashboard(kit=kit)
         quoted = [c for c in commands(page) if 'my kit' in c]
-        self.assertTrue([c for c in quoted if 'render --host claude' in c], quoted)
+        self.assertTrue([c for c in quoted if c.endswith('doctor')], quoted)
+        self.assertTrue([c for c in quoted if 'agent-setup' in c], quoted)
         for command in quoted:
             self.assertTrue(any('my kit' in token for token in shlex.split(command)), command)
 
@@ -426,6 +515,11 @@ class DashboardScenarioTests(Fixture):
         self.assertNotRegex(page, r'<(?:link|img|iframe)\b|<script\s[^>]*src=|url\(', 'an external load')
         self.assertNotRegex(page, r'(?:src|href)="https?:', 'an external load')
         self.assertIn('color-scheme:light', page)
+        hooks = section(page, 'hooks')
+        for row, kind in (('hooks-PreToolUse-bash-guards', 'blocking'), ('hooks-Stop-stop-chime', 'advisory')):
+            found = re.search(rf'<tr id="{row}">.*?</tr>', hooks)
+            assert found is not None, row
+            self.assertIn(f'>{kind}</span>', found.group(), row)
         self.assertEqual(self.status(), self.source_status, 'changed the source checkout')
 
     def test_the_default_page_goes_under_the_work_root(self) -> None:
@@ -446,8 +540,7 @@ class CredentialClassifierTests(unittest.TestCase):
         'value after a credential flag': {'command': 'npx', 'args': ['--api-key', PLANTED['after-flag value']]},
         'credential assignment': {'command': 'npx', 'args': ['API_KEY=' + PLANTED['assigned value']]},
         'header string': {'command': 'npx', 'args': ['Authorization: ' + PLANTED['bearer value']]},
-        'key-shaped URL path': {'url': 'https://mcp.example.com/v1/' + PLANTED['url path key'] + '/sse'},
-        'long URL path key': {'url': 'https://mcp.example.com/' + PLANTED['long path key']},
+        'passphrase flag': {'command': 'npx', 'args': ['--passphrase', PLANTED['passphrase']]},
         'URL userinfo': {'url': 'https://reader:' + PLANTED['userinfo password'] + '@mcp.example.com/'},
         'URL query key': {'url': 'https://mcp.example.com/mcp?api_key=' + PLANTED['url token']},
         'jwt': {'command': 'npx', 'args': [PLANTED['jwt']]},
@@ -455,28 +548,77 @@ class CredentialClassifierTests(unittest.TestCase):
         'atlassian token': {'command': 'npx', 'args': [PLANTED['atlassian token']]},
         'google token': {'command': 'npx', 'args': [PLANTED['google token']]},
     }
+    # Not certain enough to refuse an install, so masked on the page only.
+    MASKED = {
+        'key-shaped URL path': {'url': 'https://mcp.example.com/v1/' + PLANTED['url path key'] + '/sse'},
+        'long URL path key': {'url': 'https://mcp.example.com/' + PLANTED['long path key']},
+        'short flag value': {'command': 'npx', 'args': ['-p', PLANTED['short flag value']]},
+        'license key': {'command': 'npx', 'args': ['--license-key', PLANTED['license key']]},
+        'json blob': {'command': 'npx', 'args': ['{"apiKey":"' + PLANTED['json value'] + '"}']},
+        'mixed-case word': {'command': 'npx', 'args': ['x', PLANTED['flag value']]},
+    }
+    # Each passed the install before the classifier split, and shows as written.
+    PLAIN = {
+        'max-tokens': ['npx', '-y', 'some-llm-mcp', '--max-tokens', '4096'],
+        'credentials path': ['npx', '-y', 'gdrive-mcp', '--credentials', '/Users/me/.config/gdrive/oauth.json'],
+        'no-auth URL': ['npx', '-y', 'mcp-remote', '--allow-http', '--no-auth', 'http://localhost:3000/mcp'],
+        'oauth URL': ['npx', '-y', 'some-mcp', '--oauth', 'https://mcp.example.com/mcp'],
+        'authority URL': ['npx', '--authority', 'https://login.example.com/common'],
+        'session-timeout': ['uvx', 'some-mcp', '--session-timeout', '600'],
+        'host:port': ['npx', '-y', 'x', 'localhost:8080'],
+        'scoped package': ['npx', '-y', '@example/docs-server@1.2.0', '--port=3000', '--token-file', '/etc/x/token'],
+        'placeholder path': ['{{KIT_DIR}}/bin/example-mcp', '~/x', './y'],
+    }
+
+    def shown(self, spec: dict) -> str:
+        return show_url(spec['url']).text if 'url' in spec else show_args([spec['command'], *spec['args']]).text
 
     def test_validate_catalog_refuses_every_case_and_the_page_shows_none(self) -> None:
         for name, spec in self.CASES.items():
             with self.subTest(name):
                 with self.assertRaisesRegex(ValueError, 'inline credential refused'):
                     validate_catalog({'mcpServers': {'x': spec}})
-                shown = show_url(spec['url']).text if 'url' in spec else show_args([spec['command'], *spec['args']]).text
-                self.assertFalse([v for v in PLANTED.values() if v in shown], shown)
+                self.assertFalse([v for v in PLANTED.values() if v in self.shown(spec)], self.shown(spec))
 
-    def test_plain_servers_and_declared_credentials_pass(self) -> None:
+    def test_the_page_masks_what_it_cannot_vouch_for_and_the_install_takes_it(self) -> None:
+        for name, spec in self.MASKED.items():
+            with self.subTest(name):
+                validate_catalog({'mcpServers': {'x': spec}})
+                self.assertIn(MASK, self.shown(spec))
+                self.assertFalse([v for v in PLANTED.values() if v in self.shown(spec)], self.shown(spec))
+
+    def test_plain_arguments_pass_and_show_as_written(self) -> None:
+        for name, argv in self.PLAIN.items():
+            with self.subTest(name):
+                validate_catalog({'mcpServers': {'x': {'command': argv[0], 'args': argv[1:]}}})
+                self.assertEqual(show_args(argv).text, shlex.join(argv))
+        uuid = '-'.join(('550e8400', 'e29b', '41d4', 'a716', '446655440000'))
+        for url in (f'https://mcp.example.com/workspaces/{uuid}/mcp',
+                    'https://mcp.example.com/servers/github-mcp-server-v2/mcp'):
+            validate_catalog({'mcpServers': {'x': {'url': url}}})
+            self.assertEqual(show_url(url).text, url)
+        header = ['npx', '-y', 'mcp-remote', 'https://mcp.example.com/sse', '--header', 'Authorization:${AUTH_HEADER}']
+        validate_catalog({'mcpServers': {'x': {'command': header[0], 'args': header[1:]}}})
+        self.assertIn('Authorization: ${AUTH_HEADER}', show_args(header).text)
+
+    def test_declared_credentials_pass_in_one_spelling(self) -> None:
         catalog = {'mcpServers': {
-            'docs': {'command': 'npx', 'args': ['-y', 'example-docs-server@1.2.0', '--no-auth', '--port', '3000',
-                                                '--token-file', '/etc/example/token']},
             'remote': {'url': 'https://mcp.example.com/v1/sse?transport=sse'},
             'wrapped': {'command': '{{KIT_DIR}}/bin/example-mcp',
-                        'credentials': [{'keychain': 'example/wrapped', 'account': 'me'}]}}}
-        self.assertEqual(set(validate_catalog(catalog)['mcpServers']), {'docs', 'remote', 'wrapped'})
-        self.assertIn('--port 3000', show_args(catalog['mcpServers']['docs']['args']).text)
+                        'credentials': [{'service': 'example/wrapped', 'account': 'me'}]}}}
+        self.assertEqual(set(validate_catalog(catalog)['mcpServers']), {'remote', 'wrapped'})
         self.assertEqual(show_url('https://mcp.example.com/v1/sse?transport=sse').text,
                          f'https://mcp.example.com/v1/sse?transport={MASK}')
-        with self.assertRaisesRegex(ValueError, 'credentials must list'):
-            validate_catalog({'mcpServers': {'w': {'command': 'x', 'credentials': [{'keychain': 'a'}]}}})
+        for wrong in ([{'service': 'a'}], [{'keychain': 'a', 'account': 'b'}]):
+            with self.assertRaisesRegex(ValueError, 'credentials must list'):
+                validate_catalog({'mcpServers': {'w': {'command': 'x', 'credentials': wrong}}})
+
+    def test_a_row_description_shows_under_its_name(self) -> None:
+        from dashboard_html import Row, Section, row, section as render_section
+
+        self.assertEqual(row(Row(('a', 'b'), 'mcp-a', 'what it does')),
+                         '<tr id="mcp-a"><td>a<div class="desc">what it does</div></td><td>b</td></tr>')
+        self.assertIn('<div class="desc">one line</div>', render_section(Section('k', 'K', 'one line')))
 
     def test_mask_tokens_covers_every_shape(self) -> None:
         text = ' '.join([PLANTED['jwt'], PLANTED['sentry token'], PLANTED['atlassian token'], PLANTED['google token'],
@@ -496,7 +638,7 @@ class CredentialClassifierTests(unittest.TestCase):
     def test_render_drops_the_credentials_declaration(self) -> None:
         from hosts import fill_servers
 
-        filled = fill_servers({'w': {'command': 'x', 'credentials': [{'keychain': 'a', 'account': 'b'}]}}, '/kit')
+        filled = fill_servers({'w': {'command': 'x', 'credentials': [{'service': 'a', 'account': 'b'}]}}, '/kit')
         self.assertEqual(filled, {'w': {'command': 'x'}})
 
 

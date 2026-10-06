@@ -1,9 +1,10 @@
-"""The dashboard's collectors: each reads one part of the setup and returns a Section of plain values
-(dashboard_html renders it). They read only; a credential is checked for presence, never read."""
+"""The dashboard's collectors: each fills the Section collect() made for it with plain values
+(dashboard_html renders them). They read only; a credential is checked for presence, never read."""
 
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import importlib.machinery
 import importlib.util
 import json
@@ -13,15 +14,17 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from blocking import BLOCKING
-from credentials import credential_name, declared_credentials, holds_secret, show_args, show_url
+from blocking import BLOCKING, hook_name
+from credentials import Credential, credential_name, declared_credentials, holds_secret, show_args, show_url
 from dashboard_html import (
     Action,
     Badge,
+    Cell,
     Code,
     Command,
     Fold,
@@ -29,10 +32,12 @@ from dashboard_html import (
     Muted,
     Para,
     Pre,
+    Row,
     Section,
+    State,
     Strong,
     Table,
-    Tile,
+    anchor,
 )
 from hosts import (
     HOSTS,
@@ -52,6 +57,7 @@ LIB = Path(__file__).resolve().parent
 ENGINE = LIB.parents[1]
 # The presence check runs this binary, never one from PATH; tests point it at a fixture.
 SECURITY = os.environ.get("AGENT_KIT_SECURITY", "/usr/bin/security")
+TableRows = list[Row | tuple[Cell, ...]]
 
 
 def read_json(path: Path) -> Any:
@@ -86,24 +92,51 @@ def run(command: list[str]) -> subprocess.CompletedProcess[str] | None:
         return None
 
 
-def keychain_present(service: str, account: str) -> str:
+@functools.cache
+def keychain_present(item: Credential) -> State:
     """present, missing, or unknown (no Keychain tool, or it failed to run). No -w or -g: the item's
     attributes are found, its secret is never asked for, and the output is discarded."""
     if not Path(SECURITY).exists():
         return "unknown"
-    proc = run([SECURITY, "find-generic-password", "-s", service, "-a", account])
+    proc = run([SECURITY, "find-generic-password", "-s", item.service, "-a", item.account])
     if proc is None:
         return "unknown"
     return "present" if proc.returncode == 0 else "missing"
 
 
-def keychain_add(service: str, account: str) -> str:
+def keychain_add(item: Credential) -> str:
     """The prompt form: -w last with no value, so the password is typed, never on a command line."""
-    return shlex.join(["security", "add-generic-password", "-s", service, "-a", account, "-w"])
+    return shlex.join(["security", "add-generic-password", "-s", item.service, "-a", item.account, "-w"])
 
 
 def kit_command(setup: Setup, *args: str) -> str:
     return shlex.join([str(setup.kit / "bin/agent-kit"), *args])
+
+
+def setup_command(setup: Setup, *args: str, action: str = "") -> str:
+    """agent-setup from the install's source checkout, for this kit's root (not the default one)."""
+    source = setup.source()
+    head = [str(source / "bin/agent-setup"), *([action] if action else [])]
+    return shlex.join([*head, "--source", str(source), "--root-dir", str(setup.kit), *args])
+
+
+def load_script(path: Path, name: str) -> ModuleType | None:
+    """A kit bin script as a module, without writing bytecode beside it."""
+    if not path.is_file():
+        return None
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    dont_write = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.modules[name] = module  # a dataclass in the script looks its module up there
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = dont_write
+    return module
 
 
 class Setup:
@@ -113,8 +146,8 @@ class Setup:
         self.api = api
         self.kit = Path(api.KIT)
         self.check_updates = check_updates
-        self.state = read_json(self.kit / ".install-state/current.json") or {}
-        self.config = self.state.get("configuration", {})
+        self.state: dict[str, Any] = read_json(self.kit / ".install-state/current.json") or {}
+        self.config: dict[str, Any] = self.state.get("configuration", {})
         self.roots = {h: host_root_for(self.kit, h) or default_host_root(h) for h in HOSTS}
         if self.state:
             self.configured = [h for h in HOSTS if h in self.config.get("hosts", [])]
@@ -125,11 +158,11 @@ class Setup:
         self.catalog_input = Path(chosen) if chosen else None
         catalog = (read_json(self.catalog_path) or {}).get("mcpServers", {})
         self.catalog: dict[str, Any] = catalog if isinstance(catalog, dict) else {}
-        self.alerts: list[str] = []
+        self.fill_error = ""
         try:
             self.filled = fill_servers(self.catalog, str(self.kit))
         except (ValueError, SystemExit) as error:
-            self.alerts.append(f"MCP catalog placeholders not filled: {error}")
+            self.fill_error = str(error)
             self.filled = self.catalog
         self.roles = None
         self.roles_error = ""
@@ -137,7 +170,6 @@ class Setup:
             self.roles = api.load_roles()
         except SystemExit as error:
             self.roles_error = str(error)
-        self.missing: list[tuple[str, str, str]] = []
         self.inventories: dict[str, dict[str, Any]] = {}
 
     def kit_bin(self, name: str) -> Path:
@@ -162,17 +194,29 @@ class Setup:
         except (OSError, ValueError, SystemExit):
             return None
 
-    def credential(self, service: str, account: str, why: str) -> str:
-        state = keychain_present(service, account)
-        if state == "missing" and (service, account, why) not in self.missing:
-            self.missing.append((service, account, why))
-        return state
+    @functools.cached_property
+    def setup_drift(self) -> list[Path]:
+        """Paths agent-setup installed that changed since (its own managed_drift)."""
+        module = load_script(self.kit_bin("agent-setup"), "agent_setup_for_dashboard") if self.state else None
+        if module is None:
+            return []
+        return [Path(p) for p in module.managed_drift(self.state.get("managed", {}).values())]
 
 
-def credential_cell(setup: Setup, service: str, account: str, why: str) -> tuple:
-    state = setup.credential(service, account, why)
-    command = Command(keychain_add(service, account)) if state == "missing" else ""
-    return (f"Keychain {service} / {account}", Badge.state(state), command)
+def credential_cell(sec: Section, item: Credential, why: str, row: str) -> tuple[Cell, ...]:
+    """The item's presence; a missing one adds its add command to the section's Needs attention."""
+    state = keychain_present(item)
+    if state == "missing":
+        action = Action(
+            f"Missing Keychain item {item.service} / {item.account} for {why}",
+            keychain_add(item),
+            sec.key,
+            row,
+        )
+        if action not in sec.attention:
+            sec.attention.append(action)
+    command: Cell = Command(keychain_add(item)) if state == "missing" else ""
+    return (f"Keychain {item.service} / {item.account}", Badge.state(state), command)
 
 
 def last_render(setup: Setup, host: str) -> float | None:
@@ -181,91 +225,117 @@ def last_render(setup: Setup, host: str) -> float | None:
     return max((s for s in stamps if s is not None), default=None)
 
 
-def host_drift(setup: Setup, host: str) -> list[str]:
-    """claude: agent-kit doctor's own findings with MCP compared by name (no Keychain value is
-    resolved). Others: hosts.inventory's errors and duplicate hooks, and MCP names."""
+def host_drift(setup: Setup, host: str) -> list[tuple[str, str]]:
+    """(kind, line) per way the host differs. claude: agent-kit doctor's own findings with MCP
+    compared by name (no Keychain value is resolved). Others: hosts.inventory's errors and duplicate
+    hooks, and MCP names. Both: the host's files agent-setup installed that changed since."""
+    root = setup.roots[host]
+    out = [("setup", f"changed since setup: {p}") for p in setup.setup_drift if p.is_relative_to(root)]
     if host == "claude":
-        return setup.api.claude_findings(mcp="names")
+        return [(f.kind, f.line) for f in setup.api.claude_findings(mcp="names")] + out
     inv = setup.inventory(host)
-    out = list(inv["errors"])
+    out += [("inventory", str(e)) for e in inv["errors"]]
     out += [
-        f"duplicate hook {d['event']} {d['matcher'] or ''} x{d['count']}"
+        ("inventory", f"duplicate hook {d['event']} {d['matcher'] or ''} x{d['count']}")
         for d in inv["duplicate_hooks"]
     ]
     live, want = set(inv["mcp_servers"]), set(setup.catalog)
-    out += [f"mcp {n} in the catalog, not live" for n in sorted(want - live)]
-    return out + [f"mcp {n} live only, not in the catalog" for n in sorted(live - want)]
+    out += [("mcp", f"mcp {n} in the catalog, not live") for n in sorted(want - live)]
+    return out + [("mcp", f"mcp {n} live only, not in the catalog") for n in sorted(live - want)]
 
 
-def hosts_section(setup: Setup) -> Section:
-    sec = Section(
-        "hosts", "Hosts", [setup.kit / ".install-state/current.json"] if setup.state else []
-    )
-    rows, drifted = [], 0
+def host_fix(setup: Setup, host: str, kinds: set[str]) -> tuple[str, str]:
+    """(why, command) that brings host back to the kit's version."""
+    if setup.state:
+        return (
+            "agent-setup wrote these files, so re-apply the install; `agent-kit render` would refuse "
+            "them (backup keeps your version in the install journal)",
+            setup_command(setup, "--apply", "--collision", "backup"),
+        )
+    flags = [*(["--all"] if "settings" in kinds else []), *(["--force-mcp"] if "mcp" in kinds else [])]
+    flags = flags if host == "claude" else []
+    why = "Render writes the kit's sources over the drift"
+    if flags:
+        why += f" (without {' '.join(flags)} it refuses); `agent-kit adopt <key>` keeps a live setting"
+    return why, kit_command(setup, "render", "--host", host, *flags)
+
+
+def hosts_section(setup: Setup, sec: Section) -> None:
+    sec.sources = [setup.kit / ".install-state/current.json"] if setup.state else []
+    rows: TableRows = []
+    drifted = 0
     for host in HOSTS:
         root, on = setup.roots[host], host in setup.configured
-        drift: list[str] = []
+        drift: list[tuple[str, str]] = []
         if on:
             try:
                 drift = host_drift(setup, host)
             except (Exception, SystemExit) as error:  # noqa: BLE001  one host's failure is one line
-                drift = [
-                    f"not checked: {type(error).__name__}: {str(error).splitlines()[0] if str(error) else ''}"
-                ]
+                first = str(error).splitlines()[0] if str(error) else ""
+                drift = [("error", f"not checked: {type(error).__name__}: {first}")]
+        lines = [line for _, line in drift]
         drifted += bool(drift)
-        detail: Any = Badge.state("clean") if on else Muted("-")
+        detail: Cell = Badge.state("clean") if on else Muted("-")
+        row = anchor("host", host)
         if drift:
-            detail = Fold(Badge(f"{len(drift)} drift", "warn"), (Lines(tuple(drift)),))
+            detail = Fold(Badge(f"{len(drift)} drift", "warn"), (Lines(tuple(lines)),))
+            why, command = host_fix(setup, host, {kind for kind, _ in drift})
+            more = ", ..." if len(drift) > 1 else ""
             sec.attention.append(
-                Action(
-                    f"{host}: {len(drift)} drift ({drift[0]}{', ...' if len(drift) > 1 else ''})",
-                    kit_command(setup, "render", "--host", host),
-                )
+                Action(f"{host}: {len(drift)} drift ({lines[0]}{more}). {why}", command, sec.key, row)
             )
         rows.append(
-            (
-                Strong(host),
-                Badge("configured", "ok") if on else Badge("not configured"),
-                root,
-                root / RULES_FILES[host],
-                when(last_render(setup, host)),
-                detail,
+            Row(
+                (
+                    Strong(host),
+                    Badge("configured", "ok") if on else Badge("not configured"),
+                    root,
+                    root / RULES_FILES[host],
+                    when(last_render(setup, host)),
+                    detail,
+                ),
+                row,
             )
         )
-        if on:
-            sec.actions.append(
-                Action(f"Render {host}", kit_command(setup, "render", "--host", host))
-            )
-            sec.actions.append(
-                Action(f"Doctor {host}", kit_command(setup, "doctor", "--host", host))
-            )
+        if on and not setup.state:
+            sec.actions.append(Action(f"Render {host}", kit_command(setup, "render", "--host", host)))
+    roots = [setup.roots[h] for h in setup.configured]
+    elsewhere = [p for p in setup.setup_drift if not any(p.is_relative_to(r) for r in roots)]
+    if elsewhere:
+        _, command = host_fix(setup, "", set())
+        sec.attention.append(
+            Action(f"{len(elsewhere)} installed path(s) changed since setup: {elsewhere[0]}", command, sec.key)
+        )
+    sec.actions.append(Action("Check every host", kit_command(setup, "doctor")))
+    if setup.state:
+        sec.actions.append(Action("Re-apply the install", setup_command(setup, "--apply")))
+        sec.actions.append(Action("Check the install", setup_command(setup, action="doctor")))
     sec.blocks.append(
         Table(("Host", "State", "Config dir", "Rules file", "Last render", "Drift"), rows)
     )
     claude = setup.roots["claude"].resolve()
     extra = [d for d in account_dirs(setup.kit_bin("claude-account")) if d.resolve() != claude]
     if extra:
-        rows = []
+        accounts: TableRows = []
         for d in extra:
             settings = d / "settings.json"
             linked = f"link to {os.readlink(settings)}" if settings.is_symlink() else None
             skills = len(list((d / "skills").iterdir())) if (d / "skills").is_dir() else 0
-            rows.append((d, linked or ("own file" if settings.exists() else "missing"), skills))
-        sec.blocks.append(Table(("Config dir", "settings.json", "Skills"), rows, "Claude accounts"))
-    sec.tile = Tile(
-        "Hosts",
-        f"{len(setup.configured)} configured",
-        f"{drifted} with drift" if drifted else "no drift",
-        "warn" if drifted else "",
+            accounts.append((d, linked or ("own file" if settings.exists() else "missing"), skills))
+        sec.blocks.append(Table(("Config dir", "settings.json", "Skills"), accounts, "Claude accounts"))
+    sec.count = len(setup.configured)
+    sec.summary = f"{len(setup.configured)} configured, " + (
+        f"{drifted} with drift" if drifted else "no drift"
     )
-    return sec
+    sec.level = "warn" if drifted else ""
 
 
-def mcp_section(setup: Setup) -> Section:
-    sources = [setup.catalog_path] + ([setup.catalog_input] if setup.catalog_input else [])
-    sec = Section("mcp", "MCP servers", sources, alerts=list(setup.alerts))
+def mcp_section(setup: Setup, sec: Section) -> None:
+    sec.sources = [setup.catalog_path] + ([setup.catalog_input] if setup.catalog_input else [])
+    if setup.fill_error:
+        sec.alerts.append(f"MCP catalog placeholders not filled: {setup.fill_error}")
     live = {h: setup.live_servers(h) for h in setup.configured}
-    rows = []
+    rows: TableRows = []
     for name in sorted(setup.filled):
         spec = setup.filled[name] if isinstance(setup.filled[name], dict) else {}
         if "url" in spec:
@@ -273,11 +343,12 @@ def mcp_section(setup: Setup) -> Section:
         else:
             transport = "stdio"
             target = show_args([spec.get("command", ""), *(spec.get("args") or [])]).text
-        env: dict[str, Any] = spec["env"] if isinstance(spec.get("env"), dict) else {}
-        headers: dict[str, Any] = spec["headers"] if isinstance(spec.get("headers"), dict) else {}
-        creds: list[Any] = [
-            credential_cell(setup, service, account, f"MCP {name}")
-            for service, account in declared_credentials(setup.catalog.get(name))
+        env: dict[str, object] = spec["env"] if isinstance(spec.get("env"), dict) else {}
+        headers: dict[str, object] = spec["headers"] if isinstance(spec.get("headers"), dict) else {}
+        row = anchor("mcp", name)
+        creds: list[Cell] = [
+            credential_cell(sec, item, f"MCP {name}", row)
+            for item in declared_credentials(setup.catalog.get(name))
         ]
         inline = [
             k
@@ -285,20 +356,23 @@ def mcp_section(setup: Setup) -> Section:
             if credential_name(k) and not declared_credentials(v)
         ]
         if inline:
-            creds.append(f"inline in the catalog: {', '.join(sorted(inline))} (values not shown)")
+            creds.append(f"Inline in the catalog: {', '.join(sorted(inline))} (values not shown)")
         if not creds and transport == "http" and not headers:
             creds.append("OAuth: the host signs in (not checked)")
         on = tuple(
             Badge(h, "ok" if name in (live[h] or set()) else "bad") for h in setup.configured
         )
         rows.append(
-            (
-                Strong(name),
-                transport,
-                Code(target),
-                ", ".join(sorted({*env, *headers})) or "-",
-                Lines(tuple(creds)) if creds else "none",
-                on or "-",
+            Row(
+                (
+                    Strong(name),
+                    transport,
+                    Code(target),
+                    ", ".join(sorted({*env, *headers})) or "-",
+                    Lines(tuple(creds)) if creds else "None",
+                    on or "-",
+                ),
+                row,
             )
         )
     sec.blocks.append(
@@ -308,8 +382,8 @@ def mcp_section(setup: Setup) -> Section:
             empty="The installed catalog has no servers.",
         )
     )
-    others = [
-        (h, Strong(n), "added outside the kit catalog (values not shown)")
+    others: TableRows = [
+        (h, Strong(n), "Added outside the kit catalog (values not shown)")
         for h, names in live.items()
         for n in sorted((names or set()) - set(setup.filled))
     ]
@@ -318,7 +392,7 @@ def mcp_section(setup: Setup) -> Section:
         "<name>": {
             "command": "{{KIT_DIR}}/bin/<wrapper>",
             "args": [],
-            "credentials": [{"keychain": "<service>", "account": "<account>"}],
+            "credentials": [{"service": "<service>", "account": "<account>"}],
         }
     }
     sec.blocks += [
@@ -326,34 +400,35 @@ def mcp_section(setup: Setup) -> Section:
             (
                 "Add a server to the catalog the install was made from, keep its credential in a Keychain "
                 "item its wrapper reads, declare that item under credentials (names only; the render "
-                "drops the field), then re-run agent-setup or render each host.",
+                "drops the field), then apply it (Actions has the command).",
             )
         ),
         Pre(json.dumps(example, indent=2)),
     ]
-    for host in setup.configured:
-        sec.actions.append(Action(f"Render {host}", kit_command(setup, "render", "--host", host)))
-    sec.tile = Tile(
-        "MCP servers",
-        str(len(setup.filled)),
-        f"{len(others)} outside the catalog" if others else "all from the catalog",
-        "warn" if others or setup.alerts else "",
+    if setup.state:
+        sec.actions.append(Action("Apply the catalog to every host", setup_command(setup, "--apply")))
+    else:
+        for host in setup.configured:
+            sec.actions.append(Action(f"Render {host}", kit_command(setup, "render", "--host", host)))
+    sec.count = len(setup.filled)
+    sec.summary = f"{len(setup.filled)} in the catalog, " + (
+        f"{len(others)} outside it" if others else "none outside it"
     )
-    return sec
+    sec.level = "warn" if others or setup.fill_error else ""
 
 
-def skills_section(setup: Setup) -> Section:
+def skills_section(setup: Setup, sec: Section) -> None:
     """Every skill the source checkout ships (and the pack's), per configured host: linked, off, or
     left out by its own hosts: line."""
     source = setup.source()
-    pack = {p.name: p for p in sorted((setup.kit / "pack/skills").glob("*/SKILL.md"))}
+    pack = {p.parent.name: p for p in sorted((setup.kit / "pack/skills").glob("*/SKILL.md"))}
     found = {p.parent.name: p for p in sorted((source / "skills").glob("*/SKILL.md"))}
     found.update({name: path for name, path in pack.items() if name not in found})
     selected = setup.config.get("skills")
     if selected is not None:
         selected = [n for n in selected if n not in pack]
-    sec = Section("skills", "Skills", [source / "skills"])
-    rows = []
+    sec.sources = [source / "skills"]
+    rows: TableRows = []
     for name, md in sorted(found.items()):
         text = md.read_text(errors="replace")
         try:
@@ -361,7 +436,8 @@ def skills_section(setup: Setup) -> Section:
             allowed_text = ", ".join(sorted(allowed))
         except ValueError:
             allowed, allowed_text = set(), "invalid hosts: line"
-        chips, changes = [], []
+        chips: list[Cell] = []
+        changes: list[Cell] = []
         for host in setup.configured:
             if host not in allowed:
                 chips.append(Badge(host, "off"))
@@ -374,14 +450,17 @@ def skills_section(setup: Setup) -> Section:
                 changes.append(change)
         desc = frontmatter(text).get("description", "")
         rows.append(
-            (
-                Strong(name),
-                Badge("pack" if name in pack else "kit"),
-                tuple(chips) or "-",
-                Fold("change", (Lines(tuple(changes)),)) if changes else "-",
-                allowed_text,
-                desc[:220] + ("..." if len(desc) > 220 else ""),
-                md,
+            Row(
+                (
+                    Strong(name),
+                    Badge("pack" if name in pack else "kit"),
+                    tuple(chips) or "-",
+                    Fold("Change", (Lines(tuple(changes)),)) if changes else "-",
+                    allowed_text,
+                    desc[:220] + ("..." if len(desc) > 220 else ""),
+                    md,
+                ),
+                anchor("skills", name),
             )
         )
     sec.blocks.append(
@@ -390,52 +469,50 @@ def skills_section(setup: Setup) -> Section:
     sec.blocks.append(
         Para((Muted("Skills made by hand in a host folder are listed under Unmanaged sources."),))
     )
-    sec.tile = Tile("Skills", str(len(found)), f"{len(pack)} pack")
-    return sec
+    sec.count = len(found)
+    sec.summary = f"{len(found)} skills, {len(pack)} from the pack"
 
 
 def skill_toggle(
     setup: Setup, host: str, name: str, on: bool, selected: list[str] | None, in_pack: bool
-) -> Any:
+) -> Cell:
     """What changes the skill on host: a command with its label, or a note. A setup selection is
     one command for every host."""
     link = setup.roots[host] / "skills" / name
     if on and not (link.exists() or link.is_symlink()):
         return Muted(f"{host}: read from the shared skills folder")
     if in_pack:
-        return Muted("the team pack's; change it in the preset")
+        return Muted("The team pack's; change it in the preset")
     if setup.config.get("source_checkout"):
-        source = setup.source()
-        setup_cmd = [str(source / "bin/agent-setup"), "--source", str(source)]
         if selected is None:
             if on:
                 return Muted(
-                    "the saved selection is every skill: to drop one, re-run agent-setup "
+                    "The saved selection is every skill: to drop one, re-run agent-setup "
                     "with --skills naming the ones to keep"
                 )
-            return ("re-apply:", Command(shlex.join([*setup_cmd, "--apply"])))
+            return ("Re-apply:", Command(setup_command(setup, "--apply")))
         names = [n for n in selected if n != name] if on else [*selected, name]
-        label = "drop it from every host:" if on else "select it:"
-        return (label, Command(shlex.join([*setup_cmd, "--skills", *names, "--apply"])))
+        label = "Drop it from every host:" if on else "Select it:"
+        return (label, Command(setup_command(setup, "--skills", *names, "--apply")))
     if on:
         return (f"{host}: disable", Command(shlex.join(["rm", str(link)])))
     target = str(setup.kit / "skills" / name)
     return (f"{host}: enable", Command(shlex.join(["ln", "-s", target, str(link)])))
 
 
-def roles_section(setup: Setup) -> Section:
+def roles_section(setup: Setup, sec: Section) -> None:
     roles, roles_file = setup.roles, Path(setup.api.ROLES)
-    sec = Section("roles", "Roles and agents", [roles_file, setup.kit / "agents"])
+    sec.sources = [roles_file, setup.kit / "agents"]
     if roles is None:
         sec.blocks.append(Para((Muted(setup.roles_error or "This kit has no roles.toml."),)))
         if setup.roles_error:
             sec.alerts.append(setup.roles_error)
-        return sec
+        return
     hosts = [h for h in roles.hosts if h in HOSTS]
-    rows = []
+    rows: TableRows = []
     for name, role in roles.roles.items():
         src = setup.kit / "agents" / f"{name}.md"
-        cells = []
+        cells: list[Cell] = []
         for host in hosts:
             try:
                 cells.append(f"{host}: {roles.invoke(role, host)}")
@@ -443,15 +520,18 @@ def roles_section(setup: Setup) -> Section:
                 cells.append(f"{host}: ?")
         rendered = setup.roots["claude"] / "agents" / f"{name}.md"
         rows.append(
-            (
-                Strong(name),
-                f"{role.provider}:{role.model}",
-                role.effort,
-                role.prefix or "-",
-                role.fallback or "-",
-                Lines(tuple(cells)),
-                src if src.is_file() else Muted("none (main)"),
-                Badge("rendered", "ok") if rendered.is_file() else Muted("-"),
+            Row(
+                (
+                    Strong(name),
+                    f"{role.provider}:{role.model}",
+                    role.effort,
+                    role.prefix or "-",
+                    role.fallback or "-",
+                    Lines(tuple(cells)),
+                    src if src.is_file() else Muted("None (main)"),
+                    Badge("rendered", "ok") if rendered.is_file() else Muted("-"),
+                ),
+                anchor("roles", name),
             )
         )
     sec.blocks.append(
@@ -469,55 +549,52 @@ def roles_section(setup: Setup) -> Section:
             rows,
         )
     )
-    sec.blocks.append(
-        Table(
-            ("Round", "Roles"),
-            [(k, ", ".join(v)) for k, v in roles.review.items()],
-            "Review rounds",
-        )
-    )
+    rounds: TableRows = [(k, ", ".join(v)) for k, v in roles.review.items()]
+    sec.blocks.append(Table(("Round", "Roles"), rounds, "Review rounds"))
     reviewers = sum(bool(r.prefix) for r in roles.roles.values())
-    sec.tile = Tile("Roles", str(len(roles.roles)), f"{reviewers} review roles")
-    return sec
+    sec.count = len(roles.roles)
+    sec.summary = f"{len(roles.roles)} roles, {reviewers} of them review roles"
 
 
-def hooks_section(setup: Setup) -> Section:
+def hooks_section(setup: Setup, sec: Section) -> None:
     registry_path = setup.kit / "hooks/registry.json"
     registry = read_json(registry_path) or []
-    sec = Section("hooks", "Hooks", [registry_path])
-    rows, blocking = [], 0
+    sec.sources = [registry_path]
+    rows: TableRows = []
+    blocking = 0
+    ids: Counter[str] = Counter()
     for entry in registry if isinstance(registry, list) else []:
         command = str(entry.get("command", ""))
-        name = Path(command.split()[0]).name if command.split() else "?"
+        name = hook_name(command)
         script = setup.kit / "hooks" / name
         blocking += name in BLOCKING
+        row = anchor("hooks", f"{entry.get('event', '')}-{name}")
+        ids[row] += 1
+        row += f"-{ids[row]}" if ids[row] > 1 else ""
         rows.append(
-            (
-                entry.get("event", ""),
-                entry.get("matcher") or "*",
-                Strong(name),
-                Badge("blocking", "warn") if name in BLOCKING else Badge("advisory"),
-                tuple(Badge(h) for h in entry.get("hosts", [])),
-                f"{entry.get('timeout', '-')}{' async' if entry.get('async') else ''}",
-                script if script.is_file() else Code(command),
+            Row(
+                (
+                    entry.get("event", ""),
+                    entry.get("matcher") or "*",
+                    Strong(name),
+                    Badge("blocking", "warn") if name in BLOCKING else Badge("advisory"),
+                    tuple(Badge(h) for h in entry.get("hosts", [])),
+                    f"{entry.get('timeout', '-')}{' async' if entry.get('async') else ''}",
+                    script if script.is_file() else Code(command),
+                ),
+                row,
             )
         )
     if setup.state:
         state = "on" if setup.config.get("blocking_hooks") else "off"
         sec.blocks.append(
-            Para(
-                (
-                    "Blocking hooks in this install:",
-                    Strong(state),
-                    "(agent-setup --blocking-hooks).",
-                )
-            )
+            Para(("Blocking hooks in this install:", Strong(state), "(agent-setup --blocking-hooks)."))
         )
     sec.blocks.append(
         Table(("Event", "Matcher", "Hook", "Kind", "Hosts", "Timeout", "Script"), rows)
     )
-    sec.tile = Tile("Hooks", str(len(rows)), f"{blocking} blocking")
-    return sec
+    sec.count = len(rows)
+    sec.summary = f"{len(rows)} hooks, {blocking} blocking"
 
 
 def documented_keys(setup: Setup) -> set[str]:
@@ -531,7 +608,16 @@ def documented_keys(setup: Setup) -> set[str]:
     return set()
 
 
-def overlay_section(setup: Setup) -> Section:
+def append_line(target: Path, line: str) -> str:
+    """A command that appends line to target, first ending a last line that has no newline."""
+    path = shlex.quote(str(target))
+    return (
+        f'{{ [ ! -s {path} ] || [ -z "$(tail -c1 {path})" ] || echo; '
+        f"printf '%s\\n' {shlex.quote(line)}; }} >> {path}"
+    )
+
+
+def overlay_section(setup: Setup, sec: Section) -> None:
     """The overlay as kit_env reads it: the same layers, lowest first, a later one winning a key."""
     files = layers()
     values: dict[str, tuple[str, Path, list[str]]] = {}
@@ -544,17 +630,21 @@ def overlay_section(setup: Setup) -> Section:
             seen = values[key][2] if key in values else []
             values[key] = (value, layer, seen if layer.name in seen else [*seen, layer.name])
     documented = documented_keys(setup)
-    sec = Section("overlay", "Overlay settings", [p for p in files if p.exists()])
-    rows, hidden = [], 0
+    sec.sources = [p for p in files if p.exists()]
+    rows: TableRows = []
+    hidden = 0
     for key in sorted(set(values) | (documented & set(KEYS))):
         value, layer, seen = values.get(key, ("", None, []))
         if key in documented and not credential_name(key) and not holds_secret(value):
-            shown: Any = Code(value) if value else Muted("unset")
+            shown: Cell = Code(value) if value else Muted("unset")
         else:
             shown, hidden = Badge("•••• hidden", "warn"), hidden + 1
-        note = "" if key in KEYS else Muted("(not a key this kit reads)")
+        note: Cell = "" if key in KEYS else Muted("(not a key this kit reads)")
         rows.append(
-            ((Strong(key), note), shown, layer.name if layer else "-", " < ".join(seen) or "-")
+            Row(
+                ((Strong(key), note), shown, layer.name if layer else "-", " < ".join(seen) or "-"),
+                anchor("overlay", key),
+            )
         )
     sec.blocks.append(
         Para(("Values show only for keys kit.env.example documents; every other key is hidden.",))
@@ -570,23 +660,22 @@ def overlay_section(setup: Setup) -> Section:
             f"Set an overlay key in {target}; setup-paths.env, which agent-setup rewrites, wins "
             f"for {', '.join(won) or 'no key'}"
         )
-    sec.actions.append(Action(label, f"printf '%s\\n' 'KEY=value' >> {shlex.quote(str(target))}"))
-    sec.tile = Tile(
-        "Overlay keys", str(sum(1 for v in values.values() if v[0])), f"{hidden} hidden"
-    )
-    return sec
+    sec.actions.append(Action(label, append_line(target, "KEY=value")))
+    count = sum(1 for v in values.values() if v[0])
+    sec.count = count
+    sec.summary = f"{count} keys set, {hidden} hidden"
 
 
 def git_line(folder: Path) -> str:
     """HEAD, uncommitted files and commits behind the last fetched upstream: local refs only, and
     no optional lock (a status refresh would write the index)."""
     if not (folder / ".git").exists() or not shutil.which("git"):
-        return "not a git checkout"
+        return "Not a git checkout"
     git = ["git", "--no-optional-locks", "-C", str(folder)]
     head = run([*git, "rev-parse", "--short=12", "HEAD"])
     dirty = run([*git, "status", "--porcelain"])
     behind = run([*git, "rev-list", "--count", "HEAD..@{u}"])
-    parts = [f"at {head.stdout.strip()}" if head and head.returncode == 0 else "no commit"]
+    parts = [f"At {head.stdout.strip()}" if head and head.returncode == 0 else "No commit"]
     if dirty and dirty.returncode == 0 and dirty.stdout.strip():
         parts.append(f"{len(dirty.stdout.splitlines())} uncommitted")
     if behind and behind.returncode == 0:
@@ -599,111 +688,70 @@ def git_line(folder: Path) -> str:
     return ", ".join(parts)
 
 
-def pack_section(setup: Setup) -> Section:
-    from pack import git_head, pack_label
+def pack_section(setup: Setup, sec: Section) -> None:
+    from pack import pack_label
+    from preset import source_status
 
     engine, pack_dir = setup.source(), setup.kit / "pack"
-    sources = [p for p in (pack_dir, setup.kit / ".install-state/current.json") if p.exists()]
-    sec = Section("pack", "Preset and pack", sources)
-    rows: list[tuple[Any, ...]] = [("Engine", engine, git_line(engine))]
+    sec.sources = [p for p in (pack_dir, setup.kit / ".install-state/current.json") if p.exists()]
+    rows: TableRows = [("Engine", engine, git_line(engine))]
     record = setup.config.get("preset")
-    agent_setup = [str(engine / "bin/agent-setup"), "--source", str(engine)]
     if record:
         spec = str(record.get("source", ""))
-        if setup.check_updates:
-            from preset import source_status
-
-            status = source_status(record)["note"]
-        elif spec.startswith("gh:"):
+        if spec.startswith("gh:") and not setup.check_updates:
             status = "not checked (rerun with --check-updates; it asks GitHub)"
         else:
-            local = Path(spec).expanduser()
-            head = git_head(local) if local.is_dir() else None
-            status = (
-                "not checked"
-                if head is None
-                else "unchanged"
-                if head == record.get("commit")
-                else f"new commit {head[:12]} since setup"
-            )
+            status = source_status(record)["note"]
         rows.append(
-            ("Preset", Code(spec), f"at {pack_label(record.get('commit'))}; update: {status}")
+            ("Preset", Code(spec), f"At {pack_label(record.get('commit'))}; update: {status}")
         )
-        sec.actions.append(
-            Action("Preview the preset again", shlex.join([*agent_setup, "--preset", spec]))
-        )
-        sec.actions.append(
-            Action("Apply it", shlex.join([*agent_setup, "--preset", spec, "--apply"]))
-        )
+        sec.actions.append(Action("Preview the preset again", setup_command(setup, "--preset", spec)))
+        sec.actions.append(Action("Apply it", setup_command(setup, "--preset", spec, "--apply")))
     else:
-        rows.append(("Preset", Muted("none"), ""))
+        rows.append(("Preset", Muted("None"), ""))
     skills = sorted(p.name for p in (pack_dir / "skills").glob("*") if p.is_dir())
     rules = pack_dir / "rules.md"
     if skills or rules.is_file():
-        rows.append(("Pack skills", ", ".join(skills) or "none", ""))
+        rows.append(("Pack skills", ", ".join(skills) or "None", ""))
         if rules.is_file():
             words = len(rules.read_text(errors="replace").split())
             rows.append(("Pack rules", rules, f"{words} words, {rules.stat().st_size} bytes"))
-    if setup.state:
-        sec.actions.append(
-            Action(
-                "Check the install",
-                shlex.join([str(engine / "bin/agent-setup"), "doctor", "--source", str(engine)]),
-            )
-        )
     sec.blocks.append(Table(("What", "Where", "State"), rows))
-    sec.tile = Tile("Preset", "yes" if record else "none", f"{len(skills)} pack skills")
-    return sec
+    sec.count = len(skills)
+    sec.summary = ("A preset" if record else "No preset") + f", {len(skills)} pack skills"
 
 
-def load_ro_mysql(setup: Setup) -> ModuleType | None:
-    """The kit's ro-mysql as a module, for its tunnel parser and cache reader: the engine's, else
-    the install's source checkout's. Running `ro-mysql --tunnels` instead would ask the MySQL
-    login-path store for unannotated tunnels."""
-    candidates = [ENGINE / "bin/ro-mysql", setup.source() / "bin/ro-mysql"]
-    path = next((p for p in candidates if p.is_file()), None)
-    if path is None:
-        return None
-    loader = importlib.machinery.SourceFileLoader("ro_mysql_for_dashboard", str(path))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    if spec is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    dont_write = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        loader.exec_module(module)
-    finally:
-        sys.dont_write_bytecode = dont_write
-    return module
-
-
-def data_section(setup: Setup) -> Section:
-    sec = Section("data", "Data wrappers", [Path.home() / ".ssh/config"])
-    rows = []
+def data_section(setup: Setup, sec: Section) -> None:
+    sec.sources = [Path.home() / ".ssh/config"]
+    rows: TableRows = []
     for name in ("ro-mysql", "bqro"):
         kit_copy, found = setup.kit_bin(name), shutil.which(name)
-        note = "not on PATH"
+        note = "Not on PATH"
         if found:
-            note = "on PATH"
+            note = "On PATH"
             if kit_copy.is_file() and Path(found).resolve() != kit_copy.resolve():
                 same = Path(found).read_bytes() == kit_copy.read_bytes()
-                note = (
-                    "on PATH, same as the kit copy"
-                    if same
-                    else "on PATH, DIFFERS from the kit copy"
-                )
+                note = "On PATH, same as the kit copy" if same else "On PATH, DIFFERS from the kit copy"
         rows.append(
-            (
-                Strong(name),
-                Path(found) if found else "-",
-                kit_copy if kit_copy.is_file() else "-",
-                note,
-            )
+            (Strong(name), Path(found) if found else "-", kit_copy if kit_copy.is_file() else "-", note)
         )
     sec.blocks.append(Table(("Wrapper", "On PATH", "Kit copy", "State"), rows))
-    module = load_ro_mysql(setup)
-    tunnels, staging = [], 0
+    # The kit's ro-mysql as a module, for its tunnel parser and cache reader: running
+    # `ro-mysql --tunnels` instead would ask the MySQL login-path store for unannotated tunnels.
+    module = next(
+        (
+            m
+            for m in (
+                load_script(p, "ro_mysql_for_dashboard")
+                for p in (ENGINE / "bin/ro-mysql", setup.source() / "bin/ro-mysql")
+                if p.is_file()
+            )
+            if m is not None
+        ),
+        None,
+    )
+    tunnels: TableRows = []
+    staging = 0
     if module is not None:
         cache = module.read_cache()
         found_tunnels = module.load_tunnels()
@@ -712,24 +760,26 @@ def data_section(setup: Setup) -> Section:
             cached = cache.get((t.alias, t.port), {})
             via = cached.get("via", "")
             login = via.removeprefix("via login path ") if via.startswith("via login path ") else ""
+            row = anchor("data", t.name)
             if t.user and t.alias not in shared:
-                account = module.keychain_account(t, t.user)
-                cred: Any = credential_cell(
-                    setup, module.KEYCHAIN_SERVICE, account, f"ro-mysql {t.name}"
-                )
+                item = Credential(module.KEYCHAIN_SERVICE, module.keychain_account(t, t.user))
+                cred: Cell = credential_cell(sec, item, f"ro-mysql {t.name}", row)
             else:
-                cred = Muted("no Keychain item (no annotated user, or a shared alias)")
+                cred = Muted("No Keychain item (no annotated user, or a shared alias)")
             staging += t.kind == "STAGING"
             tunnels.append(
-                (
-                    Strong(t.name),
-                    t.port,
-                    Badge(t.kind, "warn" if t.kind == "PROD" else "ok"),
-                    t.user or "?",
-                    login or "-",
-                    cred,
-                    cached.get("databases", "not checked"),
-                    cached.get("checked", "-"),
+                Row(
+                    (
+                        Strong(t.name),
+                        t.port,
+                        Badge(t.kind, "warn" if t.kind == "PROD" else "ok"),
+                        t.user or "?",
+                        login or "-",
+                        cred,
+                        cached.get("databases", "not checked"),
+                        cached.get("checked", "-"),
+                    ),
+                    row,
                 )
             )
     sec.blocks.append(
@@ -752,96 +802,70 @@ def data_section(setup: Setup) -> Section:
     project = kit_env().get("BQRO_PROJECT", "")
     gcloud = Path(os.environ.get("CLOUDSDK_CONFIG") or Path.home() / ".config/gcloud")
     adc = gcloud / "application_default_credentials.json"
-    sec.blocks.append(
-        Table(
-            ("What", "State"),
-            [
-                ("Jobs project (BQRO_PROJECT)", Code(project) if project else Muted("unset")),
-                ("gcloud config folder", gcloud if gcloud.is_dir() else Badge("missing", "bad")),
-                (
-                    "Application default credentials",
-                    Badge.state("present" if adc.is_file() else "missing"),
-                ),
-            ],
-            "bqro",
-        )
-    )
+    bqro: TableRows = [
+        ("Jobs project (BQRO_PROJECT)", Code(project) if project else Muted("unset")),
+        ("gcloud config folder", gcloud if gcloud.is_dir() else Badge("missing", "bad")),
+        ("Application default credentials", Badge.state("present" if adc.is_file() else "missing")),
+    ]
+    sec.blocks.append(Table(("What", "State"), bqro, "bqro"))
     sec.actions.append(Action("List tunnels (in your own terminal)", "ro-mysql --tunnels"))
     sec.actions.append(Action("Store DB passwords (in your own terminal)", "ro-mysql --rotate"))
     if not adc.is_file():
         sec.actions.append(Action("Sign in for bqro", "gcloud auth application-default login"))
-    sec.tile = Tile("Data tunnels", str(len(tunnels)), f"{staging} staging")
-    return sec
+    sec.count = len(tunnels)
+    sec.summary = f"{len(tunnels)} tunnels, {staging} staging"
 
 
-def work_section(setup: Setup) -> Section:
+def work_section(setup: Setup, sec: Section) -> None:
     import agent_task
 
     root = Path(agent_task.work_root())
-    bound: dict[str, int] = {}
-    bind_dir = agent_task.bind_dir()
-    if bind_dir.is_dir():
-        for f in bind_dir.iterdir():
-            if f.name.startswith("tab-") or not f.is_file():
-                continue
-            key = f.read_text(errors="replace").split("\n", 1)[0].strip()
-            if key:
-                bound[key] = bound.get(key, 0) + 1
-    rows, open_total = [], 0
+    bound = Counter(agent_task.binding_keys())
+    rows: list[tuple[float, Row]] = []
+    open_total = 0
     for project in agent_task.projects(root):
         key = project.name if project.legacy else f"project:{project.name}"
         sessions = sum(n for k, n in bound.items() if k == key or k.startswith(key + "/"))
-        items = []
+        items: list[tuple[str, str, float | None, int]] = []
         for item in project.items():
             touched = max(
                 (s for s in [mtime(item), *(mtime(c) for c in item.iterdir())] if s), default=None
             )
             items.append(
-                (
-                    item.name,
-                    agent_task._item_status(item),
-                    touched,
-                    bound.get(f"{key}/{item.name}", 0),
-                )
+                (item.name, agent_task._item_status(item), touched, bound[f"{key}/{item.name}"])
             )
         open_items = [i for i in items if i[1] not in agent_task.DONE_STATUSES]
         open_total += len(open_items)
         touched = max([mtime(project.path) or 0] + [i[2] or 0 for i in items]) or None
-        detail: Any = Muted("-")
+        detail: Cell = Muted("-")
         if items:
+            item_rows: TableRows = [
+                (project.path / "items" / n, s, when(t), b) for n, s, t, b in items
+            ]
             detail = Fold(
                 f"{len(open_items)} open of {len(items)}",
-                (
-                    Table(
-                        ("Item", "Status", "Last touched", "Bound sessions"),
-                        [(project.path / "items" / n, s, when(t), b) for n, s, t, b in items],
-                    ),
-                ),
+                (Table(("Item", "Status", "Last touched", "Sessions bound (all time)"), item_rows),),
             )
-        name: Any = (
+        name: Cell = (
             (Strong(project.name), Badge("legacy")) if project.legacy else Strong(project.name)
         )
-        rows.append(
-            (
-                touched or 0,
-                (
-                    name,
-                    project.meta.get("status", "-"),
-                    detail,
-                    when(touched),
-                    sessions,
-                    project.path,
-                ),
-            )
+        cells = (
+            name,
+            project.meta.get("status", "-"),
+            detail,
+            when(touched),
+            sessions,
+            project.path,
         )
+        rows.append((touched or 0, Row(cells, anchor("work", project.name))))
     rows.sort(key=lambda r: r[0], reverse=True)
-    sec = Section("work", "Work root", [root])
+    sec.sources = [root]
     sec.blocks.append(
         Table(
-            ("Project", "Status", "Items", "Last touched", "Bound sessions", "Folder"),
+            ("Project", "Status", "Items", "Last touched", "Sessions bound (all time)", "Folder"),
             [r for _, r in rows],
             empty=f"No projects under {root}.",
         )
     )
-    sec.tile = Tile("Projects", str(len(rows)), f"{open_total} open items")
-    return sec
+    sec.count = len(rows)
+    sec.summary = f"{len(rows)} projects, {open_total} open items"
