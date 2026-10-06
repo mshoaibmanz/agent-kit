@@ -1533,7 +1533,10 @@ fi
 # ---- foreground-poll ---------------------------------------------------------------
 # A foreground wait blocks the agent for up to the 600s Bash cap with no output, so it looks hung.
 # Only Claude's Bash has run_in_background; elsewhere a wait has no alternative. Short readiness
-# spins (sleep < 5) and a command marked `# fg-wait` stay allowed.
+# spins (sleep < 5) and a command marked `# fg-wait` stay allowed. Scope: the loop shapes an agent
+# writes by habit. It is a nudge, not a security boundary: a contrived shell form that slips past
+# costs only a slow wait, so such forms are known limits, not bugs to chase. It must stay linear in
+# the command size.
 if [ "$bg" != true ] && [ "${AGENT_HOST:-claude}" = claude ] \
    && ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*fg-wait([[:space:]]|$)'; then
   # code_view's CV_CODE: quoted data is Q (a search for 'gh run watch' is not a wait), every
