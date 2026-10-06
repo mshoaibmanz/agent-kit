@@ -1,23 +1,22 @@
-"""Team presets for agent-setup (presets/example.toml documents the format) and the MCP catalog
-check they share with setup's own catalog."""
+"""Team presets for agent-setup (presets/example.toml documents the format), the team pack a preset
+repository may carry (pack.py), and the MCP catalog check they share with setup's own catalog."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
 import re
-import shutil
-import subprocess
 import sys
 import tomllib
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlsplit
 
 from hosts import HOSTS, normalize_transport
-from preflight import install_hint
+from pack import (PACK_SKILLS, PACK_TOML, Pack, PackFiles, PresetUnavailable, StalePack, build_pack, folder_entries,
+                  gh_entries, gh_file, gh_head, git_head, holds_token, pack_files, pack_summary, utf8_text)
 
 # Preset [kit] keys: overlay keys (hooks/lib/README) a team shares. The first three also answer
 # setup's own questions, so its summary and checks see them.
@@ -25,17 +24,19 @@ PRESET_ANSWERS = {'CODE_SEARCH_GH_OWNER': 'github_owner', 'CODE_DIRS_JSON': 'rep
                   'CODE_SEARCH_ZOEKT_URL': 'zoekt_url'}
 PRESET_KIT_KEYS = (*PRESET_ANSWERS, 'REVIEW_BASE', 'RELEASE_BRANCH_RE', 'BQRO_PROJECT', 'GIT_AUTHOR',
                    'SUBAGENT_RESUME_MAX')
-# Token formats with a fixed prefix, credentials in a URL, and a bearer header. Plain words such as
-# "secret" or "token" are not refused: they turn up in paths and names.
-INLINE_SECRET = re.compile(
-    r'(?<![A-Za-z0-9])(?:gh[opsur]_[A-Za-z0-9]{8,}|github_pat_\w{8,}|sk-(?:ant-)?[\w-]{8,}|xox[abpr]-[\w-]{8,}'
-    r'|AKIA[0-9A-Z]{16}|glpat-[\w-]{8,}|AIza[\w-]{20,})'
-    r'|://[^/\s@]+@|[?&](?:access[-_]?token|auth[-_]?token|token|api[-_]?key|key|password|secret)='
+# Credentials in a URL and a bearer header, beside the token formats (pack.holds_token). Plain words
+# such as "secret" or "token" are not refused: they turn up in paths and names.
+INLINE_CREDENTIAL = re.compile(
+    r'://[^/\s@]+@|[?&](?:access[-_]?token|auth[-_]?token|token|api[-_]?key|key|password|secret)='
     r'|\bbearer\s', re.I)
 CREDENTIAL_QUERY = {'apikey', 'key', 'accesskey', 'authkey', 'accesstoken', 'authtoken', 'token', 'password',
                     'secret', 'authorization'}
 CREDENTIAL_ARGUMENT = re.compile(
     r'^--(?:key|api[-_]?key|token|access[-_]token|auth[-_]token|pat|password|secret)(?:=|$)', re.I)
+
+
+def inline_secret(text: str) -> bool:
+    return holds_token(text) or bool(INLINE_CREDENTIAL.search(text))
 
 
 def validate_catalog(catalog: Any) -> dict[str, Any]:
@@ -54,7 +55,7 @@ def validate_catalog(catalog: Any) -> dict[str, Any]:
         arguments = normalized.get('args', [])
         credential_argument = isinstance(arguments, list) and any(
             isinstance(argument, str) and CREDENTIAL_ARGUMENT.match(argument) for argument in arguments)
-        if query & CREDENTIAL_QUERY or credential_argument or INLINE_SECRET.search(json.dumps(normalized)):
+        if query & CREDENTIAL_QUERY or credential_argument or inline_secret(json.dumps(normalized)):
             raise ValueError(f'MCP {name}: common inline credential patterns are refused; use a runtime wrapper')
         if 'args' in normalized and ('command' not in normalized or not isinstance(normalized['args'], list)
                                     or not all(isinstance(value, str) for value in normalized['args'])):
@@ -99,7 +100,7 @@ def validate_preset(preset: dict[str, Any], spec: str) -> None:
         if not isinstance(value, dict) or not check(value):
             raise ValueError(f'preset {spec}: [{table}] takes {takes}')
     for key, value in preset.get('kit', {}).items():
-        if any(INLINE_SECRET.search(item) for item in (value if isinstance(value, list) else [value])):
+        if any(inline_secret(item) for item in (value if isinstance(value, list) else [value])):
             raise ValueError(f'preset {spec}: [kit] {key} looks like an inline secret; presets hold non-secret defaults only')
     try:
         validate_catalog({'mcpServers': preset.get('mcp', {}).get('servers', {})})
@@ -107,88 +108,215 @@ def validate_preset(preset: dict[str, Any], spec: str) -> None:
         raise ValueError(f'preset {spec}: {error}') from None
 
 
-class PresetUnavailable(Exception):
-    """A gh: preset that could not be fetched: setup continues on its own defaults."""
+def _gh_repo(spec: str) -> tuple[str, str | None]:
+    """(owner/repo, the preset's path in it when the spec names one) of gh:owner/repo[/path]."""
+    parts = spec[3:].split('/', 2)
+    if len(parts) < 2 or not all(re.fullmatch(r'[A-Za-z0-9_.-]+', part) for part in parts[:2]):
+        raise ValueError(f'preset {spec}: expected gh:owner/repo[/path]')
+    return f'{parts[0]}/{parts[1]}', parts[2].strip('/') if len(parts) == 3 else None
 
 
-def load_preset(spec: str) -> tuple[dict[str, Any], str]:
-    """(validated preset, its sha256). A local path or gh:owner/repo[/path] (default path
-    agent-kit-preset.toml), fetched with the user's own gh login. PresetUnavailable when a gh: fetch
-    fails; ValueError when the preset is invalid or holds an inline secret."""
+class LoadedPreset(NamedTuple):
+    """A validated preset, its sha256 (over the pack's files too), its team pack, and the commit it
+    was read at (every gh: preset; a local folder that is a clean git repository)."""
+    preset: dict[str, Any]
+    sha256: str
+    pack: Pack | None
+    commit: str | None
+
+
+def _pack_preset(files: PackFiles, spec: str, commit: str | None) -> tuple[str, Pack | None]:
+    """(the preset text, the pack) of a pack's files. The text's line endings are normalized, as a
+    text read of the file does, so its sha256 does not depend on how it was fetched."""
+    found = PACK_TOML in files
+    text = preset_text(files.pop(PACK_TOML, (b'', 0))[0], PACK_TOML, spec)
+    pack = build_pack(files, spec, commit)
+    if not found and pack is None:
+        raise ValueError(f'preset {spec}: holds no {PACK_TOML}, {PACK_SKILLS}/ or rules.md')
+    return text, pack
+
+
+def preset_text(data: bytes, name: str, spec: str) -> str:
+    return utf8_text(data, name, spec).replace('\r\n', '\n').replace('\r', '\n')
+
+
+def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
+    """The preset of spec and, when it is a pack root, its team pack. A pack root is a folder, or
+    the folder of a file named agent-kit-preset.toml (gh:owner/repo reads the repository's): that
+    preset, skills/ and rules.md, each optional, and nothing else there is read. A TOML file of any
+    other name is read alone. gh:owner/repo[/path] is read at head, the commit at the head of the
+    default branch (resolved here unless given), with the user's own gh login. PresetUnavailable when
+    a gh: fetch fails; ValueError when the preset or pack is invalid or holds a secret."""
     if spec.startswith('gh:'):
-        parts = spec[3:].split('/', 2)
-        if len(parts) < 2 or not all(re.fullmatch(r'[A-Za-z0-9_.-]+', part) for part in parts[:2]):
-            raise ValueError(f'preset {spec}: expected gh:owner/repo[/path]')
-        path = parts[2] if len(parts) == 3 else 'agent-kit-preset.toml'
-        if not shutil.which('gh'):
-            raise PresetUnavailable(f'gh is not installed ({install_hint("gh")})')
-        try:
-            result = subprocess.run(['gh', 'api', '-H', 'Accept: application/vnd.github.raw',
-                                     f'repos/{parts[0]}/{parts[1]}/contents/{path}'], capture_output=True, text=True,
-                                    timeout=20, stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise PresetUnavailable(str(error)) from None
-        if result.returncode:
-            reason = (result.stderr.strip().splitlines() or ['gh api failed'])[0]
-            raise PresetUnavailable(f'{reason} (check `gh auth status` and your access to {parts[0]}/{parts[1]})')
-        text = result.stdout
+        repo, path = _gh_repo(spec)
+        root, _, toml = (path or PACK_TOML).rpartition('/')
+        commit: str | None = head or gh_head(repo)
+        if toml == PACK_TOML:
+            files = pack_files(gh_entries(repo, commit, root, spec), spec)
+            if path and PACK_TOML not in files:
+                raise ValueError(f'preset {spec}: no {path} in the repository')
+            text, pack = _pack_preset(files, spec, commit)
+        else:
+            text, pack = preset_text(gh_file(repo, commit, path or toml), toml, spec), None
     else:
-        text = Path(spec).expanduser().read_text()
+        local = Path(spec).expanduser()
+        if not local.exists():
+            raise ValueError(f'preset {spec}: no such file or folder')
+        # A link to a preset file is read where it points: its folder there is the pack root.
+        file = local.resolve()
+        if local.is_dir() or file.name == PACK_TOML:
+            folder = local if local.is_dir() else file.parent
+            commit = git_head(folder)
+            text, pack = _pack_preset(pack_files(folder_entries(folder), spec), spec, commit)
+        else:
+            text, pack, commit = preset_text(file.read_bytes(), file.name, spec), None, None
     try:
         preset = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise ValueError(f'preset {spec}: not valid TOML: {error}') from None
     validate_preset(preset, spec)
-    return preset, hashlib.sha256(text.encode()).hexdigest()
+    total = hashlib.sha256(text.encode())
+    for relative, (data, mode) in sorted(pack.files.items() if pack else []):
+        total.update(f'\0{relative}\0{int(bool(mode & 0o111))}\0{len(data)}\0'.encode() + data)
+    return LoadedPreset(preset, total.hexdigest(), pack, commit)
+
+
+def recorded_head(record: dict[str, Any] | None, spec: str) -> tuple[str | None, bool]:
+    """(the head commit of a gh: spec, whether it is the commit record was installed from). None and
+    False for a local spec."""
+    if not spec.startswith('gh:'):
+        return None, False
+    head = gh_head(_gh_repo(spec)[0])
+    return head, bool(record) and record.get('source') == spec and record.get('commit') == head
+
+
+def source_status(record: dict[str, Any]) -> dict[str, Any]:
+    """For doctor: whether the preset's source (a TOML file, a pack folder or gh:) moved on since setup.
+    A gh: source still at the recorded commit is unchanged without a download. changed is None when it
+    could not be checked."""
+    try:
+        head, unmoved = recorded_head(record, record['source'])
+        if unmoved:
+            return {'changed': False, 'note': 'unchanged'}
+        loaded = load_preset(record['source'], head)
+    except (PresetUnavailable, OSError, ValueError) as error:
+        return {'changed': None, 'note': f'not checked: {error}'}
+    if loaded.sha256 == record['sha256']:
+        return {'changed': False, 'note': 'unchanged'}
+    moved = f'new commit {loaded.commit[:12]}' if loaded.commit and loaded.commit != record.get('commit') else 'changed'
+    return {'changed': True, 'note': f'{moved} since setup: rerun with --preset {record["source"]} to apply it'}
+
+
+def kit_skills(source: Path) -> list[str]:
+    """The skills a kit checkout ships."""
+    return [path.name for path in sorted((source / 'skills').iterdir()) if path.is_dir()]
 
 
 @dataclass(frozen=True)
 class Preset:
     """A preset as setup uses it. kit: its [kit] values as local/preset.env lines hold them, the
-    layer under the user's kit.env. answers: the setup answers it supplies, under the user's own."""
+    layer under the user's kit.env. answers: the setup answers it supplies, under the user's own.
+    pack: a team pack's skills and rules block; pack_skills: its skills this install selects, on top
+    of the kit skills the answers select. table: the validated preset these were derived from, which
+    a later run derives them from again, against the kit skills it finds."""
     kit: dict[str, str] = field(default_factory=dict)
     servers: dict[str, Any] = field(default_factory=dict)
-    record: dict[str, str] | None = None
+    record: dict[str, Any] | None = None
     answers: dict[str, Any] = field(default_factory=dict)
     recommended_hosts: list[str] = field(default_factory=list)
     notes: list[tuple[str, str]] = field(default_factory=list)
+    pack: Pack | None = None
+    pack_skills: list[str] = field(default_factory=list)
+    table: dict[str, Any] | None = None
 
     def saved(self) -> dict[str, Any]:
         """What current.json keeps, so a later run without --preset applies the same values."""
-        return {'kit': self.kit, 'servers': self.servers, 'answers': self.answers,
-                'recommended_hosts': self.recommended_hosts}
+        values = {'kit': self.kit, 'servers': self.servers, 'answers': self.answers,
+                  'recommended_hosts': self.recommended_hosts, 'pack_skills': self.pack_skills}
+        return values if self.table is None else {**values, 'table': self.table}
 
     def env_text(self) -> str:
         return ''.join(f'{key}={value}\n' for key, value in self.kit.items())
 
 
-def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interactive: bool) -> Preset:
-    """--preset loaded, else the preset an earlier install saved (configuration preset and
-    preset_values), else none."""
-    kept = saved.get('preset_values', {})
-    earlier = Preset(kit=dict(kept.get('kit', {})), servers=dict(kept.get('servers', {})), record=saved.get('preset'),
-                     answers=dict(kept.get('answers', {})), recommended_hosts=list(kept.get('recommended_hosts', [])))
-    if not spec:
-        return earlier
-    try:
-        preset, sha = load_preset(spec)
-    except PresetUnavailable as error:
-        print(f'agent-setup: preset {spec} unavailable: {error}; continuing with '
-              f'{"interactive " if interactive else ""}defaults', file=sys.stderr)
-        return Preset(earlier.kit, earlier.servers, earlier.record, earlier.answers, earlier.recommended_hosts,
-                      [('Skipped', f'preset {spec}: {error}')])
+def _notes(record: dict[str, Any], pack: Pack | None, kept: Pack | None) -> list[tuple[str, str]]:
+    notes = [('Ready', f'preset {record["source"]} (sha256 {record["sha256"][:12]})')]
+    if pack is not None:
+        notes.append(('Ready', pack_summary(record['source'], kept, pack)))
+    return notes
+
+
+def _loaded_preset(spec: str, loaded: LoadedPreset, kept: Pack | None, kit_names: list[str]) -> Preset:
+    preset, pack = loaded.preset, loaded.pack
     table = preset.get('kit', {})
     kit = {key: json.dumps(value) if isinstance(value, list) else value for key, value in table.items()}
     answers: dict[str, Any] = {answer: table[key] for key, answer in PRESET_ANSWERS.items() if key in table}
     skills = preset.get('skills', {})
-    if skills.get('include') or skills.get('exclude'):
-        names = skills.get('include') or [path.name for path in sorted((source / 'skills').iterdir()) if path.is_dir()]
-        answers['skills'] = [name for name in names if name not in skills.get('exclude', [])]
+    exclude = skills.get('exclude', [])
+    pack_names = pack.skills if pack is not None else []
+    if skills.get('include') or exclude:
+        # No pack skill: those are selected through pack_skills, so a later pack that drops one
+        # leaves no saved answer naming it. An unknown name stays, for setup's unknown-skill check.
+        names = skills.get('include') or kit_names
+        answers['skills'] = [name for name in names if name not in exclude and name not in pack_names]
     for flag in ('model', 'effort'):
         values = [f'{name}={role[flag]}' for name, role in preset.get('roles', {}).items() if flag in role]
         if values:
             answers['role_' + flag] = values
-    record = {'source': spec if spec.startswith('gh:') else str(Path(spec).expanduser().absolute()), 'sha256': sha}
+    record: dict[str, Any] = {'source': spec if spec.startswith('gh:') else str(Path(spec).expanduser().absolute()),
+                              'sha256': loaded.sha256}
+    if loaded.commit:
+        record['commit'] = loaded.commit
     return Preset(kit=kit, servers=preset.get('mcp', {}).get('servers', {}), record=record, answers=answers,
-                  recommended_hosts=preset.get('hosts', {}).get('recommended', []),
-                  notes=[('Ready', f'preset {record["source"]} (sha256 {sha[:12]})')])
+                  recommended_hosts=preset.get('hosts', {}).get('recommended', []), notes=_notes(record, pack, kept),
+                  pack=pack, pack_skills=[name for name in pack_names if name not in exclude], table=preset)
+
+
+def _earlier(saved: dict[str, Any], kept: Pack | None, kit_names: list[str]) -> Preset:
+    """The preset an earlier install saved (configuration preset and preset_values) with kept, the pack
+    it kept: derived again from its table, so a [skills] exclude follows the kit skills of this run.
+    An install from before the table was saved has its values as saved."""
+    values = saved.get('preset_values', {})
+    record = saved.get('preset')
+    if record and 'table' in values:
+        loaded = LoadedPreset(values['table'], record['sha256'], kept, record.get('commit'))
+        return _loaded_preset(record['source'], loaded, kept, kit_names)
+    return Preset(kit=dict(values.get('kit', {})), servers=dict(values.get('servers', {})), record=record,
+                  answers=dict(values.get('answers', {})), recommended_hosts=list(values.get('recommended_hosts', [])),
+                  pack=kept, pack_skills=list(values.get('pack_skills', kept.skills if kept is not None else [])))
+
+
+def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interactive: bool,
+                 installed: Pack | StalePack | None) -> Preset:
+    """--preset loaded, else the preset an earlier install saved, else none. installed is the pack
+    that install kept, or a StalePack when it changed since: that refuses the run unless --preset
+    loads a new one. A gh: preset still at the commit of that install is not downloaded again. A pack
+    skill named like a kit skill refuses the run, the kept one too: a kit update may add a skill of
+    the same name."""
+    kept = installed if isinstance(installed, Pack) else None
+    stale = installed if isinstance(installed, StalePack) else None
+    kit_names = kit_skills(source)
+    earlier = _earlier(saved, kept, kit_names)
+    if not spec:
+        if stale is not None:
+            raise stale
+        result = replace(earlier, notes=[])
+    else:
+        try:
+            head, unmoved = recorded_head(earlier.record, spec)
+            if unmoved and earlier.table is not None and stale is None:
+                result = earlier
+            else:
+                result = _loaded_preset(spec, load_preset(spec, head), kept, kit_names)
+        except PresetUnavailable as error:
+            if stale is not None:
+                raise ValueError(f'preset {spec} unavailable: {error}; the pack it installed cannot be reinstalled '
+                                 f'offline: {stale}') from None
+            print(f'agent-setup: preset {spec} unavailable: {error}; continuing with '
+                  f'{"interactive " if interactive else ""}defaults', file=sys.stderr)
+            result = replace(earlier, notes=[('Skipped', f'preset {spec}: {error}')])
+    clash = sorted(set(result.pack.skills) & set(kit_names)) if result.pack is not None else []
+    if clash:
+        label = result.record['source'] if result.record else spec
+        raise ValueError(f'preset {label}: pack skill {", ".join(clash)} has the name of a kit skill; rename it in the pack')
+    return result

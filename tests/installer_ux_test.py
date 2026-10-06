@@ -19,7 +19,9 @@ SOURCE = Path(__file__).resolve().parents[1]
 BASE_TOOLS = ('git', 'sh', 'uname', 'env', 'python3', 'cat', 'tr', 'sed', 'awk', 'grep', 'dirname', 'basename', 'mkdir')
 
 
-class InstallerUxTests(unittest.TestCase):
+class InstallerUxFixture(unittest.TestCase):
+    """The fake home and its helpers, with no case of its own: other suites build on it."""
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix='.test-installer-ux-', dir=os.environ.get('TMPDIR'))
         self.outer = Path(self.temporary.name)
@@ -66,6 +68,8 @@ class InstallerUxTests(unittest.TestCase):
         self.assertEqual(self.status(), self.source_status, 'changed the source checkout')
         return result
 
+
+class InstallerUxTests(InstallerUxFixture):
     def test_no_host_says_so_and_installs_kit_files_only(self) -> None:
         result = self.setup('--components', 'rules', 'skills', '--apply')
         self.assertIn('hosts: none detected or selected', result.stdout)
@@ -170,7 +174,9 @@ class InstallerUxTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in (self.home / '.claude/skills').iterdir()), ['conventions'])
         self.assertIn('docs', json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers'])
         doctor = json.loads(self.setup('doctor').stdout)
-        self.assertEqual(doctor['preset']['current'], 'unchanged')
+        self.assertEqual(doctor['preset']['source_status'], {'changed': False, 'note': 'unchanged'})
+        preset.write_text(preset.read_text() + '\n[hosts]\nrecommended = ["claude"]\n')
+        self.assertTrue(json.loads(self.setup('doctor').stdout)['preset']['source_status']['changed'])
         self.setup('--components', 'rules', '--apply')
         self.assertEqual(self.effective()['BQRO_PROJECT'], 'example-project', 'an update without --preset keeps its values')
 
@@ -267,7 +273,12 @@ class InstallerUxTests(unittest.TestCase):
                      '[kit]\nSUBAGENT_RESUME_MAX = "abc"\n'):
             preset.write_text(text)
             self.setup('--preset', str(preset), '--components', 'rules', code=2)
-        for text in ('[kit]\nCODE_DIRS_JSON = ["~/src/auth-tokens"]\n', '[kit]\nGIT_AUTHOR = "Secretariat Bot <bot@example.com>"\n'):
+        for text in ('[kit]\nBQRO_PROJECT = "' + 'sk_' + 'live_abcdefghijklmnop1234"\n',
+                     '[kit]\nBQRO_PROJECT = "' + 'np' + 'm_abcdefghijklmnopqrstuvwxyz0123456789"\n'):
+            preset.write_text(text)
+            self.setup('--preset', str(preset), '--components', 'rules', code=2)
+        for text in ('[kit]\nCODE_DIRS_JSON = ["~/src/auth-tokens"]\n', '[kit]\nGIT_AUTHOR = "Secretariat Bot <bot@example.com>"\n',
+                     '[kit]\nBQRO_PROJECT = "' + 'gh' + 'p_XXXXXXXXXXXXXXXXXXXXXXXX"\n'):
             preset.write_text(text)
             self.setup('--preset', str(preset), '--components', 'rules')
 

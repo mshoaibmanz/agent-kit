@@ -41,11 +41,12 @@ RULES_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "cursor": "rules/age
 HOST_HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
 
 
-def skill_hosts(skill_md: Path) -> set[str]:
+def skill_hosts(skill_md: Path, text: str | None = None) -> set[str]:
     """The hosts a skill's `hosts:` frontmatter names, as an inline list; every host when it has none.
     The installer links a skill by this rule and the doctor checks by it. Any other form, or an
-    unknown name, is an error: either would install the skill nowhere."""
-    text = skill_md.read_text()
+    unknown name, is an error: either would install the skill nowhere. text: the SKILL.md content
+    when it is not on disk (a team pack's, checked before install)."""
+    text = skill_md.read_text() if text is None else text
     if text.startswith("---\n"):
         for line in text[4 : text.find("\n---", 4)].splitlines():
             key, _, value = line.partition(":")
@@ -395,11 +396,13 @@ def fill(
     host_root: str | None = None,
     what: str = "text",
     resume: int | None = None,
+    strict: bool = True,
 ) -> str:
     """text with every {{NAME}} filled: AGENT_KIT_DIR and KIT_DIR (the kit), SKILLS_DIR, OVERLAY_DIR
     (<kit>/local), RULES_FILE (the host's instructions file; host text only) and
     SUBAGENT_RESUME_MAX_K. An unknown one refuses: a literal {{...}} would reach the model as a path
-    it cannot open."""
+    it cannot open. Not strict (a team pack's text, where {{...}} is often a CI or template example),
+    an unknown one stays as written."""
     names = {match.group(1) for match in PLACEHOLDER.finditer(text)}
     if not names:
         return text
@@ -410,14 +413,14 @@ def fill(
         limit = resume_max() if resume is None else resume
         values["SUBAGENT_RESUME_MAX_K"] = f"{limit // 1000}" if limit % 1000 == 0 else f"{limit / 1000:g}"
     bad = sorted("{{" + name + "}}" for name in names - set(values))
-    if bad:
+    if bad and strict:
         known = [*values, *({"RULES_FILE", "SUBAGENT_RESUME_MAX_K"} - values.keys())]
         raise SystemExit(
             f"agent-kit: {what}: unknown placeholder {', '.join(bad)}"
             + (f" for host {host}" if host else " (host-neutral text)")
             + "; known: " + ", ".join("{{" + name + "}}" for name in known)
         )
-    return PLACEHOLDER.sub(lambda match: values[match.group(1)], text)
+    return PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), text)
 
 
 def fill_servers(servers: dict[str, Any], kit: str) -> dict[str, Any]:
@@ -447,13 +450,14 @@ def install_text(
     host: str | None = None,
     host_root: str | None = None,
     resume: int | None = None,
+    strict: bool = True,
 ) -> str:
-    """A kit markdown file as installed with its kit at <kit>: its {{...}} placeholders filled (fill),
-    each ```sh block first exports AGENT_KIT_DIR (with export), and ${CLAUDE_SKILL_DIR}, which only
-    Claude Code expands, names <kit>/skills/<skill> as one shell word. A kit given as a shell
+    """A kit markdown file as installed with its kit at <kit>: its {{...}} placeholders filled (fill,
+    strict or not), each ```sh block first exports AGENT_KIT_DIR (with export), and ${CLAUDE_SKILL_DIR},
+    which only Claude Code expands, names <kit>/skills/<skill> as one shell word. A kit given as a shell
     expression (${CLAUDE_PLUGIN_ROOT}/kit) is double-quoted so it still expands."""
     word = f'"{kit}"' if "$" in kit else shlex.quote(kit)
-    text = fill(text, kit, host, host_root, skill or "kit text", resume)
+    text = fill(text, kit, host, host_root, skill or "kit text", resume, strict)
     if export:
         text = text.replace("```sh\n", f"```sh\nexport AGENT_KIT_DIR={word}\n")
     if skill:
@@ -619,14 +623,16 @@ def render(api: Any, args: Any) -> int:
         ownership[state] = wanted_hooks
         plans.append((hook_path, api.dump(merge_hooks(live, previous, wanted_hooks))))
     if "rules" in components:
-        rules = fill(
-            (api.KIT / "rules/AGENTS.md").read_text()
-            + "\n"
-            + (api.KIT / f"rules/hosts/{host}.md").read_text(),
-            str(api.KIT),
+        rules = api.with_team_rules(
+            fill(
+                (api.KIT / "rules/AGENTS.md").read_text() + "\n" + (api.KIT / f"rules/hosts/{host}.md").read_text(),
+                str(api.KIT),
+                host,
+                str(root),
+                f"rules/AGENTS.md + rules/hosts/{host}.md",
+            ),
             host,
             str(root),
-            f"rules/AGENTS.md + rules/hosts/{host}.md",
         )
         rules_path = root / RULES_FILES[host]
         existing_rules = api.read_or_empty(rules_path)
