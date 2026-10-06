@@ -1,22 +1,29 @@
 #!/bin/bash
-# Leak scan for this public repo. Exit 1 on any finding. CI and scripts/pre-push run it.
+# Leak scan for this public repo. Exit 1 on any finding. CI and .githooks/pre-push run it.
 #   1. self-test: every custom .gitleaks.toml rule fires on a canary built at run time
 #   2. gitleaks over the publishable tree (tracked + untracked-not-ignored files)
-#   3. gitleaks over every commit reachable from any ref
-#   4. the org denylist over the tree, file names, every commit's diff and message, and identities
-#   5. commit identities: every author and committer email is a GitHub noreply address
-#   6. images: any image or PDF, in the tree or ever in history, must be listed in .scan-images-allow
+#   3. gitleaks over the commits in the range
+#   4. the org denylist (scripts/leak-check.sh) over the tree, file names, and the range's commits and
+#      annotated tags
+#   5. commit identities: every author and committer email in the range is a GitHub noreply address
+#   6. images: any image or PDF in the tree or added in the range must be listed in .scan-images-allow
 #
-#   scripts/scan.sh [--report FILE]
+#   scripts/scan.sh [--report FILE] [-- REV-LIST-ARGS...]
+# The range is a `git rev-list` range, default --all (CI); .githooks/pre-push passes what a push adds.
 # gitleaks: $GITLEAKS, else `gitleaks` on PATH (CI downloads a pinned release).
-# Denylist: $LEAK_TERMS (newline-separated case-insensitive EREs; the CI secret), else the file
-# $LEAK_TERMS_FILE. It is never committed. A hit prints where it is and the term's line NUMBER in the
-# list, never the term or the matching text: CI logs of a public repo are public. With no list the
-# step is skipped, and REQUIRE_LEAK_TERMS=1 (set in CI on pushes) turns that skip into a failure.
+# Denylist sources and format: scripts/leak-check.sh. With no list step 4 is skipped with one warning,
+# and REQUIRE_LEAK_TERMS=1 (set in CI on pushes) turns that skip into a failure.
 set -uo pipefail
 KIT=$(cd "$(dirname "$0")/.." && pwd)
 REPORT=/dev/null
-[ "${1:-}" = --report ] && REPORT=${2:?--report needs a file}
+while [ $# -gt 0 ]; do
+  case $1 in
+    --report) REPORT=${2:?--report needs a file}; shift 2 ;;
+    --) shift; break ;;
+    *) echo "scan: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[ $# -gt 0 ] || set -- --all
 : > "$REPORT"
 GL=${GITLEAKS:-$(command -v gitleaks || true)}
 TMP=$(mktemp -d) || exit 1
@@ -26,7 +33,9 @@ say() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 hit() { fail=1; say "  FINDING $*"; }
 
 [ -x "$GL" ] || { say "scan: gitleaks not found (set GITLEAKS or put it on PATH)"; exit 2; }
-say "scan: $("$GL" version 2>/dev/null | head -1) over $(git -C "$KIT" rev-list --all 2>/dev/null | wc -l | tr -d ' ') commit(s)"
+git -C "$KIT" rev-list "$@" > "$TMP/range" || { say "scan: git rev-list $* failed"; exit 2; }
+ncommits=$(grep -c . "$TMP/range")
+say "scan: $("$GL" version 2>/dev/null | head -1) over $ncommits commit(s) ($*)"
 
 # gl <dir|git> <target> <json out> [extra args]: run gitleaks from the target so allowlist paths match.
 gl() {
@@ -67,47 +76,32 @@ n=$(jq length "$TMP/tree.json"); say "  findings: $n"
 [ "$n" = 0 ] || while IFS= read -r l; do hit "$l"; done < <(findings "$TMP/tree.json")
 
 say "== 3. gitleaks: history =="
-if git -C "$KIT" rev-parse -q --verify HEAD >/dev/null; then
-  gl git "$KIT" "$TMP/hist.json" --log-opts=--all
+if [ "$ncommits" != 0 ]; then
+  gl git "$KIT" "$TMP/hist.json" --log-opts="$*"
   n=$(jq length "$TMP/hist.json"); say "  findings: $n"
   [ "$n" = 0 ] || while IFS= read -r l; do hit "$l"; done < <(findings "$TMP/hist.json")
 else
-  say "  no commits yet"
+  say "  no commits in the range"
 fi
 
 say "== 4. org denylist =="
-terms="$TMP/terms"
-if [ -n "${LEAK_TERMS:-}" ]; then printf '%s\n' "$LEAK_TERMS" > "$terms"
-elif [ -n "${LEAK_TERMS_FILE:-}" ] && [ -r "$LEAK_TERMS_FILE" ]; then cp "$LEAK_TERMS_FILE" "$terms"
-fi
-if [ -s "$terms" ]; then
-  git -C "$KIT" log --all --format='%H' 2>/dev/null > "$TMP/commits"
-  (cd "$KIT" && git ls-files --cached --others --exclude-standard) > "$TMP/paths"
-  i=0; nterms=0
-  while IFS= read -r term || [ -n "$term" ]; do
-    i=$((i + 1))
-    case $term in ''|'#'*) continue ;; esac
-    nterms=$((nterms + 1))
-    grep -rlIiE -- "$term" "$T" 2>/dev/null | sed "s|^$T/||" | while IFS= read -r f; do
-      echo "term #$i in $f"; done > "$TMP/h"
-    grep -iE -- "$term" "$TMP/paths" | sed "s/^/term #$i in the path /" >> "$TMP/h"
-    while IFS= read -r c; do
-      git -C "$KIT" show --format='%an <%ae>%n%cn <%ce>%n%B' "$c" 2>/dev/null | grep -qiE -- "$term" \
-        && echo "term #$i in commit ${c:0:12}"
-    done < "$TMP/commits" >> "$TMP/h"
-    while IFS= read -r l; do hit "$l"; done < "$TMP/h"
-  done < "$terms"
-  say "  $nterms terms checked over the tree, file names and $(wc -l < "$TMP/commits" | tr -d ' ') commit(s)"
-elif [ "${REQUIRE_LEAK_TERMS:-0}" = 1 ]; then
-  hit "no denylist: set the LEAK_TERMS secret"
-else
-  say "  SKIP: no LEAK_TERMS or LEAK_TERMS_FILE (CI runs it with the secret)"
-fi
+# File name #N is line N of `git ls-files --cached --others --exclude-standard`.
+(cd "$KIT" && git ls-files --cached --others --exclude-standard) > "$TMP/paths"
+"$BASH" "$KIT/scripts/leak-check.sh" --tree "$T" --paths "$TMP/paths" --allow "$KIT/.scan-history-allow" -- "$@" \
+  > "$TMP/leak" 2>&1
+rc=$?
+while IFS= read -r l; do say "  $l"; done < "$TMP/leak"
+case $rc in
+  0) ;;
+  1) fail=1 ;;
+  3) [ "${REQUIRE_LEAK_TERMS:-0}" = 1 ] && hit "no denylist: set the LEAK_TERMS secret" ;;
+  *) hit "leak-check failed (exit $rc)" ;;
+esac
 
 say "== 5. commit identities =="
-bad_ids=$(git -C "$KIT" log --all --format='%ae%n%ce' 2>/dev/null | sort -u | grep -vE '@users\.noreply\.github\.com$|^noreply@github\.com$' || true)
+bad_ids=$(git -C "$KIT" log --format='%ae%n%ce' "$@" 2>/dev/null | sort -u | grep -vE '@users\.noreply\.github\.com$|^noreply@github\.com$' || true)
 if [ -n "$bad_ids" ]; then
-  hit "$(printf '%s\n' "$bad_ids" | wc -l | tr -d ' ') author/committer address(es) are not GitHub noreply (git log --all --format='%ae %ce')"
+  hit "$(printf '%s\n' "$bad_ids" | wc -l | tr -d ' ') author/committer address(es) are not GitHub noreply (git log --format='%ae %ce' $*)"
 else
   say "  every author and committer is a GitHub noreply address"
 fi
@@ -116,8 +110,8 @@ say "== 6. images =="
 allow="$KIT/.scan-images-allow"
 img_re='\.(png|jpe?g|gif|webp|bmp|tiff?|ico|heic|avif|svg|pdf|psd)$'
 {
-  grep -iE "$img_re" "$TMP/paths" 2>/dev/null || (cd "$KIT" && git ls-files --cached --others --exclude-standard | grep -iE "$img_re")
-  git -C "$KIT" log --all --diff-filter=A --name-only --format= 2>/dev/null | grep -iE "$img_re"
+  grep -iE "$img_re" "$TMP/paths"
+  git -C "$KIT" log --diff-filter=A --name-only --format= "$@" 2>/dev/null | grep -iE "$img_re"
   # Content, not only the name: an image renamed to .txt still ships.
   find "$T" -type f -exec file --mime-type {} + 2>/dev/null | grep -E ': (image/|application/pdf)' | sed "s|^$T/||; s|: .*||"
 } | sort -u > "$TMP/images"

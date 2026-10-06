@@ -5,7 +5,8 @@
 #      git runs only step 2;
 #   2. the repo's own hook: <repo-local core.hooksPath>/<name> when the repo sets one (husky), else
 #      $(git rev-parse --git-common-dir)/hooks/<name>. A global core.hooksPath replaces that
-#      directory, so without this step husky v3/v4 hooks and claude-kit's leak scan would stop.
+#      directory, so without this step a repo's own hooks (husky, this kit's .githooks leak check)
+#      would stop.
 # The first non-zero exit wins. Hooks that read stdin (pre-push's ref list, post-rewrite, the
 # receive hooks) get the same bytes in both steps; the rest never touch stdin, which may be a tty.
 # A repo-local core.hooksPath normally overrides this global one; agent shells can force the
@@ -28,8 +29,8 @@ if [ -n "${AI_AGENT:-}${CLAUDECODE:-}${AGENT_HOST:-}" ] && [ "${AGENT_GIT_HOOKS:
   feed "$here/agent/$name" "$@" || exit $?
 fi
 
-# A repo whose local core.hooksPath names this directory (example-api: it held its own
-# .git/hooks, which overrides a global value) chains to the default directory.
+# A repo whose local core.hooksPath names this directory (set there because the repo had its own
+# local value, e.g. .git/hooks, which overrides a global one) chains to the default directory.
 dir=$(git config --local --get core.hooksPath 2>/dev/null)
 if [ -n "$dir" ]; then
   case $dir in "~"/*) dir="$HOME/${dir#\~/}" ;; esac

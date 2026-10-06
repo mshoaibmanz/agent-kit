@@ -176,6 +176,14 @@ python3 scripts/build_plugins.py --check
 bash scripts/scan.sh
 ```
 
+The repo is public. A pre-push hook runs the CI leak scan (`scripts/scan.sh`, which needs `gitleaks`) over what each push adds, so a leak is caught before it is published:
+
+- Enable it once per clone: `git config core.hooksPath .githooks`.
+- A clone that followed the old install (`.git/hooks/pre-push` linking to `scripts/pre-push`) still works through a shim. Switch anyway: run the line above, then `rm .git/hooks/pre-push`.
+- The denylist is a file outside the repo, never committed. Point `AGENT_KIT_LEAK_TERMS` at it, or keep it at `<kit root>/local/leak-terms.txt`. The kit root is `$AGENT_KIT_DIR`, default `~/.local/share/agent-kit`. Sources and format: `scripts/leak-check.sh`. With no list the hook prints one warning and the push goes on; CI checks it with its `LEAK_TERMS` secret.
+- After a hit: the output names line N of your list and a commit, file or file-name number, never the text. Fix the unpushed commits (amend, or rebase to reword), then push again. `git push --no-verify` only moves the failure to CI, after the commits are public.
+- `.scan-history-allow` lists published commits whose hits are accepted, because history is not rewritten. It is frozen: an entry counts only for a commit already on `main`, and never unblocks a push.
+
 Hook suites require a disposable home with `HOOKS_DIR` pointing at this checkout and `KIT_ENV=/dev/null`, plus explicit wrapper paths. The release checks include fake-home installs, rollback, unsupported capabilities, collision refusal, secret-catalog refusal, generated-package drift and redacted secret scanning. Private source history and user overlays are excluded from exports.
 
 MCP catalogs may describe command transports with `type: stdio` or HTTP URL transports with `type: http`, plus a string `description`. Setup validates transport agreement, removes the description before host rendering, and renders the transport type where the host requires it. Mixed transports, unknown types and malformed arguments are refused before changing configurations. Common inline credential patterns are also refused; detection is not exhaustive. Keep credentials in native OAuth or a local credential-store wrapper for authenticated services.

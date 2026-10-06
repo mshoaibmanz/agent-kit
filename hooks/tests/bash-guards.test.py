@@ -418,7 +418,7 @@ CASES = [
     ("deny",  f"grep 'x|y' f | {_M} -e 'x'",             "...but not before a real pipe into it"),
     # An inspection span took the next word for the tool's one argument, so an option naming a
     # command the tool runs hid the client.
-    ("deny",  f"rg --pre /opt/homebrew/bin/{_M} x lms",  "rg --pre runs the command it names"),
+    ("deny",  f"rg --pre /opt/homebrew/bin/{_M} x src",  "rg --pre runs the command it names"),
     ("deny",  f"rg --pre={_M} x f",                      "...spelled --pre="),
     ("deny",  f"rg --hostname-bin={_M} x f",             "rg --hostname-bin runs one too"),
     ("allow", "rg --pre-glob '*.gz' -n x f",             "--pre-glob names no command"),
@@ -645,6 +645,8 @@ def _sections():
         st = line.strip()
         if st.startswith("# --- ") and node.lineno < i < end:
             bounds[i] = st.split()[2]
+    if not isinstance(node.value, ast.List):
+        raise TypeError("CASES must be a list literal")
     out, current = {}, None
     for elt, case in zip(node.value.elts, CASES):
         for ln in sorted(bounds):

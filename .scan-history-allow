@@ -1,0 +1,6 @@
+# Published commits whose org-denylist hits are accepted, one full commit id per line
+# (scripts/leak-check.sh --allow). History is not rewritten, so these stay; the tree and every other
+# commit are still checked. Frozen: an entry counts only for a commit already on main, and it never
+# unblocks a push.
+# A repo name in a code comment, removed from the tree since:
+3953eb4210ee0b406bb0f7eb2488e7250977fc71

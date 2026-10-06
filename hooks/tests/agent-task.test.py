@@ -65,9 +65,9 @@ def project(name: str, meta: str) -> Path:
     return p
 
 
-project("repack", "scope: repackaging fees\nterms: repackaging, box order\nrepos: example-api\npaths: src/librepack/**\ntickets: DEMO-1082, CORE-7643")
-project("tpl-tracking", "scope: TPL tracking\nterms: tracking, carrier\nrepos: example-api")
-project("tpl-search", "scope: TPL search\nterms: tracking, search\nrepos: example-api")
+project("invoices", "scope: invoice fees\nterms: invoicing, line item\nrepos: sample-app\npaths: src/libinvoice/**\ntickets: DEMO-1500, CORE-2048")
+project("web-tracking", "scope: web tracking\nterms: tracking, browser\nrepos: sample-app")
+project("web-search", "scope: web search\nterms: tracking, search\nrepos: sample-app")
 (ROOT / "tasks" / "DEMO-42-widget-fix").mkdir(parents=True)
 (ROOT / "tasks" / "DEMO-42-widget-fix" / "HANDOFF.md").write_text("# Handoff DEMO-42\nState: half done.\n")
 
@@ -88,19 +88,19 @@ for label, variables, explicit, expected in (
     ("generic session wins over hosts", {"CODEX_THREAD_ID": "sid-codex", "CLAUDE_CODE_SESSION_ID": "sid-claude", "AGENT_SESSION_ID": "sid-generic"}, "", "sid-generic"),
     ("explicit session wins", {"CODEX_THREAD_ID": "sid-codex", "CLAUDE_CODE_SESSION_ID": "sid-claude", "AGENT_SESSION_ID": "sid-generic"}, "sid-explicit", "sid-explicit"),
 ):
-    args = ["bind", "repack", *(["--session", explicit] if explicit else [])]
+    args = ["bind", "invoices", *(["--session", explicit] if explicit else [])]
     result = task(*args, env=dict(ENV, **variables))
     check(label, result.returncode == 0 and f"Bound session {expected[:8]}" in result.stdout, result.stdout + result.stderr)
     result = task("where", "--path", env=dict(ENV, **variables), *(["--session", explicit] if explicit else []))
-    check(label + " resolves the binding", result.returncode == 0 and result.stdout.strip() == str(ROOT / "projects/repack"), result.stdout + result.stderr)
+    check(label + " resolves the binding", result.returncode == 0 and result.stdout.strip() == str(ROOT / "projects/invoices"), result.stdout + result.stderr)
 
 print("--- resolver ---")
-r = resolve("pick up DEMO-1082 today")
-check("resolver: a ticket key in PROJECT.md is an exact match", r["outcome"] == "exact" and r["candidates"][0]["project"] == "repack", str(r))
-r = resolve("the repackaging box order screen", "--paths", "src/librepack/fees.py", "src/librepack/x.py", "--repo", "example-api")
-check("resolver: terms plus paths are one strong match", r["outcome"] == "strong" and r["candidates"][0]["project"] == "repack", str(r))
-r = resolve("tracking is wrong for this carrier search")
-check("resolver: two close projects are ambiguous", r["outcome"] == "ambiguous" and {c["project"] for c in r["candidates"]} >= {"tpl-tracking", "tpl-search"}, str(r))
+r = resolve("pick up DEMO-1500 today")
+check("resolver: a ticket key in PROJECT.md is an exact match", r["outcome"] == "exact" and r["candidates"][0]["project"] == "invoices", str(r))
+r = resolve("the invoicing line item screen", "--paths", "src/libinvoice/fees.py", "src/libinvoice/x.py", "--repo", "sample-app")
+check("resolver: terms plus paths are one strong match", r["outcome"] == "strong" and r["candidates"][0]["project"] == "invoices", str(r))
+r = resolve("tracking is wrong for this browser search")
+check("resolver: two close projects are ambiguous", r["outcome"] == "ambiguous" and {c["project"] for c in r["candidates"]} >= {"web-tracking", "web-search"}, str(r))
 r = resolve("QQ-77 something unrelated")
 check("resolver: no match is none, with the ticket kept", r["outcome"] == "none" and r["ticket"] == "QQ-77", str(r))
 r = resolve("work on DEMO-42")
@@ -108,12 +108,12 @@ check("resolver: a legacy task folder matches its ticket exactly", r["outcome"] 
 
 print("--- project-bind: UserPromptSubmit ---")
 S1 = "11111111-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S1, "cwd": str(T), "prompt": "Fix DEMO-1082 rounding please"})
+out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S1, "cwd": str(T), "prompt": "Fix DEMO-1500 rounding please"})
 ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("a ticket key in the prompt binds to its project and item", binding(S1) == "project:repack/DEMO-1082", binding(S1) + out.stderr)
-check("the bind injects the slice", "PROJECT: repack · item DEMO-1082" in ctx and "exact match" in ctx, ctx)
-check("the item folder gets task.json", (ROOT / "projects/repack/items/DEMO-1082/task.json").is_file())
-check("the tab label is <project> · <item>", (T / "labels" / S1).read_text() == "repack · DEMO-1082")
+check("a ticket key in the prompt binds to its project and item", binding(S1) == "project:invoices/DEMO-1500", binding(S1) + out.stderr)
+check("the bind injects the slice", "PROJECT: invoices · item DEMO-1500" in ctx and "exact match" in ctx, ctx)
+check("the item folder gets task.json", (ROOT / "projects/invoices/items/DEMO-1500/task.json").is_file())
+check("the tab label is <project> · <item>", (T / "labels" / S1).read_text() == "invoices · DEMO-1500")
 S2 = "22222222-aaaa-4000-8000-000000000000"
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S2, "cwd": str(T), "prompt": "what does the cache layer do? also convert to UTF-8"})
 check("a Q&A prompt never binds (UTF-8 is no ticket)", out.stdout.strip() == "" and binding(S2) == "", out.stdout + out.stderr)
@@ -123,16 +123,16 @@ check("no match creates a project of one named after the ticket", binding(S3) ==
 inbox = "".join(f.read_text() for f in (ROOT / "retro").glob("*.md")) if (ROOT / "retro").is_dir() else ""
 check("...and records it in the retro inbox", "[auto]" in inbox and "project created project of one ABC-12" in inbox, inbox)
 S4 = "44444444-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S4, "cwd": str(T), "prompt": "the tracking for this carrier search is off, see TPL-1"})
+out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S4, "cwd": str(T), "prompt": "the tracking for this browser search is off, see WEB-1"})
 ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("ambiguous: one line with the candidates and the bind command, no bind", binding(S4) == "" and "tpl-search" in ctx and "agent-task bind" in ctx and ctx.count("\n") == 0, ctx)
+check("ambiguous: one line with the candidates and the bind command, no bind", binding(S4) == "" and "web-search" in ctx and "agent-task bind" in ctx and ctx.count("\n") == 0, ctx)
 S5 = "55555555-aaaa-4000-8000-000000000000"
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S5, "cwd": str(T), "prompt": "DEMO-42 next step"})
 ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
 check("a legacy folder binds as a project of one with its handoff", binding(S5) == "DEMO-42-widget-fix" and "TASK DIR:" in ctx and "Handoff DEMO-42" in ctx, ctx)
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S1, "cwd": str(T), "prompt": "now ABC-99 too"})
-check("a bound session is not rebound by a later ticket", binding(S1) == "project:repack/DEMO-1082" and out.stdout.strip() == "")
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S2, "cwd": str(T), "prompt": "DEMO-1082"}, env=dict(ENV, CI_WATCH_ACTIVE="1"))
+check("a bound session is not rebound by a later ticket", binding(S1) == "project:invoices/DEMO-1500" and out.stdout.strip() == "")
+out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S2, "cwd": str(T), "prompt": "DEMO-1500"}, env=dict(ENV, CI_WATCH_ACTIVE="1"))
 check("CI_WATCH_ACTIVE: never binds", binding(S2) == "")
 
 print("--- session-start: lazy OUT DIR, /clear inheritance ---")
@@ -155,18 +155,18 @@ check("...marked inherited", (T / "state" / "task-bindings" / S6C[:8]).read_text
 task("session-start", "--session", S1, "--source", "resume", "--repo", "gate-repo")
 S6D = "6666666d-aaaa-4000-8000-000000000000"
 task("session-start", "--session", S6D, "--source", "clear", "--repo", "gate-repo")
-check("resuming a bound session points the tab at it; clear then inherits that", binding(S6D) == "project:repack/DEMO-1082", binding(S6D))
+check("resuming a bound session points the tab at it; clear then inherits that", binding(S6D) == "project:invoices/DEMO-1500", binding(S6D))
 
 print("--- project-bind: a binding inherited across /clear ---")
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6D, "cwd": str(T), "prompt": "what next?"})
-check("a prompt with no ticket keeps the inherited binding and its mark", out.stdout.strip() == "" and binding(S6D) == "project:repack/DEMO-1082" and "inherited" in (T / "state/task-bindings" / S6D[:8]).read_text(), out.stdout)
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6D, "cwd": str(T), "prompt": "carry on with DEMO-1082"})
-check("naming the inherited item keeps it, silently, and makes it sticky", out.stdout.strip() == "" and (T / "state/task-bindings" / S6D[:8]).read_text() == "project:repack/DEMO-1082\n", out.stdout)
+check("a prompt with no ticket keeps the inherited binding and its mark", out.stdout.strip() == "" and binding(S6D) == "project:invoices/DEMO-1500" and "inherited" in (T / "state/task-bindings" / S6D[:8]).read_text(), out.stdout)
+out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6D, "cwd": str(T), "prompt": "carry on with DEMO-1500"})
+check("naming the inherited item keeps it, silently, and makes it sticky", out.stdout.strip() == "" and (T / "state/task-bindings" / S6D[:8]).read_text() == "project:invoices/DEMO-1500\n", out.stdout)
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6D, "cwd": str(T), "prompt": "now DEMO-42"})
-check("...after which another ticket does not rebind", binding(S6D) == "project:repack/DEMO-1082" and out.stdout.strip() == "")
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6C, "cwd": str(T), "prompt": "pick up DEMO-1082 now"})
+check("...after which another ticket does not rebind", binding(S6D) == "project:invoices/DEMO-1500" and out.stdout.strip() == "")
+out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6C, "cwd": str(T), "prompt": "pick up DEMO-1500 now"})
 ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("an inherited binding re-resolves on a ticket with an exact project hit, saying so", binding(S6C) == "project:repack/DEMO-1082" and ctx.startswith("Bound to repack (exact match on DEMO-1082) (was DEMO-42-widget-fix, kept from before /clear)") and "PROJECT: repack" in ctx, ctx)
+check("an inherited binding re-resolves on a ticket with an exact project hit, saying so", binding(S6C) == "project:invoices/DEMO-1500" and ctx.startswith("Bound to invoices (exact match on DEMO-1500) (was DEMO-42-widget-fix, kept from before /clear)") and "PROJECT: invoices" in ctx, ctx)
 task("bind", "DEMO-78", "--session", S6B)
 S6E = "6666666e-aaaa-4000-8000-000000000000"
 task("session-start", "--session", S6E, "--source", "clear", "--repo", "gate-repo")
@@ -183,11 +183,11 @@ S12 = "12121212-aaaa-4000-8000-000000000000"
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S12, "cwd": str(REPO), "prompt": "implement this like DEMO-100 did"})
 check("a prompt's ticket with no project loses to the branch's ticket", binding(S12) == "project:DEMO-200/DEMO-200" and not (ROOT / "projects/DEMO-100").exists(), binding(S12) + out.stdout)
 S13 = "13131313-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S13, "cwd": str(REPO), "prompt": "port the fix from DEMO-1082 here"})
-check("a prompt's ticket with an exact project hit beats the branch's", binding(S13) == "project:repack/DEMO-1082", binding(S13) + out.stdout)
+out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S13, "cwd": str(REPO), "prompt": "port the fix from DEMO-1500 here"})
+check("a prompt's ticket with an exact project hit beats the branch's", binding(S13) == "project:invoices/DEMO-1500", binding(S13) + out.stdout)
 r = resolve("like DEMO-100 did", "--branch", "DEMO-201-widget")
 check("resolver: no exact hit keeps the branch's ticket", r["outcome"] == "none" and r["ticket"] == "DEMO-201", str(r))
-for text in ("start on DEMO-310 now", "pick up ticket DEMO-310", "switch to DEMO-310", "DEMO-310", "let's move on to DEMO-310 like DEMO-1082", "fix DEMO-310", "ok. please implement DEMO-310"):
+for text in ("start on DEMO-310 now", "pick up ticket DEMO-310", "switch to DEMO-310", "DEMO-310", "let's move on to DEMO-310 like DEMO-1500", "fix DEMO-310", "ok. please implement DEMO-310"):
     r = resolve(text, "--branch", "DEMO-201-widget")
     check(f"resolver: a request for another ticket beats the branch ({text!r})", r["outcome"] == "none" and r["ticket"] == "DEMO-310", str(r))
 for text in ("implement the DEMO-100 approach here", "this started in DEMO-100", "see DEMO-100 for context, then continue", "reuse the fix DEMO-100 shipped", "how did we handle DEMO-100?", "what do DEMO-100 and DEMO-101 share", "the work DEMO-100 did"):
@@ -223,15 +223,15 @@ r = task("resolve", "x", "--branch", "ABC-9-thing", env=KENV)
 check("...and an unknown branch prefix names no ticket", json.loads(r.stdout)["ticket"] == "", r.stdout)
 
 out = task("session-start", "--session", S1, "--source", "compact")
-check("a bound session gets the slice on compact", out.stdout.startswith("PROJECT: repack · item DEMO-1082"), out.stdout)
+check("a bound session gets the slice on compact", out.stdout.startswith("PROJECT: invoices · item DEMO-1500"), out.stdout)
 
 print("--- context budget: compact re-injection, the nudge text ---")
-item = ROOT / "projects/repack/items/DEMO-1082"
-(item / "HANDOFF.md").write_text("# Handoff DEMO-1082\n" + "".join(f"- step {i}: " + "detail " * 20 + "\n" for i in range(60)))
-(item / "HANDOFF.auto.md").write_text("# HANDOFF.auto\n- branch: DEMO-1082-x\n")
+item = ROOT / "projects/invoices/items/DEMO-1500"
+(item / "HANDOFF.md").write_text("# Handoff DEMO-1500\n" + "".join(f"- step {i}: " + "detail " * 20 + "\n" for i in range(60)))
+(item / "HANDOFF.auto.md").write_text("# HANDOFF.auto\n- branch: DEMO-1500-x\n")
 out = task("session-start", "--session", S1, "--source", "compact", "--cap", "6000")
 o = out.stdout
-check("compact: the slice, then HANDOFF.md and HANDOFF.auto.md", o.startswith("PROJECT: repack · item DEMO-1082") and f"HANDOFF.md ({item}/HANDOFF.md):" in o and f"HANDOFF.auto.md ({item}/HANDOFF.auto.md):" in o, o)
+check("compact: the slice, then HANDOFF.md and HANDOFF.auto.md", o.startswith("PROJECT: invoices · item DEMO-1500") and f"HANDOFF.md ({item}/HANDOFF.md):" in o and f"HANDOFF.auto.md ({item}/HANDOFF.auto.md):" in o, o)
 check("...HANDOFF.md cut to its share of the cap, naming the file to Read", "... (cut at 2100 characters; Read" in o and "- step 59:" not in o, o[-800:])
 check("...the slice's 8-line HANDOFF opening is not repeated", "Read it before starting" not in o, o)
 check("...within the cap", len(o.rstrip("\n")) <= 6000, str(len(o)))
@@ -241,7 +241,7 @@ check("compact: no HANDOFF.auto.md, no section for it", "HANDOFF.auto.md" not in
 o = task("session-start", "--session", S5, "--source", "compact").stdout
 check("compact: a legacy folder gets its TASK DIR and HANDOFF.md", o.startswith("TASK DIR:") and "HANDOFF.md (" in o and "Handoff DEMO-42" in o, o)
 o = task("nudge", "--session", S1, "--ctx", "612345", "--at", "600000").stdout
-check("nudge: a bound item names its HANDOFF.md, the project INDEX and agent-task retro", o.startswith("CONTEXT 612K: past the 600K handoff point") and f"update {item}/HANDOFF.md" in o and "projects/repack/INDEX.md (it regenerates" in o and f"agent-task retro" in o and f"--session {S1}" in o, o)
+check("nudge: a bound item names its HANDOFF.md, the project INDEX and agent-task retro", o.startswith("CONTEXT 612K: past the 600K handoff point") and f"update {item}/HANDOFF.md" in o and "projects/invoices/INDEX.md (it regenerates" in o and f"agent-task retro" in o and f"--session {S1}" in o, o)
 o = task("nudge", "--session", S5, "--ctx", "700000", "--at", "600000").stdout
 check("nudge: a legacy folder's INDEX.md is kept by hand", "INDEX.md (a line per file you leave)" in o and "DEMO-42-widget-fix/HANDOFF.md" in o, o)
 (item / "HANDOFF.auto.md").write_text("# HANDOFF.auto\n- branch: OLD-branch\n")
@@ -326,9 +326,9 @@ sl = task("slice", "--session", S7).stdout
 check("the slice stays under 9000 characters (about 2.5K tokens)", 0 < len(sl) <= 9000 and "more lines" in sl, str(len(sl)))
 
 print("--- auto-index keeps hand lines ---")
-rp = ROOT / "projects" / "repack"
+rp = ROOT / "projects" / "invoices"
 (rp / "scripts" / "a.py").write_text('"""Fee replay for one order."""\n')
-task("index", "repack")
+task("index", "invoices")
 idx = (rp / "INDEX.md").read_text().replace("- `scripts/a.py` (python): Fee replay for one order.", "- `scripts/a.py` (python): Fee replay for one order.\n  - use: replay one order's fees\n  - proved: rounding is per line")
 (rp / "INDEX.md").write_text(idx + "\n## Notes\nHand note kept.\n")
 (rp / "scripts" / "b.py").write_text('"""Second script."""\n')
@@ -337,15 +337,15 @@ idx = (rp / "INDEX.md").read_text()
 check("PostToolUse(Write) re-indexes the project", "`scripts/b.py` (python): Second script." in idx, idx)
 check("...keeping the use/proved lines under their entry", "- `scripts/a.py` (python): Fee replay for one order.\n  - use: replay one order's fees\n  - proved: rounding is per line" in idx, idx)
 check("...and the ## Notes section", "## Notes\nHand note kept." in idx)
-check("...and lists the items with status", "- `items/DEMO-1082/` (open)" in idx, idx)
+check("...and lists the items with status", "- `items/DEMO-1500/` (open)" in idx, idx)
 
 print("--- project-bind: PreToolUse(Write) on the first durable write ---")
 S8 = "88888888-aaaa-4000-8000-000000000000"
 target = str(rp / "data" / "q.csv")
 pre = hook("project-bind", {"hook_event_name": "PreToolUse", "tool_name": "Write", "session_id": S8, "tool_input": {"file_path": target}})
-check("the first write under a project binds silently (no decision)", binding(S8) == "project:repack" and pre.stdout.strip() == "", pre.stdout + binding(S8))
+check("the first write under a project binds silently (no decision)", binding(S8) == "project:invoices" and pre.stdout.strip() == "", pre.stdout + binding(S8))
 post = hook("project-bind", {"hook_event_name": "PostToolUse", "tool_name": "Write", "session_id": S8, "tool_input": {"file_path": target}})
-check("...and the next PostToolUse injects the slice once", "PROJECT: repack" in post.stdout and "by this write" in post.stdout, post.stdout)
+check("...and the next PostToolUse injects the slice once", "PROJECT: invoices" in post.stdout and "by this write" in post.stdout, post.stdout)
 post = hook("project-bind", {"hook_event_name": "PostToolUse", "tool_name": "Write", "session_id": S8, "tool_input": {"file_path": target}})
 check("...only once", "PROJECT:" not in post.stdout)
 S9 = "99999999-aaaa-4000-8000-000000000000"
@@ -375,7 +375,7 @@ out = hook("retro-extract", {"hook_event_name": "SessionEnd", "session_id": S1, 
 inbox = "".join(f.read_text() for f in (ROOT / "retro").glob("*.md"))
 for tag, needle in (("denial", "denial 1x permission-rule: Permission to use Bash"), ("correction", "correction no, use the wrapper instead"), ("block", "block 1x Stop: Review agents"), ("hook-error", "hook-error 1x ~/.claude/hooks/test-exec-gate rc=1"), ("compaction", "compaction 1 compaction(s)"), ("tool-error", "tool-error 3x Bash: Exit code #"), ("review", "review review rounds past budget")):
     check(f"retro-extract writes a {tag} line", needle in inbox, inbox[-1500:])
-check("retro-extract lines carry the session's project/item", f"[auto] " in inbox and " 11111111 repack/DEMO-1082 denial" in inbox)
+check("retro-extract lines carry the session's project/item", f"[auto] " in inbox and " 11111111 invoices/DEMO-1500 denial" in inbox)
 check("a plain follow-up prompt is not a correction", "correction carry on" not in inbox)
 check("a prompt right after a PreToolUse block is a correction", "correction that was the test gate again" in inbox, inbox[-800:])
 check("the prompt after a Stop block and slash commands are not corrections", "correction next task" not in inbox and "correction /compact" not in inbox)
@@ -383,7 +383,7 @@ check("a PreToolUse block is counted", "block 1x PreToolUse:Bash hook error: bar
 out = hook("retro-extract", {"hook_event_name": "SessionEnd", "session_id": S1, "transcript_path": str(tr)}, env=dict(ENV, CI_WATCH_ACTIVE="1"))
 check("retro-extract skips under CI_WATCH_ACTIVE", "".join(f.read_text() for f in (ROOT / "retro").glob("*.md")) == inbox)
 out = task("retro", "fact: fees round per line", "--session", S1)
-check("agent-task retro writes a model line with tag and item", "- [model] " in out.stdout and " 11111111 repack/DEMO-1082 fact fees round per line" in out.stdout, out.stdout + out.stderr)
+check("agent-task retro writes a model line with tag and item", "- [model] " in out.stdout and " 11111111 invoices/DEMO-1500 fact fees round per line" in out.stdout, out.stdout + out.stderr)
 out = task("retro", "the /retro command line", "--source", "user")
 check("/retro (source user) writes a user line", out.stdout.startswith("- [user] ") and " - - note the /retro command line" in out.stdout, out.stdout)
 pend = task("retro", "--pending").stdout
@@ -427,18 +427,18 @@ text = "".join(f.read_text() for f in (CR / "retro").glob("*.md"))
 check("24 parallel appends with marks in flight: every line kept, one header", all(f"race line {i:02}" in text for i in range(24)) and text.count("# Retro inbox") == 1, text[-600:])
 
 print("--- harvest, brief, where, ls, migrate, shim ---")
-hv = task("harvest", "repack/DEMO-1082")
-tj = json.loads((rp / "items/DEMO-1082/task.json").read_text())
+hv = task("harvest", "invoices/DEMO-1500")
+tj = json.loads((rp / "items/DEMO-1500/task.json").read_text())
 check("harvest asks the three questions and marks the item", all(s in hv.stdout for s in ("1. Domain docs", "2. Project knowledge", "3. Scripts", "never overwrite it")) and tj["status"] == "harvested", hv.stdout + hv.stderr)
-br = task("brief", "repack/DEMO-1082", "--name", "fix")
+br = task("brief", "invoices/DEMO-1500", "--name", "fix")
 bf = Path(br.stdout.strip())
-check("brief writes a skeleton with the injected slice", bf.is_file() and "PROJECT: repack" in bf.read_text() and "Learnings:" in bf.read_text(), br.stdout + br.stderr)
+check("brief writes a skeleton with the injected slice", bf.is_file() and "PROJECT: invoices" in bf.read_text() and "Learnings:" in bf.read_text(), br.stdout + br.stderr)
 w = task("where", "--path", "--session", "deadbeef-0000")
 check("where --path exits 1 when unbound", w.returncode == 1 and w.stdout == "")
 w = task("where", "--path", "--session", S1)
-check("where --path prints the bound folder", w.returncode == 0 and w.stdout.strip() == str(rp / "items/DEMO-1082"), w.stdout)
+check("where --path prints the bound folder", w.returncode == 0 and w.stdout.strip() == str(rp / "items/DEMO-1500"), w.stdout)
 ls = task("ls", "--paths").stdout
-check("ls --paths shows paths and legacy folders", "repack  status=active" in ls and "paths=src/librepack/**" in ls and "tasks/DEMO-42-widget-fix  (legacy)" in ls, ls)
+check("ls --paths shows paths and legacy folders", "invoices  status=active" in ls and "paths=src/libinvoice/**" in ls and "tasks/DEMO-42-widget-fix  (legacy)" in ls, ls)
 (ROOT / "tasks" / "DEMO-43-widget-cache").mkdir()
 mg = task("migrate", "--plan")
 check("migrate --plan proposes a grouping and moves nothing", "widget" in mg.stdout and "DEMO-42-widget-fix, DEMO-43-widget-cache" in mg.stdout and (ROOT / "tasks/DEMO-43-widget-cache").is_dir(), mg.stdout)
@@ -466,10 +466,10 @@ check("...and surfaces its handoff", "HANDOFF:" in out.stdout, out.stdout)
 task("bind", "demo-91", "--session", S18)
 check("a lower-case spelling resolves to the same project and item", binding(S18) == "project:DEMO-91/DEMO-91", binding(S18))
 check("one folder per ticket: one project and one item for DEMO-91", [p.name for p in (ROOT / "projects").iterdir() if p.name.lower() == "demo-91"] == ["DEMO-91"] and [p.name for p in (ROOT / "projects/DEMO-91/items").iterdir()] == ["DEMO-91"])
-check("one folder per ticket: DEMO-1082 has one item folder across projects", len(list((ROOT / "projects").glob("*/items/DEMO-1082"))) == 1)
-task("bind", "repack/DEMO-1082", "--session", S18)
-task("bind", "DEMO-1082", "--session", S18)
-check("...after binding it again by project/item and by ticket", len(list((ROOT / "projects").glob("*/items/DEMO-1082"))) == 1 and binding(S18) == "project:repack/DEMO-1082", binding(S18))
+check("one folder per ticket: DEMO-1500 has one item folder across projects", len(list((ROOT / "projects").glob("*/items/DEMO-1500"))) == 1)
+task("bind", "invoices/DEMO-1500", "--session", S18)
+task("bind", "DEMO-1500", "--session", S18)
+check("...after binding it again by project/item and by ticket", len(list((ROOT / "projects").glob("*/items/DEMO-1500"))) == 1 and binding(S18) == "project:invoices/DEMO-1500", binding(S18))
 
 print("--- adopting per-session folders never moves a project ---")
 S19 = "19191919-aaaa-4000-8000-000000000000"
@@ -479,16 +479,16 @@ pj = ROOT / "projects" / f"old-{S19[:8]}"
 sess = ROOT / "gate-repo" / f"2026-10-03-1200-{S19[:8]}"
 sess.mkdir(parents=True)
 (sess / "note.md").write_text("# note\n")
-task("bind", "repack", "--session", S19)
+task("bind", "invoices", "--session", S19)
 check("a per-session folder moves into the bound project", sess.is_symlink() and (rp / "out/sessions" / sess.name / "note.md").is_file())
 check("a project whose name ends in the session id stays put", pj.is_dir() and not pj.is_symlink() and (pj / "knowledge/findings.md").is_file())
 
 print("--- harvest skips checkouts and dependencies ---")
-hv_item = ROOT / "projects/repack/items/DEMO-1083"
+hv_item = ROOT / "projects/invoices/items/DEMO-1501"
 for rel in ("scripts/keep.py", "worktrees/wt/src/deep.py", ".git/hooks/pre.sh", "node_modules/pkg/build.py", "out/sessions/s/x.py"):
     (hv_item / rel).parent.mkdir(parents=True, exist_ok=True)
     (hv_item / rel).write_text('"""x."""\n')
-hv = task("harvest", "repack/DEMO-1083").stdout
+hv = task("harvest", "invoices/DEMO-1501").stdout
 check("harvest lists the item's scripts only", "scripts/keep.py" in hv and not any(s in hv for s in ("deep.py", "pre.sh", "build.py", "sessions/s/x.py")), hv)
 
 print("--- one work-root resolver ---")

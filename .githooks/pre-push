@@ -1,0 +1,32 @@
+#!/bin/bash
+# git pre-push hook: scripts/scan.sh, the CI leak scan, over what this push adds to the remote.
+# Enable once per clone: git config core.hooksPath .githooks (README, "Develop").
+# Denylist sources and format: scripts/leak-check.sh. Exit 1 on a finding, 2 when the scan cannot run.
+set -uo pipefail
+KIT=$(git rev-parse --show-toplevel) || exit 2
+remote=$1
+# stdin: "<local ref> <local sha> <remote ref> <remote sha>" per ref; an all-zero sha is a deletion
+# (local) or a new ref (remote). The range is the pushed tips minus what THIS remote already has: the
+# remote sha of each updated ref, plus every ref tracked for this remote when a ref is new there. Never
+# --remotes: a commit on another remote (a private fork) is not public on this one.
+tips='' known='' new=0
+while read -r _ lsha _ rsha; do
+  case $lsha in *[!0]*) ;; *) continue ;; esac
+  tips="$tips $lsha"
+  case $rsha in
+    *[!0]*) if git cat-file -e "$rsha^{commit}" 2>/dev/null; then known="$known $rsha"; else new=1; fi ;;
+    *) new=1 ;;
+  esac
+done
+[ -n "$tips" ] || exit 0
+[ "$new" = 0 ] || known="$known $(git for-each-ref --format='%(objectname)' "refs/remotes/$remote/")"
+# shellcheck disable=SC2086 # tips and known are lists of object ids
+"$BASH" "$KIT/scripts/scan.sh" -- $tips --not $known
+rc=$?
+case $rc in
+  0) ;;
+  1) echo "pre-push: the leak scan found something (above). Fix the unpushed commits and push again;" \
+       "--no-verify only moves the failure to CI, after the push is public." >&2 ;;
+  *) echo "pre-push: the scan could not run (exit $rc, above)." >&2 ;;
+esac
+exit "$rc"

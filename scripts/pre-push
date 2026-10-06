@@ -1,15 +1,4 @@
 #!/bin/bash
-# git pre-push hook: the CI leak scan, locally, before anything leaves the machine.
-# Install once per clone:  ln -sf ../../scripts/pre-push .git/hooks/pre-push
-# Needs gitleaks (on PATH, or GITLEAKS=<path>) and your org denylist: LEAK_TERMS_FILE, default
-# ~/.config/claude-kit/leak-terms.txt (newline-separated EREs; never commit it). A push without the
-# denylist is refused, as CI refuses one.
-set -uo pipefail
-# git runs hooks from the repo root.
-KIT=$(git rev-parse --show-toplevel) || exit 1
-export LEAK_TERMS_FILE=${LEAK_TERMS_FILE:-$HOME/.config/claude-kit/leak-terms.txt}
-export REQUIRE_LEAK_TERMS=1
-if ! bash "$KIT/scripts/scan.sh"; then
-  echo "pre-push: the leak scan found something (above). Fix it, amend, and push again." >&2
-  exit 1
-fi
+# The hook moved to .githooks/pre-push. This stays for clones that installed the old way
+# (`ln -sf ../../scripts/pre-push .git/hooks/pre-push`): without it that link dangles and git skips it.
+exec "$BASH" "$(git rev-parse --show-toplevel)/.githooks/pre-push" "$@"
