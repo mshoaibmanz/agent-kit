@@ -193,6 +193,17 @@ class LeakCheckTests(unittest.TestCase):
         )
         self.assertEqual(self.leak_check("--", "--no-walk", removed).returncode, 0)
 
+    def test_removed_bullets_and_unchanged_neighbours_do_not_count(self) -> None:
+        self.commit("a list", {"list.md": "- keep\n- globex-corp note\n", "near.txt": "globex-corp line\nkeep\n"})
+        # A removed `- term` bullet shows as `-- term`; the edit below leaves the term on the line
+        # above, which a full diff shows as context and a -U0 hunk header still repeats.
+        dropped = self.commit("drop a bullet", {"list.md": "- keep\n"})
+        edited = self.commit("edit beside it", {"near.txt": "globex-corp line\nkept\n"})
+        for sha in (dropped, edited):
+            with self.subTest(sha):
+                result = self.leak_check("--", "--no-walk", sha)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_annotated_tags_are_checked(self) -> None:
         head = self.git("rev-parse", "HEAD").stdout.strip()
         self.git("tag", "-a", "v1", "-m", "release for hooli")
@@ -204,16 +215,36 @@ class LeakCheckTests(unittest.TestCase):
         self.assertEqual(self.hits(everything), [f"term #2 in tag {tag[:12]}"], everything.stdout)
         self.assertIn("1 tag(s)", everything.stdout)
 
-    def test_the_allowlist_covers_only_public_history(self) -> None:
-        self.bare_remote("origin")
-        public = self.commit("published", {"a.txt": "globex-corp\n"})
-        self.git("push", "-q", "origin", "main")
-        unpushed = self.commit("not yet published", {"b.txt": "globex-corp\n"})
-        allow = self.root / "allow.txt"
-        allow.write_text(f"# accepted\n{public}\n{unpushed}\n")
-        result = self.leak_check("--allow", str(allow), "--", "--all")
-        self.assertEqual(self.hits(result), [f"term #3 in commit {unpushed[:12]}"], result.stdout + result.stderr)
-        self.assertIn("1 public commit(s) skipped", result.stdout)
+    def test_a_tag_of_a_tag_is_checked_after_the_inner_ref_is_gone(self) -> None:
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("tag", "-a", "inner", "-m", "staging for initech")
+        inner = self.git("rev-parse", "inner").stdout.strip()
+        self.git("tag", "-a", "outer", "-m", "a neutral release", "inner")
+        self.git("tag", "-d", "inner")
+        for args in (("outer", "--not", head), ("--all",)):
+            with self.subTest(args):
+                result = self.leak_check("--", *args)
+                self.assertEqual(self.hits(result), [f"term #4 in tag {inner[:12]}"], result.stdout + result.stderr)
+                self.assertIn("2 tag(s)", result.stdout)
+
+    def test_history_exceptions_come_from_the_base_and_its_history(self) -> None:
+        published = self.commit("published", {"a.txt": "globex-corp\n"})
+        base = self.commit("accept it", {"a.txt": None, ".scan-history-allow": f"# accepted\n{published}\n"})
+        leak = self.commit("a new leak", {"b.txt": "globex-corp\n"})
+        # The change under check lists its own leak in the checkout's copy.
+        self.commit("cover it", {"b.txt": None, ".scan-history-allow": f"{published}\n{leak}\n"})
+        both = sorted([f"term #3 in commit {published[:12]}", f"term #3 in commit {leak[:12]}"])
+        cases = [
+            ("the base's list", base, [f"term #3 in commit {leak[:12]}"]),
+            # A base from before the file: the checkout's copy, still only for the base's history.
+            ("a base without the file", published, [f"term #3 in commit {leak[:12]}"]),
+            ("no base", "", both),
+            ("an unknown base", "no-such-rev", both),
+        ]
+        for label, rev, expected in cases:
+            with self.subTest(label):
+                result = self.leak_check("--allow", rev, "--", "--all")
+                self.assertEqual(self.hits(result), expected, result.stdout + result.stderr)
 
     def test_list_sources_in_order(self) -> None:
         sha = self.commit("mention initech", {"a.txt": "neutral\n"})
@@ -225,25 +256,33 @@ class LeakCheckTests(unittest.TestCase):
         fallback = self.home / ".local/share/agent-kit/local/leak-terms.txt"
         fallback.parent.mkdir(parents=True)
         fallback.write_text(TERMS)
+        old_default = self.home / ".config/claude-kit/leak-terms.txt"
+        old_default.parent.mkdir(parents=True)
+        old_default.write_text(quiet)
         base = {k: v for k, v in self.env.items() if k != "AGENT_KIT_LEAK_TERMS"}
         cases = [
             ("LEAK_TERMS over AGENT_KIT_LEAK_TERMS", dict(self.env, LEAK_TERMS=quiet), 0),
             ("AGENT_KIT_LEAK_TERMS over AGENT_KIT_DIR", dict(self.env, AGENT_KIT_DIR=str(kit)), 1),
             ("AGENT_KIT_DIR over the HOME default", dict(base, AGENT_KIT_DIR=str(kit)), 0),
-            ("the HOME default", base, 1),
+            ("the HOME default over the old default", base, 1),
         ]
         for label, env, code in cases:
             with self.subTest(label):
                 result = self.leak_check(*commits, env=env)
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         fallback.unlink()
-        # LEAK_TERMS_FILE was the older name; it is not read.
-        missing = dict(base, LEAK_TERMS_FILE=str(self.terms))
-        result = self.leak_check(*commits, env=missing)
-        self.assertEqual(result.returncode, 3)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
-        self.assertIn("WARNING", result.stderr)
+        old_default.write_text(TERMS)
+        with self.subTest("the old default, last"):
+            result = self.leak_check(*commits, env=base)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        for label, env in (("off", dict(self.env, AGENT_KIT_LEAK_TERMS="none")), ("no list", base)):
+            with self.subTest(label):
+                old_default.unlink(missing_ok=True)
+                result = self.leak_check(*commits, env=env)
+                self.assertEqual(result.returncode, 3)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                self.assertIn("WARNING", result.stderr)
 
     def test_pre_push_reports_a_scan_that_could_not_run(self) -> None:
         self.bare_remote("origin")
@@ -254,18 +293,43 @@ class LeakCheckTests(unittest.TestCase):
         self.assertIn("pre-push: the scan could not run (exit 2", result.stderr)
         self.assertNotIn("found something", result.stderr)
 
-    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
-    def test_scan_fails_without_a_list_when_required(self) -> None:
-        env = {k: v for k, v in self.env.items() if k != "AGENT_KIT_LEAK_TERMS"}
-        result = subprocess.run(
-            [BASH, str(self.repo / "scripts/scan.sh")],
-            env=dict(env, REQUIRE_LEAK_TERMS="1"),
+    def scan(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [BASH, str(self.repo / "scripts/scan.sh"), *args],
+            env=env or self.env,
             capture_output=True,
             text=True,
             timeout=120,
         )
+
+    def test_usage_errors_exit_2_not_1(self) -> None:
+        # 1 means a finding; a script that cannot run must not look like one.
+        for args in (("--report",), ("--allow-base",), ("--bogus",)):
+            with self.subTest(args):
+                self.assertEqual(self.scan(*args).returncode, 2)
+        for args in (("--paths",), ("--allow",), ("--tree", "x")):
+            with self.subTest(args):
+                self.assertEqual(self.leak_check(*args).returncode, 2)
+
+    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
+    def test_scan_fails_without_a_list_when_required(self) -> None:
+        env = {k: v for k, v in self.env.items() if k != "AGENT_KIT_LEAK_TERMS"}
+        result = self.scan(env=dict(env, REQUIRE_LEAK_TERMS="1"))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("FINDING no denylist", result.stdout)
+
+    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
+    def test_a_change_that_lists_its_own_leak_is_still_refused(self) -> None:
+        # CI's view of a push to main: the previous main is the base, the checkout is the push.
+        published = self.commit("published", {"a.txt": "globex-corp\n"})
+        base = self.commit("accept it", {"a.txt": None, ".scan-history-allow": f"{published}\n"})
+        leak = self.commit("a new leak", {"b.txt": "globex-corp\n"})
+        self.commit("cover it", {"b.txt": None, ".scan-history-allow": f"{published}\n{leak}\n"})
+        result = self.scan("--allow-base", base)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"term #3 in commit {leak[:12]}", result.stdout)
+        self.assertNotIn(f"commit {published[:12]}", result.stdout)
+        self.assertIn("1 public commit(s) skipped", result.stdout)
 
     @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
     def test_pre_push_refuses_a_term_in_a_message_and_passes_a_clean_push(self) -> None:
@@ -284,10 +348,44 @@ class LeakCheckTests(unittest.TestCase):
         self.assertEqual(self.remote_sha(remote, "main"), published)
         self.git("commit", "--amend", "-qm", "tidy the readme")
         without_list = dict(self.env, AGENT_KIT_LEAK_TERMS=str(self.root / "missing.txt"))
-        passed = self.git("push", "-q", "origin", "main", check=False, env=without_list)
+        refused = self.git("push", "-q", "origin", "main", check=False, env=without_list)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("FINDING no denylist", refused.stdout + refused.stderr)
+        self.assertEqual(self.remote_sha(remote, "main"), published)
+        opted_out = dict(self.env, AGENT_KIT_LEAK_TERMS="none")
+        passed = self.git("push", "-q", "origin", "main", check=False, env=opted_out)
         self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
-        self.assertIn("WARNING: no denylist", passed.stdout + passed.stderr)
+        self.assertIn("WARNING: the denylist check is off", passed.stdout + passed.stderr)
         self.assertEqual(self.remote_sha(remote, "main"), self.git("rev-parse", "HEAD").stdout.strip())
+
+    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
+    def test_pre_push_checks_only_what_the_push_adds(self) -> None:
+        self.bare_remote("origin")
+        self.commit("published before the hook", {"a.txt": "globex-corp\n"})
+        self.git("push", "-q", "--no-verify", "origin", "main")
+        self.git("config", "core.hooksPath", ".githooks")
+        self.commit("a clean change", {"b.txt": "neutral\n"})
+        (self.repo / "scratch.txt").write_text("hooli\n")
+        passed = self.git("push", "-q", "origin", "main", check=False)
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertIn("1 commit(s)", passed.stdout + passed.stderr)
+        self.assertNotIn("rule self-test", passed.stdout + passed.stderr)
+
+    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
+    def test_pre_push_trusts_tracking_refs_only_from_the_push_url(self) -> None:
+        self.bare_remote("origin")
+        self.git("config", "core.hooksPath", ".githooks")
+        sha = self.commit("wire the hooli client", {"a.txt": "neutral\n"})
+        self.git("push", "-q", "--no-verify", "origin", "main")
+        # Same URL: origin/main records what the destination has, so a new ref adds nothing.
+        same = self.git("push", "-q", "origin", "main:feature", check=False)
+        self.assertEqual(same.returncode, 0, same.stdout + same.stderr)
+        public = self.root / "public.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(public)], env=self.env, check=True)
+        self.git("remote", "set-url", "--push", "origin", str(public))
+        refused = self.git("push", "-q", "origin", "main", check=False)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn(f"term #2 in commit {sha[:12]}", refused.stdout + refused.stderr)
 
     @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
     def test_pre_push_checks_commits_another_remote_already_has(self) -> None:
@@ -312,17 +410,63 @@ class LeakCheckTests(unittest.TestCase):
         refused = self.git("push", "-q", "origin", "v1", check=False)
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertIn("term #2 in tag", refused.stdout + refused.stderr)
+        self.git("tag", "-a", "inner", "-m", "staging for initech")
+        inner = self.git("rev-parse", "inner").stdout.strip()
+        self.git("tag", "-a", "outer", "-m", "a neutral release", "inner")
+        self.git("tag", "-d", "inner")
+        refused = self.git("push", "-q", "origin", "outer", check=False)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn(f"term #4 in tag {inner[:12]}", refused.stdout + refused.stderr)
 
-    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
-    def test_the_old_symlink_install_still_refuses(self) -> None:
-        self.bare_remote("origin")
+    def old_install(self) -> None:
         hook = self.repo / ".git/hooks/pre-push"
         hook.parent.mkdir(exist_ok=True)
         hook.symlink_to("../../scripts/pre-push")
-        self.commit("wire the hooli client", {"a.txt": "neutral\n"})
-        refused = self.git("push", "-q", "origin", "main", check=False)
+
+    @unittest.skipUnless(GITLEAKS, "gitleaks is not installed")
+    def test_the_old_symlink_install_keeps_its_list(self) -> None:
+        self.bare_remote("origin")
+        self.old_install()
+        sha = self.commit("wire the hooli client", {"a.txt": "neutral\n"})
+        old_env = {k: v for k, v in self.env.items() if k != "AGENT_KIT_LEAK_TERMS"}
+        old_default = self.home / ".config/claude-kit/leak-terms.txt"
+        cases = [
+            ("LEAK_TERMS_FILE", dict(old_env, LEAK_TERMS_FILE=str(self.terms))),
+            ("the old default list", old_env),
+        ]
+        for label, env in cases:
+            with self.subTest(label):
+                if label == "the old default list":
+                    old_default.parent.mkdir(parents=True)
+                    old_default.write_text(TERMS)
+                refused = self.git("push", "-q", "origin", "main", check=False, env=env)
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn(f"term #2 in commit {sha[:12]}", refused.stdout + refused.stderr)
+                self.assertIn("pre-push: the leak scan found something", refused.stderr)
+
+    def test_the_old_symlink_runs_the_pushing_worktrees_own_hook(self) -> None:
+        self.bare_remote("origin")
+        self.old_install()
+        worktree = self.root / "older branch"
+        self.git("worktree", "add", "-q", "-b", "older", str(worktree))
+
+        def in_worktree(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "-C", str(worktree), *args], env=self.env, capture_output=True, text=True, timeout=120
+            )
+
+        # A branch from before the hook moved: no .githooks, and no hook of its own either.
+        in_worktree("rm", "-q", ".githooks/pre-push", "scripts/pre-push")
+        in_worktree("commit", "-qm", "a branch from before the hook")
+        passed = in_worktree("push", "-q", "origin", "older")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        own = worktree / "scripts/pre-push"
+        own.write_text("#!/bin/bash\necho 'its own pre-push ran' >&2\nexit 1\n")
+        in_worktree("add", "scripts/pre-push")
+        in_worktree("commit", "-qm", "its own hook")
+        refused = in_worktree("push", "-q", "origin", "older")
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
-        self.assertIn("pre-push: the leak scan found something", refused.stderr)
+        self.assertIn("its own pre-push ran", refused.stderr)
 
 
 if __name__ == "__main__":

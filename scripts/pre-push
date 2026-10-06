@@ -1,4 +1,18 @@
 #!/bin/bash
 # The hook moved to .githooks/pre-push. This stays for clones that installed the old way
 # (`ln -sf ../../scripts/pre-push .git/hooks/pre-push`): without it that link dangles and git skips it.
-exec "$BASH" "$(git rev-parse --show-toplevel)/.githooks/pre-push" "$@"
+# git runs the link from every worktree of the clone, so the hook run is the pushing worktree's own.
+# The old install's list settings still apply: LEAK_TERMS_FILE here, ~/.config/claude-kit/leak-terms.txt
+# in scripts/leak-check.sh.
+top=$(git rev-parse --show-toplevel) || exit 2
+if [ -n "${LEAK_TERMS_FILE:-}" ] && [ -z "${AGENT_KIT_LEAK_TERMS:-}" ]; then
+  export AGENT_KIT_LEAK_TERMS="$LEAK_TERMS_FILE"
+fi
+[ ! -f "$top/.githooks/pre-push" ] || exec "$BASH" "$top/.githooks/pre-push" "$@"
+# A branch from before the move: its own scripts/pre-push is the hook it shipped with. The variable
+# stops a copy of this shim from running itself again.
+if [ -z "${AGENT_KIT_PRE_PUSH_SHIM:-}" ] && [ -f "$top/scripts/pre-push" ]; then
+  export AGENT_KIT_PRE_PUSH_SHIM=1
+  exec "$BASH" "$top/scripts/pre-push" "$@"
+fi
+exit 0

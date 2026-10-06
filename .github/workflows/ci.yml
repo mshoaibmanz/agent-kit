@@ -4,6 +4,8 @@ on:
   pull_request:
 permissions:
   contents: read
+env:
+  GITLEAKS_VERSION: 8.30.1
 
 jobs:
   tests:
@@ -19,10 +21,10 @@ jobs:
           python-version: "3.12"
       - name: Install gitleaks (pinned, checksum-verified) for the pre-push hook tests
         env:
-          V: 8.30.1
           SHA256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
         working-directory: ${{ runner.temp }}
         run: |
+          V=$GITLEAKS_VERSION
           curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_darwin_arm64.tar.gz"
           echo "${SHA256}  gitleaks.tgz" | shasum -a 256 -c -
           tar -xzf gitleaks.tgz gitleaks
@@ -40,11 +42,11 @@ jobs:
           fetch-depth: 0 # the scan reads every commit
       - name: Install gitleaks (pinned, checksum-verified)
         env:
-          V: 8.30.1
           SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         # Outside the checkout: the scan reads untracked files too.
         working-directory: ${{ runner.temp }}
         run: |
+          V=$GITLEAKS_VERSION
           curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
           echo "${SHA256}  gitleaks.tgz" | sha256sum -c -
           tar -xzf gitleaks.tgz gitleaks
@@ -56,8 +58,19 @@ jobs:
           # term of 6 characters or fewer matches only at a word start; longer ones anywhere; other
           # lines are EREs. A hit prints only line numbers, so the list never reaches these logs.
           LEAK_TERMS: ${{ secrets.LEAK_TERMS }}
-          # Fork PRs get no secrets; a push without the list is a failure, not a pass.
-          REQUIRE_LEAK_TERMS: ${{ github.event_name == 'push' && '1' || '0' }}
+          # Fork PRs get no secrets and skip the list with a warning; on a push or a same-repo PR a
+          # missing list is a failure, not a pass.
+          REQUIRE_LEAK_TERMS: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && '1' || '0' }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        # .scan-history-allow is read from a commit this run did not add, never from the checkout: the
+        # PR's base, the main a push to main replaces, or where a pushed branch left main.
         run: |
           mkdir -p "$TMPDIR"
-          bash scripts/scan.sh
+          case "$EVENT:$GITHUB_REF" in
+            pull_request:*) base=$PR_BASE ;;
+            push:refs/heads/main) base=$BEFORE ;;
+            *) base=$(git merge-base HEAD refs/remotes/origin/main || true) ;;
+          esac
+          bash scripts/scan.sh --allow-base "$base"

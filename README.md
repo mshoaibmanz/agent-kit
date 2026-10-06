@@ -176,13 +176,14 @@ python3 scripts/build_plugins.py --check
 bash scripts/scan.sh
 ```
 
-The repo is public. A pre-push hook runs the CI leak scan (`scripts/scan.sh`, which needs `gitleaks`) over what each push adds, so a leak is caught before it is published:
+The repo is public. A pre-push hook runs the history steps of the CI leak scan (`scripts/scan.sh`, which needs `gitleaks`) over what each push adds: its commits (messages, authors, added lines) and annotated tags. The tree is CI's; `bash scripts/scan.sh` with no arguments checks the whole repo.
 
 - Enable it once per clone: `git config core.hooksPath .githooks`.
-- A clone that followed the old install (`.git/hooks/pre-push` linking to `scripts/pre-push`) still works through a shim. Switch anyway: run the line above, then `rm .git/hooks/pre-push`.
-- The denylist is a file outside the repo, never committed. Point `AGENT_KIT_LEAK_TERMS` at it, or keep it at `<kit root>/local/leak-terms.txt`. The kit root is `$AGENT_KIT_DIR`, default `~/.local/share/agent-kit`. Sources and format: `scripts/leak-check.sh`. With no list the hook prints one warning and the push goes on; CI checks it with its `LEAK_TERMS` secret.
-- After a hit: the output names line N of your list and a commit, file or file-name number, never the text. Fix the unpushed commits (amend, or rebase to reword), then push again. `git push --no-verify` only moves the failure to CI, after the commits are public.
-- `.scan-history-allow` lists published commits whose hits are accepted, because history is not rewritten. It is frozen: an entry counts only for a commit already on `main`, and never unblocks a push.
+- A clone that followed the old install (`.git/hooks/pre-push` linking to `scripts/pre-push`) still works through a shim, which keeps the old `LEAK_TERMS_FILE` setting. Switch anyway: run the line above, then `rm .git/hooks/pre-push`.
+- The denylist is a file outside the repo, never committed. Point `AGENT_KIT_LEAK_TERMS` at it, or keep it at `<kit root>/local/leak-terms.txt`. The kit root is `$AGENT_KIT_DIR`, default `~/.local/share/agent-kit`; the old default, `~/.config/claude-kit/leak-terms.txt`, is read last. Sources and format: `scripts/leak-check.sh`. With no list the hook refuses the push; `AGENT_KIT_LEAK_TERMS=none git push` pushes without the denylist check, which CI still runs with its `LEAK_TERMS` secret.
+- Reading a hit: `term #N` is line N of your list (`sed -n Np <list>`); `commit <sha>` and `tag <sha>` are objects to `git show`; `file #K` and `file name #K` are line K of `git ls-files --cached --others --exclude-standard`. The text itself is never printed.
+- After a hit, fix the unpushed commits (amend, or rebase to reword), then push again. `git push --no-verify` only moves the failure to CI, after the commits are public.
+- `.scan-history-allow` lists published commits whose hits are accepted, because history is not rewritten. CI reads it from the commit it checks against (the PR's base, or the `main` a push replaces), and an entry counts only for a commit already in that commit's history, so a change can never exempt its own commits. The hook never reads it.
 
 Hook suites require a disposable home with `HOOKS_DIR` pointing at this checkout and `KIT_ENV=/dev/null`, plus explicit wrapper paths. The release checks include fake-home installs, rollback, unsupported capabilities, collision refusal, secret-catalog refusal, generated-package drift and redacted secret scanning. Private source history and user overlays are excluded from exports.
 
