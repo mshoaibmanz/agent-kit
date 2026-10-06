@@ -740,6 +740,8 @@ TIMED = [
     ("allow", "echo security " + "a" * 60000,               1.0, "a 60KB word (its basename regex was quadratic: 9s)"),
     ("deny",  "echo security " + "a" * 70000,               1.0, "a command over 64KB is refused, not lexed"),
     ("allow", "security list-keychains; " + "a b|" * 16000 + "sh", 4.0, "64KB of the lexer's costliest shape"),
+    ("deny",  "echo " + "! " * 20000 + "while\ndate\nwhile true; do sleep 20; done", 4.0,
+     "40KB of keywords before a poll (the per-keyword rescan took 13s)"),
 ]
 
 
