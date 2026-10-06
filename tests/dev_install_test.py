@@ -404,6 +404,77 @@ class DevInstallTests(PackRepos):
         context = run(str(self.root / 'hooks/host-session-context'), payload=json.dumps({'cwd': str(self.checkout)}))
         self.assertIn(str(self.root / 'local/kit-rules.md'), context)
 
+        # The installed tools and hooks import from the checkout; none may leave bytecode in it.
+        environment.pop('PYTHONDONTWRITEBYTECODE', None)
+        run(str(self.root / 'bin/agent-kit'), 'roles')
+        run(str(self.root / 'hooks/host-adapter'), 'codex', 'edit-guard', payload=json.dumps(
+            {'hook_event_name': 'PreToolUse', 'tool_name': 'apply_patch', 'cwd': str(self.home),
+             'tool_input': {'command': '*** Begin Patch\n*** Add File: notes.txt\n+x\n*** End Patch\n'}}))
+        self.assertEqual(sorted(str(path) for path in self.checkout.rglob('__pycache__')), [])
+
+    def test_agent_kit_loads_its_own_modules_in_an_older_agent_setup(self) -> None:
+        """An older installed agent-setup runs the checkout's agent-kit in its own process (kit_api) after
+        importing its own kit_env and hosts, which may lack names this agent-kit imports."""
+        older = self.home / 'older-lib'
+        older.mkdir()
+        (older / 'kit_env.py').write_text('def kit_env(path=None):\n    return {}\n')
+        (older / 'hosts.py').write_text('HOSTS = ()\n')
+        script = ('import importlib.machinery, importlib.util, sys\n'
+                  f'sys.path.insert(0, {str(older)!r})\n'
+                  'import hosts, kit_env\n'
+                  f'loader = importlib.machinery.SourceFileLoader("agent_setup_kit", {str(self.checkout / "bin/agent-kit")!r})\n'
+                  'module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))\n'
+                  'sys.modules[loader.name] = module\n'
+                  'loader.exec_module(module)\n'
+                  'print(module.KIT, module.rules_root("codex"))\n')
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True,
+                                env={'HOME': str(self.home), 'PATH': str(self.shim), 'AGENT_KIT_DIR': str(self.checkout)})
+        self.assertEqual((result.returncode, result.stdout), (0, f'{self.checkout} {self.home / ".codex"}\n'), result.stderr)
+
+    def test_doctor_reports_a_sync_that_a_collision_blocks(self) -> None:
+        self.install(*FLAGS, '--dev', '--apply')
+        (self.checkout / 'rules/TEAM.md').write_text('# Team\n')
+        (self.root / 'rules/TEAM.md').write_text('mine\n')
+        self.assertEqual(self.kit('sync', '--dry-run').returncode, 2)
+        problems = self.doctor(code=1)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertTrue(problems[0].startswith('agent-kit sync is blocked: '), problems)
+        self.assertIn(str(self.root / 'rules/TEAM.md'), problems[0])
+
+    def test_update_source_records_a_clone_with_the_same_files(self) -> None:
+        self.remote()
+        self.install(*FLAGS, '--apply')
+        journal = self.state()['id']
+        other = self.home / 'other'
+        self.git(self.home, 'clone', '-q', str(self.home / 'remote.git'), str(other))
+        result = self.installed('update', '--source', str(other))
+        self.assertIn('configuration', result.stdout)
+        self.assertEqual(self.state()['configuration']['source_checkout'], str(other))
+        recorded = self.state()['id']
+        self.assertNotEqual(recorded, journal)
+        self.assertIn('nothing changed', self.installed('update').stdout)
+        self.assertEqual(self.state()['id'], recorded, 'an unchanged sync wrote a journal')
+        self.installed('rollback', recorded, '--root-dir', str(self.root))
+        self.assertEqual((self.state()['id'], self.state()['configuration']['source_checkout']), (journal, str(self.checkout)))
+
+    def test_update_previews_a_catalog_the_checkout_tracks_as_the_upstream_has_it(self) -> None:
+        upstream = self.remote()
+        catalog = self.checkout / 'mcp/team.json'
+        catalog.write_text(json.dumps({'mcpServers': {'docs': {'type': 'http', 'url': 'https://example.com/mcp'}}}) + '\n')
+        self.commit(self.checkout, 'Team catalog')
+        self.git(self.checkout, 'push', '-q', 'origin', 'main')
+        self.git(upstream, 'pull', '-q', '--ff-only')
+        self.install(*FLAGS, '--mcp-catalog', str(catalog), '--apply')
+        head = self.git(self.checkout, 'rev-parse', 'HEAD')
+        journal = self.state()['id']
+        inline = {'mcpServers': {'docs': {'command': 'docs-mcp', 'env': {'DOCS_TOKEN': 'x'}}}}
+        self.push(upstream, 'mcp/team.json', json.dumps(inline) + '\n')
+        result = self.install('update', code=2)
+        self.assertIn('MCP docs: use native OAuth or a runtime wrapper', result.stderr)
+        self.assertEqual(self.git(self.checkout, 'rev-parse', 'HEAD'), head)
+        self.assertEqual(self.state()['id'], journal)
+        self.assertEqual(self.state()['configuration']['mcp_catalog'], str(catalog))
+
 
 if __name__ == '__main__':
     unittest.main()

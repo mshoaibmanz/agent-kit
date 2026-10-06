@@ -1102,13 +1102,37 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
     return Plan(summary, prepared, records, collisions, report)
 
 
+def configured(args: argparse.Namespace, preset: Preset, answered: set[str], preset_owned: set[str]) -> dict[str, Any]:
+    """The install's saved configuration as current.json records it: every answer of this run."""
+    configuration = {key: getattr(args, key) for key in SAVED_KEYS}
+    # The catalog as an absolute path, so a later update that reselects mcp keeps it.
+    configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
+    configuration['answered'] = sorted(answered)
+    # Kept across runs: once a preset drops a key, the next run's saved preset no longer names
+    # it, and only this record keeps the default out of setup-paths.env, above kit.env.
+    configuration['preset_owned'] = sorted(preset_owned)
+    if preset.record:
+        # The preset outlives this run: a later update without --preset applies the same values.
+        configuration.update(preset=preset.record, preset_values=preset.saved())
+    configuration['source_checkout'] = str(Path(args.source).expanduser().resolve())
+    configuration['dev'] = args.dev
+    configuration['confirm_hook_support'] = args.confirm_hook_support
+    # Every selected host's root as installed, however it was named (--host-root, CLAUDE_CONFIG_DIR,
+    # CODEX_HOME): a later run in a shell without that variable renders into the same root.
+    configuration['host_roots'] = {**args.host_roots,
+                                   **{host: str(host_target(args, host, Path.home())) for host in args.hosts}}
+    configuration['project_roots'] = dict(args.project_roots)
+    if args.project_root and 'cursor' in args.hosts:
+        configuration['project_roots']['cursor'] = args.project_root
+    return configuration
+
+
 def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[str], preset_owned: set[str]) -> int:
     """Make the previewed changes under a journal, then record the install, its answers and which
     of them the preset layer owns (left out of setup-paths.env)."""
     if planned.blocked:
         raise ValueError('apply blocked: ' + '; '.join(row.line for row in planned.rows if row.blocks))
     root = Path(args.root_dir).expanduser().absolute()
-    source = Path(args.source).expanduser().resolve()
     identifier = time.strftime('%Y%m%dT%H%M%S') + '-' + str(os.getpid())
     journal = root / '.install-state' / identifier
     journal.mkdir(parents=True, exist_ok=False)
@@ -1137,26 +1161,7 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
                 if record.get('retired_identity'):
                     managed.pop(record['retired_identity'], None)
                 managed[record['kind'] + ':' + record['target']] = record
-        configuration = {key: getattr(args, key) for key in SAVED_KEYS}
-        # The catalog as an absolute path, so a later update that reselects mcp keeps it.
-        configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
-        configuration['answered'] = sorted(answered)
-        # Kept across runs: once a preset drops a key, the next run's saved preset no longer names
-        # it, and only this record keeps the default out of setup-paths.env, above kit.env.
-        configuration['preset_owned'] = sorted(preset_owned)
-        if preset.record:
-            # The preset outlives this run: a later update without --preset applies the same values.
-            configuration.update(preset=preset.record, preset_values=preset.saved())
-        configuration['source_checkout'] = str(source)
-        configuration['dev'] = args.dev
-        configuration['confirm_hook_support'] = args.confirm_hook_support
-        # Every selected host's root as installed, however it was named (--host-root, CLAUDE_CONFIG_DIR,
-        # CODEX_HOME): a later run in a shell without that variable renders into the same root.
-        configuration['host_roots'] = {**args.host_roots,
-                                       **{host: str(host_target(args, host, Path.home())) for host in args.hosts}}
-        configuration['project_roots'] = dict(args.project_roots)
-        if args.project_root and 'cursor' in args.hosts:
-            configuration['project_roots']['cursor'] = args.project_root
+        configuration = configured(args, preset, answered, preset_owned)
         atomic(root / '.install-state/current.json', (json.dumps({'id': identifier, 'managed': managed,
                'configuration': configuration}, indent=2) + '\n').encode())
         (root / '.install-state/pending.json').unlink(missing_ok=True)
@@ -1294,9 +1299,13 @@ def sync_pending(root: Path, state: dict[str, Any]) -> str | None:
     args = parser().parse_args(['sync', '--root-dir', str(root)])
     try:
         preset, _, from_preset, notes = resolve(args, root, state, state.get('configuration', {}))
-        pending = len(preview(args, preset, from_preset, notes).prepared)
+        planned = preview(args, preset, from_preset, notes)
     except Exception as error:  # noqa: BLE001 (doctor diagnoses: a checkout mid-merge breaks the preview in any way)
         return f'agent-kit sync cannot preview this install: {type(error).__name__}: {" ".join(str(error).split())}'
+    if planned.blocked:
+        # Such a change is left out of prepared, so a sync that would refuse can count none pending.
+        return 'agent-kit sync is blocked: ' + '; '.join(f'{row.section}: {row.line}' for row in planned.rows if row.blocks)
+    pending = len(planned.prepared)
     return f'{pending} derived change(s) pending: run agent-kit sync' if pending else None
 
 
@@ -1327,8 +1336,15 @@ def update(args: argparse.Namespace, root: Path, state: dict[str, Any]) -> int:
     if after != before:
         with tempfile.TemporaryDirectory(prefix='agent-kit-update-') as folder:
             checkout.export(source, after, Path(folder))
+            # A catalog or local preset the checkout tracks is previewed as the upstream has it; the
+            # sync below keeps the saved paths.
+            catalog = configuration.get('mcp_catalog')
+            local = [*(['--preset', checkout.exported(record['source'], source, Path(folder))]
+                       if record and not record['source'].startswith('gh:') else []),
+                     *(['--mcp-catalog', checkout.exported(catalog, source, Path(folder))] if catalog else [])]
             trial = subprocess.run([sys.executable, str(Path(folder) / 'bin/agent-setup'), 'sync', '--dry-run',
-                                    '--source', folder, *flags], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                                    '--source', folder, *flags, *local], capture_output=True, text=True,
+                                   stdin=subprocess.DEVNULL)
         if trial.returncode:
             sys.stderr.write(trial.stdout + trial.stderr)
             raise checkout.refusal(source, f'cannot install its upstream {checkout.short(after)}: its agent-setup '
@@ -1580,11 +1596,20 @@ def sync(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[
     if planned.blocked:
         print('sync: blocked: fix the rows above, then rerun', file=sys.stderr)
         return 2
-    if not planned.prepared:
+    # A changed answer with no file to change (update --source naming a clone with the same files) is
+    # still saved, under a journal of no records, so rollback restores the earlier configuration. A key an
+    # older install never saved is derived again on every run, except the checkout it installs from.
+    saved = load_json(root / '.install-state/current.json', {}).get('configuration', {})
+    configuration = json.loads(json.dumps(configured(args, preset, answered, from_preset)))
+    changed = sorted(key for key in configuration
+                     if configuration[key] != saved.get(key) and (key in saved or key == 'source_checkout'))
+    if changed and not planned.prepared:
+        print(f'  {"configuration":12} {", ".join(changed)}')
+    if not planned.prepared and not changed:
         print(f'sync: nothing changed; {root} matches {Path(args.source).expanduser().resolve()}')
         return 0
     if args.dry_run:
-        print(f'sync: {len(planned.prepared)} change(s) to apply; rerun without --dry-run to apply them')
+        print(f'sync: {len(planned.prepared) or 1} change(s) to apply; rerun without --dry-run to apply them')
         return 0
     return apply(args, planned, preset, answered, from_preset)
 

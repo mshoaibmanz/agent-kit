@@ -69,6 +69,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# A dev install links this file into the checkout: no __pycache__ there.
+sys.dont_write_bytecode = True
+
+
+def _own_modules(*folders: str) -> None:
+    """agent-setup runs this file in its own process (kit_api), after importing kit_env, hosts and the rest
+    from its own kit, which may be older than this one: drop each such module this kit ships a file of,
+    so the imports here load this kit's."""
+    for folder in folders:
+        for name in os.listdir(folder) if os.path.isdir(folder) else ():
+            stem, suffix = os.path.splitext(name)
+            module = sys.modules.get(stem) if suffix == ".py" else None
+            loaded = getattr(module, "__file__", None)
+            if loaded and os.path.realpath(loaded) != os.path.realpath(os.path.join(folder, name)):
+                del sys.modules[stem]
+
+
+_own_modules(*(os.path.join(os.path.dirname(os.path.realpath(__file__)), *parts) for parts in (("..", "hooks", "lib"), ("lib",))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "hooks", "lib"))
 from kit_env import kit_root  # noqa: E402
 

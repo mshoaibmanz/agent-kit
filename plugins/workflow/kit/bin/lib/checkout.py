@@ -79,6 +79,18 @@ def export(checkout: Path, commit: str, folder: Path) -> None:
             tar.extractall(folder)  # noqa: S202 (git's own archive of the user's checkout)
 
 
+def exported(path: str, checkout: Path, folder: Path) -> str:
+    """path as a preview of the export in folder reads it: a path git tracks in checkout becomes its copy
+    there (the upstream's version, or none when the upstream deleted it); any other path is unchanged."""
+    try:
+        relative = Path(path).expanduser().resolve().relative_to(checkout.resolve())
+    except ValueError:
+        return path
+    if not relative.parts or git(checkout, 'ls-files', '--error-unmatch', '--', str(relative)).returncode:
+        return path
+    return str(folder / relative)
+
+
 def fast_forward(checkout: Path, commit: str) -> None:
     """Moves the checkout's branch to commit. git refuses to overwrite an untracked file itself."""
     merged = git(checkout, 'merge', '--ff-only', '--quiet', commit)
