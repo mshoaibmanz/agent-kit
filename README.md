@@ -146,6 +146,28 @@ The bundled code-search skill refreshes eligible local clones under the configur
 
 Missing coverage goes to the user's authenticated `gh` CLI, scoped to `--repo owner/name` or the configured `CODE_SEARCH_GH_OWNER`. Zoekt is optional and only used for known repositories without GitHub access. Chrome and its optional SSO helper are unnecessary for local and GitHub searches.
 
+## Update
+
+```sh
+python3 ~/.local/share/agent-kit/bin/agent-setup update
+```
+
+`update` fast-forwards the checkout you installed from to its upstream, then reapplies every saved choice with the new commit's own installer (`agent-setup sync`), and prints the old and new kit and pack commits.
+
+- The saved preset is read again from its source: a `gh:` pack at its new head commit.
+- A `--confirm-hook-support` you gave once is kept; give it again to replace it, or `--confirm-hook-support none` to clear it.
+- `--source <checkout>` updates and installs from another checkout, which the install then records. `update` also takes `--dev`/`--no-dev` and `--collision`; it refuses any other setup flag, since rerunning setup with `--apply` changes a saved choice.
+- It refuses a checkout with uncommitted changes to tracked files, a detached HEAD, no upstream branch or commits its upstream lacks. Untracked files are left alone; git itself refuses a fast-forward that would overwrite one. It never stashes, resets or merges your work.
+- Before the checkout moves, the upstream commit's installer previews the reapply from an export of that commit. When the preview fails or blocks, nothing changes.
+- The update is not atomic: if the reapply fails after the fast-forward, the checkout stays on the new commit and `update` prints the `git reset --keep` that moves it back. A dev install already runs the new commit's linked files.
+- The reapply is an ordinary install: `rollback` with its journal undoes it.
+
+An install made before `update` existed has no such action: fast-forward its checkout once yourself, then reinstall from it.
+
+```sh
+git -C <checkout> pull --ff-only && python3 <checkout>/bin/agent-setup --source <checkout> --apply
+```
+
 ## Inspect and roll back
 
 ```sh
@@ -162,6 +184,24 @@ The original plugin names remain available through the marketplace: `guard-rails
 Use the setup command for host paths, model choices and Git shell activation. Avoid installing the same hook component through both setup and a plugin. Plugin hook packages activate their listed events when installed; review their manifests before choosing them.
 
 ## Develop
+
+### Develop on the kit
+
+```sh
+python3 bin/agent-setup --dev --hosts claude codex --apply          # from your checkout
+python3 ~/.local/share/agent-kit/bin/agent-kit sync [--dry-run]   # after editing settings, MCP, hooks, roles or rules
+```
+
+A dev install links each kit file (`bin/`, `hooks/`, `skills/`, `agents/`, `rules/` and the rest) into your checkout instead of copying it, so an edit there is live on the next tool call.
+
+- What setup derives stays a copy: a skill text with the kit path filled in, the selected MCP catalog and hook rows, roles with your overrides, your overlay, and the team pack, pinned by commit (`--preset ./my-pack` reapplies a local pack folder).
+- `bin/agent-setup`, `bin/lib/` and the hook libraries setup imports (`hooks/lib/hook-io`, `kit_env.py`, `host.py` and `session.py`) stay copies too, so `rollback` and `--no-dev` run from the install while the checkout is mid-rebase or broken. An edit to them reaches `agent-setup` and the bash hooks, which load the install's `hook-io`, after `agent-kit sync`. The Python tools and hooks follow their links and load the checkout's `kit_env.py` at once.
+- A syntax error in a linked bash hook blocks tool calls at once, in every session that runs the hook.
+- Host configs (Claude `settings.json` and `mcp.json`, Codex `config.toml` and `AGENTS.md`, Cursor's rules and hooks) are rendered as before, so a rules edit reaches Claude at once and Codex and Cursor after a sync. `agent-kit sync` runs the checkout's `agent-setup sync`: it re-renders them from the current sources with your saved choices, lists what changed, and writes nothing (no journal) when nothing did. A new file in the checkout needs it to be linked. `--dry-run` only lists, and fails when a row blocks.
+- Later runs keep dev mode until `--no-dev`, which installs copies again; rolling back the dev install's journal restores the copies too.
+- `agent-setup doctor` counts uncommitted changes in the checkout (`dev.dirty`) without calling them a problem. It reports a missing checkout, a link whose file left it, a link changed to point elsewhere, and changes waiting for `agent-kit sync`.
+
+### Test
 
 Set `TMPDIR` explicitly to an existing fixture directory in your bound task or project, outside this source checkout. The release runner refuses an unset path or a directory inside the checkout. It creates disposable homes and runs the installer, package, installed guard and GC portability suites plus hook checks. Running `hooks/tests/run-all.sh` directly requires an explicit disposable `HOME`.
 

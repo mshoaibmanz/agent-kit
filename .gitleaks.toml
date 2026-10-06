@@ -77,8 +77,8 @@ description = "A named cloud project: --project[_id]=<id>, projects/<id>, gcloud
 regex = '''(?:--project(?:_id)?=|\bprojects/|config set project )([a-z][a-z0-9-]{4,28}[a-z0-9])\b'''
 secretGroup = 1
   [[rules.allowlists]]
-  description = "the made-up jobs projects tests/run-tests.sh passes to bqro"
-  paths = ['''^tests/run-tests\.sh$''']
+  description = "the made-up jobs projects the tests pass to bqro"
+  paths = ['''^tests/run-tests\.sh$''', '''^tests/dev_install_test\.py$''']
   regexTarget = "secret"
   regexes = ['''^(?:kit-jobs|env-jobs|flag-jobs)$''']
 

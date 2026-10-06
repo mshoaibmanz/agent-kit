@@ -3,7 +3,11 @@ hook-io      hook_lib <open|closed> [lib...] (jq + libs; closed denies on PreToo
              hook_input, hook_read VAR='jq expr'... (one jq), decide <deny|ask> <reason> [context],
              deny, ask, add_context <event> <text>, stop_block <sid> <reason>; HOOK_LIB, STOP_BLOCK_DIR
              kit_env: load the per-user overlay once (below); KIT_KEYS, the declared keys
-kit_env.py   kit_env() -> dict: the same overlay for Python (comment-guard, agent_task, bqro)
+kit_env.py   kit_env() -> dict: the same overlay for Python (comment-guard, agent_task, bqro);
+             kit_root(script) -> the kit an entry point in bin/ or hooks/ runs from ($AGENT_KIT_DIR,
+             else its folder's parent, following links only until an agent-setup install, which a dev
+             install links into); kit_dir() -> the kit for library code ($AGENT_KIT_DIR, else its own)
+kit-root.sh  kit_root <script>: the same for the shell tools in bin/ (agent-run, claude-gc)
 cmd-view     cmd_view <cmd> (CMD_MASKED, CMD_BARE), cmd_mask <text>, cmd_flag <word>,
              cmd_tokens (CMD_TOKENS), cmd_invokes <ere> [tokens]
 state        path_key <path>; branch -> PR pointer: pr_open, pr_number, pr_ptr_set, pr_ptr_clear <branch>

@@ -11,6 +11,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 from host import EVENTS, cursor_output, detect_host, normalize
+from kit_env import kit_root
+
+KIT = kit_root(__file__)
 
 _failure_event = ""
 
@@ -20,8 +23,8 @@ def main() -> int:
     host, name = sys.argv[1:3]
     payload = json.load(sys.stdin)
     _failure_event = EVENTS.get(payload.get("hook_event_name"), payload.get("hook_event_name", ""))
-    target = Path(__file__).resolve().parent / name
-    if target.parent != Path(__file__).resolve().parent or not target.is_file():
+    target = KIT / "hooks" / name
+    if target.parent != KIT / "hooks" or not target.is_file():
         raise ValueError("invalid kit hook name")
     if not payload:
         sys.stdout.write("{}\n")
@@ -50,7 +53,7 @@ def main() -> int:
             CLAUDE_PROJECT_DIR=item["cwd"],
             AGENT_SESSION_ID=item["session_id"],
         )
-        env.setdefault('KIT_ENV', str(Path(__file__).resolve().parent.parent / 'local/setup-paths.env'))
+        env.setdefault('KIT_ENV', str(KIT / 'local/setup-paths.env'))
         proc = subprocess.run(
             [str(target)],
             input=json.dumps(item),
@@ -80,14 +83,13 @@ def main() -> int:
     if host == "cursor":
         out = cursor_output(out, event)
         if event == "SessionStart" and os.environ.get("AGENT_GIT_HOOKS") != "off":
-            kit = Path(__file__).resolve().parent.parent
             out["env"] = {
                 "AGENT_SESSION_ID": items[0]["session_id"],
                 "AI_AGENT": host,
                 "AGENT_HOST": host,
                 "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "core.hooksPath",
-                "GIT_CONFIG_VALUE_0": str(kit / "git-hooks"),
+                "GIT_CONFIG_VALUE_0": str(KIT / "git-hooks"),
             }
     elif (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "ask":
         # Codex currently treats an unsupported ask as a failed hook and continues the tool call.
