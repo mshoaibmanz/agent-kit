@@ -36,6 +36,15 @@ class RunnerTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 10, "the child outlived the stop")
             self.assertNotEqual(suite.result, "PASS")
 
+    def test_a_failure_tail_names_failing_cases_above_the_cut(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            log = Path(folder) / "suite.log"
+            cases = ["PASS a\n", "FAIL early case\n", "ERROR: test_x\n", "FAIL: test_y\n"]
+            log.write_text("".join(cases) + "".join(f"PASS {i}\n" for i in range(run_suites.TAIL_LINES)))
+            lines = run_suites.tail(log)
+        self.assertEqual(lines[:4], ["FAIL early case\n", "ERROR: test_x\n", "FAIL: test_y\n", "...\n"])
+        self.assertEqual(len(lines), run_suites.TAIL_LINES + 4)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

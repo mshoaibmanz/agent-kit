@@ -135,6 +135,8 @@ ROLE_NAME = re.compile(r"[a-z][a-z0-9-]*")
 # Claude imports rules/AGENTS.md as is, and this filled copy of rules/hosts/claude.md.
 CLAUDE_HOST_RULES = STATE / "claude-host-rules.md"
 TEAM_RULES = KIT / "pack/rules.md"
+# The personal overlay's rules block, after the pack's (bin/lib/overlay.py).
+OVERLAY_RULES = KIT / "local/rules.md"
 
 
 def expand(path: str) -> Path:
@@ -1036,13 +1038,23 @@ def claude_host_rules(path: Path | None = None, resume: int | None = None) -> st
 
 
 def with_team_rules(rules: str, host: str, host_root: str | None = None, resume: int | None = None) -> str:
-    """rules (filled) with the team pack's rules block appended, when a pack installed one: its kit
-    placeholders filled, any other {{...}} left as the pack wrote it."""
-    team = read_or_empty(TEAM_RULES).strip()
-    if not team:
-        return rules
-    team = fill_for_host(team, host=host, host_root=host_root, what=str(TEAM_RULES), resume=resume, strict=False)
-    return rules.rstrip("\n") + "\n\n" + team + "\n"
+    """rules (filled) with the team pack's rules block appended, when a pack installed one, then the
+    personal overlay's (local/rules.md, read as setup reads it; an invalid overlay stops the render):
+    their kit placeholders filled, any other {{...}} left as written."""
+    blocks = {TEAM_RULES: read_or_empty(TEAM_RULES)}
+    if os.path.lexists(OVERLAY_RULES):
+        from overlay import read_overlay
+
+        try:
+            blocks[OVERLAY_RULES] = read_overlay(OVERLAY_RULES.parent).rules
+        except ValueError as error:
+            raise SystemExit(f"agent-kit: {error}") from None
+    for path, block in blocks.items():
+        block = block.strip()
+        if block:
+            block = fill_for_host(block, host=host, host_root=host_root, what=str(path), resume=resume, strict=False)
+            rules = rules.rstrip("\n") + "\n\n" + block + "\n"
+    return rules
 
 
 def plan_claude_rules() -> tuple[Path, str, str, str]:

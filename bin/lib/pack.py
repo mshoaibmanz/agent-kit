@@ -88,6 +88,13 @@ def normal_mode(mode: int) -> int:
     return 0o755 if mode & 0o111 else 0o644
 
 
+def write_pack_file(path: Path, data: bytes, mode: int) -> None:
+    """A pack or overlay file written where setup stages it, with the mode setup installs it with."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(normal_mode(mode))
+
+
 def gh_api(arguments: list[str], repo: str, timeout: int, spool: IO[bytes] | None = None) -> bytes:
     """`gh api` output with the user's own login (written to spool instead when given);
     PresetUnavailable when it cannot answer."""
@@ -177,10 +184,11 @@ def folder_entries(folder: Path) -> Iterator[Entry]:
                     yield found
 
 
-def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
-    """Every file of a pack (path -> content, mode). A link that names a file in the pack reads as
-    that file; a link out of the pack or to a folder, a special file, or two paths that differ only
-    in case or Unicode normalization (one file on macOS) refuses."""
+def pack_files(entries: Iterable[Entry], label: str, allow_links: bool = True) -> PackFiles:
+    """Every file of a pack (path -> content, mode); label (`preset <spec>`) opens each refusal. A
+    link that names a file in the pack reads as that file (any link refuses without allow_links); a
+    link out of the pack or to a folder, a special file, or two paths that differ only in case or
+    Unicode normalization (one file on macOS) refuses."""
     files: PackFiles = {}
     links: dict[str, str] = {}
     folded: dict[str, str] = {}
@@ -191,19 +199,21 @@ def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
             path = '/'.join(parts[:depth])
             other = folded.setdefault(unicodedata.normalize('NFC', path).casefold(), path)
             if other != path:
-                raise ValueError(f'preset {spec}: {other} and {path} differ only in case or Unicode form')
+                raise ValueError(f'{label}: {other} and {path} differ only in case or Unicode form')
         if kind == 'other':
-            raise ValueError(f'preset {spec}: {relative} is not a regular file or link')
+            raise ValueError(f'{label}: {relative} is not a regular file or link')
+        if kind == 'link' and not allow_links:
+            raise ValueError(f'{label}: {relative} is a link; it holds files only')
         if kind == 'link':
             link = data.decode(errors='replace')
             target = PurePosixPath(os.path.normpath(os.path.join(os.path.dirname(relative), link))).as_posix()
             if link.startswith('/') or target == '..' or target.startswith('../'):
-                raise ValueError(f'preset {spec}: symlink {relative} points outside the pack')
+                raise ValueError(f'{label}: symlink {relative} points outside the pack')
             links[relative] = target
             continue
         total += len(data)
         if total > PACK_MAX_BYTES:
-            raise ValueError(f'preset {spec}: the pack is over {PACK_MAX_BYTES >> 20} MB')
+            raise ValueError(f'{label}: the pack is over {PACK_MAX_BYTES >> 20} MB')
         files[relative] = (data, mode)
     for relative, target in links.items():
         seen = {relative}
@@ -211,7 +221,7 @@ def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
             seen.add(target)
             target = links[target]
         if target not in files:
-            raise ValueError(f'preset {spec}: symlink {relative} must name a file in the pack')
+            raise ValueError(f'{label}: symlink {relative} must name a file in the pack')
         files[relative] = files[target]
     return files
 
@@ -238,46 +248,53 @@ class Pack:
     def skill_files(self, name: str) -> PackFiles:
         return {path: value for path, value in self.files.items() if path.startswith(f'{PACK_SKILLS}/{name}/')}
 
+    def digest(self, prefix: bytes = b'') -> str:
+        """sha256 over prefix (a preset's text) and every file: its path, executable bit and content."""
+        total = hashlib.sha256(prefix)
+        for relative, (data, mode) in sorted(self.files.items()):
+            total.update(f'\0{relative}\0{int(bool(mode & 0o111))}\0{len(data)}\0'.encode() + data)
+        return total.hexdigest()
 
-def utf8_text(data: bytes, relative: str, spec: str) -> str:
+
+def utf8_text(data: bytes, relative: str, label: str) -> str:
     """data of a pack text file (Markdown, the preset), which setup reads as UTF-8."""
     try:
         return data.decode()
     except UnicodeDecodeError:
-        raise ValueError(f'preset {spec}: {relative} is not UTF-8 text') from None
+        raise ValueError(f'{label}: {relative} is not UTF-8 text') from None
 
 
-def build_pack(files: PackFiles, spec: str, commit: str | None) -> Pack | None:
-    """The pack in files (skills/ and rules.md), None when it has neither. Refused when a file looks
-    like a credential (by name, a token format or a private key), a skill is malformed, or rules.md is
-    over PACK_RULES_WORDS words."""
+def build_pack(files: PackFiles, label: str, commit: str | None, words: int = PACK_RULES_WORDS) -> Pack | None:
+    """The pack in files (skills/ and rules.md), None when it has neither; label as pack_files takes
+    it. Refused when a file looks like a credential (by name, a token format or a private key), a
+    skill is malformed, or rules.md is over words words."""
     if not files:
         return None
     for relative, (data, _) in sorted(files.items()):
         name = relative.rsplit('/', 1)[-1]
         if name.endswith('.md'):
-            utf8_text(data, relative, spec)
+            utf8_text(data, relative, label)
         if SECRET_FILE.fullmatch(name) and not SECRET_FILE_EXAMPLE.fullmatch(name):
-            raise ValueError(f'preset {spec}: {relative} looks like a credential file; a pack holds no secrets')
+            raise ValueError(f'{label}: {relative} looks like a credential file; a pack holds no secrets')
         text = data.decode('latin-1')
         if holds_token(text) or PRIVATE_KEY.search(text):
-            raise ValueError(f'preset {spec}: {relative} holds a token or private key; a pack holds no secrets')
+            raise ValueError(f'{label}: {relative} holds a token or private key; a pack holds no secrets')
         if relative == PACK_SKILLS or (relative.startswith(PACK_SKILLS + '/') and relative.count('/') == 1):
-            raise ValueError(f'preset {spec}: {relative}: a pack skill is a folder skills/<name>/ with a SKILL.md')
+            raise ValueError(f'{label}: {relative}: a pack skill is a folder skills/<name>/ with a SKILL.md')
     pack = Pack(files, commit)
     if pack.has_mcp and not all(f'{PACK_MCP}/{name}' in files for name in ('pyproject.toml', 'uv.lock')):
-        raise ValueError(f'preset {spec}: {PACK_MCP}/ is a uv project: it needs pyproject.toml and uv.lock')
+        raise ValueError(f'{label}: {PACK_MCP}/ is a uv project: it needs pyproject.toml and uv.lock')
     for name in pack.skills:
         skill = files.get(f'{PACK_SKILLS}/{name}/SKILL.md')
         if not PACK_SKILL_NAME.fullmatch(name) or skill is None:
-            raise ValueError(f'preset {spec}: skills/{name} needs a lowercase name and a SKILL.md')
+            raise ValueError(f'{label}: skills/{name} needs a lowercase name and a SKILL.md')
         try:
             skill_hosts(Path(f'{PACK_SKILLS}/{name}/SKILL.md'), skill[0].decode())
         except ValueError as error:
-            raise ValueError(f'preset {spec}: {error}') from None
-    words = len(pack.rules.split())
-    if words > PACK_RULES_WORDS:
-        raise ValueError(f'preset {spec}: rules.md has {words} words, over the cap of {PACK_RULES_WORDS}; '
+            raise ValueError(f'{label}: {error}') from None
+    count = len(pack.rules.split())
+    if count > words:
+        raise ValueError(f'{label}: rules.md has {count} words, over the cap of {words}; '
                          'move the detail into a pack skill')
     return pack
 
