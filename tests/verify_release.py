@@ -43,9 +43,13 @@ with tempfile.TemporaryDirectory(prefix='verify-release-', dir=os.environ.get('T
     market = json.loads((root / '.claude-plugin/marketplace.json').read_text())
     if sorted(row['name'] for row in market['plugins']) != sorted(path.name for path in plugins.iterdir()):
         failures.append('marketplace plugin matrix')
+    sys.path.insert(0, str(root / 'scripts'))
+    from build_plugins import plugin_source
+    # Each entry is what --marketplace writes, and that is plugins/<name> on the branch publish_dist.sh writes.
     for row in market['plugins']:
-        if row.get('source') != {'source': 'git-subdir', 'url': 'https://github.com/mshoaibmanz/agent-kit.git',
-                                 'path': f'plugins/{row["name"]}', 'ref': 'dist'}:
+        source = plugin_source(row['name'])
+        if row.get('source') != source or (source['source'], source['path'], source['ref']) != (
+                'git-subdir', f'plugins/{row["name"]}', 'dist'):
             failures.append(f'marketplace source for {row["name"]} is not plugins/{row["name"]} on dist')
     # dist publishes only a commit ci has passed on main: never on a bare push or by hand.
     dist_flow = (root / '.github/workflows/dist.yml').read_text()

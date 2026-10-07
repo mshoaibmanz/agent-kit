@@ -55,9 +55,11 @@ ptc_default() { # git's default for push-to-checkout: refuse a dirty worktree, e
 }
 [ -n "$own" ] || [ "$name" != push-to-checkout ] || own=ptc_default
 
+reads_stdin() { case $name in pre-push|post-rewrite|pre-receive|post-receive) return 0 ;; esac; return 1; }
+
 if [ -z "$agent" ] || [ -z "$own" ]; then
   if [ -z "$agent$own" ]; then
-    case $name in pre-push|post-rewrite|pre-receive|post-receive|reference-transaction) cat >/dev/null ;; esac
+    ! reads_stdin || cat >/dev/null
     exit 0
   fi
   [ "$own" != ptc_default ] || { ptc_default "$@"; exit; }
@@ -65,12 +67,11 @@ if [ -z "$agent" ] || [ -z "$own" ]; then
 fi
 
 tmp=''
-case $name in
-  pre-push|post-rewrite|pre-receive|post-receive|reference-transaction)
-    tmp=$(mktemp "${TMPDIR:-/tmp}/agent-git-hook.XXXXXX") || exit 1
-    trap 'rm -f "$tmp"' EXIT
-    cat > "$tmp" ;;
-esac
+if reads_stdin; then
+  tmp=$(mktemp "${TMPDIR:-/tmp}/agent-git-hook.XXXXXX") || exit 1
+  trap 'rm -f "$tmp"' EXIT
+  cat > "$tmp"
+fi
 feed() { if [ -n "$tmp" ]; then "$@" < "$tmp"; else "$@"; fi; }
 feed "$agent" "$@" || exit $?
 feed "$own" "$@"

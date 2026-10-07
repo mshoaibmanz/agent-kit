@@ -1,7 +1,7 @@
 """Run the release suites, each in its own HOME, TMPDIR and work root; called by run-tests.sh.
 
-Suites named with --first run one at a time before the rest, and a failure there stops the run.
-The rest run concurrently on --jobs workers, longest (by the last run's timings) first.
+The FIRST suites run one at a time before the rest, and a failure there stops the run. The rest
+(SUITES) run concurrently on --jobs workers, longest (by the last run's timings) first.
 `hooks/tests` expands into one suite per hook-test file, the same set run-all.sh runs.
 """
 
@@ -23,6 +23,23 @@ import time
 import suite_lock
 
 ROOT = Path(__file__).resolve().parents[1]
+# Run first, one at a time, and stop on a failure: a broken manifest or package build fails fast.
+FIRST = ("tests/verify_release.py",)
+# Run concurrently. hooks/tests is one suite per hook-test file in it.
+SUITES = (
+    "tests/setup_test.py",
+    "tests/setup_review_test.py",
+    "tests/installer_ux_test.py",
+    "tests/team_pack_test.py",
+    "tests/dev_install_test.py",
+    "tests/dashboard_test.py",
+    "tests/plugin_portability_test.py",
+    "tests/installed_guard_test.py",
+    "tests/gc_portability_test.py",
+    "tests/leak_check_test.py",
+    "tests/run_suites_test.py",
+    "hooks/tests",
+)
 HOOK_SUITES = ("hooktest.sh", "review-gates.sh", "*.test.sh", "*.test.py")
 # Session and host variables of the agent that started the run; CI has none of them.
 DROPPED = (
@@ -46,7 +63,7 @@ TAIL_LINES = 60
 class Suite:
     name: str
     command: list[str]
-    slot: int = 0
+    index: int = 0  # its place in the run: the fixture folder <run>/<index>/
     seconds: float = 0.0
     result: str = "not run"
 
@@ -116,7 +133,7 @@ class Runner:
     def run(self, suite: Suite) -> Suite:
         if self.stopping:
             return suite
-        base = self.run_dir / str(suite.slot)
+        base = self.run_dir / str(suite.index)
         log = self.log(suite)
         started = time.monotonic()
         with open(log, "wb") as output:
@@ -175,8 +192,6 @@ def main() -> int:
             "waits while another run holds it."
         ),
     )
-    parser.add_argument("--first", action="append", default=[], help=argparse.SUPPRESS)
-    parser.add_argument("--suite", action="append", default=[], help=argparse.SUPPRESS)
     parser.add_argument(
         "--jobs",
         "-j",
@@ -201,18 +216,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     patterns = [part for value in args.only for part in value.split(",") if part]
-    first = [
-        suite
-        for entry in args.first
-        for suite in expand(entry)
-        if selected(suite, patterns)
-    ]
-    rest = [
-        suite
-        for entry in args.suite
-        for suite in expand(entry)
-        if selected(suite, patterns)
-    ]
+    first = [suite for entry in FIRST for suite in expand(entry) if selected(suite, patterns)]
+    rest = [suite for entry in SUITES for suite in expand(entry) if selected(suite, patterns)]
     if args.list:
         sys.stdout.write("".join(f"{suite.name}\n" for suite in first + rest))
         return 0
@@ -222,7 +227,8 @@ def main() -> int:
     if args.jobs < 1:
         sys.stderr.write("--jobs must be at least 1\n")
         return 2
-    held = suite_lock.acquire(f"{ROOT} run-tests.sh")
+    # The handle holds the lock until this process exits: keep the reference, never close it early.
+    _lock = suite_lock.acquire(f"{ROOT} run-tests.sh")
     tmp = Path(os.environ["TMPDIR"])
     (tmp / "runs").mkdir(parents=True, exist_ok=True)
     run_dir = Path(
@@ -230,8 +236,8 @@ def main() -> int:
     )
     (run_dir / "logs").mkdir()
     durations_file = tmp / "runs" / "durations.json"
-    for slot, suite in enumerate(first + rest):
-        suite.slot = slot
+    for index, suite in enumerate(first + rest):
+        suite.index = index
     try:
         durations: dict[str, float] = json.loads(durations_file.read_text())
     except (OSError, ValueError):
@@ -285,8 +291,6 @@ def main() -> int:
         f"wall {wall:.1f}s, {passed} passed, {len(failed)} failed, "
         f"{len(suites) - passed - len(failed)} not run; logs in {run_dir / 'logs'}\n"
     )
-    if held:
-        held.close()
     return 0 if passed == len(suites) else 1
 
 

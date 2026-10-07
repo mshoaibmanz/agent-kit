@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Binds a session to a project item by deterministic rules and keeps project indexes current.
 
-  UserPromptSubmit           unbound: run agent_task.decide (worktree, branch, new <TICKET>-*
+  UserPromptSubmit           unbound: run binding.decide (worktree, branch, new <TICKET>-*
                              worktree, pasted work-root path, prompt ticket of one existing item,
                              ticket only one project lists) and bind on its answer, announcing
                              `bound: <project>/<item> (rule: …)`. Nothing certain: offer this repo's
@@ -30,8 +30,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
 try:
     import agent_task as at
+    import binding as bd
 except ImportError as e:
-    print(json.dumps({"systemMessage": f"project-bind is off: hooks/lib/agent_task.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
+    print(json.dumps({"systemMessage": f"project-bind is off: hooks/lib/agent_task.py or binding.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
     sys.exit(0)
 
 
@@ -39,9 +40,9 @@ def context(event: str, text: str) -> None:
     print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
 
 
-def offer_once(sid: str, d: "at.Decision") -> str:
+def offer_once(sid: str, d: "bd.Decision") -> str:
     """The fallback offer, unless this session was already shown the same one."""
-    text = at.offer_text(d, sid)
+    text = bd.offer_text(d, sid)
     if not text:
         return ""
     mark = at.bind_dir() / f"{sid[:8]}.offered"
@@ -51,15 +52,15 @@ def offer_once(sid: str, d: "at.Decision") -> str:
             return ""
     except OSError:
         pass
-    at._atomic_write(mark, key)
+    at.atomic_write(mark, key)
     return text
 
 
-def rebind(sid: str, d: "at.Decision", pl: "at.Place", was: "at.Binding | None", event: str, note: str = "") -> None:
-    b = at.bind(sid, d.target, here=pl, rule=d.rule)
+def rebind(sid: str, d: "bd.Decision", pl: "bd.Place", was: "at.Binding | None", event: str, note: str = "") -> None:
+    b = bd.bind(sid, d.target, here=pl, rule=d.rule)
     if was and was.key == b.key:
         return
-    context(event, at.slice_text(b, at.announce(b, d.rule, was) + note))
+    context(event, at.slice_text(b, bd.announce(b, d.rule, was) + note))
 
 
 def on_prompt(p: dict) -> None:
@@ -67,22 +68,22 @@ def on_prompt(p: dict) -> None:
     prompt = p.get("prompt", "") or ""
     if not sid or prompt.lstrip().startswith("/bind"):
         return
-    pl = at.place(cwd)
+    pl = bd.place(cwd)
     data = at.binding_file(sid)
     cur = at.bound(sid)
     if cur and not data.get(at.INHERITED):
         if pl.top == data.get("wt", ""):
             return
         at.set_binding_wt(sid, pl.top)
-        d = at.decide("", pl, cheap_only=True)
-        if at.may_move(d, cur):
+        d = bd.decide("", pl, cheap_only=True)
+        if bd.may_move(d, cur):
             rebind(sid, d, pl, cur, "UserPromptSubmit")
         return
-    d = at.decide(prompt, pl)
+    d = bd.decide(prompt, pl)
     if cur:
         # Inherited across /clear: a certain rule moves it; otherwise it stays (and stays inherited
         # until a prompt names a ticket).
-        if at.may_move(d, cur):
+        if bd.may_move(d, cur):
             rebind(sid, d, pl, cur, "UserPromptSubmit", " (the old binding was kept from before /clear)")
         elif d or at.tickets_in(prompt, known=True):
             at.keep_binding(sid)
@@ -103,13 +104,13 @@ def on_enter_worktree(p: dict) -> None:
     resp = p.get("tool_response")
     paths = [s for s in _strings(resp) if "/.claude/worktrees/" in s and os.path.isdir(s)] if resp else []
     cwd = paths[0] if paths else (p.get("cwd") or os.getcwd())
-    pl = at.place(cwd)
+    pl = bd.place(cwd)
     if not pl.linked:
         return
     cur = at.bound(sid)
     at.set_binding_wt(sid, pl.top)
-    d = at.decide("", pl, cheap_only=True)
-    if at.may_move(d, cur):
+    d = bd.decide("", pl, cheap_only=True)
+    if bd.may_move(d, cur):
         rebind(sid, d, pl, cur, "PostToolUse")
 
 
@@ -146,7 +147,7 @@ def on_pre_write(p: dict) -> None:
     target = durable_target(path)
     if not target:
         return
-    at.bind(sid, target, here=at.place(p.get("cwd") or os.getcwd()), rule="write")
+    bd.bind(sid, target, here=bd.place(p.get("cwd") or os.getcwd()), rule="write")
     (at.bind_dir() / f"{sid[:8]}.fresh").touch()
 
 
@@ -163,7 +164,7 @@ def on_post_write(p: dict) -> None:
         fresh.unlink()
         b = at.bound(sid)
         if b:
-            context("PostToolUse", at.slice_text(b, at.announce(b, "write") + " Bound by this write."))
+            context("PostToolUse", at.slice_text(b, bd.announce(b, "write") + " Bound by this write."))
 
 
 def main() -> None:

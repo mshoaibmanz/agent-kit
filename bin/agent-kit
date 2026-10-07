@@ -73,6 +73,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -103,8 +104,8 @@ KIT = kit_root(__file__)
 LIB = Path(__file__).resolve().parent / "lib"
 HOST_DIR = KIT / "hosts/claude"
 BASE = HOST_DIR / "settings.base.json"
-# The user's own settings layer (permissions, env, statusLine and the like), merged over BASE.
-USER_SETTINGS = KIT / "local/settings.json"
+# Settings-layer keys agent-setup applies as their own kinds (environment, plugins, marketplaces).
+LAYER_OBJECTS = ("env", "enabledPlugins", "extraKnownMarketplaces")
 REGISTRY = KIT / "hooks/registry.json"
 SERVERS = KIT / "mcp/servers.json"
 STATE = KIT / "state/rendered"
@@ -572,32 +573,39 @@ def merged(base: Any, over: Any) -> Any:
     return copy.deepcopy(over)
 
 
-def base_settings() -> tuple[dict[str, Any], str]:
-    """settings.base.json with the user's own local/settings.json merged over it, and the files read."""
-    base = json.loads(BASE.read_text())
-    if not USER_SETTINGS.is_file():
-        return base, str(BASE)
-    user = json.loads(USER_SETTINGS.read_text())
-    if not isinstance(user, dict):
-        raise SystemExit(f"agent-kit: {USER_SETTINGS} must hold a JSON object")
-    return merged(base, user), f"{BASE} or {USER_SETTINGS}"
-
-
-def source_settings(host: dict[str, Any], components: set[str] | None = None) -> dict[str, Any]:
-    selected = components or {"hooks", "roles"}
-    base, files = base_settings() if "hooks" in selected else ({}, str(BASE))
-    clash = sorted(set(base) & set(host["uiOwned"]))
+def base_settings(root: Path = KIT, *, ui_owned: Iterable[str] = (), roles: bool = False) -> dict[str, Any]:
+    """The settings layer render and agent-setup apply: settings.base.json with the user's own
+    <root>/local/settings.json merged over it. Refused: a UI-owned key, a hooks key, the [roles.main]
+    keys when roles render, and a non-object value under a key setup applies on its own."""
+    user_settings = root / "local/settings.json"
+    base = json.loads(BASE.read_text()) if BASE.is_file() else {}
+    files = str(BASE)
+    if user_settings.is_file():
+        user = json.loads(user_settings.read_text())
+        if not isinstance(user, dict) or not isinstance(base, dict):
+            raise SystemExit(f"agent-kit: {user_settings} and {BASE} must each hold a JSON object")
+        base, files = merged(base, user), f"{BASE} or {user_settings}"
+    clash = sorted(set(base) & set(ui_owned))
     if clash:
         raise SystemExit(
             f"agent-kit: {files} sets UI-owned keys {clash}; remove them or drop them from uiOwned"
         )
     if "hooks" in base:
         raise SystemExit(f"agent-kit: {files} has a hooks key; hooks come from {REGISTRY}")
+    clash = sorted(set(base) & set(ROLE_SETTINGS)) if roles else []
+    if clash:
+        raise SystemExit(f"agent-kit: {files} sets {clash}; they come from {ROLES} [roles.main]")
+    bad = [key for key in LAYER_OBJECTS if not isinstance(base.get(key, {}), dict)]
+    if bad:
+        raise SystemExit(f"agent-kit: {files}: {', '.join(bad)} must each be an object")
+    return base
+
+
+def source_settings(host: dict[str, Any], components: set[str] | None = None) -> dict[str, Any]:
+    selected = components or {"hooks", "roles"}
     roles = load_roles() if "roles" in selected else None
+    base = base_settings(ui_owned=host["uiOwned"], roles=roles is not None) if "hooks" in selected else {}
     if roles is not None:
-        clash = sorted(set(base) & set(ROLE_SETTINGS))
-        if clash:
-            raise SystemExit(f"agent-kit: {files} sets {clash}; they come from {ROLES} [roles.main]")
         for key, value in role_settings(roles, "claude").items():
             if key not in host["uiOwned"]:
                 base[key] = value
@@ -858,19 +866,16 @@ def mcp_catalog() -> dict[str, Any]:
         return {"mcpServers": {}}
     catalog = json.loads(SERVERS.read_text())
     servers = catalog.get("mcpServers")
-    # A kit copied without bin/lib (a bare agent-kit) renders a plain catalog as is.
+    sys.path.insert(0, str(LIB))
     if isinstance(servers, dict) and (
         "{{" in json.dumps(servers) or any(isinstance(s, dict) and "credentials" in s for s in servers.values())
     ):
-        sys.path.insert(0, str(LIB))
         from hosts import fill_servers
 
         catalog["mcpServers"] = servers = fill_servers(servers, str(KIT))
     # One server per Sentry instance (bin/lib/sentry.py), each beyond the catalog's own only once
     # it has a token.
-    if isinstance(servers, dict) and (LIB / "sentry.py").is_file():
-        if str(LIB) not in sys.path:
-            sys.path.insert(0, str(LIB))
+    if isinstance(servers, dict):
         from sentry import expand_servers
 
         try:

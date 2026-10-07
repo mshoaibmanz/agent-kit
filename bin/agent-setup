@@ -55,10 +55,6 @@ TEXT_BEGIN = '<!-- BEGIN agent-kit setup -->'
 TEXT_END = '<!-- END agent-kit setup -->'
 TOML_BEGIN = '# BEGIN agent-kit setup'
 TOML_END = '# END agent-kit setup'
-# Role names before 2026-10-05, as a saved install's role_model / role_effort may still hold them.
-ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'second-opinion',
-                'reviewer': 'task-reviewer', 'thermo-bugs': 'bug-reviewer',
-                'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
 from blocking import BLOCKING  # noqa: E402
 import checkout  # noqa: E402
@@ -131,23 +127,6 @@ def with_field(document: dict[str, Any], field: str, value: dict[str, Any], keep
     else:
         document.pop(field, None)
     return document
-
-
-def settings_layer(api: Any, root: Path) -> dict[str, Any]:
-    """settings.base.json with the user's own <root>/local/settings.json merged over it, as `agent-kit
-    render` builds it (bin/agent-kit base_settings)."""
-    base = json.loads(api.BASE.read_text()) if api.BASE.is_file() else {}
-    user_path = root / 'local/settings.json'
-    user = load_json(user_path, {})
-    if not isinstance(user, dict) or not isinstance(base, dict):
-        raise ValueError(f'{user_path} and settings.base.json must each hold a JSON object')
-    layer = api.merged(base, user)
-    if 'hooks' in layer:
-        raise ValueError(f'{user_path} or settings.base.json has a hooks key; hooks come from hooks/registry.json')
-    for key in LAYER_ELSEWHERE:
-        if not isinstance(layer.get(key, {}), dict):
-            raise ValueError(f'settings layer: {key} must be an object')
-    return layer
 
 
 def safe_catalog(path: Path, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -254,6 +233,16 @@ def kit_api(source: Path) -> Any:
     with scoped_environ(AGENT_KIT_DIR=str(source)):
         loader.exec_module(module)
     return module
+
+
+def retired_roles() -> dict[str, str]:
+    """old name -> role, from roles.toml `replaces`. A kit agent-kit cannot load gives none: doctor
+    reports that kit rather than failing here."""
+    try:
+        roles = kit_api(SOURCE).load_roles()
+    except (OSError, SyntaxError, SystemExit):
+        return {}
+    return {old: role.name for role in roles.roles.values() for old in role.replaces} if roles else {}
 
 
 def host_target(args: argparse.Namespace, host: str, home: Path) -> Path:
@@ -378,7 +367,8 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
     if host == 'claude':
         api = kit_api(view)
         # The settings layer comes with the hooks component, as `agent-kit render` applies it.
-        layer = settings_layer(api, root) if 'hooks' in components else {}
+        layer = api.base_settings(root, ui_owned=api.host_paths()['uiOwned'],
+                                  roles='roles' in components) if 'hooks' in components else {}
         if 'rules' in components:
             # rules/AGENTS.md is imported as is; the host rules through their filled copy.
             host_rules = root / api.CLAUDE_HOST_RULES.relative_to(view)
@@ -1688,12 +1678,14 @@ def resolve(args: argparse.Namespace, root: Path, state: dict[str, Any], saved: 
         args.project_roots['cursor'] = saved['project_root']
     if args.project_root is None and 'cursor' in args.hosts:
         args.project_root = args.project_roots.get('cursor')
-    # The user's own role overrides; the preset's sit under them (installation_view).
+    # The user's own role overrides; the preset's sit under them (installation_view). A saved install
+    # may hold a role's retired name (roles.toml `replaces`).
+    renamed = retired_roles() if any(saved.get(key) or getattr(args, key) for key in ('role_model', 'role_effort')) else {}
     for key in ('role_model', 'role_effort'):
         values = {}
         for value in [*saved.get(key, []), *getattr(args, key)]:
             name, separator, setting = value.partition('=')
-            name = ROLE_ALIASES.get(name, name)
+            name = renamed.get(name, name)
             values[name] = name + separator + setting
         setattr(args, key, [value for value in values.values() if value.partition('=')[2]])
     if args.interactive and args.action == 'setup':

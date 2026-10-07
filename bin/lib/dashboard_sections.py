@@ -837,7 +837,7 @@ def work_section(setup: Setup, sec: Section) -> None:
                 (s for s in [mtime(item), *(mtime(c) for c in item.iterdir())] if s), default=None
             )
             items.append(
-                (item.name, agent_task._item_status(item), touched, bound[f"{key}/{item.name}"])
+                (item.name, agent_task.item_status(item), touched, bound[f"{key}/{item.name}"])
             )
         open_items = [i for i in items if i[1] not in agent_task.DONE_STATUSES]
         open_total += len(open_items)

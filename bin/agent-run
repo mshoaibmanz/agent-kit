@@ -76,6 +76,7 @@ done
 [ -n "$role" ] && [ -n "$wt" ] || usage
 
 . "$KIT/hooks/lib/review-state" || die "cannot load $KIT/hooks/lib/review-state" 1
+rv_roles
 role=$(rv_role_name "$role")
 rv_role "$role" || die "no role $role in roles.toml (agent-kit roles lists them)" 2
 provider=$RV_R_PROVIDER prefix=$RV_R_PREFIX fallback=$RV_R_FALLBACK

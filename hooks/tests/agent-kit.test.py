@@ -60,9 +60,12 @@ def check(label: str, cond: bool, detail: str = "") -> None:
 
 
 def copy_agent_kit(kit: Path) -> None:
-    """bin/agent-kit into kit with the hook libraries it loads (kit_env.py reads hook-io's key list)."""
-    (kit / "bin").mkdir(parents=True)
+    """bin/agent-kit into kit with the libraries it always loads (kit_env.py reads hook-io's key
+    list; the MCP render expands Sentry instances)."""
+    (kit / "bin/lib").mkdir(parents=True)
     shutil.copy2(AGENT_KIT, kit / "bin/agent-kit")
+    for name in ("sentry.py", "secret_store.py"):
+        shutil.copy2(KIT_SRC / "bin/lib" / name, kit / "bin/lib" / name)
     (kit / "hooks/lib").mkdir(parents=True, exist_ok=True)
     for name in ("kit_env.py", "hook-io"):
         shutil.copy2(KIT_SRC / "hooks/lib" / name, kit / "hooks/lib" / name)

@@ -10,7 +10,7 @@ HANDOFF.md, briefs/, out/ (evidence for its PR) and tmp/ (fixtures, clones, test
 indexed). Reusable scripts and knowledge live at the project level. <work root>/.index.json is a
 cache derived from every task.json, rebuilt on each agent-task write; never edit it.
 
-Binding rules (agent_task.decide), certain ones first: explicit bind; the session's own binding;
+Binding rules (binding.decide), certain ones first: explicit bind; the session's own binding;
 a worktree the index maps; a ticket branch mapping to one item; a new <TICKET>-* worktree (creates
 the item); a pasted work-root path of one item; a prompt ticket mapping to one existing item; a
 ticket only one project lists (the project alone). Otherwise the session stays unbound and is
@@ -46,7 +46,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -54,10 +53,13 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "hooks", "lib"))
 import agent_task as at  # noqa: E402
+import binding as bd  # noqa: E402
+import handoff  # noqa: E402
+import retro  # noqa: E402
 from kit_env import kit_root  # noqa: E402
 
+# bin/lib: tmp_sweep, which agent_task's harvest imports on use.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
-from tmp_sweep import generated  # noqa: E402
 
 os.environ["AGENT_KIT_DIR"] = str(kit_root(__file__))
 
@@ -77,6 +79,16 @@ def need_sid(sid: str) -> str:
     return sid
 
 
+def place_of(a: argparse.Namespace, cwd: str) -> bd.Place:
+    """The checkout at cwd (none for ''), with --branch and --repo overriding what git says."""
+    pl = bd.place(cwd) if cwd else bd.Place()
+    if a.branch:
+        pl.branch = a.branch
+    if a.repo:
+        pl.repo = a.repo
+    return pl
+
+
 def cmd_bind(a: argparse.Namespace) -> int:
     sid = need_sid(a.session)
     if not a.args:
@@ -85,30 +97,21 @@ def cmd_bind(a: argparse.Namespace) -> int:
     m = re.match(r"^([A-Za-z][A-Za-z0-9]*-[0-9]+)-(.+)$", target)
     if m and "/" not in target and not at.find_legacy(target):
         target, desc = m.group(1).upper(), at.slug(f"{m.group(2)} {desc}")
-    here = at.place(a.cwd or os.getcwd())
-    if a.branch:
-        here.branch = a.branch
     was = at.bound(sid)
     try:
-        b = at.bind(sid, target, desc=desc, here=here, repo=a.repo, rule="explicit", pick_item=True)
-    except at.AmbiguousTicket as e:
+        b = bd.bind(sid, target, desc=desc, here=place_of(a, a.cwd or os.getcwd()), rule="explicit", pick_item=True)
+    except bd.AmbiguousTicket as e:
         die(f"not bound: {e}")
     print(f"Bound session {sid[:8]} to {at.where_label(b)} ({b.folder}). Tab: {b.label}.")
-    if not b.item and not b.project.legacy:
-        live = [d.name for d in b.project.items() if at._item_status(d) not in at.DONE_STATUSES]
-        if live:
-            print(f"Bound to the project only: it has {len(live)} open items. Bind one with /bind {b.project.name}/<item>: {', '.join(live[:12])}.")
-    print(at.slice_text(b, at.announce(b, "explicit", was)))
+    live = b.open_items
+    if live:
+        print(f"Bound to the project only: it has {len(live)} open items. Bind one with /bind {b.project.name}/<item>: {', '.join(live[:12])}.")
+    print(at.slice_text(b, bd.announce(b, "explicit", was)))
     return 0
 
 
 def cmd_resolve(a: argparse.Namespace) -> int:
-    pl = at.place(a.cwd) if a.cwd else at.Place()
-    if a.branch:
-        pl.branch = a.branch
-    if a.repo:
-        pl.repo = a.repo
-    d = at.decide(" ".join(a.args), pl)
+    d = bd.decide(" ".join(a.args), place_of(a, a.cwd))
     print(json.dumps({"rule": d.rule, "target": d.target, "why": d.why, "candidates": d.candidates}))
     return 0
 
@@ -134,7 +137,7 @@ def cmd_ls(a: argparse.Namespace) -> int:
         print(line)
         rows = sorted(((at.touched(d), d) for d in p.items()), key=lambda x: -x[0])
         for t, d in rows:
-            print(f"  {p.name}/{d.name}  {at._item_status(d)}  {at.dt.date.fromtimestamp(t).isoformat()}")
+            print(f"  {p.name}/{d.name}  {at.item_status(d)}  {at.dt.date.fromtimestamp(t).isoformat()}")
     return 0
 
 
@@ -193,107 +196,19 @@ lines, each tagged mistake, fact, doc or tooling) for `agent-task retro`.
 ## Project context (injected by agent-task brief)
 {at.slice_text(b)}
 """
-    at._atomic_write(f, text)
+    at.atomic_write(f, text)
     if not p.legacy:
         at.index(p.name)
     print(f)
     return 0
 
 
-HARVEST_SKIP = {"worktrees", ".git", "node_modules", "sessions", "__pycache__", ".venv"}
-
-
-def item_files(d: Path) -> list[Path]:
-    """The item's own files: checkouts, dependencies and per-session folders are pruned unread."""
-    out = []
-    for top, dirs, names in os.walk(d):
-        # Also the bulk the tmp sweep calls generated (scratch homes, checkouts), as close's promotion does.
-        dirs[:] = [x for x in dirs if x not in HARVEST_SKIP and not generated(Path(top) / x)]
-        out += [Path(top) / n for n in names]
-    return sorted(out)
-
-
 def cmd_harvest(a: argparse.Namespace) -> int:
     if not a.args:
         die("usage: agent-task harvest <project>/<item>")
     p, item = split_target(a.args[0])
-    b = at.Binding(p, item)
-    d = b.folder
-    files = item_files(d)
-    # A script whose name the project's scripts/ already has needs no move (close's promotion rule).
-    have = {f.name for f in (p.path / "scripts").iterdir()} if not p.legacy and (p.path / "scripts").is_dir() else set()
-    scripts = [f for f in files if f.suffix in (".py", ".sh", ".sql") and f.name not in have]
-    if a.status_to == "closed":
-        # close has already offered (or, under --no-promote, been told to skip) the tmp/ scripts.
-        scripts = [f for f in scripts if d / "tmp" not in f.parents]
-    docs = [f for f in files if f.suffix == ".md" and f.name != "HANDOFF.md"]
-    print(f"HARVEST {at.where_label(b)} ({d}). Answer three questions, act on each, then append the summary.")
-    print("1. Domain docs: which facts are true beyond this ticket, about business meaning, flows or decisions, and verified in code? Add them through the docs-rollup worktree (session-review skill, \"Domain-doc learnings\"), then record each in knowledge/ as a one-line `status: in-docs -> <doc link>` entry.")
-    kroot = p.path / "knowledge" if not p.legacy else d
-    print(f"2. Project knowledge: which other findings, decisions, code-map notes and query recipes go to {kroot}/{{findings,decisions,code-map,queries}}.md, each with a source, a last-verified date and a status (project-only or pending-docs)?")
-    print(f"3. Scripts: which of these move to {p.path / 'scripts'}/ with a docstring (git mv is not needed; mv, then fix callers):")
-    for f in scripts[:30]:
-        print(f"   - {f.relative_to(d)}: {at._desc(f) or '(no docstring)'}")
-    if not scripts:
-        print("   (no scripts in the item)")
-    if docs:
-        print("   Item docs to mine for 1 and 2: " + ", ".join(str(f.relative_to(d)) for f in docs[:15]))
-    proposed = at.durable_lines(d / "HANDOFF.md")
-    if proposed:
-        print(f"Proposed for {kroot}/ (lines from HANDOFF.md that read as durable; keep, reword or drop each):")
-        for x in proposed:
-            print(f"   - {x}")
-    print(f"Then append to {d / 'HANDOFF.md'} (never overwrite it): `## Summary (harvested {at.today()})` with the PR, what shipped, and where each harvested fact and script went.")
-    print("Last, record at most 3 learnings: agent-task retro \"<mistake|fact|doc|tooling>: <text>\".")
-    if not p.legacy and item:
-        at.update_item(p, item, status=a.status_to or "harvested", harvested=at.today(), **({"pr": a.pr} if a.pr else {}), **({"closed": at.today()} if a.status_to == "closed" else {}))
-        at.index(p.name)
+    print(at.harvest(p, item, closing=False, pr=a.pr))
     return 0
-
-
-PROMOTE_SUFFIXES = {".py": "python3", ".sh": "bash", ".sql": "run"}
-
-
-def tmp_scripts(p: at.Project, d: Path) -> list[Path]:
-    """Scripts under the item's tmp/ whose name the project's scripts/ lacks; generated bulk (checkouts,
-    scratch homes, virtualenvs, caches) is not read."""
-    tmp = d / "tmp"
-    if not tmp.is_dir() or tmp.is_symlink():
-        return []
-    have = {f.name for f in (p.path / "scripts").iterdir()} if (p.path / "scripts").is_dir() else set()
-    out = []
-    for top, dirs, names in os.walk(tmp):
-        dirs[:] = sorted(x for x in dirs if not os.path.islink(os.path.join(top, x)) and not generated(Path(top) / x))
-        for n in sorted(names):
-            f = Path(top) / n
-            if f.suffix in PROMOTE_SUFFIXES and n not in have and not f.is_symlink():
-                out.append(f)
-    return out
-
-
-def add_use_line(p: at.Project, rel: str, text: str) -> None:
-    """A `  - use:` line under the INDEX.md entry of rel (index keeps hand lines by path)."""
-    idx = at.index(p.name, p.path.parent.parent)
-    if idx is None:
-        return
-    lines = idx.read_text().split("\n")
-    for n, line in enumerate(lines):
-        if line.startswith(f"- `{rel}`"):
-            if not (n + 1 < len(lines) and lines[n + 1].startswith("  - use:")):
-                lines.insert(n + 1, f"  - use: {text}")
-                at._atomic_write(idx, "\n".join(lines))
-            return
-
-
-def promote(p: at.Project, d: Path, f: Path) -> str:
-    dest = p.path / "scripts" / f.name
-    if dest.exists():
-        return f"kept {f.relative_to(d)}: scripts/{f.name} exists"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(f, dest)
-    desc = at._desc(f) or f"promoted from items/{d.name}/{f.relative_to(d)}; say when to reach for it"
-    add_use_line(p, f"scripts/{f.name}", f"`{PROMOTE_SUFFIXES[f.suffix]} scripts/{f.name}`: {desc}")
-    return f"promoted {f.relative_to(d)} -> scripts/{f.name} (INDEX.md has its use line)"
 
 
 def cmd_close(a: argparse.Namespace) -> int:
@@ -306,7 +221,7 @@ def cmd_close(a: argparse.Namespace) -> int:
     if p.legacy or not item:
         die("agent-task close takes <project>/<item>")
     d = at.Binding(p, item).folder
-    candidates = tmp_scripts(p, d)
+    candidates, _ = at.item_scripts(p, d)
     chosen: list[Path] = []
     if a.promote:
         for name in a.promote:
@@ -320,28 +235,27 @@ def cmd_close(a: argparse.Namespace) -> int:
             if answer in ("y", "yes"):
                 chosen.append(f)
     for f in chosen:
-        print(promote(p, d, f))
+        print(at.promote(p, d, f))
     left = [f for f in candidates if f not in chosen]
     if left and not a.no_promote:
         print("Scripts still in tmp/ that scripts/ lacks (claude-gc salvages them to out/salvage/ after the grace period):")
         for f in left:
-            print(f"   - {f.relative_to(d)}: {at._desc(f) or '(no docstring)'}")
+            print(f"   - {f.relative_to(d)}: {at.describe(f) or '(no docstring)'}")
         print(f"   Promote one with: agent-task close {p.name}/{item} --promote <file>")
-    a.status_to = "closed"
-    rc = cmd_harvest(a)
+    print(at.harvest(p, item, closing=True, pr=a.pr))
     print(f"Closed {p.name}/{item} (status closed; task.json keeps its branch, worktree, PR and sessions).")
-    return rc
+    return 0
 
 
 def cmd_retro(a: argparse.Namespace) -> int:
     if a.pending:
-        for f, n, line in at.retro_pending():
-            print(f"{at.retro_id(f, n, line)} {line}")
+        for f, n, line in retro.retro_pending():
+            print(f"{retro.retro_id(f, n, line)} {line}")
         return 0
     if a.mark:
         if not a.args:
             die("usage: agent-task retro --mark <id> ... (the ids --pending printed: only the lines you reviewed)")
-        print(f"marked {at.retro_mark(a.args)} lines processed")
+        print(f"marked {retro.retro_mark(a.args)} lines processed")
         return 0
     if a.stdin:
         a.args = [sys.stdin.read()]
@@ -352,7 +266,7 @@ def cmd_retro(a: argparse.Namespace) -> int:
         die("--source is model, user or auto")
     sid = session_id(a.session)
     b = at.bound(sid) if sid else None
-    print(at.record_retro(" ".join(a.args), source=source, tag=a.tag, session=sid, where=at.where_label(b)))
+    print(retro.record_retro(" ".join(a.args), source=source, tag=a.tag, session=sid, where=at.where_label(b)))
     return 0
 
 
@@ -417,43 +331,39 @@ def cmd_session_start(a: argparse.Namespace) -> int:
     cwd = a.cwd or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     if a.source == "compact":
         cap = min(at.CONTEXT_CAP, max(a.cap, 1500)) if a.cap else at.CONTEXT_CAP
-        print(at.compact_text(sid, cwd, a.repo, a.branch, cap))
+        print(handoff.compact_text(sid, cwd, a.repo, a.branch, cap))
         return 0
     cap = min(at.SLICE_CAP, max(a.cap, 1000)) if a.cap else at.SLICE_CAP
     how = ""
     if a.source in ("startup", "resume"):
         at.set_tab(sid, b)
     if b:
-        how = at.announce(b, "session")
+        how = bd.announce(b, "session")
     if not b and a.source == "clear":
         b = at.tab_binding()
         if b:
             at.write_binding(sid, b, inherited=True, rule="tab")
-            how = at.announce(b, "tab") + f" Kept this tab's binding across /clear; a prompt naming another ticket rebinds."
-    pl = at.place(cwd)
-    if a.branch:
-        pl.branch = a.branch
-    if a.repo:
-        pl.repo = a.repo
+            how = bd.announce(b, "tab") + f" Kept this tab's binding across /clear; a prompt naming another ticket rebinds."
+    pl = place_of(a, cwd)
     if not b:
-        d = at.decide("", pl, cheap_only=True)
+        d = bd.decide("", pl, cheap_only=True)
         if d:
-            b = at.bind(sid, d.target, here=pl, rule=d.rule)
-            how = at.announce(b, d.rule)
+            b = bd.bind(sid, d.target, here=pl, rule=d.rule)
+            how = bd.announce(b, d.rule)
     if b:
         at.set_binding_wt(sid, pl.top)
         print(at.slice_text(b, how, cap=cap))
         return 0
-    print(at.unbound_text(at.handoff_folder(sid, cwd, a.repo)[1], a.branch))
-    offer = at.offer_text(at.Decision(candidates=at.recent_items(pl.repo)), sid)
+    print(handoff.unbound_text(handoff.handoff_folder(sid, cwd, a.repo)[1], a.branch))
+    offer = bd.offer_text(bd.Decision(candidates=bd.recent_items(pl.repo)), sid, lead=f"Recent open items for {pl.repo}.")
     if offer:
-        print(offer.replace("unbound: no rule was certain.", "Recent open items for " + pl.repo + "."))
+        print(offer)
     return 0
 
 
 def cmd_nudge(a: argparse.Namespace) -> int:
     """hooks/context-watch: the text of the handoff nudge at the context threshold."""
-    print(at.nudge_text(need_sid(a.session), a.ctx, a.at, a.cwd or os.getcwd()))
+    print(handoff.nudge_text(need_sid(a.session), a.ctx, a.at, a.cwd or os.getcwd()))
     return 0
 
 
@@ -486,7 +396,6 @@ def main() -> int:
     a = ap.parse_intermixed_args()
     if a.sub == "ls" and a.paths is not None:
         a.paths = True
-    a.status_to = ""
     cmds = {"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "close": cmd_close, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge}
     if a.help or a.sub not in cmds:
         print(__doc__)

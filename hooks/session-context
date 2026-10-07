@@ -125,7 +125,7 @@ emit() {
 # The session's project (bin/agent-task, under the work root): a bound session gets the project
 # slice, and on /clear an unbound one inherits its terminal tab's binding. An unbound session gets
 # the path its per-session folder will have; nothing is created until something is written there.
-# agent-task names the per-session folder's repo itself (agent_task.handoff_folder, from
+# agent-task names the per-session folder's repo itself (handoff.handoff_folder, from
 # CLAUDE_PROJECT_DIR), the one derivation the context-watch nudge and pre-compact also use.
 task_dir() {
   local sid src branch

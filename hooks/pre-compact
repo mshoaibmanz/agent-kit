@@ -4,7 +4,7 @@ beside it, mechanically from the transcript and git, so the compacted session (s
 re-injects both) and the next one keep the state. Never blocks: every path exits 0.
 
 Stale: HANDOFF.md is missing, or unmodified since context-watch's handoff nudge, or in the last
-30 minutes when no nudge fired, or since the last HANDOFF.auto.md (agent_task.handoff_stale). The folder is the bound item or
+30 minutes when no nudge fired, or since the last HANDOFF.auto.md (handoff.handoff_stale). The folder is the bound item or
 project, else the session's OUT DIR under the work root.
 
 HANDOFF.auto.md: branch, `git status --short`, the last commits, the last 5 user prompts, the files
@@ -25,8 +25,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
 try:
     import agent_task as at
+    import handoff
 except ImportError as e:
-    print(json.dumps({"systemMessage": f"pre-compact is off: hooks/lib/agent_task.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
+    print(json.dumps({"systemMessage": f"pre-compact is off: hooks/lib/agent_task.py or handoff.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
     sys.exit(0)
 
 PROMPTS = 5
@@ -175,24 +176,24 @@ def main() -> None:
     sid = p.get("session_id") or ""
     if not sid:
         return
-    b, folder = at.handoff_folder(sid, p.get("cwd") or os.getcwd())
-    if not at.handoff_stale(folder, sid):
+    b, folder = handoff.handoff_folder(sid, p.get("cwd") or os.getcwd())
+    if not handoff.handoff_stale(folder, sid):
         # HANDOFF.md is current, so an earlier compaction's snapshot would be re-injected as state.
         auto = folder / "HANDOFF.auto.md"
         if auto.is_file():
             os.replace(auto, folder / "HANDOFF.auto.prev.md")
         return
-    nudged = at.nudge_marker(sid).is_file()
+    nudged = handoff.nudge_marker(sid).is_file()
     hf = folder / "HANDOFF.md"
     if not hf.is_file():
         note = "this session has no HANDOFF.md"
-    elif at.auto_handoff_current(folder):
+    elif handoff.auto_handoff_current(folder):
         note = "HANDOFF.md was not updated after the previous compaction's snapshot"
     elif nudged:
         note = "HANDOFF.md was not updated after the context handoff nudge"
     else:
         note = "HANDOFF.md was not updated in the 30 minutes before this compaction"
-    at._atomic_write(folder / "HANDOFF.auto.md", render(p, note))
+    at.atomic_write(folder / "HANDOFF.auto.md", render(p, note))
     print(json.dumps({"systemMessage": f"pre-compact: {note}; wrote {folder / 'HANDOFF.auto.md'}."}))
 
 
