@@ -470,7 +470,7 @@ class DevInstallTests(PackRepos):
         inline = {'mcpServers': {'docs': {'command': 'docs-mcp', 'env': {'DOCS_TOKEN': 'x'}}}}
         self.push(upstream, 'mcp/team.json', json.dumps(inline) + '\n')
         result = self.install('update', code=2)
-        self.assertIn('MCP docs: use native OAuth or a runtime wrapper', result.stderr)
+        self.assertIn('MCP docs: env refused; use native OAuth or a runtime wrapper', result.stderr)
         self.assertEqual(self.git(self.checkout, 'rev-parse', 'HEAD'), head)
         self.assertEqual(self.state()['id'], journal)
         self.assertEqual(self.state()['configuration']['mcp_catalog'], str(catalog))

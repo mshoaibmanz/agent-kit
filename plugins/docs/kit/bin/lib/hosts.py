@@ -369,7 +369,7 @@ def normalize_transport(spec: dict[str, Any]) -> dict[str, Any]:
     expected = "stdio" if field == "command" else "http"
     if "type" in spec and spec["type"] != expected:
         raise ValueError("MCP type must match the command or HTTP URL transport")
-    return {key: value for key, value in spec.items() if key not in ("type", "description")}
+    return {key: value for key, value in spec.items() if key != "type"}
 
 
 def safe_servers(kit: Path) -> dict[str, Any]:
@@ -483,16 +483,19 @@ def fill(
     return PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), text)
 
 
+CATALOG_ONLY = ("credentials", "description")
+
+
 def fill_servers(servers: dict[str, Any], kit: str) -> dict[str, Any]:
     """servers as a host starts them: each command and args filled (fill) for the kit at <kit>, and
-    the catalog's `credentials` declaration (read by the dashboard only) dropped. A host starts an
-    MCP command as written, without expanding ~ or a variable, so a preset names a wrapper the kit
-    ships as {{KIT_DIR}}/bin/sentry-mcp."""
+    the catalog's `credentials` and `description` (read by the dashboard only) dropped. A host starts
+    an MCP command as written, without expanding ~ or a variable, so a preset names a wrapper the
+    kit ships as {{KIT_DIR}}/bin/sentry-mcp."""
     out = {}
     for name, spec in servers.items():
         if isinstance(spec, dict):
             what = f"MCP server {name}"
-            spec = {key: value for key, value in spec.items() if key != "credentials"}
+            spec = {key: value for key, value in spec.items() if key not in CATALOG_ONLY}
             if isinstance(spec.get("command"), str):
                 spec["command"] = fill(spec["command"], kit, what=what)
             if isinstance(spec.get("args"), list):

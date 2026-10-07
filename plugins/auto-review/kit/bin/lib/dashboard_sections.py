@@ -52,6 +52,8 @@ from hosts import (
     skill_hosts,
 )
 from kit_env import KEYS, kit_env, layers, parse
+from mcp_describe import Described
+from mcp_describe import read_cache as read_described
 
 LIB = Path(__file__).resolve().parent
 ENGINE = LIB.parents[1]
@@ -335,14 +337,32 @@ def hosts_section(setup: Setup, sec: Section) -> None:
     sec.level = "warn" if drifted else ""
 
 
+def described(entry: Described | None) -> tuple[Cell, str]:
+    """(the Tools cell, a fallback description) from one server's `agent-kit mcp describe` entry."""
+    if entry is None:
+        return Muted("not described"), ""
+    if entry.status != "ok":
+        return Badge(entry.status, "warn"), ""
+    names = entry.tools
+    cell: Cell = Fold(f"{len(names)} tools", (Lines(names),)) if names else "0 tools"
+    shown: Cell = (cell, Muted(f"{entry.server}, checked {entry.checked or '?'}")) if entry.server else cell
+    return shown, entry.instructions or entry.server
+
+
 def mcp_section(setup: Setup, sec: Section) -> None:
     sec.sources = [setup.catalog_path] + ([setup.catalog_input] if setup.catalog_input else [])
     if setup.fill_error:
         sec.alerts.append(f"MCP catalog placeholders not filled: {setup.fill_error}")
     live = {h: setup.live_servers(h) for h in setup.configured}
+    cache_file, cache = read_described(setup.kit)
+    if cache:
+        sec.sources.append(cache_file)
     rows: TableRows = []
     for name in sorted(setup.filled):
         spec = setup.filled[name] if isinstance(setup.filled[name], dict) else {}
+        raw = setup.catalog.get(name) if isinstance(setup.catalog.get(name), dict) else {}
+        tools, fallback = described(cache.get(name))
+        description = str(raw.get("description") or "") or fallback
         if "url" in spec:
             transport, target = "http", show_url(str(spec["url"])).text
         else:
@@ -376,15 +396,23 @@ def mcp_section(setup: Setup, sec: Section) -> None:
                     ", ".join(sorted({*env, *headers})) or "-",
                     Lines(tuple(creds)) if creds else "None",
                     on or "-",
+                    tools,
                 ),
                 row,
+                description,
             )
         )
     sec.blocks.append(
         Table(
-            ("Server", "Transport", "Command / URL", "Env / header names", "Credential", "Live on"),
+            ("Server", "Transport", "Command / URL", "Env / header names", "Credential", "Live on", "Tools"),
             rows,
             empty="The installed catalog has no servers.",
+        )
+    )
+    sec.actions.append(
+        Action(
+            "Ask each MCP server for its tools and instructions (starts each once; never automatic)",
+            kit_command(setup, "mcp", "describe"),
         )
     )
     others: TableRows = [
@@ -462,15 +490,13 @@ def skills_section(setup: Setup, sec: Section) -> None:
                     tuple(chips) or "-",
                     Fold("Change", (Lines(tuple(changes)),)) if changes else "-",
                     allowed_text,
-                    desc[:220] + ("..." if len(desc) > 220 else ""),
                     md,
                 ),
                 anchor("skills", name),
+                desc,
             )
         )
-    sec.blocks.append(
-        Table(("Skill", "Source", "Hosts", "Change", "hosts:", "Description", "File"), rows)
-    )
+    sec.blocks.append(Table(("Skill", "Source", "Hosts", "Change", "hosts:", "File"), rows))
     sec.blocks.append(
         Para((Muted("Skills made by hand in a host folder are listed under Unmanaged sources."),))
     )
@@ -524,6 +550,9 @@ def roles_section(setup: Setup, sec: Section) -> None:
             except SystemExit:
                 cells.append(f"{host}: ?")
         rendered = setup.roots["claude"] / "agents" / f"{name}.md"
+        description = ""
+        if src.is_file():
+            description = str(frontmatter(src.read_text(errors="replace")).get("description", ""))
         rows.append(
             Row(
                 (
@@ -537,6 +566,7 @@ def roles_section(setup: Setup, sec: Section) -> None:
                     Badge("rendered", "ok") if rendered.is_file() else Muted("-"),
                 ),
                 anchor("roles", name),
+                description,
             )
         )
     sec.blocks.append(
@@ -579,15 +609,16 @@ def hooks_section(setup: Setup, sec: Section) -> None:
         rows.append(
             Row(
                 (
+                    Strong(name),
                     entry.get("event", ""),
                     entry.get("matcher") or "*",
-                    Strong(name),
                     Badge("blocking", "warn") if name in BLOCKING else Badge("advisory"),
                     tuple(Badge(h) for h in entry.get("hosts", [])),
                     f"{entry.get('timeout', '-')}{' async' if entry.get('async') else ''}",
                     script if script.is_file() else Code(command),
                 ),
                 row,
+                str(entry.get("description", "")),
             )
         )
     if setup.state:
@@ -596,21 +627,33 @@ def hooks_section(setup: Setup, sec: Section) -> None:
             Para(("Blocking hooks in this install:", Strong(state), "(agent-setup --blocking-hooks)."))
         )
     sec.blocks.append(
-        Table(("Event", "Matcher", "Hook", "Kind", "Hosts", "Timeout", "Script"), rows)
+        Table(("Hook", "Event", "Matcher", "Kind", "Hosts", "Timeout", "Script"), rows)
     )
     sec.count = len(rows)
     sec.summary = f"{len(rows)} hooks, {blocking} blocking"
 
 
-def documented_keys(setup: Setup) -> set[str]:
-    """The keys kit.env.example documents: the overlay's settings, none of them a credential."""
+def documented_keys(setup: Setup) -> dict[str, str]:
+    """The keys kit.env.example documents (the overlay's settings, none of them a credential), each
+    with the comment lines right above it as its description."""
     for example in (setup.kit / "kit.env.example", ENGINE / "kit.env.example"):
         try:
             text = example.read_text()
         except OSError:
             continue
-        return {m.group(1) for m in re.finditer(r"^([A-Z][A-Z0-9_]*)=", text, re.M)}
-    return set()
+        keys: dict[str, str] = {}
+        comment: list[str] = []
+        for line in text.splitlines():
+            key = re.match(r"([A-Z][A-Z0-9_]*)=", line)
+            if key:
+                keys.setdefault(key.group(1), " ".join(comment))
+                comment = []
+            elif line.startswith("#"):
+                comment.append(line.lstrip("#").strip())
+            else:
+                comment = []
+        return keys
+    return {}
 
 
 def append_line(target: Path, line: str) -> str:
@@ -638,7 +681,7 @@ def overlay_section(setup: Setup, sec: Section) -> None:
     sec.sources = [p for p in files if p.exists()]
     rows: TableRows = []
     hidden = 0
-    for key in sorted(set(values) | (documented & set(KEYS))):
+    for key in sorted(set(values) | (set(documented) & set(KEYS))):
         value, layer, seen = values.get(key, ("", None, []))
         if key in documented and not credential_name(key) and not holds_secret(value):
             shown: Cell = Code(value) if value else Muted("unset")
@@ -649,6 +692,7 @@ def overlay_section(setup: Setup, sec: Section) -> None:
             Row(
                 ((Strong(key), note), shown, layer.name if layer else "-", " < ".join(seen) or "-"),
                 anchor("overlay", key),
+                documented.get(key, ""),
             )
         )
     sec.blocks.append(
@@ -707,8 +751,13 @@ def pack_section(setup: Setup, sec: Section) -> None:
             status = "not checked (rerun with --check-updates; it asks GitHub)"
         else:
             status = source_status(record)["note"]
+        table = setup.config.get("preset_values", {}).get("table", {})
         rows.append(
-            ("Preset", Code(spec), f"At {pack_label(record.get('commit'))}; update: {status}")
+            Row(
+                ("Preset", Code(spec), f"At {pack_label(record.get('commit'))}; update: {status}"),
+                anchor("pack", "preset"),
+                str(table.get("description", "")) if isinstance(table, dict) else "",
+            )
         )
         sec.actions.append(Action("Preview the preset again", setup_command(setup, "--preset", spec)))
         sec.actions.append(Action("Apply it", setup_command(setup, "--preset", spec, "--apply")))
@@ -726,8 +775,20 @@ def pack_section(setup: Setup, sec: Section) -> None:
     sec.summary = ("A preset" if record else "No preset") + f", {len(skills)} pack skills"
 
 
+def docstring_line(path: Path) -> str:
+    """A script's description: the first sentence of its module docstring's first paragraph."""
+    try:
+        found = re.search(r'^"""(.*?)(?:\n\n|""")', path.read_text(errors="replace"), re.M | re.S)
+    except OSError:
+        return ""
+    if found is None:
+        return ""
+    text = " ".join(found.group(1).split())
+    end = re.search(r"\.(\s|$)", text)
+    return text[: end.start() + 1] if end else text
+
+
 def data_section(setup: Setup, sec: Section) -> None:
-    sec.sources = [Path.home() / ".ssh/config"]
     rows: TableRows = []
     for name in ("ro-mysql", "bqro"):
         kit_copy, found = setup.kit_bin(name), shutil.which(name)
@@ -738,72 +799,14 @@ def data_section(setup: Setup, sec: Section) -> None:
                 same = Path(found).read_bytes() == kit_copy.read_bytes()
                 note = "On PATH, same as the kit copy" if same else "On PATH, DIFFERS from the kit copy"
         rows.append(
-            (Strong(name), Path(found) if found else "-", kit_copy if kit_copy.is_file() else "-", note)
+            Row(
+                (Strong(name), Path(found) if found else "-", kit_copy if kit_copy.is_file() else "-", note),
+                anchor("data", name),
+                next((docstring_line(p) for p in (kit_copy, setup.source() / "bin" / name) if p.is_file()), ""),
+            )
         )
     sec.blocks.append(Table(("Wrapper", "On PATH", "Kit copy", "State"), rows))
-    # The kit's ro-mysql as a module, for its tunnel parser and cache reader: running
-    # `ro-mysql --tunnels` instead would ask the MySQL login-path store for unannotated tunnels.
-    module = next(
-        (
-            m
-            for m in (
-                load_script(p, "ro_mysql_for_dashboard")
-                for p in (ENGINE / "bin/ro-mysql", setup.source() / "bin/ro-mysql")
-                if p.is_file()
-            )
-            if m is not None
-        ),
-        None,
-    )
-    tunnels: TableRows = []
-    staging = 0
-    if module is not None:
-        cache = module.read_cache()
-        found_tunnels = module.load_tunnels()
-        shared = module.multi_port_aliases(found_tunnels)
-        for t in found_tunnels:
-            cached = cache.get((t.alias, t.port), {})
-            via = cached.get("via", "")
-            login = via.removeprefix("via login path ") if via.startswith("via login path ") else ""
-            row = anchor("data", t.name)
-            if t.user and t.alias not in shared:
-                item = Credential(module.KEYCHAIN_SERVICE, module.keychain_account(t, t.user))
-                cred: Cell = credential_cell(sec, item, f"ro-mysql {t.name}", row)
-            else:
-                cred = Muted("No Keychain item (no annotated user, or a shared alias)")
-            staging += t.kind == "STAGING"
-            tunnels.append(
-                Row(
-                    (
-                        Strong(t.name),
-                        t.port,
-                        Badge(t.kind, "warn" if t.kind == "PROD" else "ok"),
-                        t.user or "?",
-                        login or "-",
-                        cred,
-                        cached.get("databases", "not checked"),
-                        cached.get("checked", "-"),
-                    ),
-                    row,
-                )
-            )
-    sec.blocks.append(
-        Table(
-            (
-                "Tunnel",
-                "Port",
-                "Kind",
-                "DB user",
-                "Login path",
-                "Keychain item",
-                "Databases (cached)",
-                "Checked",
-            ),
-            tunnels,
-            "ro-mysql tunnels",
-            "No db-tunnel-* LocalForward in ~/.ssh/config.",
-        )
-    )
+    sec.blocks.append(Para((Muted("ro-mysql's tunnels are under SQL instances."),)))
     project = kit_env().get("BQRO_PROJECT", "")
     gcloud = Path(os.environ.get("CLOUDSDK_CONFIG") or Path.home() / ".config/gcloud")
     adc = gcloud / "application_default_credentials.json"
@@ -813,12 +816,11 @@ def data_section(setup: Setup, sec: Section) -> None:
         ("Application default credentials", Badge.state("present" if adc.is_file() else "missing")),
     ]
     sec.blocks.append(Table(("What", "State"), bqro, "bqro"))
-    sec.actions.append(Action("List tunnels (in your own terminal)", "ro-mysql --tunnels"))
-    sec.actions.append(Action("Store DB passwords (in your own terminal)", "ro-mysql --rotate"))
     if not adc.is_file():
         sec.actions.append(Action("Sign in for bqro", "gcloud auth application-default login"))
-    sec.count = len(tunnels)
-    sec.summary = f"{len(tunnels)} tunnels, {staging} staging"
+    sec.count = len(rows)
+    on_path = sum(1 for name in ("ro-mysql", "bqro") if shutil.which(name))
+    sec.summary = f"{len(rows)} wrappers, {on_path} on PATH"
 
 
 def work_section(setup: Setup, sec: Section) -> None:

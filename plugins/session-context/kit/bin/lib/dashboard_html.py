@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
-from typing import Literal, Union
+from typing import Literal, NamedTuple, Union
 from urllib.parse import quote
 
 TEMPLATE = Path(__file__).with_name("dashboard.html")
@@ -98,8 +98,19 @@ class Pre:
     text: str
 
 
+@dataclass(frozen=True)
+class AddHelper:
+    """The add-connection form. The page's one script fills it in the browser and sends nothing;
+    ports and aliases are the known tunnels', for its collision check, and patterns are
+    (name, value) pairs of ro-mysql's own checks, written as data-p-<name> attributes."""
+
+    ports: tuple[str, ...]
+    aliases: tuple[str, ...]
+    patterns: tuple[tuple[str, str], ...] = ()
+
+
 Cell = Union[str, int, Path, Badge, Strong, Muted, Code, Command, Fold, Lines, Table, tuple]
-Block = Union[Table, Para, Pre]
+Block = Union[Table, Para, Pre, AddHelper]
 
 
 @dataclass(frozen=True)
@@ -181,12 +192,21 @@ def cell(value: Cell) -> str:
     return esc(value)
 
 
+DESCRIPTION_LIMIT = 220
+
+
+def clamp(text: str, limit: int = DESCRIPTION_LIMIT) -> str:
+    """text on one line, cut to limit characters with an ellipsis."""
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
 def row(value: Row | tuple[Cell, ...]) -> str:
     value = value if isinstance(value, Row) else Row(value)
     ident = f' id="{esc(value.anchor)}"' if value.anchor else ""
     cells = [cell(c) for c in value.cells]
     if value.description and cells:
-        cells[0] += f'<div class="desc">{esc(value.description)}</div>'
+        cells[0] += f'<div class="desc">{esc(clamp(value.description))}</div>'
     return f"<tr{ident}>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
 
 
@@ -205,11 +225,55 @@ def table(value: Table) -> str:
     )
 
 
+class FormField(NamedTuple):
+    key: str
+    label: str
+    placeholder: str
+    value: str = ""
+
+
+AH_FIELDS = (
+    FormField("name", "Name", "orders"),
+    FormField("user", "DB user", "reader"),
+    FormField("via", "Bastion alias", "jump"),
+    FormField("host", "Remote host", "db.example.com"),
+    FormField("port", "Remote port", "3306", "3306"),
+    FormField("local", "Local port", "15310"),
+)
+
+
+def add_helper(value: AddHelper) -> str:
+    fields = "".join(
+        f'<label>{esc(f.label)}<input data-f="{f.key}" type="text" autocomplete="off" spellcheck="false" '
+        f'placeholder="{esc(f.placeholder)}"' + (f' value="{esc(f.value)}"' if f.value else "") + "></label>"
+        for f in AH_FIELDS
+    )
+    patterns = "".join(f' data-p-{esc(name)}="{esc(pattern)}"' for name, pattern in value.patterns)
+    return (
+        f'<div class="ah" id="sql-add" data-ports="{esc(" ".join(value.ports))}" '
+        f'data-aliases="{esc(" ".join(value.aliases))}"{patterns}><h3>Add an instance</h3>'
+        '<p class="muted">Paste a connection URI or fill the fields. This form runs in the page and '
+        "sends nothing; a password in the URI is removed, never shown.</p>"
+        # The script sets the example placeholder: written here, the page's userinfo mask would hide it.
+        '<label class="wide">Connection URI<input id="ah-uri" type="text" autocomplete="off" '
+        'spellcheck="false"></label>'
+        f'<div class="ahf">{fields}<label class="chk"><input data-f="staging" type="checkbox">Staging</label></div>'
+        '<p class="alert" id="ah-warn" hidden></p>'
+        '<div class="cmd"><code id="ah-cmd"></code><button class="cp" type="button" data-c="" id="ah-cmd-cp">'
+        "copy</button></div>"
+        '<details><summary>Or by hand: the checked ssh block, the Keychain prompt and the check</summary>'
+        '<div class="cmd"><pre id="ah-manual"></pre><button class="cp" type="button" data-c="" id="ah-man-cp">'
+        "copy</button></div></details></div>"
+    )
+
+
 def block(value: Block) -> str:
     if isinstance(value, Table):
         return table(value)
     if isinstance(value, Pre):
         return f"<pre>{esc(value.text)}</pre>"
+    if isinstance(value, AddHelper):
+        return add_helper(value)
     return "<p>" + " ".join(cell(v) for v in value.items) + "</p>"
 
 
@@ -261,7 +325,7 @@ def inline_hash(text: str, tag: str) -> str:
     """The CSP source for the template's one inline <tag> block: its sha256, so no other inline
     script or style may run."""
     found = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.S)
-    body = found.group(1) if found else ""
+    body = (found.group(1) if found else "").replace("$$", "$")  # as Template.substitute writes it
     return "'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'"
 
 

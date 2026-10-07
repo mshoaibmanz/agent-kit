@@ -55,6 +55,12 @@ button.cp.done{background:#e3f4e8;border-color:#7cc49a}
 .b{display:inline-block;font-size:11px;border-radius:10px;padding:1px 8px;margin:1px 3px 1px 0;background:#eef1f4;color:#3b4550;white-space:nowrap}
 .b.ok{background:#e3f4e8;color:#1d6b3b}.b.bad{background:#fbe6e6;color:#9b2323}.b.warn{background:#fff3d6;color:#7a5600}
 .b.off{background:#f3f4f6;color:#8a939c;text-decoration:line-through}
+.ah{border:1px solid #eceff2;border-radius:8px;padding:4px 14px 12px;margin-top:20px}
+.ah label{display:flex;flex-direction:column;font-size:12px;color:var(--soft);gap:2px}
+.ah input[type=text]{font:13px ui-monospace,Menlo,monospace;padding:5px 7px;border:1px solid #cfd6de;border-radius:5px;color:var(--ink)}
+.ah .wide{margin:8px 0}.ahf{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:10px}
+.ah label.chk{flex-direction:row;align-items:center;gap:6px;color:var(--ink);font-size:13px}
+.ah pre{margin:0;flex:1}
 .muted{color:#7b858f}details summary{cursor:pointer;color:var(--link)}details[open]>summary{margin-bottom:4px}
 @media (max-width:900px){
 .side{position:static;width:auto;border-right:0;border-bottom:1px solid var(--line)}
@@ -95,6 +101,64 @@ Object.keys(links).forEach(function(k){links[k].classList.toggle('on',k===card.i
 if(el&&el!==card){var d=el.closest('details');if(d)d.open=true;el.scrollIntoView({block:'center'});el.classList.add('hit');
 setTimeout(function(){el.classList.remove('hit')},1800)}else{window.scrollTo(0,0)}}
 document.body.classList.add('views');q.addEventListener('input',filter);window.addEventListener('hashchange',show);show()})();
+/*ah:begin*/
+var AH_SECRET=/pass|pwd|secret|token/i,AH_LOOKS_SECRET=/:[^\/@]*@|pass|pwd|secret|token/i;
+function ahDec(s){try{return decodeURIComponent(s)}catch(x){return s}}
+function ahRules(get){var re=function(k){return new RegExp('^(?:'+get(k)+')$$',get(k+'-flags'))},range=function(k){return get(k).split('-').map(Number)};
+return{name:re('name'),user:re('user'),via:re('via'),host:re('host'),port:re('port'),local:re('port'),
+localPorts:range('local-ports'),remotePorts:range('remote-ports'),staging:new RegExp(get('staging'),get('staging-flags')),
+prefix:get('prefix'),suffix:get('suffix'),service:get('service')}}
+function ahScrub(text){var s=text.trim(),i=s.indexOf('://'),secret=false;if(i<0)return{text:s,secret:false};
+var head=s.slice(0,i+3),rest=s.slice(i+3),at=-1,u,c;
+for(var j=rest.length-1;j>=0&&at<0;j--){if(rest.charAt(j)!=='@')continue;u=rest.slice(0,j);c=u.indexOf(':');if(!/[\/?#]/.test(c<0?u:u.slice(0,c)))at=j}
+if(at>=0){u=rest.slice(0,at);c=u.indexOf(':');if(c>=0){secret=true;u=u.slice(0,c)}rest=(u?u+'@':'')+rest.slice(at+1)}
+var q=rest.indexOf('?');if(q>=0){var h=rest.indexOf('#',q),end=h<0?rest.length:h,kept=[];
+rest.slice(q+1,end).split('&').forEach(function(kv){if(!kv)return;if(AH_SECRET.test(ahDec(kv.split('=')[0])))secret=true;else kept.push(kv)});
+rest=rest.slice(0,q)+(kept.length?'?'+kept.join('&'):'')+rest.slice(end)}
+return{text:head+rest,secret:secret}}
+function ahParse(uri){var m=/^mysql:\/\/(?:([^:@\/?#]+)@)?([^:@\/?#]+)(?::([0-9]+))?(?:\/([^?#]*))?(?:\?([^#]*))?$$/i.exec(uri.trim());
+if(!m)return{error:'Not a mysql:// connection URI.'};
+var f={user:ahDec(m[1]||''),host:m[2],port:m[3]||'3306',name:ahDec(m[4]||'')};
+(m[5]||'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('='),k=ahDec(i<0?kv:kv.slice(0,i)),v=ahDec(i<0?'':kv.slice(i+1));
+if(k==='via')f.via=v;else if(k==='local_port')f.local=v;else if(k==='name')f.name=v;else if(k==='staging')f.staging=v===''||v==='1'||v==='true'});
+return{fields:f}}
+function ahRead(text){var s=ahScrub(text),notes=[],p=ahParse(s.text);
+if(s.secret)notes.push('A password in the URI was removed and is not shown: ro-mysql add asks for it.');
+if(!p.error)return{value:s.text,fields:p.fields,notes:notes};
+if(AH_LOOKS_SECRET.test(s.text))return{value:'',notes:notes.concat(['The URI could not be read and looked like it held a password, so it was cleared: fill the fields instead.',p.error])};
+return{value:s.text,notes:notes.concat([p.error])}}
+function ahBuild(f,known,r){var w=[],bad=[],raw=f.name||'',name=raw.indexOf(r.prefix)===0?raw.slice(r.prefix.length):raw;
+['name','user','via','host','port','local'].forEach(function(k){if(!r[k].test(k==='name'?raw:(f[k]||'')))bad.push(k)});
+var local=parseInt(f.local,10),port=parseInt(f.port,10);
+if(bad.indexOf('local')<0&&(local<r.localPorts[0]||local>r.localPorts[1]))bad.push('local');
+if(bad.indexOf('port')<0&&(port<r.remotePorts[0]||port>r.remotePorts[1]))bad.push('port');
+if(f.via&&f.via.toLowerCase().indexOf(r.prefix)===0)bad.push('via');
+var alias=r.prefix+(f.staging&&!r.staging.test(name)?name+r.suffix:name);
+if(!f.staging&&r.staging.test(alias)){w.push('The name reads as STAGING: tick Staging, or pick another name.');if(bad.indexOf('name')<0)bad.push('name')}
+if(known.ports.indexOf(String(local))>=0)w.push('Local port '+local+' is already forwarded by a known tunnel: pick another.');
+if(name&&known.aliases.indexOf(alias)>=0)w.push(alias+' already exists.');
+if(bad.length)return{cmd:'',manual:'',alias:'',warnings:w,missing:bad};
+var cmd='ro-mysql add --name '+name+' --user '+f.user+' --via '+f.via+' --remote '+f.host+':'+f.port+' --local-port '+local+(f.staging?' --staging':'');
+var manual=['# 1. Print the ssh block, checked with ssh -G, and where it goes in ~/.ssh/config:',cmd+' --dry-run',
+'# 2. Paste it there, then store the password (security prompts for it):','security add-generic-password -U -s '+r.service+' -a '+f.user+'@'+alias+' -w',
+'# 3. Check it:','ro-mysql --tunnels --refresh'].join('\n');
+return{cmd:cmd,manual:manual,alias:alias,warnings:w,missing:[]}}
+/*ah:end*/
+(function(){var box=document.getElementById('sql-add');if(!box)return;
+var list=function(a){return(box.getAttribute(a)||'').split(' ').filter(Boolean)},known={ports:list('data-ports'),aliases:list('data-aliases')};
+var rules=ahRules(function(k){return box.getAttribute('data-p-'+k)||''});
+var uri=document.getElementById('ah-uri'),warn=document.getElementById('ah-warn'),cmd=document.getElementById('ah-cmd'),man=document.getElementById('ah-manual');
+var cmdCp=document.getElementById('ah-cmd-cp'),manCp=document.getElementById('ah-man-cp'),inputs={};
+uri.placeholder='mysql://'+'reader@orders-db:3306/orders?via=jump&local_port=15310&staging=1';
+box.querySelectorAll('[data-f]').forEach(function(i){inputs[i.getAttribute('data-f')]=i});
+function fields(){var f={};Object.keys(inputs).forEach(function(k){f[k]=inputs[k].type==='checkbox'?inputs[k].checked:inputs[k].value.trim()});return f}
+function update(notes){var r=ahBuild(fields(),known,rules),w=(notes||[]).concat(r.warnings);warn.hidden=!w.length;warn.textContent=w.join(' ');
+cmd.textContent=r.cmd||'Still needed: '+r.missing.join(', ');cmdCp.setAttribute('data-c',r.cmd);cmdCp.disabled=!r.cmd;
+man.textContent=r.manual;manCp.setAttribute('data-c',r.manual);manCp.disabled=!r.manual}
+uri.addEventListener('input',function(){if(!uri.value.trim()){update();return}var r=ahRead(uri.value);
+if(r.value!==uri.value.trim())uri.value=r.value;
+Object.keys(r.fields||{}).forEach(function(k){var i=inputs[k];if(!i)return;if(i.type==='checkbox')i.checked=!!r.fields[k];else i.value=r.fields[k]});update(r.notes)});
+Object.keys(inputs).forEach(function(k){inputs[k].addEventListener('input',function(){update()})});update()})();
 </script>
 </body>
 </html>
