@@ -41,10 +41,7 @@ from dashboard_html import (
 )
 from hosts import (
     HOSTS,
-    RULES_FILES,
     account_dirs,
-    default_host_root,
-    fill_servers,
     frontmatter,
     host_root_for,
     inventory,
@@ -52,13 +49,11 @@ from hosts import (
     skill_hosts,
 )
 from kit_env import KEYS, kit_env, layers, parse
+from kit_text import RULES_FILES, default_host_root, fill_servers
 import secret_store
 
 LIB = Path(__file__).resolve().parent
 ENGINE = LIB.parents[1]
-# The page asks the Keychain for attributes only (keychain_present), so its tests may point the
-# store's fixed binary at a fixture; the wrappers that read values never take this variable.
-secret_store.SECURITY = os.environ.get("AGENT_KIT_SECURITY", secret_store.SECURITY)
 TableRows = list[Row | tuple[Cell, ...]]
 
 
@@ -98,10 +93,12 @@ def run(command: list[str]) -> subprocess.CompletedProcess[str] | None:
 def keychain_present(item: Credential) -> State:
     """present, missing, or unknown (no Keychain, or it failed to answer). Read through secret_store
     without reveal: the item's attributes are found, its secret is never asked for. secret-tool has
-    no such read, so on Linux the state is unknown."""
-    if secret_store.store() != "keychain":
+    no such read, so on Linux the state is unknown. AGENT_KIT_SECURITY (a test's fixture) replaces
+    the security binary for this existence check alone."""
+    security = os.environ.get("AGENT_KIT_SECURITY", "")
+    if not security and secret_store.store() != "keychain":
         return "unknown"
-    code, _ = secret_store.lookup(item.service, item.account, reveal=False)
+    code, _ = secret_store.lookup(item.service, item.account, reveal=False, security=security)
     return "present" if code == 0 else "missing" if code == secret_store.ITEM_NOT_FOUND else "unknown"
 
 

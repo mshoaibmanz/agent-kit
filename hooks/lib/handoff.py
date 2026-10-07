@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import time
 from pathlib import Path
 
@@ -146,8 +145,3 @@ def compact_text(sid: str, cwd: str = "", repo: str = "", branch: str = "", cap:
     else:
         head = unbound_text(folder, branch)[:room]
     return (head + ("\n" + tail if tail else ""))[:cap]
-
-
-if __name__ == "__main__" and sys.argv[1:] == ["points"]:
-    # hook-io's context_points: "<handoff_default> <compact_at, 0 when unknown>".
-    print(handoff_default(), compact_at() or 0)

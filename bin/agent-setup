@@ -58,10 +58,10 @@ TOML_END = '# END agent-kit setup'
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
 from blocking import BLOCKING  # noqa: E402
 import checkout  # noqa: E402
-from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root,  # noqa: E402
-                   fill_servers, git_layer_env, install_text, keep_host_tables, resume_max, skill_hosts,
-                   strip_legacy_sandbox)
+from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, git_layer_env,  # noqa: E402
+                   keep_host_tables, skill_hosts, strip_legacy_sandbox)
 from kit_env import code_dir, kit_env  # noqa: E402
+from kit_text import default_host_root, fill_servers, install_text, resume_max  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary)
 from pack import (PACK_DIR, PACK_SKILLS, McpPlan, extension_lists, installed_pack, mcp_plan,  # noqa: E402
@@ -262,7 +262,7 @@ def resolve_values(value: Any, view: Path, root: Path, host_view: Path, target: 
     if isinstance(value, list):
         return [resolve_values(item, view, root, host_view, target) for item in value]
     if isinstance(value, str):
-        # Placeholders were filled at render (hosts.fill) with the view's paths; these map them.
+        # Placeholders were filled at render (kit_text.fill) with the view's paths; these map them.
         return value.replace(str(view), str(root)).replace(str(host_view), str(target))
     return value
 
@@ -1517,6 +1517,11 @@ def resolve_answers(args: argparse.Namespace, given: set[str], saved: dict[str, 
         else:
             value = saved.get(key, default)
         setattr(args, key, value)
+    # A preset's MCP servers and Sentry instances install only with the mcp component, so unless the
+    # user chose the components, a preset that declares either adds it.
+    if 'components' not in answered and (preset.servers or preset.sentry) and 'mcp' not in args.components:
+        args.components = [*args.components, 'mcp']
+        from_preset.add('components')
     return answered, from_preset
 
 

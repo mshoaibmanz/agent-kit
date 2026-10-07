@@ -31,17 +31,20 @@ def secret_tool() -> str:
     return next(path for path in SECRET_TOOL_PATHS if os.path.exists(path))
 
 
-def lookup(service: str, account: str, reveal: bool, timeout: int = 10) -> Tuple[int, str]:
+def lookup(service: str, account: str, reveal: bool, timeout: int = 10, security: str = "") -> Tuple[int, str]:
     """(exit code, the secret when reveal, else ""); 0 means found. The secret comes without the
     newline the store ends its output with. Without reveal the Keychain is asked for the item's
     attributes only, never the secret. secret-tool exits 1 for a missing item and a refusal alike, so
     either, or an empty secret, reads as ITEM_NOT_FOUND. A store that cannot run reads as 1; the env
-    store has no items."""
-    where = store()
+    store has no items. `security` replaces SECURITY (a test's fixture) for an existence check only:
+    a revealing read always runs the fixed binary."""
+    if security and reveal:
+        raise ValueError("secret_store.lookup: a revealing read never takes another security binary")
+    where = "keychain" if security else store()
     if where == "env":
         return ITEM_NOT_FOUND, ""
     if where == "keychain":
-        command = [SECURITY, "find-generic-password", "-s", service, "-a", account, *(["-w"] if reveal else [])]
+        command = [security or SECURITY, "find-generic-password", "-s", service, "-a", account, *(["-w"] if reveal else [])]
     else:
         command = [secret_tool(), "lookup", "service", service, "account", account]
     try:

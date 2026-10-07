@@ -126,22 +126,26 @@ class Instances(Fixture):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 sentry.load_instances(self.kit, self.overlay)
 
-    def test_label_prefers_the_slug_then_the_config(self) -> None:
+    def test_label_prefers_the_config_then_the_slug(self) -> None:
         alpha = sentry.load_instances(self.kit, self.overlay)["alpha"]
         self.assertEqual(
             [alpha.label(o) for o in ("main", "alt", "acmeprd-web", "acmestg-web", "other")],
             ["prod", "staging", "prod", "staging", "unknown"],
         )
+        self.write(self.overlay / sentry.INSTANCES_FILE, {"alpha": {"orgs": {"xprd": "staging", "xstg": "prod"}}})
+        alpha = sentry.load_instances(self.kit, self.overlay)["alpha"]
+        self.assertEqual([alpha.label(o) for o in ("xprd", "xstg", "yprd")], ["staging", "prod", "prod"])
 
     def test_presence_reads_attributes_only_and_falls_back_to_the_variable(self) -> None:
+        instances = sentry.load_instances(self.kit, self.overlay).values()
         beta = sentry.load_instances(self.kit, self.overlay)["beta"]
         self.assertEqual(beta.env_name, "SENTRY_ACCESS_TOKEN_BETA")
-        self.assertFalse(sentry.token_present(beta))
+        self.assertFalse(sentry.token_present(beta, instances))
         with self.assertRaises(sentry.KeychainMissing):
-            sentry.read_token(beta)
+            sentry.read_token(beta, instances)
         self.items.write_text(f"{self.beta_item}={TOKEN}\n")
-        self.assertTrue(sentry.token_present(beta))
-        self.assertEqual(sentry.read_token(beta), TOKEN)
+        self.assertTrue(sentry.token_present(beta, instances))
+        self.assertEqual(sentry.read_token(beta, instances), TOKEN)
 
 
 class Servers(Fixture):
@@ -324,7 +328,7 @@ class Origins(Fixture):
     def test_a_redirect_to_another_origin_is_refused_before_the_token_leaves(self) -> None:
         self.home.routes["/api/0/organizations/"] = (302, {"Location": f"{self.other_url}/api/0/organizations/"}, [])  # type: ignore[attr-defined]
         with self.assertRaisesRegex(RuntimeError, "another origin"):
-            self.mod.crawl(self.inst)
+            self.mod.crawl(self.inst, [self.inst])
         self.assertEqual(self.other.seen, [])  # type: ignore[attr-defined]
 
     def test_a_same_origin_redirect_is_followed(self) -> None:
@@ -337,11 +341,11 @@ class Origins(Fixture):
         self.home.routes["/api/0/organizations/"] = (  # type: ignore[attr-defined]
             200, {"Link": f'<{self.other_url}/api/0/organizations/>; rel="next"; results="true"'}, [])
         with self.assertRaisesRegex(RuntimeError, "another origin"):
-            self.mod.crawl(self.inst)
+            self.mod.crawl(self.inst, [self.inst])
         self.home.routes["/api/0/organizations/"] = (200, {}, [{"slug": "o", "links": {"regionUrl": self.other_url}}])  # type: ignore[attr-defined]
         self.home.routes["/api/0/organizations/o/projects/"] = (200, {}, [{"slug": "p"}])  # type: ignore[attr-defined]
         self.home.routes["/api/0/organizations/o/events/"] = (200, {}, {"data": []})  # type: ignore[attr-defined]
-        result = self.mod.crawl(self.inst)
+        result = self.mod.crawl(self.inst, [self.inst])
         self.assertEqual([(o["slug"], o["region_url"], [p["slug"] for p in o["projects"]]) for o in result["orgs"]],
                          [("o", self.home_url, ["p"])])
         self.assertEqual(self.other.seen, [])  # type: ignore[attr-defined]
@@ -357,15 +361,48 @@ class Origins(Fixture):
 
     def test_the_variable_name_before_hex_is_read_with_a_warning_to_rename(self) -> None:
         self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {"prod-a": {"host": "a.invalid", "keychain": "k/a"}})
-        inst = sentry.load_instances(self.kit, self.overlay)["prod-a"]
+        instances = sentry.load_instances(self.kit, self.overlay)
+        inst = instances["prod-a"]
         os.environ["SENTRY_ACCESS_TOKEN_PROD_A"] = TOKEN
         self.addCleanup(os.environ.pop, "SENTRY_ACCESS_TOKEN_PROD_A", None)
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self.assertTrue(sentry.token_present(inst))
-            self.assertEqual(sentry.read_token(inst), TOKEN)
+            self.assertTrue(sentry.token_present(inst, instances.values()))
+            self.assertEqual(sentry.read_token(inst, instances.values()), TOKEN)
         self.assertIn("sentry: rename SENTRY_ACCESS_TOKEN_PROD_A to SENTRY_ACCESS_TOKEN_PROD_2DA", err.getvalue())
         self.assertNotIn(TOKEN, err.getvalue())
+
+    def test_an_old_variable_name_two_instances_share_reaches_neither(self) -> None:
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {
+            "prod-a": {"host": "a.invalid", "keychain": "k/a"}, "prod_a": {"host": "b.invalid", "keychain": "k/b"}})
+        instances = sentry.load_instances(self.kit, self.overlay)
+        os.environ["SENTRY_ACCESS_TOKEN_PROD_A"] = TOKEN
+        self.addCleanup(os.environ.pop, "SENTRY_ACCESS_TOKEN_PROD_A", None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for inst in instances.values():
+                self.assertEqual(sentry.env_token(inst, instances.values()), "", inst.name)
+                self.assertFalse(sentry.token_present(inst, instances.values()), inst.name)
+                with self.assertRaises(sentry.KeychainMissing):
+                    sentry.read_token(inst, instances.values())
+            out = sentry.expand_servers(self.kit, {"sentry": TEMPLATE}, overlay=self.overlay)
+        self.assertEqual(list(out), ["sentry"])
+        self.assertIn("SENTRY_ACCESS_TOKEN_PROD_A is not read for prod-a: another instance shares that name; "
+                      "set SENTRY_ACCESS_TOKEN_PROD_2DA", err.getvalue())
+        self.assertNotIn(TOKEN, err.getvalue())
+
+    def test_an_old_variable_name_that_is_another_instances_own_reaches_only_that_one(self) -> None:
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {
+            "prod_a": {"host": "a.invalid", "keychain": "k/a"}, "prod_5fa": {"host": "b.invalid", "keychain": "k/b"}})
+        instances = sentry.load_instances(self.kit, self.overlay)
+        self.assertEqual(instances["prod_5fa"].old_env_name, instances["prod_a"].env_name)
+        os.environ["SENTRY_ACCESS_TOKEN_PROD_5FA"] = TOKEN
+        self.addCleanup(os.environ.pop, "SENTRY_ACCESS_TOKEN_PROD_5FA", None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sentry.read_token(instances["prod_a"], instances.values()), TOKEN)
+            self.assertEqual(sentry.env_token(instances["prod_5fa"], instances.values()), "")
+            with self.assertRaises(sentry.KeychainMissing):
+                sentry.read_token(instances["prod_5fa"], instances.values())
 
 
 class Match(unittest.TestCase):

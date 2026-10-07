@@ -36,6 +36,7 @@ offered this repo's three most recently touched open items.
   agent-task session-start --session id --source startup|resume|clear|compact [--repo r] [--branch b] [--cap n]
                                 (the OUT DIR's repo: --repo, else CLAUDE_PROJECT_DIR's, else the cwd's)
   agent-task nudge --session id --ctx n --at n [--cwd d]   the context-watch handoff text
+  agent-task context-points                     "<handoff default> <compaction point, 0 = unknown>" (hook-io)
 
 --session defaults to AGENT_SESSION_ID; native Codex prefers CODEX_THREAD_ID over an inherited Claude session.
 """
@@ -365,6 +366,12 @@ def cmd_nudge(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_context_points(_a: argparse.Namespace) -> int:
+    """hook-io's context_points: "<handoff default> <compaction point, 0 when unknown>"."""
+    print(handoff.handoff_default(), handoff.compact_at() or 0)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="agent-task", add_help=False)
     ap.add_argument("sub", nargs="?")
@@ -394,7 +401,7 @@ def main() -> int:
     a = ap.parse_intermixed_args()
     if a.sub == "ls" and a.paths is not None:
         a.paths = True
-    cmds = {"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "close": cmd_close, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge}
+    cmds = {"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "close": cmd_close, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge, "context-points": cmd_context_points}
     if a.help or a.sub not in cmds:
         print(__doc__)
         return 0 if a.help or not a.sub else 2

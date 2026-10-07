@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -532,6 +533,22 @@ exit 1''')
         self.assertEqual(list(servers), ['sentry'])
         self.assertEqual(servers['sentry']['command'], str(self.root / 'bin/sentry-mcp'))
 
+    def test_a_preset_with_mcp_servers_installs_them_by_default_unless_the_components_are_chosen(self) -> None:
+        self.host_cli('claude')
+        pack = self.pack()
+        (pack / 'agent-kit-preset.toml').write_text(
+            '[mcp.servers.sentry]\ncommand = "{{KIT_DIR}}/bin/sentry-mcp"\n'
+            '[sentry.instances.main]\nhost = "sentry.example.com"\nkeychain = "agent-kit/mcp/sentry"\nserver = "sentry"\n')
+        self.setup('--preset', str(pack), '--hosts', 'claude', '--apply')
+        self.assertIn('mcp', self.state()['configuration']['components'])
+        self.assertIn('main', json.loads((self.root / 'mcp/sentry-instances.json').read_text())['instances'])
+        self.assertEqual(list(json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers']), ['sentry'])
+        self.assertIn('sync: nothing changed', self.setup('sync').stdout)
+        self.setup('--hosts', 'claude', '--components', 'rules', 'skills', '--apply')
+        self.assertNotIn('mcp', self.state()['configuration']['components'])
+        self.setup('--hosts', 'claude', '--apply')
+        self.assertNotIn('mcp', self.state()['configuration']['components'], 'the chosen components were overridden')
+
     def test_a_preset_with_a_malformed_engine_key_plugin_or_clone_command_is_refused(self) -> None:
         cases = {
             'lowercase ticket keys': ('[kit]\nTICKET_PREFIXES = "abc"\n', 'TICKET_PREFIXES takes Jira project keys'),
@@ -761,6 +778,20 @@ exit 1''')
         self.assertTrue((project / '.venv').is_dir())
         self.assertEqual([path.name for path in (self.home / 'tmp').iterdir() if not path.name.startswith('uv-')], [],
                          'setup left files in TMPDIR')
+
+
+class SyncStampTests(unittest.TestCase):
+    def test_a_sync_whose_stamp_cannot_be_written_says_so(self) -> None:
+        sys.path.insert(0, str(SOURCE / 'bin/lib'))
+        import pack
+
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            (project / 'uv.lock').write_text('version = 1\n')
+            (project / '.venv').write_text('not a folder\n')
+            said = pack.sync_pack_mcp(('/usr/bin/true', str(project)))
+        self.assertIn(f'team pack mcp/ project synced ({project}), but its stamp could not be written', said)
+        self.assertIn('the next agent-setup or agent-kit sync runs it again', said)
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(TeamPackTests)

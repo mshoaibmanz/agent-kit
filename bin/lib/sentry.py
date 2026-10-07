@@ -11,7 +11,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import secret_store
 from secret_store import ITEM_NOT_FOUND
@@ -78,14 +78,16 @@ class Instance:
         return f"no Keychain or secret-tool here, and {self.env_name} is unset"
 
     def label(self, org: str) -> str:
-        """prod/staging for an org: from its slug when the slug says so, else the configured label,
-        else unknown. Discovery names the orgs; the config only labels ones whose names don't."""
+        """prod/staging for an org: the configured label (orgs) when it names one, else from its slug
+        when the slug says so, else unknown. The table wins: a slug can say prd and be a staging org."""
+        if org in self.orgs:
+            return self.orgs[org]
         slug = org.lower()
         if any(part in slug for part in ("prd", "prod")):
             return "prod"
         if any(part in slug for part in ("stg", "staging")):
             return "staging"
-        return self.orgs.get(org, "unknown")
+        return "unknown"
 
 
 LEGACY = Instance("default", "", LEGACY_SERVICE, TEMPLATE_SERVER)
@@ -171,29 +173,35 @@ def default_instance(instances: Dict[str, Instance]) -> Instance:
     return next((i for i in instances.values() if i.server.lower() == TEMPLATE_SERVER), LEGACY)
 
 
-def env_token(inst: Instance) -> str:
+def env_token(inst: Instance, instances: Iterable[Instance]) -> str:
     """The instance's token from its variable. The name before the hex spelling is still read, with a
-    one-line warning to rename it."""
+    one-line warning to rename it, unless another of `instances` (every configured one) shares that
+    old name or has it as its own: prod-a and prod_a both spelled SENTRY_ACCESS_TOKEN_PROD_A, and a
+    token set for one must never reach the other's host."""
     token = os.environ.get(inst.env_name, "")
-    if not token and inst.old_env_name != inst.env_name and os.environ.get(inst.old_env_name):
-        print(f"sentry: rename {inst.old_env_name} to {inst.env_name}; the old name is read for now", file=sys.stderr)
-        token = os.environ[inst.old_env_name]
-    return token
+    old = inst.old_env_name
+    if token or old == inst.env_name or not os.environ.get(old):
+        return token
+    if any(other.name != inst.name and old in (other.env_name, other.old_env_name) for other in instances):
+        print(f"sentry: {old} is not read for {inst.name}: another instance shares that name; set {inst.env_name}", file=sys.stderr)
+        return ""
+    print(f"sentry: rename {old} to {inst.env_name}; the old name is read for now", file=sys.stderr)
+    return os.environ[old]
 
 
-def token_present(inst: Instance) -> bool:
-    """Whether the instance has a token: its store item, else its variable."""
-    return secret_store.lookup(inst.keychain, ACCOUNT, reveal=False)[0] == 0 or bool(env_token(inst))
+def token_present(inst: Instance, instances: Iterable[Instance]) -> bool:
+    """Whether the instance has a token: its store item, else its variable (env_token)."""
+    return secret_store.lookup(inst.keychain, ACCOUNT, reveal=False)[0] == 0 or bool(env_token(inst, instances))
 
 
-def read_token(inst: Instance) -> str:
-    """The instance's token from its store item, else its variable. KeychainMissing when neither
-    has one, KeychainDenied when the item exists but could not be read. A revealing read may wait on
-    a Keychain prompt."""
+def read_token(inst: Instance, instances: Iterable[Instance]) -> str:
+    """The instance's token from its store item, else its variable (env_token). KeychainMissing when
+    neither has one, KeychainDenied when the item exists but could not be read. A revealing read may
+    wait on a Keychain prompt."""
     code, token = secret_store.lookup(inst.keychain, ACCOUNT, reveal=True, timeout=120)
     if code == 0 and token:
         return token
-    fallback = env_token(inst)
+    fallback = env_token(inst, instances)
     if fallback:
         return fallback
     if code == ITEM_NOT_FOUND:
@@ -232,8 +240,8 @@ def expand_servers(
     template_name = next((n for n in servers if n.lower() == TEMPLATE_SERVER), None)
     if template_name is None or not isinstance(servers[template_name], dict):
         return servers
-    present = present or token_present
     instances = load_instances(kit, overlay)
+    present = present or (lambda inst: token_present(inst, instances.values()))
     out: Dict[str, Any] = {}
     for name, spec in servers.items():
         out[name] = spec

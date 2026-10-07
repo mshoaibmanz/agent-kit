@@ -14,7 +14,8 @@ import subprocess
 import sys
 from typing import Any
 
-from hosts import HOSTS, default_host_root
+from hosts import HOSTS
+from kit_text import default_host_root
 import secret_store
 
 KIT = Path(__file__).resolve().parents[2]

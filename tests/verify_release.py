@@ -45,7 +45,6 @@ with tempfile.TemporaryDirectory(prefix='verify-release-', dir=os.environ.get('T
         failures.append('marketplace plugin matrix')
     sys.path.insert(0, str(root / 'scripts'))
     from build_plugins import plugin_source
-    # Each entry's source is the one --marketplace generates from plugin_source.
     for row in market['plugins']:
         if row.get('source') != plugin_source(row['name']):
             failures.append(f'marketplace source for {row["name"]} differs from plugin_source (run build_plugins.py --marketplace)')

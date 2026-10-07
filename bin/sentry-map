@@ -25,7 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 KIT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(KIT / "bin" / "lib"))
@@ -123,9 +123,9 @@ class Client:
             raise RuntimeError(f"{self.inst.host} unreachable ({reason})") from None
 
 
-def crawl(inst: Instance) -> dict[str, Any]:
+def crawl(inst: Instance, instances: Iterable[Instance]) -> dict[str, Any]:
     try:
-        client = Client(inst, read_token(inst))
+        client = Client(inst, read_token(inst, instances))
     except KeychainMissing:
         raise RuntimeError(
             f"{inst.missing()}; enable with: {inst.enable_command()}"
@@ -200,7 +200,7 @@ def load(force: bool) -> tuple[dict[str, Instance], dict[str, Any]]:
         if fresh and not force:
             continue
         try:
-            cache[name] = crawl(inst)
+            cache[name] = crawl(inst, instances.values())
             changed = True
         except RuntimeError as e:
             stale = f"; using the cache from {time.strftime('%Y-%m-%d %H:%M', time.localtime(entry['fetched_at']))}" if entry else ""
@@ -302,8 +302,9 @@ def cmd_refresh(_args: argparse.Namespace) -> int:
 def cmd_instances(_args: argparse.Namespace) -> int:
     from sentry import token_present
 
-    for inst in load_instances(KIT).values():
-        state = "token present" if token_present(inst) else f"{inst.missing()}; enable: {inst.enable_command()}"
+    instances = load_instances(KIT)
+    for inst in instances.values():
+        state = "token present" if token_present(inst, instances.values()) else f"{inst.missing()}; enable: {inst.enable_command()}"
         labels = ", ".join(f"{o}={label}" for o, label in inst.orgs.items()) or "-"
         note = f"  note: {inst.note}" if inst.note else ""
         print(f"{inst.name}: host {inst.host}, MCP server {inst.server}, item {inst.keychain} ({state}); org labels {labels}{note}")

@@ -447,7 +447,7 @@ def keychain_get(account: str) -> str | None:
 def store_get(account: str) -> str | None:
     """The account's password from the store (secret_store)."""
     code, secret = secret_store.lookup(KEYCHAIN_SERVICE, account, reveal=True)
-    return secret or None if code == 0 else None
+    return secret if code == 0 and secret else None
 
 
 def keychain_set(account: str, password: str) -> bool:

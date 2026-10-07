@@ -364,6 +364,10 @@ check("nudge: a bound item names its HANDOFF.md, the project INDEX and agent-tas
 (T / "cfg/settings.json").write_text('{"autoCompactWindow": 623000}\n')
 o = task("nudge", "--session", S1, "--ctx", "575000", env=dict(ENV, CLAUDE_CONFIG_DIR=str(T / "cfg"))).stdout
 check("nudge: with no --at, the point sits 30K before the compaction autoCompactWindow places", o.startswith("CONTEXT 575K: past the 570K handoff point; auto-compaction follows near 600K."), o)
+o = task("context-points", env=dict(ENV, CLAUDE_CONFIG_DIR=str(T / "cfg"))).stdout
+check("context-points: hook-io's handoff default and compaction point", o == "570000 600000\n", o)
+o = task("context-points", env=dict(ENV, CLAUDE_CONFIG_DIR=str(T / "nocfg"))).stdout
+check("context-points: no autoCompactWindow: the 600K default, compaction unknown (0)", o == "600000 0\n", o)
 o = task("nudge", "--session", S1, "--ctx", "612345", "--at", "600000", env=dict(ENV, CLAUDE_CONFIG_DIR=str(T / "nocfg"))).stdout
 check("nudge: no autoCompactWindow names no compaction point", o.startswith("CONTEXT 612K: past the 600K handoff point. ") and "near" not in o, o)
 o = task("nudge", "--session", S5, "--ctx", "700000", "--at", "600000").stdout

@@ -71,7 +71,7 @@ def main() -> None:
     if name is not None and host_arg:
         die(f"--instance {name} sets the host; drop --host/--url")
     try:
-        token = read_token(inst)
+        token = read_token(inst, instances.values())
     except KeychainMissing:
         die(f"{inst.missing()} for instance {inst.name}. Fix: {inst.enable_command()} (in your own terminal)")
     except KeychainDenied:

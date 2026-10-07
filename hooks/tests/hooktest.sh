@@ -681,6 +681,18 @@ check "context-watch: the fallback text (no agent-task) takes the same compactio
 out=$(printf '%s' "$(cwp cw-s22 "$CW/t1.jsonl")" | KIT_ENV=/dev/null CLAUDE_STATE_DIR=$CW/state CLAUDE_PROJECT_DIR= bash "$CW/copy/hooks/context-watch")
 check "...and leaves the compaction point out when autoCompactWindow is unset" "$out" 'past the 600K handoff point\. At the next'
 check "...naming no number for it" "$out" 'near' absent
+# context_points' cache: an edit in the cache's own second (bash 3.2's -nt sees whole seconds; touch -r
+# makes it exact) is read again, and two config dirs sharing a state dir keep one cache each.
+pts() { ( export KIT_ENV=/dev/null CLAUDE_CONFIG_DIR=$1 CLAUDE_STATE_DIR=$CW/pts-state; unset CONTEXT_HANDOFF_AT
+  . "$H/lib/hook-io" && context_points && printf '%s %s' "$HANDOFF_AT" "$COMPACT_AT" ) }
+mkdir -p "$CW/pts-a" "$CW/pts-b"
+printf '{"autoCompactWindow": 680000}\n' > "$CW/pts-a/settings.json"
+check "context_points: autoCompactWindow 680000 hands off at 627K, compacts near 657K" "$(pts "$CW/pts-a")" '^627000 657000$'
+printf '{"autoCompactWindow": 623000}\n' > "$CW/pts-a/settings.json"
+touch -r "$(ls "$CW/pts-state/context-watch/".points*pts_a)" "$CW/pts-a/settings.json"
+check "...an edit stamped the cache's own mtime is read: 570K, 600K" "$(pts "$CW/pts-a")" '^570000 600000$'
+check "...another config dir on the same state dir has its own answer" "$(pts "$CW/pts-b")" '^600000 0$'
+check "...one cache file per config dir" "$(ls -a "$CW/pts-state/context-watch" | grep -c '^\.points')" '^2$'
 { aline 0 0 650000; aline 0 0 640000 2026-10-03T10:00:00.000Z claude-opus-5-5 true; aline 0 0 0; } > "$CW/t2.jsonl"
 out=$(cw "$(cwp cw-s7 "$CW/t2.jsonl")")
 check "context-watch: a sidechain line and a zero (synthetic) usage are skipped" "$out" 'CONTEXT 650K'

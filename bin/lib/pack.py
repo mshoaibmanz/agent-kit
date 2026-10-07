@@ -21,7 +21,8 @@ from urllib.parse import quote
 import zlib
 
 from checkout import git
-from hosts import HOSTS, PACK_DIR, fill_servers, frontmatter, skill_hosts
+from hosts import HOSTS, frontmatter, skill_hosts
+from kit_text import PACK_DIR, fill_servers
 from preflight import install_hint, server_runtime
 
 TOKEN_FORMATS = (r'gh[opsur]_[A-Za-z0-9]{8,}|github_pat_\w{8,}|sk-(?:ant-)?[\w-]{8,}|[sr]k_live_[A-Za-z0-9]{16,}'
@@ -369,7 +370,10 @@ def _clone_missing(spec: dict[str, Any], local: str) -> str | None:
     command = str(spec.get('command', ''))
     if '{{CODE_DIR}}' in command and not os.access(command.replace('{{CODE_DIR}}', local), os.X_OK):
         return f'{command.replace("{{CODE_DIR}}", local)} is not an executable in your clone yet'
-    for argument in spec.get('args', []) if isinstance(spec.get('args'), list) else []:
+    args = spec.get('args')
+    if not isinstance(args, list):
+        args = []
+    for argument in args:
         for match in CODE_DIR_PATH.finditer(str(argument)):
             path = match.group().replace('{{CODE_DIR}}', local)
             if not os.path.exists(path):
@@ -440,8 +444,9 @@ def sync_pack_mcp(command: Sequence[str] | None) -> str | None:
     try:
         stamp = hashlib.sha256((project / 'uv.lock').read_bytes()).hexdigest()
         (project / '.venv' / SYNC_STAMP).write_text(stamp + '\n')
-    except OSError:
-        pass
+    except OSError as error:
+        return (f'team pack mcp/ project synced ({project}), but its stamp could not be written ({error}); '
+                'the next agent-setup or agent-kit sync runs it again')
     return f'team pack mcp/ project synced ({project})'
 
 

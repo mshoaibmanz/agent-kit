@@ -13,7 +13,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'bin/lib'))
-from hosts import SUBAGENT_RESUME_MAX, install_text  # noqa: E402
+from kit_text import SUBAGENT_RESUME_MAX, install_text  # noqa: E402
 MATRIX = json.loads((ROOT / '.claude-plugin/components.json').read_text())
 HOOKS = {name: set(hooks) for name, hooks in MATRIX['hook_plugins'].items()}
 SKILLS = MATRIX['skill_plugins']

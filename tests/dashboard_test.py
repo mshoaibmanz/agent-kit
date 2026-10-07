@@ -8,7 +8,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import importlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -24,6 +26,7 @@ sys.path.insert(0, str(SOURCE / 'bin/lib'))
 sys.path.insert(0, str(SOURCE / 'hooks/lib'))
 from credentials import MASK, mask_tokens, show_args, show_url  # noqa: E402
 from preset import validate_catalog  # noqa: E402
+import secret_store  # noqa: E402
 
 SECTIONS = ('hosts', 'mcp', 'unmanaged', 'overlay', 'data', 'skills', 'roles', 'hooks', 'pack', 'work', 'actions')
 # Values a page must never hold, built so this file holds no token a scanner would flag.
@@ -581,6 +584,20 @@ class DashboardScenarioTests(Fixture):
         self.assertTrue((self.home / 'work/dashboard/index.html').is_file())
 
 
+class KeychainFixtureTests(unittest.TestCase):
+    """The page's AGENT_KIT_SECURITY fixture reaches its existence check, never a revealing read."""
+
+    def test_the_fixture_binary_never_reaches_a_revealing_read(self) -> None:
+        fixed = secret_store.SECURITY
+        os.environ['AGENT_KIT_SECURITY'] = '/bin/echo'
+        self.addCleanup(os.environ.pop, 'AGENT_KIT_SECURITY', None)
+        importlib.reload(importlib.import_module('dashboard_sections'))
+        self.assertEqual(secret_store.SECURITY, fixed)
+        with self.assertRaisesRegex(ValueError, 'never takes another security binary'):
+            secret_store.lookup('example/item', 'me', reveal=True, security='/bin/echo')
+        self.assertEqual(secret_store.lookup('example/item', 'me', reveal=False, security='/usr/bin/true'), (0, ''))
+
+
 class CredentialClassifierTests(unittest.TestCase):
     """credentials.py: what validate_catalog refuses is what the page masks."""
 
@@ -711,7 +728,7 @@ class CredentialClassifierTests(unittest.TestCase):
                                              'notes': 'kept\napart', 'hosts': '[claude]'})
 
     def test_render_drops_the_credentials_declaration(self) -> None:
-        from hosts import fill_servers
+        from kit_text import fill_servers
 
         filled = fill_servers({'w': {'command': 'x', 'credentials': [{'service': 'a', 'account': 'b'}]}}, '/kit')
         self.assertEqual(filled, {'w': {'command': 'x'}})

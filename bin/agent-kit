@@ -49,7 +49,7 @@ Roles (roles.toml, the one source for model and effort per role; see its header)
   agent-body <role> [--host H]   print agents/<role>.md's body filled for H (agent-run's prompt)
 
 Placeholders: agent bodies, host rules (rules/hosts/<host>.md) and installed skill text may hold
-{{NAME}}, filled per host by bin/lib/hosts.py fill:
+{{NAME}}, filled per host by bin/lib/kit_text.py fill:
   AGENT_KIT_DIR, KIT_DIR  the kit           SKILLS_DIR  <kit>/skills     OVERLAY_DIR  <kit>/local
   RULES_FILE              the host's instructions file (CLAUDE.md, AGENTS.md, rules/agent-kit.mdc)
   SUBAGENT_RESUME_MAX_K   kit.env SUBAGENT_RESUME_MAX (default 300000) in thousands
@@ -391,10 +391,10 @@ def role_settings(roles: Roles, host: str) -> dict[str, Any]:
 
 def fill_for_host(text: str, kit: str | None = None, host: str = "claude", host_root: str | None = None,
                   what: str = "text", resume: int | None = None, strict: bool = True) -> str:
-    """hosts.fill with this kit as the default kit: an unknown placeholder refuses the render (strict)."""
+    """kit_text.fill with this kit as the default kit: an unknown placeholder refuses the render (strict)."""
     if "{{" not in text:
         return text  # no lib needed: a synthetic kit without bin/lib renders placeholder-free text
-    from hosts import fill
+    from kit_text import fill
 
     return fill(text, kit or str(KIT), host, host_root, what, resume, strict)
 
@@ -868,7 +868,7 @@ def render_settings(
 
 def mcp_catalog() -> dict[str, Any]:
     """The catalog as the host gets it: kit placeholders ({{KIT_DIR}}) filled for this kit and the
-    `credentials` declarations dropped (hosts.fill_servers). An install without the mcp component
+    `credentials` declarations dropped (kit_text.fill_servers). An install without the mcp component
     has no catalog: an empty one."""
     if not SERVERS.is_file():
         return {"mcpServers": {}}
@@ -877,7 +877,7 @@ def mcp_catalog() -> dict[str, Any]:
     if isinstance(servers, dict) and (
         "{{" in json.dumps(servers) or any(isinstance(s, dict) and "credentials" in s for s in servers.values())
     ):
-        from hosts import fill_servers
+        from kit_text import fill_servers
 
         catalog["mcpServers"] = servers = fill_servers(servers, str(KIT))
     # One server per Sentry instance (bin/lib/sentry.py), each beyond the catalog's own only once
