@@ -807,6 +807,14 @@ def inventory(
     ]
     if host == "codex" and set(config.get("hooks", {})) & set(EVENTS):
         errors.append("inline hooks and hooks.json are both configured")
+    import overlay  # here: overlay imports this module
+
+    local = root / "local"
+    installed = (api.KIT / ".install-state").is_dir() and host_root_for(api.KIT, host) is not None
+    if host == "claude" and installed and not (
+        local.is_symlink() and Path(os.path.realpath(local)) == (api.KIT / "local").resolve()
+    ):
+        errors.append(f"{local} is not the link to {api.KIT / 'local'} (agent-setup creates it)")
     rules = [root / RULES_FILES[host]]
     if repo:
         if host == "codex":
@@ -870,6 +878,9 @@ def inventory(
         "duplicate_hooks": duplicate_hooks,
         "skills": skills,
         "incompatible_skills": incompatible,
+        # The personal overlay's skills (installed among skills) and the kit or pack ones they replace.
+        "overlay_skills": overlay.skill_names(api.KIT / "local"),
+        "overlay_overrides": overlay.installed_overrides(api.KIT, overlay.skill_names(api.KIT / "local")),
         "skill_dirs": [str(path) for path in skill_dirs(host, root)],
         "rendered_files": [name for name in RENDERED_FILES[host] if (root / name).is_file()],
         "mcp_servers": sorted(mcp),

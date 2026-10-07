@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from installer_ux_test import SOURCE, InstallerUxFixture  # noqa: E402
 
 RULES = '## Team rules\n\n- Name the ticket in every branch.\n'
+OVERLAY_RULES = '## My rules\n\n- Answer in one line.\n'
 GIT = ('git', '-c', 'user.name=Pack Author', '-c', 'user.email=author@example.com', '-c', 'commit.gpgsign=false')
 # The environment of every git a test runs, its own or the installer's: no auto maintenance, which git
 # runs detached after a commit or fetch, racing the fake home's cleanup.
@@ -678,6 +679,95 @@ exit 1''')
         (pack / 'skills/team-data/SKILL.md').write_text('---\nname: team-data\ndescription: Team data.\n---\n')
         self.setup('--preset', str(pack), *flags)
         self.assertIn('No installed skill extends debug.', (self.home / '.codex/skills/debug/SKILL.md').read_text())
+
+    def overlay(self) -> Path:
+        """A personal overlay in the kit's local/: a skill of its own, one named like the pack's
+        team-howto, a loose note (no skill) and a rules block."""
+        local = self.root / 'local'
+        (local / 'skills/mine').mkdir(parents=True)
+        (local / 'skills/mine/SKILL.md').write_text('---\nname: mine\ndescription: Mine.\n---\n\nKit at {{KIT_DIR}}.\n')
+        (local / 'skills/team-howto').mkdir()
+        (local / 'skills/team-howto/SKILL.md').write_text('---\nname: team-howto\ndescription: My how-to.\n---\n\nOverlay how-to.\n')
+        (local / 'skills/NOTES.md').write_text('# not a skill\n')
+        (local / 'rules.md').write_text(OVERLAY_RULES)
+        return local
+
+    def test_overlay_skills_and_rules_install_on_every_host_and_an_overlay_skill_overrides_the_packs(self) -> None:
+        hosts = ('claude', 'codex', 'cursor')
+        for host in hosts:
+            self.host_cli(host)
+        pack, local = self.pack(), self.overlay()
+        result = self.setup('--preset', str(pack), '--hosts', *hosts, '--components', 'rules', 'skills', '--apply')
+        self.assertIn(f'overlay {local}: skills mine, team-howto; rules block of 8 words', result.stdout)
+        self.assertIn('overlay skill team-howto overrides the team pack skill of that name', result.stdout)
+        self.assertEqual((self.home / '.claude/local').readlink(), local)
+        rules = {'claude': self.root / 'state/rendered/claude-host-rules.md', 'codex': self.home / '.codex/AGENTS.md',
+                 'cursor': self.home / '.cursor/rules/agent-kit.mdc'}
+        for host in hosts:
+            with self.subTest(host):
+                skills = self.home / f'.{host}/skills'
+                self.assertEqual((skills / 'mine').readlink(), self.root / 'skills/mine')
+                self.assertIn(f'Kit at {self.root}.', (skills / 'mine/SKILL.md').read_text())
+                self.assertIn('Overlay how-to.', (skills / 'team-howto/SKILL.md').read_text())
+                self.assertFalse((skills / 'NOTES.md').exists())
+                text = rules[host].read_text()
+                self.assertIn(OVERLAY_RULES.strip(), text)
+                self.assertLess(text.index(RULES.strip()), text.index(OVERLAY_RULES.strip()), 'the overlay comes last')
+        self.assertFalse((self.root / 'skills/team-howto/references').exists(), 'an overlay skill replaces the whole folder')
+        self.assertEqual((pack / 'skills/team-howto/references/deploys.md').read_text(), '# Deploys\n')
+        report = self.doctor()['overlay']
+        self.assertEqual((report['skills'], report['rules_words'], report['overrides']),
+                         (['mine', 'team-howto'], 8, {'team-howto': 'team pack'}))
+        inventory = json.loads(self.kit('doctor', '--host', 'all').stdout)
+        for entry in inventory:
+            with self.subTest(entry['host']):
+                self.assertEqual(entry['errors'], [])
+                self.assertEqual(entry['overlay_overrides'], {'team-howto': 'team pack'})
+                self.assertIn('mine', entry['skills'])
+
+        # An edit to the overlay is a doctor problem until a rerun installs it.
+        (local / 'rules.md').write_text('## Mine\n\n- Changed.\n')
+        problems = self.doctor(code=1)['problems']
+        self.assertTrue(any('changed since setup: run agent-kit sync' in problem for problem in problems), problems)
+        shutil.rmtree(local / 'skills/team-howto')
+        self.setup('--apply')
+        self.doctor()
+        self.assertIn('- Changed.', rules['codex'].read_text())
+        self.assertNotIn(OVERLAY_RULES.strip(), rules['codex'].read_text())
+        self.assertTrue((self.root / 'skills/team-howto/references/deploys.md').is_file(), "the pack's skill is back")
+        (local / 'rules.md').unlink()
+        shutil.rmtree(local / 'skills/mine')
+        self.setup('--apply')
+        self.assertFalse((self.home / '.codex/skills/mine').is_symlink() or (self.root / 'skills/mine/SKILL.md').exists())
+        self.assertNotIn('- Changed.', rules['claude'].read_text())
+
+    def test_an_overlay_over_its_rules_cap_or_with_a_malformed_skill_is_refused(self) -> None:
+        self.host_cli('claude')
+        local = self.root / 'local'
+        local.mkdir(parents=True)
+        (local / 'rules.md').write_text('word ' * 401)
+        result = self.setup(*FLAGS, '--apply', code=2)
+        self.assertIn(f'overlay {local}: rules.md has 401 words, over the cap of 400', result.stderr)
+        (local / 'rules.md').write_text(OVERLAY_RULES)
+        (local / 'skills/Bad').mkdir(parents=True)
+        result = self.setup(*FLAGS, '--apply', code=2)
+        self.assertIn(f'overlay {local}: skills/Bad needs a lowercase name and a SKILL.md', result.stderr)
+        self.assertFalse((self.root / '.install-state').exists())
+
+    def test_a_real_claude_local_folder_is_kept_and_doctor_reports_it(self) -> None:
+        self.host_cli('claude')
+        legacy = self.home / '.claude/local'
+        legacy.mkdir(parents=True)
+        (legacy / 'notes.md').write_text('mine\n')
+        result = self.setup(*FLAGS, '--apply')
+        self.assertIn(f'agent-setup: kept {legacy}: a folder, not the link to {self.root / "local"}', result.stderr)
+        self.assertEqual((legacy / 'notes.md').read_text(), 'mine\n')
+        problems = self.doctor(code=1)['problems']
+        self.assertTrue(any(f'{legacy} is not the link to {self.root / "local"}' in problem for problem in problems), problems)
+        shutil.rmtree(legacy)
+        self.setup(*FLAGS, '--apply')
+        self.assertEqual(legacy.readlink(), self.root / 'local')
+        self.doctor()
 
     def test_a_server_left_out_for_a_missing_command_is_listed_under_skipped(self) -> None:
         self.host_cli('claude')

@@ -66,6 +66,7 @@ from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary)
 from pack import (PACK_DIR, PACK_SKILLS, McpPlan, extension_lists, installed_pack, mcp_plan,  # noqa: E402
                   sync_pack_mcp)
+import overlay  # noqa: E402
 from preset import Preset, apply_preset, kit_skills, plugin_settings, source_status, validate_catalog  # noqa: E402
 from sentry import INSTANCES_FILE, expand_servers, merge_instances, read_instances  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
@@ -512,6 +513,16 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
             changes.append(Change('file', target / 'commands' / command.name, text.encode()))
     if host == 'claude' and 'hooks' in components:
         changes.append(Change('link', target / 'bin', str(root / 'bin')))
+    if host == 'claude':
+        # Claude's hooks, commands and skill texts name <config dir>/local, the overlay's older home:
+        # it links to the kit's overlay, so nothing reads a hand-placed copy. A real folder there
+        # holds the user's files: kept, and doctor reports it until they move into <kit>/local.
+        local = target / 'local'
+        if local.is_dir() and not local.is_symlink() and not prior_record(root, local, 'link'):
+            print(f'agent-setup: kept {local}: a folder, not the link to {root / "local"}; move its files '
+                  f'into {root / "local"}, remove it and rerun', file=sys.stderr)
+        else:
+            changes.append(Change('link', local, str(root / 'local')))
     for change in changes:
         if change.kind not in ('hooks', 'cursor-hooks'):
             continue
@@ -531,9 +542,15 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
 
 
 def selected_skills(args: argparse.Namespace, preset: Preset) -> list[str]:
-    """The skills this install selects: --skills (every kit skill when unset) and the team pack's."""
+    """The skills this install selects: --skills (every kit skill when unset), the team pack's and the
+    personal overlay's (<root>/local/skills)."""
     names = args.skills if args.skills is not None else kit_skills(Path(args.source).expanduser().resolve())
-    return [*names, *(name for name in preset.pack_skills if name not in names)]
+    names = [*names, *(name for name in preset.pack_skills if name not in names)]
+    return [*names, *(name for name in overlay_skills(args) if name not in names)]
+
+
+def overlay_skills(args: argparse.Namespace) -> list[str]:
+    return overlay.skill_names(Path(args.root_dir).expanduser().absolute() / 'local')
 
 
 def copy_source_code(source: str | Path, destination: str | Path) -> str:
@@ -569,6 +586,19 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
                 path.chmod(0o755 if mode & 0o111 else 0o644)
+    # The personal overlay over both: each of its skills replaces a kit or pack skill of that name
+    # whole, and its rules.md waits in view/local for the host renders (with_team_rules), which the
+    # plan never installs: local/ is the user's.
+    personal = overlay.read_overlay(Path(args.root_dir).expanduser().absolute() / 'local')
+    for name in personal.skills:
+        shutil.rmtree(view / 'skills' / name, ignore_errors=True)
+    for relative, (data, mode) in personal.files.items():
+        path = view / ('local/' + relative if relative == overlay.OVERLAY_RULES else relative)
+        if relative != overlay.OVERLAY_RULES:
+            derived.add(path.relative_to(view))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
     copy_source_code(source / 'hooks/lib/state', view / 'hooks/lib/state')
     matrix = source / '.claude-plugin/components.json'
     if matrix.is_file():
@@ -606,12 +636,15 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
     changes = []
     selected = selected_skills(args, preset)
     pack_skills = preset.pack.skills if preset.pack is not None else []
-    extensions = extension_lists(view / 'skills', selected, str(root / 'skills')) if 'skills' in args.components else {}
+    personal = overlay_skills(args)
+    extensions =extension_lists(view / 'skills', selected, str(root / 'skills')) if 'skills' in args.components else {}
     for path in sorted(view.rglob('*')):
         if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
             continue
         if path.is_file():
             relative = path.relative_to(view)
+            if relative.parts[0] == 'local':
+                continue
             if relative.parts[0] == 'skills':
                 selected_skill = 'skills' in args.components and relative.parts[1] in selected
                 reference_asset = relative.parts[1] == 'review-rubric' and path.name != 'SKILL.md'
@@ -628,7 +661,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.suffix == '.md':
                 filled = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
-                                      strict=relative.parts[1] not in pack_skills,
+                                      strict=relative.parts[1] not in (*pack_skills, *personal),
                                       extensions=extensions.get(relative.parts[1], [])).encode()
                 if filled != content:
                     derived.add(relative)
@@ -678,6 +711,7 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
     hosts = {host_target(args, host, home) for host in args.hosts}
     skills = 'skills' in args.components
     selected = set(selected_skills(args, preset))
+    personal = set(overlay_skills(args))
     removals = []
     for record in load_json(root / '.install-state/current.json', {}).get('managed', {}).values():
         target = Path(record['target'])
@@ -694,6 +728,8 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
             if skills and relative.parts[0] == 'skills':
                 skill = relative.parts[1]
                 retired = retired or (skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md'))
+                # An overlay skill replaces the kit's of its name whole: a kit file it lacks goes.
+                retired = retired or (skill in personal and not (view / relative).exists())
         elif record['kind'] == 'file':
             # With roles selected the render owns the host's agents folder even when it writes nothing
             # there (Codex with native_agents = false), so what it wrote before is retired.
@@ -1184,6 +1220,8 @@ def configured(args: argparse.Namespace, preset: Preset, answered: set[str], pre
         # The preset outlives this run: a later update without --preset applies the same values.
         configuration.update(preset=preset.record, preset_values=preset.saved())
     configuration['source_checkout'] = str(Path(args.source).expanduser().resolve())
+    # What the overlay's skills and rules were at this install: doctor says when they changed since.
+    configuration['overlay'] = overlay.read_overlay(Path(args.root_dir).expanduser().absolute() / 'local').digest()
     configuration['dev'] = args.dev
     configuration['confirm_hook_support'] = args.confirm_hook_support
     # Every selected host's root as installed, however it was named (--host-root, CLAUDE_CONFIG_DIR,
@@ -1325,6 +1363,35 @@ def managed_drift(records: Iterable[dict[str, Any]]) -> list[str]:
     return drift
 
 
+def overlay_report(root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """The overlay as doctor reports it: its skills, rules size and the kit or pack skills its skills
+    override; 'problem' when it changed since setup, no longer reads, or Claude's <config dir>/local is
+    not the link to it."""
+    configuration = state.get('configuration', {})
+    report: dict[str, Any] = {'folder': str(root / 'local')}
+    problems = []
+    try:
+        personal = overlay.read_overlay(root / 'local')
+    except ValueError as error:
+        personal = None
+        problems.append(str(error))
+    if personal is not None:
+        report.update(skills=personal.skills, rules_words=len(personal.rules.split()),
+                      overrides=overlay.installed_overrides(root, personal.skills))
+        recorded = configuration.get('overlay')
+        if state and recorded is not None and recorded != personal.digest():
+            problems.append(f'the overlay\'s skills or rules.md under {root / "local"} changed since setup: '
+                            'run agent-kit sync to install them')
+    if 'claude' in configuration.get('hosts', []):
+        local = Path(configuration.get('host_roots', {}).get('claude') or default_host_root('claude')) / 'local'
+        if not local.is_symlink() or Path(os.path.realpath(local)) != (root / 'local').resolve():
+            problems.append(f'{local} is not the link to {root / "local"}: move any files there into it, remove '
+                            f'{local} and rerun agent-setup --apply')
+    if problems:
+        report['problem'] = '; '.join(problems)
+    return report
+
+
 def doctor(args: argparse.Namespace) -> int:
     root = Path(args.root_dir).expanduser().absolute()
     state = load_json(root / '.install-state/current.json', {})
@@ -1340,6 +1407,9 @@ def doctor(args: argparse.Namespace) -> int:
                         '--collision skip to keep your edits, or --collision backup to replace them (the install '
                         'journal keeps your version)')
     configuration = state.get('configuration', {})
+    personal = overlay_report(root, state)
+    if personal.get('problem'):
+        problems.append(personal.pop('problem'))
     dev = None
     if configuration.get('dev'):
         source = Path(configuration.get('source_checkout', ''))
@@ -1359,7 +1429,8 @@ def doctor(args: argparse.Namespace) -> int:
         logged, how = host_login(host, getattr(args, host + '_bin'), host_target(args, host, Path.home()))
         logins[host] = {'logged_in': logged, 'checked': how}
     output({'wrappers': [str(root / 'bin' / name) for name in ('ro-mysql', 'bqro') if (root / 'bin' / name).is_file()], 'installed': bool(state), 'root': str(root), 'drift': drift,
-            'problems': problems, 'preset': preset, 'dev': dev, 'dependencies': deps, 'native_auth': logins})
+            'problems': problems, 'preset': preset, 'overlay': personal, 'dev': dev, 'dependencies': deps,
+            'native_auth': logins})
     for problem in problems:
         print('agent-setup doctor: ' + problem, file=sys.stderr)
     return 1 if problems else 0
@@ -1600,6 +1671,13 @@ def resolve(args: argparse.Namespace, root: Path, state: dict[str, Any], saved: 
     else:
         args.confirm_hook_support = sorted(set(args.confirm_hook_support) - {'none'})
     notes = [Row(*note) for note in preset.notes]
+    if plans_install:
+        personal = overlay.read_overlay(root.absolute() / 'local')
+        if personal.files:
+            notes.append(Row('Ready', overlay.summary(personal)))
+        clashes = overlay.overrides(personal.skills, kit_skills(Path(args.source).expanduser().resolve()),
+                                    preset.pack.skills if preset.pack is not None else [])
+        notes.extend(Row('Ready', line) for line in overlay.override_lines(clashes))
     if args.dev and plans_install:
         notes.append(Row('Ready', f'dev install: kit files link into {Path(args.source).expanduser().resolve()}, '
                                   'so an edit there is live; agent-kit sync re-renders the hosts'))

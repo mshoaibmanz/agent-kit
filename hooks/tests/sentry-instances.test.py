@@ -212,6 +212,9 @@ class Wrapper(Fixture):
     def install(self, *names: str) -> None:
         for name in (*names, "lib/sentry.py", "lib/secret_store.py"):
             shutil.copy2(SOURCE / "bin" / name, self.kit / "bin" / name)
+        (self.kit / "hooks/lib").mkdir(parents=True, exist_ok=True)
+        for name in ("kit_env.py", "hook-io"):
+            shutil.copy2(SOURCE / "hooks/lib" / name, self.kit / "hooks/lib" / name)
         lib = self.kit / "bin/lib/secret_store.py"
         text = lib.read_text().replace('SECURITY = "/usr/bin/security"', f'SECURITY = "{self.security}"')
         self.assertIn(str(self.security), text)

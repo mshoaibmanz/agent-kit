@@ -14,11 +14,16 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 from typing import NoReturn
 
-KIT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(KIT / "bin" / "lib"))
+# Code beside the script's target; the instances of the kit it runs from (kit_root: a dev install
+# links this file into its checkout, whose instances are not the install's).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "hooks", "lib"))
+
+from kit_env import kit_root  # noqa: E402
+
+KIT = kit_root(__file__)
 
 from sentry import (  # noqa: E402
     HOST_OPTIONS,
