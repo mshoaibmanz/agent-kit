@@ -22,6 +22,7 @@ ENGINE = LIB.parents[1]
 sys.path.insert(0, str(LIB))
 sys.path.insert(0, str(ENGINE / "hooks/lib"))
 from credentials import mask_tokens  # noqa: E402
+from dashboard_docs import doc_parts  # noqa: E402
 from dashboard_html import Action, Command, Para, Section, Table, page  # noqa: E402
 from dashboard_sections import (  # noqa: E402
     Setup,
@@ -98,7 +99,7 @@ def build(api: ModuleType, check_updates: bool = False) -> tuple[str, int]:
     setup = Setup(api, check_updates)
     sections = [collect(setup, key, title, collector) for key, title, collector in ORDER]
     sections.append(actions_section(setup, sections))
-    return mask_tokens(page(sections, needs_attention(sections), setup.kit, ENGINE))
+    return mask_tokens(page(sections, needs_attention(sections), setup.kit, ENGINE, doc_parts(setup)))
 
 
 def cmd_dashboard(api: ModuleType, args: argparse.Namespace) -> int:

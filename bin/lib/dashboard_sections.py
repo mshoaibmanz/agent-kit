@@ -15,9 +15,10 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 from blocking import BLOCKING, hook_name
 from credentials import Credential, credential_name, declared_credentials, holds_secret, show_args, show_url
@@ -49,14 +50,42 @@ from hosts import (
     skill_hosts,
 )
 from kit_env import KEYS, kit_env, layers, parse
-from kit_text import RULES_FILES, default_host_root, fill_servers
+from kit_text import PACK_DIR, RULES_FILES, default_host_root, fill_servers
 from mcp_describe import Described
 from mcp_describe import read_cache as read_described
+from pack import PACK_SKILLS
 import secret_store
 
 LIB = Path(__file__).resolve().parent
 ENGINE = LIB.parents[1]
 TableRows = list[Row | tuple[Cell, ...]]
+# How a shared row builder shows a file: the Setup view's full path cell, or the docs view's link.
+Linker = Callable[[Path], Cell]
+DATA_WRAPPERS = ("ro-mysql", "bqro")
+
+
+class HookRow(NamedTuple):
+    """One registry entry as agent-kit's validate_registry accepts it, each field a plain value."""
+
+    event: str
+    matcher: str  # "" when the entry has none: every tool
+    name: str
+    command: str
+    hosts: tuple[str, ...]
+    description: str
+    timeout: str
+    blocking: bool
+
+
+class SkillEntry(NamedTuple):
+    """One skill the kit installs, once: layer is kit, pack or overlay (the layer setup took it
+    from), md its SKILL.md, and replaces whether it stands in for an engine skill of that name with
+    other text."""
+
+    name: str
+    layer: str
+    md: Path
+    replaces: bool
 
 
 def read_json(path: Path) -> Any:
@@ -121,7 +150,8 @@ def setup_command(setup: Setup, *args: str, action: str = "") -> str:
 
 
 def load_script(path: Path, name: str) -> ModuleType | None:
-    """A kit bin script as a module, without writing bytecode beside it."""
+    """A kit bin script as a module, without writing bytecode beside it or keeping the import
+    paths it adds."""
     if not path.is_file():
         return None
     loader = importlib.machinery.SourceFileLoader(name, str(path))
@@ -129,14 +159,28 @@ def load_script(path: Path, name: str) -> ModuleType | None:
     if spec is None:
         return None
     module = importlib.util.module_from_spec(spec)
-    dont_write = sys.dont_write_bytecode
+    dont_write, paths = sys.dont_write_bytecode, list(sys.path)
     sys.dont_write_bytecode = True
     sys.modules[name] = module  # a dataclass in the script looks its module up there
     try:
         loader.exec_module(module)
     finally:
         sys.dont_write_bytecode = dont_write
+        sys.path[:] = paths
     return module
+
+
+def script_parser(path: Path) -> Any:
+    """The argparse parser a Python bin script builds in its own parser(), else None. Only a script
+    that defines one and guards its main is loaded: anything else might act on import."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return None
+    if not re.search(r"^def parser\(", text, re.M) or "__name__ ==" not in text:
+        return None
+    module = load_script(path, "dashboard_cmd_" + re.sub(r"\W", "_", path.name))
+    return module.parser() if module is not None else None
 
 
 class Setup:
@@ -171,6 +215,61 @@ class Setup:
         except SystemExit as error:
             self.roles_error = str(error)
         self.inventories: dict[str, dict[str, Any]] = {}
+        self.registries: dict[Path, list[HookRow]] = {}
+
+    def registry(self, path: Path) -> list[HookRow]:
+        """The hook registry at path, validated once by agent-kit's own validate_registry; an
+        invalid one raises with what is wrong, so the part reading it shows that, not empty tables.
+        A kit with no registry file has no hooks."""
+        if path not in self.registries:
+            if not path.is_file():
+                return []
+            try:
+                entries = json.loads(path.read_text())
+            except ValueError as error:
+                raise ValueError(f"{path} is not JSON: {error}") from None
+            try:
+                self.api.validate_registry(entries)
+            except SystemExit as error:
+                said = str(error).replace(str(self.api.REGISTRY), str(path))
+                raise ValueError(" ".join(said.split())) from None
+            self.registries[path] = [
+                HookRow(
+                    event=e["event"],
+                    matcher=str(e.get("matcher") or ""),
+                    name=hook_name(str(e.get("command", ""))),
+                    command=str(e.get("command", "")),
+                    hosts=tuple(e["hosts"]),
+                    description=str(e.get("description") or ""),
+                    timeout=f"{e.get('timeout', '-')}{' async' if e.get('async') else ''}",
+                    blocking=hook_name(str(e.get("command", ""))) in BLOCKING,
+                )
+                for e in entries
+            ]
+        return self.registries[path]
+
+    @functools.cached_property
+    def skills(self) -> list[SkillEntry]:
+        """Every skill once, as setup lays them out: the source checkout's, the pack's (setup copies
+        each into skills/ as well, so that copy is the pack's, not a second skill), and the
+        overlay's when the install record names any. A source checkout lists its own."""
+        source, installed = self.source() / "skills", self.kit / "skills"
+        pack = self.kit / PACK_DIR / PACK_SKILLS
+        record = self.config.get("overlay")
+        overlay = set(record.get("skills") or []) if isinstance(record, dict) else set()
+        names = sorted({md.parent.name for d in (source, installed, pack) for md in d.glob("*/SKILL.md")})
+        out: list[SkillEntry] = []
+        for name in names:
+            engine = source / name / "SKILL.md"
+            if name in overlay and (installed / name / "SKILL.md").is_file():
+                layer, md = "overlay", installed / name / "SKILL.md"
+            elif (pack / name / "SKILL.md").is_file():
+                layer, md = "pack", pack / name / "SKILL.md"
+            else:
+                layer, md = "kit", engine if engine.is_file() else installed / name / "SKILL.md"
+            replaces = layer != "kit" and engine.is_file() and engine.read_bytes() != md.read_bytes()
+            out.append(SkillEntry(name, layer, md, replaces))
+        return out
 
     def kit_bin(self, name: str) -> Path:
         """The kit's own copy of a bin script, else the engine's."""
@@ -347,6 +446,18 @@ def described(entry: Described | None) -> tuple[Cell, str]:
     return shown, entry.instructions or entry.server
 
 
+def server_line(setup: Setup, name: str) -> tuple[str, str, str]:
+    """(transport, its command or URL with any credential masked, the catalog's description) of one
+    catalog server, as both views show it."""
+    filled, raw = setup.filled.get(name), setup.catalog.get(name)
+    spec = filled if isinstance(filled, dict) else {}
+    description = str(raw.get("description") or "") if isinstance(raw, dict) else ""
+    if "url" in spec:
+        return "http", show_url(str(spec["url"])).text, description
+    target = show_args([str(spec.get("command", "")), *map(str, spec.get("args") or [])]).text
+    return "stdio", target, description
+
+
 def mcp_section(setup: Setup, sec: Section) -> None:
     sec.sources = [setup.catalog_path] + ([setup.catalog_input] if setup.catalog_input else [])
     if setup.fill_error:
@@ -358,14 +469,9 @@ def mcp_section(setup: Setup, sec: Section) -> None:
     rows: TableRows = []
     for name in sorted(setup.filled):
         spec = setup.filled[name] if isinstance(setup.filled[name], dict) else {}
-        raw = setup.catalog.get(name) if isinstance(setup.catalog.get(name), dict) else {}
         tools, fallback = described(cache.get(name))
-        description = str(raw.get("description") or "") or fallback
-        if "url" in spec:
-            transport, target = "http", show_url(str(spec["url"])).text
-        else:
-            transport = "stdio"
-            target = show_args([spec.get("command", ""), *(spec.get("args") or [])]).text
+        transport, target, description = server_line(setup, name)
+        description = description or fallback
         env: dict[str, object] = spec["env"] if isinstance(spec.get("env"), dict) else {}
         headers: dict[str, object] = spec["headers"] if isinstance(spec.get("headers"), dict) else {}
         row = anchor("mcp", name)
@@ -449,24 +555,18 @@ def mcp_section(setup: Setup, sec: Section) -> None:
 
 
 def skills_section(setup: Setup, sec: Section) -> None:
-    """Every skill the source checkout ships (and the pack's), per configured host: linked, off, or
-    left out by its own hosts: line."""
+    """Every skill setup.skills lists, per configured host: linked, off, or left out by its own
+    hosts: line."""
     source = setup.source()
-    pack = {p.parent.name: p for p in sorted((setup.kit / "pack/skills").glob("*/SKILL.md"))}
-    found = {p.parent.name: p for p in sorted((source / "skills").glob("*/SKILL.md"))}
-    found.update({name: path for name, path in pack.items() if name not in found})
+    layered = {s.name for s in setup.skills if s.layer != "kit"}
     selected = setup.config.get("skills")
     if selected is not None:
-        selected = [n for n in selected if n not in pack]
+        selected = [n for n in selected if n not in layered]
     sec.sources = [source / "skills"]
     rows: TableRows = []
-    for name, md in sorted(found.items()):
-        text = md.read_text(errors="replace")
-        try:
-            allowed = skill_hosts(md, text)
-            allowed_text = ", ".join(sorted(allowed))
-        except ValueError:
-            allowed, allowed_text = set(), "invalid hosts: line"
+    for entry in setup.skills:
+        name, md = entry.name, entry.md
+        text, allowed, allowed_text = skill_text(md)
         chips: list[Cell] = []
         changes: list[Cell] = []
         for host in setup.configured:
@@ -476,42 +576,59 @@ def skills_section(setup: Setup, sec: Section) -> None:
                 continue
             on = any((d / name).exists() for d in skill_dirs(host, setup.roots[host]))
             chips.append(Badge(host, "ok" if on else "off"))
-            change = skill_toggle(setup, host, name, on, selected, name in pack)
+            change = skill_toggle(setup, host, name, on, selected, entry.layer)
             if change not in changes:
                 changes.append(change)
-        desc = frontmatter(text).get("description", "")
         rows.append(
             Row(
                 (
                     Strong(name),
-                    Badge("pack" if name in pack else "kit"),
+                    layer_cell(entry),
                     tuple(chips) or "-",
                     Fold("Change", (Lines(tuple(changes)),)) if changes else "-",
                     allowed_text,
                     md,
                 ),
                 anchor("skills", name),
-                desc,
+                frontmatter(text).get("description", ""),
             )
         )
     sec.blocks.append(Table(("Skill", "Source", "Hosts", "Change", "hosts:", "File"), rows))
     sec.blocks.append(
         Para((Muted("Skills made by hand in a host folder are listed under Unmanaged sources."),))
     )
-    sec.count = len(found)
-    sec.summary = f"{len(found)} skills, {len(pack)} from the pack"
+    pack = sum(s.layer == "pack" for s in setup.skills)
+    sec.count = len(setup.skills)
+    sec.summary = f"{len(setup.skills)} skills, {pack} from the pack"
+
+
+def skill_text(md: Path) -> tuple[str, set[str], str]:
+    """(SKILL.md's text, the hosts its hosts: line allows, that list as shown)."""
+    text = md.read_text(errors="replace")
+    try:
+        allowed = skill_hosts(md, text)
+    except ValueError:
+        return text, set(), "invalid hosts: line"
+    return text, allowed, ", ".join(sorted(allowed))
+
+
+def layer_cell(entry: SkillEntry) -> Cell:
+    badge = Badge(entry.layer, "ok" if entry.layer == "overlay" else "")
+    return (badge, Muted("replaces the engine's skill of this name")) if entry.replaces else badge
 
 
 def skill_toggle(
-    setup: Setup, host: str, name: str, on: bool, selected: list[str] | None, in_pack: bool
+    setup: Setup, host: str, name: str, on: bool, selected: list[str] | None, layer: str
 ) -> Cell:
     """What changes the skill on host: a command with its label, or a note. A setup selection is
     one command for every host."""
     link = setup.roots[host] / "skills" / name
     if on and not (link.exists() or link.is_symlink()):
         return Muted(f"{host}: read from the shared skills folder")
-    if in_pack:
+    if layer == "pack":
         return Muted("The team pack's; change it in the preset")
+    if layer == "overlay":
+        return Muted("Your overlay's; change it in its local/skills folder")
     if setup.config.get("source_checkout"):
         if selected is None:
             if on:
@@ -537,98 +654,106 @@ def roles_section(setup: Setup, sec: Section) -> None:
         if setup.roles_error:
             sec.alerts.append(setup.roles_error)
         return
-    hosts = [h for h in roles.hosts if h in HOSTS]
-    rows: TableRows = []
-    for name, role in roles.roles.items():
-        src = setup.kit / "agents" / f"{name}.md"
-        cells: list[Cell] = []
-        for host in hosts:
-            try:
-                cells.append(f"{host}: {roles.invoke(role, host)}")
-            except SystemExit:
-                cells.append(f"{host}: ?")
-        rendered = setup.roots["claude"] / "agents" / f"{name}.md"
-        description = ""
-        if src.is_file():
-            description = str(frontmatter(src.read_text(errors="replace")).get("description", ""))
-        rows.append(
-            Row(
-                (
-                    Strong(name),
-                    f"{role.provider}:{role.model}",
-                    role.effort,
-                    role.prefix or "-",
-                    role.fallback or "-",
-                    Lines(tuple(cells)),
-                    src if src.is_file() else Muted("None (main)"),
-                    Badge("rendered", "ok") if rendered.is_file() else Muted("-"),
-                ),
-                anchor("roles", name),
-                description,
-            )
-        )
-    sec.blocks.append(
-        Table(
-            (
-                "Role",
-                "Model",
-                "Effort",
-                "Review prefix",
-                "Fallback",
-                "Runs as",
-                "Agent file",
-                "Claude agent",
-            ),
-            rows,
-        )
-    )
-    rounds: TableRows = [(k, ", ".join(v)) for k, v in roles.review.items()]
-    sec.blocks.append(Table(("Round", "Roles"), rounds, "Review rounds"))
+    sec.blocks.append(role_table(setup, "roles", lambda p: p, live=True))
+    sec.blocks.append(round_table(setup, title="Review rounds"))
     reviewers = sum(bool(r.prefix) for r in roles.roles.values())
     sec.count = len(roles.roles)
     sec.summary = f"{len(roles.roles)} roles, {reviewers} of them review roles"
 
 
-def hooks_section(setup: Setup, sec: Section) -> None:
-    registry_path = setup.kit / "hooks/registry.json"
-    registry = read_json(registry_path) or []
-    sec.sources = [registry_path]
-    rows: TableRows = []
-    blocking = 0
+def event_cell(row: HookRow) -> str:
+    """The event with its matcher folded in: PreToolUse · Bash, Read."""
+    return f"{row.event} · {', '.join(row.matcher.split('|'))}" if row.matcher else row.event
+
+
+def hook_table(
+    rows: list[HookRow],
+    hooks: Path,
+    prefix: str,
+    link: Linker,
+    installed: set[tuple[str, str]] | None = None,
+    timeout: bool = False,
+    **table: Any,
+) -> Table:
+    """The hooks table both views show, one row per registry entry: a row installed does not hold
+    is marked not installed, and timeout adds the Setup view's column."""
+    out: TableRows = []
     ids: Counter[str] = Counter()
-    for entry in registry if isinstance(registry, list) else []:
-        command = str(entry.get("command", ""))
-        name = hook_name(command)
-        script = setup.kit / "hooks" / name
-        blocking += name in BLOCKING
-        row = anchor("hooks", f"{entry.get('event', '')}-{name}")
+    for hook in rows:
+        row = anchor(prefix, f"{hook.event}-{hook.name}")
         ids[row] += 1
         row += f"-{ids[row]}" if ids[row] > 1 else ""
-        rows.append(
-            Row(
-                (
-                    Strong(name),
-                    entry.get("event", ""),
-                    entry.get("matcher") or "*",
-                    Badge("blocking", "warn") if name in BLOCKING else Badge("advisory"),
-                    tuple(Badge(h) for h in entry.get("hosts", [])),
-                    f"{entry.get('timeout', '-')}{' async' if entry.get('async') else ''}",
-                    script if script.is_file() else Code(command),
-                ),
-                row,
-                str(entry.get("description", "")),
-            )
+        kind: Cell = Badge("blocking", "warn") if hook.blocking else Badge("advisory")
+        if installed is not None and (hook.event, hook.name) not in installed:
+            kind = (kind, Badge("not installed"))
+        script = hooks / hook.name
+        cells: tuple[Cell, ...] = (
+            Strong(hook.name),
+            event_cell(hook),
+            kind,
+            tuple(Badge(h) for h in hook.hosts),
+            *((hook.timeout,) if timeout else ()),
+            link(script) if script.is_file() else Code(hook.command),
         )
+        out.append(Row(cells, row, hook.description))
+    headers = ("Hook", "Event", "Kind", "Hosts", *(("Timeout",) if timeout else ()), "Source")
+    return Table(headers, out, layout="hooks", **table)
+
+
+def role_table(setup: Setup, prefix: str, link: Linker, live: bool = False, **table: Any) -> Table:
+    """The roles table both views show; live adds how each runs per host and whether Claude has
+    its rendered agent file."""
+    roles = setup.roles
+    assert roles is not None
+    hosts = [h for h in roles.hosts if h in HOSTS]
+    rows: TableRows = []
+    for name, role in roles.roles.items():
+        src = setup.kit / "agents" / f"{name}.md"
+        description = ""
+        if src.is_file():
+            description = str(frontmatter(src.read_text(errors="replace")).get("description", ""))
+        cells: list[Cell] = [
+            Strong(name),
+            Code(f"{role.provider}:{role.model}"),
+            role.effort,
+            Badge(role.prefix, "warn") if role.prefix else Muted("-"),
+            role.fallback or Muted("-"),
+            link(src) if src.is_file() else Muted("None (the main session)"),
+        ]
+        if live:
+            runs: list[Cell] = []
+            for host in hosts:
+                try:
+                    runs.append(f"{host}: {roles.invoke(role, host)}")
+                except SystemExit:
+                    runs.append(f"{host}: ?")
+            rendered = setup.roots["claude"] / "agents" / f"{name}.md"
+            cells += [Lines(tuple(runs)), Badge("rendered", "ok") if rendered.is_file() else Muted("-")]
+        rows.append(Row(tuple(cells), anchor(prefix, name), description))
+    headers = ("Role", "Model", "Effort", "Review prefix", "Fallback", "Agent file")
+    headers += ("Runs as", "Claude agent") if live else ()
+    return Table(headers, rows, **table)
+
+
+def round_table(setup: Setup, **table: Any) -> Table:
+    """roles.toml [review] as written: each list's key and its roles."""
+    review = setup.roles.review if setup.roles is not None else {}
+    rows: TableRows = [(Code(k), ", ".join(v)) for k, v in review.items()]
+    return Table(("[review] key", "Roles"), rows, **table)
+
+
+def hooks_section(setup: Setup, sec: Section) -> None:
+    registry_path = setup.kit / "hooks/registry.json"
+    rows = setup.registry(registry_path)
+    sec.sources = [registry_path]
     if setup.state:
         state = "on" if setup.config.get("blocking_hooks") else "off"
         sec.blocks.append(
             Para(("Blocking hooks in this install:", Strong(state), "(agent-setup --blocking-hooks)."))
         )
-    sec.blocks.append(
-        Table(("Hook", "Event", "Matcher", "Kind", "Hosts", "Timeout", "Script"), rows)
-    )
+    sec.blocks.append(hook_table(rows, setup.kit / "hooks", "hooks", lambda p: p, timeout=True))
     sec.count = len(rows)
-    sec.summary = f"{len(rows)} hooks, {blocking} blocking"
+    sec.summary = f"{len(rows)} hooks, {sum(r.blocking for r in rows)} blocking"
 
 
 def documented_keys(setup: Setup) -> dict[str, str]:
@@ -788,7 +913,7 @@ def docstring_line(path: Path) -> str:
 
 def data_section(setup: Setup, sec: Section) -> None:
     rows: TableRows = []
-    for name in ("ro-mysql", "bqro"):
+    for name in DATA_WRAPPERS:
         kit_copy, found = setup.kit_bin(name), shutil.which(name)
         note = "Not on PATH"
         if found:
@@ -817,7 +942,7 @@ def data_section(setup: Setup, sec: Section) -> None:
     if not adc.is_file():
         sec.actions.append(Action("Sign in for bqro", "gcloud auth application-default login"))
     sec.count = len(rows)
-    on_path = sum(1 for name in ("ro-mysql", "bqro") if shutil.which(name))
+    on_path = sum(1 for name in DATA_WRAPPERS if shutil.which(name))
     sec.summary = f"{len(rows)} wrappers, {on_path} on PATH"
 
 

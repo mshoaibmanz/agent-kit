@@ -1441,9 +1441,11 @@ def update(args: argparse.Namespace, root: Path, state: dict[str, Any]) -> int:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description='Choose components, preview changes, apply and roll back agent-kit.')
     result.add_argument('action', choices=('setup', 'doctor', 'rollback', 'sync', 'update'), nargs='?', default='setup',
-                        help='sync: reapply every saved choice, applying only what changed (agent-kit sync runs it); '
-                        'update: fast-forward the recorded source checkout, then sync')
-    result.add_argument('journal', nargs='?')
+                        help='setup: preview every file it would write, then write them with --apply and record a '
+                        'journal; doctor: report installed files changed since setup and missing dependencies; rollback: undo one install by its '
+                        'journal, stopping on any later edit; sync: reapply every saved choice, applying only what '
+                        'changed (agent-kit sync runs it); update: fast-forward the recorded source checkout, then sync')
+    result.add_argument('journal', nargs='?', help='rollback: the journal id of the install to undo')
     result.add_argument('--source', help='Source checkout; installed setup inherits its recorded original checkout')
     result.add_argument('--root-dir', default=os.environ.get('AGENT_KIT_DIR', str(Path.home() / '.local/share/agent-kit')))
     result.add_argument('--hosts', nargs='+', choices=HOSTS)

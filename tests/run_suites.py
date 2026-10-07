@@ -33,6 +33,7 @@ SUITES = (
     "tests/dev_install_test.py",
     "tests/dashboard_test.py",
     "tests/dashboard_rows_test.py",
+    "tests/dashboard_docs_test.py",
     "tests/mcp_describe_test.py",
     "tests/plugin_portability_test.py",
     "tests/installed_guard_test.py",
