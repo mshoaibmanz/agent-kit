@@ -5,6 +5,7 @@
 #   tally owed         -> a review agent returned findings: settled by a TALLY line in the final
 #                         message, else block once with RV_VERIFY
 #   end of our chain   -> clear the edit marker unless an agent round is still out
+#   new type errors    -> block once with them (lib/verify.py gate; the push refuses them)
 #   code edited        -> rv_decide self on the work since the last completed review: a small
 #                         delta (floor to ~40 lines) gets a self-check block, a larger one is left
 #                         to the push
@@ -56,6 +57,15 @@ fi
 
 rv_sweep
 { [ -n "$root" ] && rv_edited "$session_id" "$root"; } || exit 0
+
+# The type gate (lib/verify.py): errors the branch introduced in its changed files, shown once per
+# tree state; the push refuses them until they are fixed. Before the review: reviewing code that
+# does not type-check spends a round on what the checker already found.
+if ! verify_out=$(VERIFY_TIMEOUT=100 python3 "${0%/*}/lib/verify.py" gate "$root" stop 2>/dev/null) && [ -n "$verify_out" ]; then
+  stop_block "$session_id" "Fix the new type errors below before finishing; the push refuses them (a false positive: say why, then AGENT_PUSH_NOW=\"<reason>\" git push).
+$verify_out
+$CLOSING"
+fi
 
 # The marker stays until a review completes: clearing it here, before sizing, let a Stop that
 # ran no review (unchanged tree, under the floor) wave the next push through. An unchanged tree

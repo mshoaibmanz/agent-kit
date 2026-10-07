@@ -66,7 +66,7 @@
         "path": "plugins/python-hygiene",
         "ref": "dist"
       },
-      "description": "Runs ruff on every edited .py file, only in repos that already carry a ruff config (never reformats a repo that has not adopted it). Ships the conventions house-style skill for Python and SQL. No effect on non-Python edits."
+      "description": "After each edit, tells the model only the lint errors that edit introduced (ruff F/E9/B for Python, the repo's eslint or oxlint for TypeScript, sqlfluff parse for SQL; a missing tool is skipped). Formats with ruff only in repos that carry a ruff config (never reformats a repo that has not adopted it). Ships the conventions house-style skill for Python and SQL."
     },
     {
       "name": "terminal-signals",

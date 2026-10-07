@@ -9,7 +9,8 @@
 #             the review instruction; past the branch's 3 rounds allowed with a warning
 #   sprawl    a ticket that already has 3+ commits on the branch, no PR -> refuse
 #   tests     no local test run recorded this session or worktree      -> refuse
-# AGENT_PUSH_NOW="<reason>" skips review, sprawl and tests (CI-only check, WIP share, infra down);
+#   verify    a type error the branch introduced in a changed file      -> refuse (lib/verify.py gate)
+# AGENT_PUSH_NOW="<reason>" skips review, sprawl, tests and verify (CI-only check, WIP share, infra down);
 # an empty reason is refused. It is the only override: a `# push-now` shell comment never reaches git.
 # Output goes to stderr, which the agent's tool result shows. Exit status is the decision.
 
@@ -54,7 +55,7 @@ pg_push_now() {
   case ${AGENT_PUSH_NOW//[[:space:]]/} in
     '') pg_refuse "AGENT_PUSH_NOW is set but empty. Give the reason: AGENT_PUSH_NOW=\"red CI fix, reviewed in round 2\" git push ..." ;;
   esac
-  pg_note "AGENT_PUSH_NOW: ${AGENT_PUSH_NOW} (review, sprawl and test checks skipped)"
+  pg_note "AGENT_PUSH_NOW: ${AGENT_PUSH_NOW} (review, sprawl, test and type checks skipped)"
   return 0
 }
 
@@ -128,6 +129,14 @@ Otherwise hold until the review cycle ends, keep follow-ups uncommitted, then co
 
     # After the review gate: a tested-but-unreviewed push is the case that produces the sprawl.
     tr_ran "$sid" "$top" || pg_refuse "no local test run is recorded for this session or worktree. $(host_noun rules): run a representative local test subset before pushing. If test infra is down: AGENT_PUSH_NOW=\"untested: <why>\" git push ..., then watch CI to a verdict in this session."
+
+    # The type gate: errors the branch introduced in its changed files (verify.py; cached per tree,
+    # so a push right after the Stop that ran it costs nothing). A checker that cannot run passes.
+    local verify_out
+    if ! verify_out=$(python3 "${BASH_SOURCE[0]%/*}/verify.py" gate "$top" 2>/dev/null) && [ -n "$verify_out" ]; then
+      pg_refuse "new type errors in changed files ($override):
+$verify_out"
+    fi
   fi
   [ -z "$ctx" ] || pg_note "$ctx"
   return 0

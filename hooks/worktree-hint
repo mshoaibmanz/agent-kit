@@ -5,8 +5,12 @@
 # the worktree — heredocs, `for`/`while`, `;`/`&&`/`||` chains, `cd X && …`, `git a...b`
 # ranges, `gh api`. Measured 2026-08-13..09-11: 205 such refusals across 30 sessions, each a
 # wasted turn. The refusal text arrives only after the first failure; this note arrives first.
+#
+# It also gives the new worktree the main checkout's untracked pyrightconfig.json and .venv
+# (lib/verify.py worktree), so type checking resolves imports there; verify.toml can turn that off.
 command -v jq >/dev/null 2>&1 || exit 0
-cat >/dev/null 2>&1
+wt=$(jq -r '.tool_response.worktreePath // empty' 2>/dev/null)
+[ -z "$wt" ] || python3 "${0%/*}/lib/verify.py" worktree "$wt" >/dev/null 2>&1
 jq -n --arg m 'WORKTREE ISOLATION IS NOW ON. The harness refuses any Bash command it cannot prove stays inside this worktree: heredocs (`<<`), `for`/`while` loops, `;` `&&` `||` chains, `cd X && …`, `git A...B` ranges, `gh api` with computed paths. Each refusal wastes a turn. From here: ONE plain command per Bash call, run from the worktree cwd (no `cd`, no `git -C`); write any script with the Write tool into the scratchpad dir named in your system prompt and run `python3 <that file>`; read files with the Read tool, not `sed -n`/`cat`.' \
   '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:$m}}'
 exit 0

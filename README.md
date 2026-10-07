@@ -148,6 +148,36 @@ Keep review prefixes and rounds; existing high effort is valid for both provider
 
 Keep user workflow values in `local/kit.env`; generated path choices live in `local/setup-paths.env`, and a team preset's values in `local/preset.env`. The shared parser loads the preset layer first, then the user layer, then the generated path layer, so each later one wins. Setup never reads or copies the user's values into its journal. `kit.env.example` describes optional, non-secret settings. Your own Claude Code settings (permissions, a status line, env) go in `local/settings.json`, merged over `hosts/claude/settings.base.json`; setup with the hooks component and `agent-kit render` both apply it. Setup owns only the top-level keys the layer gives it: a key you add in the host's `settings.json` stays, a key you drop from the layer goes on the next run, and a layer key that would replace a value of your own is a collision. The layer refuses, and setup exits 2 naming your `local/settings.json`, when it sets a key the host UI owns (`theme`, `model`: `hosts/claude/host.json` `uiOwned`), a `hooks` key (hooks come from `hooks/registry.json`), or, with the roles component, `model`, `effortLevel` or `modelSettings` (they come from `roles.toml` `[roles.main]`); a dev install's `agent-setup doctor` lists the same refusal as a problem, and `agent-kit render` exits on it. There is no default commit author override; Git's existing identity is used.
 
+## Verification
+
+Why it is shaped this way:
+- Measured wins: a per-edit syntax and undefined-name lint (+3 points on SWE-agent), compiler and type feedback in the loop, and test feedback over lint feedback (FeedbackEval).
+- Measured cost: in one month of a user's sessions, editor diagnostics took about 1.3M tokens, 76% of them unresolved imports, "not accessed" hints and deprecation hints, and about one real error in ten changed what the agent did next.
+- So the model hears only errors it introduced, only from correctness rules, and a missing tool is skipped, never reported per call.
+
+Two checks, both silent when their tool is missing (`agent-kit doctor` prints a `verify` line per tool and per repo):
+- **Per edit** (`hooks/verify-edit`, PostToolUse): checks the edited file and its text before the edit (the edit tool's `originalFile`, else the committed copy) and tells the model only the errors the edit added, at most 10 lines. Python: `ruff check --select F,E9,B` without the unused-import and unused-variable rules, which an edit-by-edit flow trips before the next edit uses the name. A repo with a ruff config is also fixed and formatted with it, and its per-file ignores apply; a repo without one is never reformatted. TypeScript and JavaScript: the repo's eslint (errors only) when it has a config, else `oxlint -D correctness` when installed. SQL: `sqlfluff parse` with the dialect from the repo's sqlfluff config. Rust: nothing per edit. It never blocks.
+- **Stop and push** (`review-trigger` and the agent pre-push gate, through `hooks/lib/verify.py gate`): type-checks the files the branch changed against its merge-base with the review base, errors only, and reports only errors the branch introduced. Python: basedpyright, else pyright. The base's errors come from the merge-base's files, extracted once per merge-base into `~/.cache/agent-kit/verify/` with the checkout's untracked `pyrightconfig.json`, `.venv` and `node_modules`; basedpyright compares through its own `--baselinefile`, pyright and tsc by rule and message, so moved lines do not count. TypeScript: `tsc --noEmit -p <nearest tsconfig.json>`, incremental. Rust: `cargo clippy` in each changed crate, errors only. A Stop shows a tree's new errors once; the push refuses them until they are fixed or `AGENT_PUSH_NOW="<reason>"` is given.
+
+New worktrees (EnterWorktree, or `git worktree add` in an agent shell) get the main checkout's untracked `pyrightconfig.json` copied and its `.venv` linked, so type checks resolve imports there.
+
+Configure in `verify.toml` beside `kit.env` in the overlay, over a team pack's `verify.toml`. Everything is on by default; a repo table wins over `[default]`, and the user's file over the pack's:
+
+```toml
+[default.python.edit]
+select = "repo"          # report every rule of the repo's ruff config, not just F/E9/B
+[repo.my-api.python.stop]
+enabled = false          # no type gate in this repo
+[repo.web.typescript.stop]
+cmd = "pnpm exec tsc"    # the tool to run; the kit adds its own arguments
+[repo.my-api.worktree]
+enabled = false          # do not copy pyrightconfig.json or link .venv into new worktrees
+```
+
+Keys: `<lang>.<phase>` with lang `python`, `typescript`, `sql` or `rust` and phase `edit` or `stop` (`sql` has only `edit`, `rust` only `stop`), each taking `enabled`, `cmd` and, for Python edits, `select`; and `worktree.enabled`.
+
+Editor diagnostics: Claude Code answers pyright's `workspace/configuration` request from the LSP server entry's `settings`, and the official pyright plugin's entry sets none, nor can `settings.json` add them. Pyright's switch for the hint-class diagnostics (`pyright.disableTaggedHints`) is a language-server setting, not a `pyrightconfig.json` key, so the kit cannot turn those hints off through the settings layer. Keep the plugin for navigation; the unresolved-import share goes away once worktrees carry `pyrightconfig.json` and `.venv`.
+
 ## Search code
 
 The bundled code-search skill refreshes eligible local clones under the configured repository roots before searching them. It only pulls clean, attached branches with an upstream and zero unpushed commits, using `pull --ff-only --no-rebase --no-autostash`. Dirty, ahead, detached, diverged or failed clones are skipped and reported as coverage gaps. It checks incoming paths against existing ignored files and symlink parents before pulling the exact fetched tip. A collision skips that refresh and reports the gap; unrelated ignored caches remain compatible. It never stashes or resets user work.
