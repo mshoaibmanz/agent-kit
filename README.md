@@ -150,17 +150,15 @@ Keep user workflow values in `local/kit.env`; generated path choices live in `lo
 
 ## Verification
 
-Evidence: a per-edit undefined-name lint and type feedback in the loop measurably help agents. Editor diagnostics cost one user about 1.3M tokens a month, three quarters of it unresolved-import and unused or deprecated hints.
-
-The model hears only errors it introduced, from correctness rules. A check whose tool is missing is skipped silently.
-- **Per edit** (`hooks/verify-edit`): the edited file is checked before and after the edit (the edit tool's `originalFile`, else the committed copy). Only new errors reach the model, at most 10 lines, and the edit is never blocked.
-  - Python: ruff. A repo with a ruff config is also fixed and formatted with it, and its rule selection applies; one without is checked with `--select F,E9,B` and never reformatted. Either way only F, E9 and B codes are reported, without F401, F841 and B008.
-  - TypeScript and JavaScript: the repo's eslint, errors only, when the repo has an eslint config. One run per edit; an error counts when it is on a line the edit wrote.
-- **Stop and push** (`review-trigger` and the agent pre-push gate): the files the branch changed since it left its base branch are type-checked, errors only, and only errors the branch introduced count. The base errors come from the merge-base's files, extracted into `~/.cache/agent-kit/verify/<worktree>/`. Unresolved imports are ignored.
-  - Python: basedpyright (its own `--baselinefile`), else pyright, with the environment that `pyrightconfig.json` names, else `.venv` or `venv`. With no environment, the check is skipped and the skip is said once.
+The model hears only errors from correctness rules, and only those its change made. A check whose tool is missing is skipped silently.
+- **Per edit** (`hooks/verify-edit`): the edited file is checked before and after the edit (the edit tool's `originalFile`, else the committed copy). Only errors the old text did not have reach the model, at most 10 lines, and the edit is never blocked.
+  - Python: ruff. A repo with a ruff config is also fixed and formatted with it, and its rule selection applies; one without is checked with `--select F,E9,B` and never reformatted. Either way only F, E9, B and syntax errors are reported, without F401, F841 and B008.
+  - TypeScript and JavaScript: the repo's eslint, errors only, when the repo has an eslint config.
+- **Stop and push** (`review-trigger` and the agent pre-push gate): the files the branch changed since it left its base branch are type-checked, errors only, and an error counts only on a line the branch added or changed (`git diff -U0` against the fork point). Errors the change causes on unchanged lines, such as a caller of a changed signature, are left to CI and tests. Unresolved imports are ignored.
+  - Python: basedpyright, else pyright, with the environment that `pyrightconfig.json` names, else `.venv` or `venv`. With no environment, the check is skipped and the push says so once.
   - TypeScript: `tsc --noEmit -p <nearest tsconfig.json>`.
-  - Both check tracked files only. Stop checks the working tree; the push checks the commit being pushed.
-  - Stop shows a tree's new errors once, together with the self-check review. The push refuses them until they are fixed or `AGENT_PUSH_NOW="<reason>"` is given. A check that runs past its deadline (40 s at Stop, 240 s at push) passes with a note, and nothing is recorded as passed.
+  - Both check tracked files only. Stop checks the working tree; the push checks the commit being pushed, with that commit's `pyrightconfig.json`.
+  - Stop shows a tree's errors once, together with the self-check review. The push refuses them until they are fixed or `AGENT_PUSH_NOW="<reason>"` is given; a push of the tree a Stop checked reuses that result. A check that runs past its deadline (40 s at Stop, 90 s at push) passes with a note, and nothing is recorded as passed.
 
 A new worktree (EnterWorktree, or `git worktree add` in an agent shell) gets the main checkout's untracked `pyrightconfig.json`, with `venvPath`/`venv` pointing at the main checkout's environment.
 

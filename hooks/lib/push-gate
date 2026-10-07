@@ -9,7 +9,7 @@
 #             the review instruction; past the branch's 3 rounds allowed with a warning
 #   sprawl    a ticket that already has 3+ commits on the branch, no PR -> refuse
 #   tests     no local test run recorded this session or worktree      -> refuse
-#   verify    a type error the branch introduced in a changed file      -> refuse (lib/verify.py gate)
+#   verify    a type error on a line the branch added or changed        -> refuse (lib/verify.py gate)
 # AGENT_PUSH_NOW="<reason>" skips review, sprawl, tests and verify (CI-only check, WIP share, infra down);
 # an empty reason is refused. It is the only override: a `# push-now` shell comment never reaches git.
 # Output goes to stderr, which the agent's tool result shows. Exit status is the decision.

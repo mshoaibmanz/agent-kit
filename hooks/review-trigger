@@ -58,8 +58,8 @@ fi
 rv_sweep
 { [ -n "$root" ] && rv_edited "$session_id" "$root"; } || exit 0
 
-# The type gate (lib/verify.py, its own deadline inside this hook's): errors the branch introduced
-# in its changed files, shown once per tree state; the push refuses them until they are fixed. It
+# The type gate (lib/verify.py, its own deadline inside this hook's): errors on the lines the branch
+# added or changed, shown once per tree state; the push refuses them until they are fixed. It
 # joins the self-check block rather than replacing it, so the review still runs in this chain.
 types=''
 if ! verify_out=$(python3 "${0%/*}/lib/verify.py" gate "$root" stop 2>/dev/null) && [ -n "$verify_out" ]; then

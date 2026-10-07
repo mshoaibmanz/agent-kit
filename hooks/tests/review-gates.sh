@@ -466,7 +466,6 @@ rm -f "$C/lib/kit_env.py"
 out=$(cedit "$REPO/m.py" "a=1" "$six
 a=1" | python3 "$C/comment-guard"); check "comment-guard without lib/kit_env.py: tells the user it is off" "$out" 'systemMessage.*comment-guard is off'
 
-
 echo "--- review-state: concurrent writers ---"
 # SubagentStop (rv_complete) and Stop or pre-push (_rv_round, rv_chain_*) write one session file
 # at once. Separate processes, as the hooks are: a subshell shares $$ and so the writers' tmp file.
@@ -581,6 +580,9 @@ for f in q.sql models/tables.py tables_v2.py svc/shipping_fee.py domain/Fees.ts 
   case $f in feed.py|FeedbackForm.tsx|tablet.py) want=no ;; *) want=yes ;; esac
   [ "$got" = "$want" ] && ok "_rv_sensitive $f: $want" || bad "_rv_sensitive $f: want $want, got $got"
   rm -f "$RS/$f"
+done
+for f in a.mts b.cts c.tsx; do
+  ( . "$H/lib/review-state" && rv_is_code "$f" ) && ok "rv_is_code $f" || bad "rv_is_code $f: not code"
 done
 
 echo "--- tally owed: a TALLY line settles it ---"
