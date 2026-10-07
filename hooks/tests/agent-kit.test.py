@@ -59,6 +59,15 @@ def check(label: str, cond: bool, detail: str = "") -> None:
             logger.info("     %s", detail.strip().replace("\n", "\n     "))
 
 
+def copy_agent_kit(kit: Path) -> None:
+    """bin/agent-kit into kit with the hook libraries it loads (kit_env.py reads hook-io's key list)."""
+    (kit / "bin").mkdir(parents=True)
+    shutil.copy2(AGENT_KIT, kit / "bin/agent-kit")
+    (kit / "hooks/lib").mkdir(parents=True, exist_ok=True)
+    for name in ("kit_env.py", "hook-io"):
+        shutil.copy2(KIT_SRC / "hooks/lib" / name, kit / "hooks/lib" / name)
+
+
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
@@ -304,8 +313,7 @@ def roles(root: Path) -> None:
     write_json(kit / "mcp/servers.json", CATALOG)
     (kit / "roles.toml").write_text(ROLES_TOML)
     isolated = root / "isolated-kit"
-    (isolated / "bin").mkdir(parents=True)
-    shutil.copy2(AGENT_KIT, isolated / "bin/agent-kit")
+    copy_agent_kit(isolated)
     (isolated / "roles.toml").write_text(ROLES_TOML.replace('model = "anthropic:opus[1m]"', 'model = "anthropic:sonnet"'))
     isolated_env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_KIT_")}
     proc = subprocess.run([str(isolated / "bin/agent-kit"), "roles", "--format", "sh"],
@@ -449,8 +457,7 @@ def roles(root: Path) -> None:
     (home / ".claude").mkdir(parents=True)
     foreign = root / "foreign-kit"
     shutil.copytree(kit, foreign, ignore=shutil.ignore_patterns("state"))
-    (foreign / "bin").mkdir()
-    shutil.copy2(AGENT_KIT, foreign / "bin/agent-kit")
+    copy_agent_kit(foreign)
     plain = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_KIT_")}
     p = subprocess.run([str(foreign / "bin/agent-kit"), "render", "--host", "claude"], env=dict(plain, HOME=str(home)),
                        capture_output=True, text=True, check=False)

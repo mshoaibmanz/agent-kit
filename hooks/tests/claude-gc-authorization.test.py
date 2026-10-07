@@ -322,6 +322,7 @@ class AuthorizationTests(unittest.TestCase):
         (kit / "hooks/lib").mkdir(parents=True)
         script = kit / "bin/claude-gc"
         shutil.copyfile(GC, script)
+        shutil.copyfile(GC.parent.parent / "hooks/lib/kit-root.sh", kit / "hooks/lib/kit-root.sh")
         helper = kit / "hooks/lib/gc-lock.py"
         source = (GC.parent.parent / "hooks/lib/gc-lock.py").read_text()
         source = source.replace("import fcntl\n", "import fcntl\nimport signal\n")

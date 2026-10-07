@@ -20,6 +20,10 @@ from installer_ux_test import SOURCE, InstallerUxFixture  # noqa: E402
 
 RULES = '## Team rules\n\n- Name the ticket in every branch.\n'
 GIT = ('git', '-c', 'user.name=Pack Author', '-c', 'user.email=author@example.com', '-c', 'commit.gpgsign=false')
+# The environment of every git a test runs, its own or the installer's: no auto maintenance, which git
+# runs detached after a commit or fetch, racing the fake home's cleanup.
+QUIET_GIT = {'GIT_CONFIG_COUNT': '2', 'GIT_CONFIG_KEY_0': 'maintenance.auto', 'GIT_CONFIG_VALUE_0': 'false',
+             'GIT_CONFIG_KEY_1': 'gc.auto', 'GIT_CONFIG_VALUE_1': '0'}
 GH = 'gh:example-org/team-pack'
 FLAGS = ('--hosts', 'claude', '--components', 'rules', 'skills')
 SKILL = b'---\nname: team-a\ndescription: A.\n---\n'
@@ -28,7 +32,9 @@ TOKEN = 'gh' + 'p_' + 'A1b2C3d4E5f6G7h8I9j0'
 PRIVATE_KEY = '-----BEGIN OPENSSH ' + 'PRIVATE KEY-----\n'
 
 
-class TeamPackTests(InstallerUxFixture):
+class PackRepos(InstallerUxFixture):
+    """The installer UX fixture with git repositories in its fake home and a synthetic team pack."""
+
     def pack(self, folder: Path | None = None) -> Path:
         """A synthetic pack: a preset, a skill for every host (with a reference), one for Claude only,
         a rules block, and a README that is not part of the pack."""
@@ -45,13 +51,16 @@ class TeamPackTests(InstallerUxFixture):
 
     def git(self, folder: Path, *arguments: str) -> str:
         return subprocess.run([*GIT, '-C', str(folder), *arguments], capture_output=True, text=True, check=True,
-                              env={'PATH': str(self.shim), 'HOME': str(self.home), 'GIT_CONFIG_GLOBAL': '/dev/null'}).stdout.strip()
+                              env={'PATH': str(self.shim), 'HOME': str(self.home), 'GIT_CONFIG_GLOBAL': '/dev/null',
+                                   **QUIET_GIT}).stdout.strip()
 
     def commit(self, folder: Path, message: str) -> str:
         self.git(folder, 'add', '-A')
         self.git(folder, 'commit', '-q', '-m', message)
         return self.git(folder, 'rev-parse', 'HEAD')
 
+
+class TeamPackTests(PackRepos):
     def served(self, folder: Path | None = None) -> tuple[Path, str]:
         """A pack in a git repository that the gh fixture serves, and its first commit."""
         repository = self.pack(folder or self.home / 'served')

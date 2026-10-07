@@ -47,9 +47,10 @@ def overlay_project() -> str:
     sys.path.insert(0, KIT_LIB)
     sys.dont_write_bytecode = True
     try:
-        from kit_env import kit_env
+        from kit_env import kit_env, kit_root
     except ImportError as e:
         die(f"cannot load {KIT_LIB}/kit_env.py ({e}); restore it: git -C {Path(__file__).resolve().parents[1]} checkout -- hooks/lib")
+    os.environ["AGENT_KIT_DIR"] = str(kit_root(__file__))
     return kit_env()["BQRO_PROJECT"]
 
 

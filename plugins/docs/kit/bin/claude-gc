@@ -20,15 +20,10 @@ esac
 log() { printf '%s claude-gc: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
 usage() { echo "usage: claude-gc [--prune-worktrees] [--report-file PATH] [--report-sha256 HASH]" >&2; exit 2; }
 src=${BASH_SOURCE[0]}
-links=0
-while [ -L "$src" ]; do
-  links=$((links + 1))
-  [ "$links" -le 40 ] || { log "entrypoint symlink chain is too long"; exit 1; }
-  link=$(readlink "$src") || exit 1
-  case $link in /*) src=$link ;; *) src=${src%/*}/$link ;; esac
-done
-KIT=$(cd -P "${src%/*}/.." && pwd) || { log "cannot resolve the kit directory"; exit 1; }
-export AGENT_KIT_DIR="${AGENT_KIT_DIR:-$KIT}"
+. "$(dirname "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")")/../hooks/lib/kit-root.sh" ||
+  { log "cannot load hooks/lib/kit-root.sh beside $src"; exit 1; }
+KIT=$(kit_root "$src") || { log "cannot resolve the kit directory (or its link chain is too long)"; exit 1; }
+export AGENT_KIT_DIR=$KIT
 if ! { . "$KIT/hooks/lib/hook-io" 2>/dev/null && kit_env; }; then
   log "hooks/lib/hook-io is missing, so the overlay is unread: repo-based steps skipped"
   CODE_DIRS=''; CODE_DIRS_JSON=''

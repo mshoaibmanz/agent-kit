@@ -71,7 +71,7 @@ def on_prompt(p: dict) -> None:
         names = ", ".join(f"{pr.name}{' (legacy)' if pr.legacy else ''}" for pr, _ in r.candidates)
         item = f"/{r.ticket}" if r.ticket else ""
         still = f" Still bound to {at.where_label(cur)} until then." if cur else ""
-        context("UserPromptSubmit", f"PROJECT: this session could belong to {names}. Ask the user once which, then bind: {at.AGENT_TASK} bind <project>{item} --session {sid}.{still}")
+        context("UserPromptSubmit", f"PROJECT: this session could belong to {names}. Ask the user once which, then bind: {at.agent_task_bin()} bind <project>{item} --session {sid}.{still}")
         return
     if r.outcome in ("exact", "strong"):
         proj = r.candidates[0][0]
