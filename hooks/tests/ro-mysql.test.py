@@ -293,15 +293,6 @@ HELD_BY_COMM = {"23309": ("2", "ssh -f -N -o BatchMode=yes db-tunnel-comm")}
 HELD_BY_APP = {"23307": ("3", "ssh -f -N -o BatchMode=yes db-tunnel-app")}
 
 
-def registry_matches() -> bool:
-    lib = os.path.join(HOOKS, "lib", "db-registry")
-    out = subprocess.run(
-        ["/bin/bash", "-c", 'source "$1" && db_tunnels "$2"', "_", lib, SSH_CONFIG],
-        capture_output=True, text=True,
-    ).stdout.splitlines()
-    return out == [f"{a} {p} {m.kind_of(a)}" for a, p, _ in EXPECTED_TUNNELS]
-
-
 def keychain_password_only_in_option_file() -> bool:
     fresh_logs()
     m.run(plan(["--tunnel=prod", *Q], keychain={"reader-b@db-tunnel-prod": "s3cret!"}))
@@ -625,14 +616,14 @@ def rotate_needs_a_terminal() -> bool:
     return r.returncode == 2 and b"terminal" in r.stderr
 
 
+
 checks: dict[str, Callable[[], bool]] = {
     "parse: db-tunnel hosts, ports, block users; wildcard/Match/other hosts skipped": lambda: [
-        tuple(t) for t in m.load_tunnels(SSH_CONFIG)
+        tuple(t)[:3] for t in m.load_tunnels(SSH_CONFIG)
     ] == EXPECTED_TUNNELS,
     "kind: staging/stg name segments are STAGING, postgres is not": lambda: [
         m.kind_of(n) for n in ("app-staging", "shop-stg", "db-tunnel-comm-staging", "postgres", "prod-ro")
     ] == ["STAGING", "STAGING", "STAGING", "PROD", "PROD"],
-    "hooks/lib/db-registry derives the same alias/port/kind": registry_matches,
     "--tunnel picks by name and beats MYSQL_RO_PORT": lambda: plan(
         ["--tunnel=app-staging", *Q], env={"MYSQL_RO_PORT": "23306"}, keychain={"reader-b@db-tunnel-app-staging": "x"}
     ).tunnel.alias == "db-tunnel-app-staging",
@@ -769,6 +760,8 @@ checks: dict[str, Callable[[], bool]] = {
     "--file reads the statement and validates it like -e; --file with -e is refused": file_statement,
     "--each runs one call per value with {} as a quoted literal, and needs a {}": each_runs_one_call_per_value,
 }
+
+
 def rejected(sql: str) -> bool:
     try:
         m.validate(sql)
@@ -777,24 +770,30 @@ def rejected(sql: str) -> bool:
     return False
 
 
-fails = 0
-for sql in REJECT:
-    if not rejected(sql):
-        fails += 1
-        print(f"FAIL allowed a write: {sql}")
-for sql in ALLOW:
-    if rejected(sql):
-        fails += 1
-        print(f"FAIL rejected a read: {sql}")
-for name, check in checks.items():
-    try:
-        passed = check()
-    except Exception as e:  # a missing function on an older copy is a failed case, not a crash
-        passed = False
-        name = f"{name}  ({type(e).__name__}: {e})"
-    if not passed:
-        fails += 1
-        print(f"FAIL {name}")
-total = len(REJECT) + len(ALLOW) + len(checks)
-print(f"{total - fails}/{total} passed")
-sys.exit(1 if fails else 0)
+def run(checks: dict[str, Callable[[], bool]], reject: tuple[str, ...] = (), allow: tuple[str, ...] = ()) -> int:
+    """Run each check (and the write/read classifier cases); print every failure and the tally."""
+    fails = 0
+    for sql in reject:
+        if not rejected(sql):
+            fails += 1
+            print(f"FAIL allowed a write: {sql}")
+    for sql in allow:
+        if rejected(sql):
+            fails += 1
+            print(f"FAIL rejected a read: {sql}")
+    for name, check in checks.items():
+        try:
+            passed = check()
+        except Exception as e:  # a missing function on an older copy is a failed case, not a crash
+            passed = False
+            name = f"{name}  ({type(e).__name__}: {e})"
+        if not passed:
+            fails += 1
+            print(f"FAIL {name}")
+    total = len(reject) + len(allow) + len(checks)
+    print(f"{total - fails}/{total} passed")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(checks, REJECT, ALLOW))

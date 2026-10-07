@@ -362,7 +362,7 @@ def normalize_transport(spec: dict[str, Any]) -> dict[str, Any]:
     expected = "stdio" if field == "command" else "http"
     if "type" in spec and spec["type"] != expected:
         raise ValueError("MCP type must match the command or HTTP URL transport")
-    return {key: value for key, value in spec.items() if key not in ("type", "description")}
+    return {key: value for key, value in spec.items() if key != "type"}
 
 
 def safe_servers(kit: Path) -> dict[str, Any]:

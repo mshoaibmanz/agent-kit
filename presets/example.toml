@@ -9,6 +9,9 @@
 # Secrets never go here: setup refuses token formats (ghp_, sk-, xox*-, AKIA and the like) and
 # credentials in URLs.
 
+# One line on what this preset and its pack are for; the dashboard shows it under the preset.
+description = "Example team defaults: code search, review base and one docs MCP server"
+
 # [kit]: overlay keys, the names and meanings in hooks/lib/README. They land in local/preset.env.
 [kit]
 CODE_SEARCH_GH_OWNER = "example-org"              # code-search's default org; setup checks you are a member
@@ -31,8 +34,10 @@ source = "github:openai/codex-plugin-cc"
 # the Keychain or secret-tool at start) or a URL with native OAuth. No env, headers or inline keys.
 # A command or arg names the kit as {{KIT_DIR}}: setup fills each user's own kit root, since hosts
 # expand neither ~ nor variables in an MCP command. Options go in args, as the preset has no env.
+# Every server carries a one-line description: the dashboard shows it, the render drops it.
 [mcp.servers.docs]
 url = "https://mcp.example.com/mcp"
+description = "The team's documentation search (signs in with OAuth)"
 
 # A server run from each user's local clone: {{CODE_DIR}} is their first repository root
 # (CODE_DIRS_JSON); setup leaves the server out until that clone has the command.
@@ -50,6 +55,7 @@ url = "https://mcp.example.com/mcp"
 # [mcp.servers.sentry]
 # command = "{{KIT_DIR}}/bin/sentry-mcp"
 # args = ["--host=sentry.example.com", "--disable-skills=seer"]
+# description = "Error tracking: issues, events and traces"
 
 # Sentry instances (mcp/sentry-instances.json): each has a host and the Keychain or secret-tool
 # service its token lives in (never the token). The one whose server is "sentry" is the entry above;

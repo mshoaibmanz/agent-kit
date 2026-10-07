@@ -97,17 +97,23 @@ def validate_catalog(catalog: Any) -> dict[str, Any]:
     for name, spec in catalog.get('mcpServers', {}).items():
         if not re.fullmatch(r'[a-zA-Z0-9_-]+', name) or not isinstance(spec, dict):
             raise ValueError('MCP catalog has an invalid server descriptor')
-        if set(spec) - {'command', 'args', 'url', 'type', 'description', 'credentials'}:
-            raise ValueError(f'MCP {name}: use native OAuth or a runtime wrapper, not inline secrets')
+        extra = sorted(set(spec) - {'command', 'args', 'url', 'type', 'description', 'credentials'})
+        if extra:
+            raise ValueError(f'MCP {name}: {", ".join(extra)} refused; use native OAuth or a runtime wrapper, '
+                             'not inline secrets')
+        if not isinstance(spec.get('description', ''), str) or '\n' in spec.get('description', ''):
+            raise ValueError(f'MCP {name}: description takes one line of text')
         if 'credentials' in spec and not valid_declarations(spec['credentials']):
             raise ValueError(f'MCP {name}: credentials must list {{"service": <service>, "account": <account>}}')
         normalized = normalize_transport(spec)
         arguments = normalized.get('args', [])
-        found = [*show_url(normalized['url']).credentials] if 'url' in normalized else []
+        found = {'url': [*show_url(normalized['url']).credentials]} if 'url' in normalized else {}
         if isinstance(arguments, list):
-            found += show_args(arguments).credentials
-        if found or inline_secret(json.dumps(normalized)):
-            raise ValueError(f'MCP {name}: inline credential refused ({", ".join(found) or "a token shape"}); '
+            found['args'] = show_args(arguments).credentials
+        # The description is free text the dashboard shows masked: a token-shaped word there is prose.
+        shaped = [key for key, value in normalized.items() if key != 'description' and inline_secret(json.dumps(value))]
+        for key in [k for k, kinds in found.items() if kinds] + [k for k in shaped if not found.get(k)]:
+            raise ValueError(f'MCP {name}: inline credential refused in {key} ({", ".join(found.get(key, [])) or "a token shape"}); '
                              'use a runtime wrapper that reads it from the Keychain')
         if 'args' in normalized and ('command' not in normalized or not isinstance(normalized['args'], list)
                                     or not all(isinstance(value, str) for value in normalized['args'])):
@@ -168,11 +174,16 @@ PRESET_SCHEMA: dict[str, tuple[str, Callable[[dict[str, Any]], bool]]] = {
 
 
 def validate_preset(preset: dict[str, Any], spec: str) -> None:
-    """Refuse unknown tables or keys, wrong types, and anything that looks like an inline secret."""
-    unknown = set(preset) - set(PRESET_SCHEMA)
+    """Refuse unknown tables or keys, wrong types, and anything that looks like an inline secret. A
+    top-level description (one line) says what the preset and its pack are for."""
+    description = preset.get('description', '')
+    if not isinstance(description, str) or '\n' in description or inline_secret(description):
+        raise ValueError(f'preset {spec}: description takes one line of plain text')
+    tables = {key: value for key, value in preset.items() if key != 'description'}
+    unknown = set(tables) - set(PRESET_SCHEMA)
     if unknown:
         raise ValueError(f'preset {spec}: unknown table(s) {", ".join(sorted(unknown))}; expected {", ".join(PRESET_SCHEMA)}')
-    for table, value in preset.items():
+    for table, value in tables.items():
         takes, check = PRESET_SCHEMA[table]
         try:
             valid = isinstance(value, dict) and check(value)

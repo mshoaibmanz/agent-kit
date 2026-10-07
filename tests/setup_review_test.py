@@ -619,18 +619,20 @@ module.main()
                 str(catalog),
                 "--apply",
             )
+            # The installed catalog keeps the description for the dashboard; no host file gets it.
             installed = json.loads((self.root / "mcp/servers.json").read_text())[
                 "mcpServers"
-            ]["example"]
+            ]
             self.assertEqual(
-                installed, {"command": "/usr/bin/true", "args": ["--help"]}
+                installed["example"],
+                {"command": "/usr/bin/true", "args": ["--help"], "description": "Uses native OAuth tokens"},
             )
             self.assertEqual(
-                json.loads((self.root / "mcp/servers.json").read_text())["mcpServers"][
-                    "remote"
-                ],
-                {"url": "https://example.invalid/mcp"},
+                installed["remote"],
+                {"url": "https://example.invalid/mcp", "description": "Example HTTP transport"},
             )
+            leaked = [p for p in self.host.rglob("*") if p.is_file() and b"Uses native OAuth tokens" in p.read_bytes()]
+            self.assertEqual(leaked, [], f"{host} got the description")
 
     def test_round2_mcp_invalid_metadata_refuses_before_mutation(self) -> None:
         specs = [

@@ -28,7 +28,8 @@ from credentials import MASK, mask_tokens, show_args, show_url  # noqa: E402
 from preset import validate_catalog  # noqa: E402
 import secret_store  # noqa: E402
 
-SECTIONS = ('hosts', 'mcp', 'unmanaged', 'overlay', 'data', 'skills', 'roles', 'hooks', 'pack', 'work', 'actions')
+SECTIONS = ('hosts', 'mcp', 'unmanaged', 'overlay', 'data', 'sql', 'skills', 'roles', 'hooks', 'pack', 'work',
+            'actions')
 # Values a page must never hold, built so this file holds no token a scanner would flag.
 PLANTED = {
     'keychain value': 'kc-value-' + 'Zq81xw',
@@ -108,9 +109,10 @@ def commands(page: str) -> list[str]:
 class Fixture(InstallerUxFixture):
     """The fake home with an install, and the dashboard run through an audit-hook launcher."""
 
-    def install(self, *flags: str, components: tuple[str, ...] = ('rules', 'skills', 'hooks', 'mcp')) -> Path:
+    def install(self, *flags: str, components: tuple[str, ...] = ('rules', 'skills', 'hooks', 'mcp'),
+                servers: dict | None = None) -> Path:
         catalog = self.home / 'catalog.json'
-        catalog.write_text(json.dumps({'mcpServers': {
+        catalog.write_text(json.dumps({'mcpServers': servers or {
             'docs': {'command': 'npx', 'args': ['-y', 'example-docs-server']},
             'tracker': {'url': 'https://mcp.example.com/v1'}}}))
         for tool in ('npx', 'claude'):
@@ -174,7 +176,8 @@ class Fixture(InstallerUxFixture):
         (local / 'preset.env').write_text(f"REVIEW_BASE=develop\nTEAM_SECRET={PLANTED['preset value']}\n"
                                           "TICKET_PREFIXES=ABC,OPS\nGH_ORG=example-org\n")
         (self.home / '.ssh').mkdir(exist_ok=True)
-        (self.home / '.ssh/config').write_text(SSH_CONFIG)
+        (self.home / '.ssh/team.conf').write_text('Host jump\n  HostName bastion.example.test\n')
+        (self.home / '.ssh/config').write_text(f'Include "{self.home}/.ssh/team.conf"\n\n' + SSH_CONFIG)
         state = self.home / '.claude/state'
         state.mkdir(parents=True, exist_ok=True)
         (state / 'db-tunnels.tsv').write_text('alias\tport\tkind\tchecked\tvia\tdatabases\n'
@@ -286,7 +289,7 @@ class DashboardPageTests(unittest.TestCase):
         self.assertRegex(nav(self.page, 'unmanaged'), r'<i class="dot warn"')
         self.assertIn('2 configured, 2 with drift', page_text(section(self.page, 'hosts')))
         self.assertRegex(page_text(section(self.page, 'hooks')), r'Hooks\s+\d+ hooks, 0 blocking')
-        self.assertIn('2 tunnels, 1 staging', page_text(section(self.page, 'data')))
+        self.assertIn('2 tunnels, 1 staging', page_text(section(self.page, 'sql')))
 
     def test_csp_allows_only_the_pages_own_script_and_style(self) -> None:
         policy = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', self.page)
@@ -300,7 +303,7 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_each_attention_item_links_to_its_row(self) -> None:
         targets = re.findall(r'<li><a href="#([^"]+)">', section(self.page, 'attention'))
-        for wanted in ('host-claude', 'mcp-wrapped', 'data-orders-stg', 'unmanaged-plugins'):
+        for wanted in ('host-claude', 'mcp-wrapped', 'sql-orders-stg', 'unmanaged-plugins'):
             self.assertIn(wanted, targets)
         for target in targets:
             self.assertIn(f' id="{target}"', self.page, f'a Needs attention link to no element: {target}')
@@ -375,12 +378,25 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_overlay_reads_kit_envs_layers_and_names_the_users_layer(self) -> None:
         overlay = page_text(section(self.page, 'overlay'))
-        self.assertRegex(overlay, r'REVIEW_BASE\s+main\s+kit\.env\s+preset\.env < kit\.env')
-        # The engine keys a team preset sets show with their values; the unset ones as unset.
-        self.assertRegex(overlay, r'TICKET_PREFIXES\s+ABC,OPS\s+preset\.env')
+        self.assertRegex(overlay, r'REVIEW_BASE\s+The branch reviews diff against first \(review-state\), before '
+                                  r'origin/HEAD, main and master\.\s+main\s+kit\.env\s+preset\.env < kit\.env')
+        # The engine keys a team preset sets show with their values; the unset ones as unset. A
+        # documented key's kit.env.example comment sits between its name and its value.
+        described = {
+            'TICKET_PREFIXES': 'Jira project keys (comma-separated, 2-6 characters each); when set, only these '
+                               'name tickets in branches, worktree names and prompts. Unset: any 2-6 character '
+                               'prefix does.',
+            'TMP_SWEEP_DAYS': "Days a closed or merged item's tmp/ stays untouched before claude-gc's sweep "
+                              'report lists it.',
+            'SUBAGENT_RESUME_MAX': 'Context tokens past which a finished subagent is replaced, not resumed. '
+                                   'Rendered into the Claude routing rule and agent bodies '
+                                   '({{SUBAGENT_RESUME_MAX_K}}); empty means 300000.',
+        }
+        self.assertRegex(overlay, r'TICKET_PREFIXES\s+' + re.escape(described['TICKET_PREFIXES'])
+                         + r'\s+ABC,OPS\s+preset\.env')
         self.assertRegex(overlay, r'GH_ORG\s+\(not a key this kit reads\)\s+•••• hidden')
         for key in ('TMP_SWEEP_DAYS', 'SUBAGENT_RESUME_MAX'):
-            self.assertRegex(overlay, key + r'\s+unset')
+            self.assertRegex(overlay, key + r'\s+' + re.escape(described[key]) + r'\s+unset')
         set_key = [c for c in commands(self.page) if 'KEY=value' in c]
         self.assertEqual(set_key, [append_line(self.fx.root / 'local/kit.env')])
 
@@ -395,15 +411,33 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_data(self) -> None:
         data = page_text(section(self.page, 'data'))
-        self.assertRegex(data, r'orders-stg\s+15307\s+STAGING')
-        self.assertRegex(data, r'orders\s+15306\s+PROD\s+reader')
-        self.assertIn('orders-stg-ro', data, 'the login-path name from the tunnel cache')
         self.assertIn('example-project', data)
+        self.assertIn('Read-only MySQL for agents: one SELECT/SHOW/EXPLAIN/DESCRIBE/WITH statement per call,',
+                      data, "a wrapper's description is its docstring's first sentence")
+        self.assertIn('<div class="desc">Read-only BigQuery for agents:', section(self.page, 'data'))
+
+    def test_sql_instances_one_row_per_tunnel_from_the_parser_and_cache(self) -> None:
+        sql = section(self.page, 'sql')
+        text = page_text(sql)
+        self.assertRegex(text, r'db-tunnel-orders-stg\s+db-stg\.example\.test:3306\s+'
+                               r'15307\s+STAGING\s+reader\s+Keychain ro-mysql / '
+                               r'reader@db-tunnel-orders-stg\s+missing')
+        self.assertRegex(text, r'orders\s+ok\s+2026-01-02 via login path orders-stg-ro', 'cached databases and state')
+        self.assertRegex(text, r'db-tunnel-orders\s+db\.example\.test:3306\s+'
+                               r'15306\s+PROD\s+reader\s+Keychain ro-mysql / reader@db-tunnel-orders\s+present\s+-\s+'
+                               r'not checked')
+        self.assertNotIn('MySQL at', text, 'the description does not repeat Kind')
+        self.assertNotIn('through db-tunnel', text, 'an alias is never shown as the bastion')
+        self.assertIn('id="sql-add" data-ports="15306 15307" data-aliases="db-tunnel-orders db-tunnel-orders-stg"', sql)
+        self.assertIn(' data-p-name="[a-z0-9][a-z0-9-]*"', sql, "the form checks with ro-mysql's own patterns")
+        self.assertIn('team.conf', sql, 'a file the ssh config Includes is a source too')
+        self.assertIn('ro-mysql add --name', page_text(section(self.page, 'actions')))
 
     def test_skills_list_the_source_and_label_a_host_its_hosts_line_leaves_out(self) -> None:
         skills = page_text(section(self.page, 'skills'))
         self.assertIn('code-search', skills)
-        self.assertRegex(skills, r'pr-study\s+kit\s+claude\s+codex\s+Change\b.*?codex: left out by its hosts: line')
+        self.assertRegex(skills, r'pr-study\s+[^\n]*?\s+kit\s+claude\s+codex\s+Change\b.*?codex: left out by its hosts: line')
+        self.assertRegex(section(self.page, 'skills'), r'<b>pr-study</b><div class="desc">[^<]+</div>')
         self.assertIn('The saved selection is every skill', skills)
         self.assertFalse([c for c in commands(self.page) if '--skills' in c], 'a command pins a skill list')
 
@@ -415,6 +449,11 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn('vscode://file/', self.page)
         self.assertIn('Engine', page_text(section(self.page, 'pack')))
         self.assertIn('Review rounds', page_text(section(self.page, 'roles')))
+        self.assertRegex(section(self.page, 'roles'), r'</b><div class="desc">[^<]+</div>', "an agent's frontmatter")
+        self.assertIn('<b>comment-guard</b><div class="desc">Nudges when an edit adds code comments.</div>',
+                      section(self.page, 'hooks'))
+        self.assertIn('<div class="desc">Commit author the docs tell the agent to use; git config&#x27;s identity when '
+                      'unset.</div>', section(self.page, 'overlay'), 'the comment above the key in kit.env.example')
         actions = page_text(section(self.page, 'actions'))
         self.assertNotIn(' sync', actions)
         self.assertNotIn(' update', actions)
@@ -449,7 +488,7 @@ class DashboardScenarioTests(Fixture):
         (local / 'preset.env').write_text('REVIEW_BASE=develop\nTEAM_ONLY=x\n')
         page, _ = self.dashboard()
         overlay = page_text(section(page, 'overlay'))
-        self.assertRegex(overlay, r'REVIEW_BASE\s+main\s+kit\.env\s+kit\.env\s')
+        self.assertRegex(overlay, r'REVIEW_BASE\s+The branch reviews[^<]*?master\.\s+main\s+kit\.env\s+kit\.env\s')
         self.assertNotIn('TEAM_ONLY', overlay, 'a layer kit_env does not read')
         self.assertIn(append_line(local / 'kit.env'), commands(page))
 
@@ -475,8 +514,20 @@ class DashboardScenarioTests(Fixture):
         installed.write_text(json.dumps(servers))
         page, _ = self.dashboard(security=self.home / 'absent')
         self.assertRegex(page_text(section(page, 'mcp')), r'Keychain example/wrapped / me\s+not checked')
-        self.assertNotIn('add-generic-password', page)
+        self.assertNotIn('add-generic-password', re.sub(r'<script>.*?</script>', '', page, flags=re.S),
+                         "an add command outside the add-connection form's script")
         self.assertNotIn('Missing Keychain item', page)
+
+    def test_an_installed_catalog_keeps_descriptions_and_no_host_gets_one(self) -> None:
+        said = 'Searches the example documentation.'
+        self.install(servers={'docs': {'command': 'npx', 'args': ['-y', 'example-docs-server'], 'description': said}})
+        installed = json.loads((self.root / 'mcp/servers.json').read_text())['mcpServers']
+        self.assertEqual(installed['docs'].get('description'), said)
+        outside = [p for p in self.home.rglob('*') if p.is_file() and self.root not in p.parents
+                   and p.name != 'catalog.json' and said.encode() in p.read_bytes()]
+        self.assertEqual(outside, [], 'a host config got the description')
+        page, _ = self.dashboard()
+        self.assertIn(f'<b>docs</b><div class="desc">{said}</div>', section(page, 'mcp'))
 
     def test_a_fresh_install_needs_no_attention(self) -> None:
         self.install()
@@ -712,6 +763,14 @@ class CredentialClassifierTests(unittest.TestCase):
                          '<tr id="mcp-a"><td>a<div class="desc">what it does</div></td><td>b</td></tr>')
         self.assertIn('<div class="desc">one line</div>', render_section(Section('k', 'K', 'one line')))
 
+    def test_a_row_description_is_clamped_once_by_the_renderer(self) -> None:
+        from dashboard_html import Row, row
+
+        shown = re.search(r'<div class="desc">([^<]*)</div>', row(Row(('a',), '', 'word ' * 100)))
+        assert shown is not None
+        self.assertLessEqual(len(shown.group(1)), 220)
+        self.assertTrue(shown.group(1).endswith('...'))
+
     def test_mask_tokens_covers_every_shape(self) -> None:
         text = ' '.join([PLANTED['jwt'], PLANTED['sentry token'], PLANTED['atlassian token'], PLANTED['google token'],
                          'Bearer ' + PLANTED['bearer value'], 'https://u:' + PLANTED['userinfo password'] + '@h/', TOKEN])
@@ -734,10 +793,19 @@ class CredentialClassifierTests(unittest.TestCase):
         self.assertEqual(filled, {'w': {'command': 'x'}})
 
 
+def load_agent_kit():
+    from dashboard_sections import load_script
+
+    module = load_script(SOURCE / 'bin/agent-kit', 'agent_kit_for_test')
+    assert module is not None
+    return module
+
+
 if __name__ == '__main__':
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite([loader.loadTestsFromTestCase(case) for case in
-                                (CredentialClassifierTests, DashboardPageTests, DashboardScenarioTests)])
+                                (CredentialClassifierTests, KeychainFixtureTests, DashboardPageTests,
+                                 DashboardScenarioTests)])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.stdout.write(json.dumps({'cases': result.testsRun, 'successful': result.wasSuccessful(),
                                 'failures': len(result.failures), 'errors': len(result.errors)}, indent=2) + '\n')

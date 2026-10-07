@@ -87,17 +87,20 @@ def fill(
     return PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), text)
 
 
+CATALOG_ONLY = ("credentials", "description")
+
+
 def fill_servers(servers: dict[str, Any], kit: str, code: str | None = None) -> dict[str, Any]:
     """servers as a host starts them: each command and args filled (fill) for the kit at <kit>, and
-    the catalog's `credentials` declaration (read by the dashboard only) dropped. A host starts an
-    MCP command as written, without expanding ~ or a variable, so a preset names a wrapper the kit
+    the catalog's `credentials` and `description` (read by the dashboard only) dropped. A host starts
+    an MCP command as written, without expanding ~ or a variable, so a preset names a wrapper the kit
     ships as {{KIT_DIR}}/bin/sentry-mcp, and a server run from a local clone as
     {{CODE_DIR}}/<repo>/<path> (code: that folder, else code_dir() reads the overlay)."""
     out = {}
     for name, spec in servers.items():
         if isinstance(spec, dict):
             what = f"MCP server {name}"
-            spec = {key: value for key, value in spec.items() if key != "credentials"}
+            spec = {key: value for key, value in spec.items() if key not in CATALOG_ONLY}
             extra: dict[str, str] = {}
             if "{{CODE_DIR}}" in json.dumps(spec):
                 extra["CODE_DIR"] = code_dir() if code is None else code
