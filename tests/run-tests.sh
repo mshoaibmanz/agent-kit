@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Run the release suites (tests/run_suites.py lists them): concurrently by default, each in its own
+# HOME, TMPDIR and work root, queued behind any other run on this machine. --serial, --jobs N,
+# --only <suite>, --list; see --help.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "${TMPDIR:-}" ]; then
@@ -13,16 +16,4 @@ case "$TMPDIR/" in
 esac
 mkdir -p "$TMPDIR"
 export TMPDIR
-python3 "$ROOT/tests/verify_release.py"
-python3 "$ROOT/tests/setup_test.py"
-python3 "$ROOT/tests/setup_review_test.py"
-python3 "$ROOT/tests/installer_ux_test.py"
-python3 "$ROOT/tests/team_pack_test.py"
-python3 "$ROOT/tests/dev_install_test.py"
-python3 "$ROOT/tests/dashboard_test.py"
-python3 "$ROOT/tests/mcp_describe_test.py"
-python3 "$ROOT/tests/plugin_portability_test.py"
-python3 "$ROOT/tests/installed_guard_test.py"
-python3 "$ROOT/tests/gc_portability_test.py"
-python3 "$ROOT/tests/leak_check_test.py"
-python3 "$ROOT/tests/run_hooks.py"
+exec python3 "$ROOT/tests/run_suites.py" "$@"

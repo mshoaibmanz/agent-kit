@@ -60,9 +60,12 @@ def check(label: str, cond: bool, detail: str = "") -> None:
 
 
 def copy_agent_kit(kit: Path) -> None:
-    """bin/agent-kit into kit with the hook libraries it loads (kit_env.py reads hook-io's key list)."""
-    (kit / "bin").mkdir(parents=True)
+    """bin/agent-kit into kit with the libraries it always loads (kit_env.py reads hook-io's key
+    list; the MCP render expands Sentry instances)."""
+    (kit / "bin/lib").mkdir(parents=True)
     shutil.copy2(AGENT_KIT, kit / "bin/agent-kit")
+    for name in ("sentry.py", "secret_store.py"):
+        shutil.copy2(KIT_SRC / "bin/lib" / name, kit / "bin/lib" / name)
     (kit / "hooks/lib").mkdir(parents=True, exist_ok=True)
     for name in ("kit_env.py", "hook-io"):
         shutil.copy2(KIT_SRC / "hooks/lib" / name, kit / "hooks/lib" / name)
@@ -276,12 +279,37 @@ def mcp(sb: Sandbox) -> None:
           and (sb.mcp.stat().st_mode & 0o777) == 0o600, out)
 
 
+def user_layer(sb: Sandbox) -> None:
+    """local/settings.json, the user's own layer, is merged over the base: objects key by key."""
+    layer = sb.kit / "local/settings.json"
+    sb.edit_base(lambda d: d.update(env={"A": "1", "B": "2"}))
+    sb.render("--all")
+    write_json(layer, {"env": {"B": "user"}, "statusLine": {"type": "command", "command": "status"}})
+    rc, out = sb.render()
+    cur = sb.live()
+    check("the user layer adds a key and overrides one env value", rc == 0
+          and cur["statusLine"] == {"type": "command", "command": "status"}
+          and cur["env"] == {"A": "1", "B": "user"}, out)
+    check("the base file is untouched", sb.base()["env"] == {"A": "1", "B": "2"})
+    write_json(layer, {"theme": "dark"})
+    rc, out = sb.render()
+    check("the user layer may not set a UI-owned key", rc != 0 and "UI-owned" in out and "local/settings.json" in out, out)
+    layer.write_text("[]\n")
+    rc, out = sb.render()
+    check("a user layer that is not an object is refused", rc != 0 and "JSON object" in out, out)
+    layer.unlink()
+    rc, out = sb.render()
+    check("without the layer the base value comes back", rc == 0 and sb.live()["env"]["B"] == "2", out)
+
+
 ROLES_TOML = """[roles.main]
 model = "anthropic:opus[1m]"
 effort = "high"
 [roles.engineer]
 model = "anthropic:opus"
 effort = "high"
+replaces = ["worker"]
+brief = true
 [roles.bug-reviewer]
 model = "anthropic:inherit"
 effort = "high"
@@ -356,6 +384,8 @@ def roles(root: Path) -> None:
     text = sh.read_text() if sh.exists() else ""
     check("roles: roles-claude.sh has the rounds and a run row for cross-reviewer",
           "RV_ROUND1='bug-reviewer cross-reviewer'" in text and "cross-reviewer openai gpt-6.1-sol high run CX bug-reviewer 900" in text, text)
+    check("roles: roles-claude.sh has the retired names and the brief roles agent-type-guard reads",
+          "RV_RETIRED=worker=engineer\n" in text and "RV_BRIEF_ROLES=engineer\n" in text, text)
     ino = target.stat().st_ino if target.exists() else 0
     rc, out = render()
     check("roles: a second render writes nothing, same directory",
@@ -399,6 +429,12 @@ def roles(root: Path) -> None:
          "an openai role inheriting main's anthropic model", "would take main's anthropic model"),
         (ROLES_TOML.replace('fallback = "bug-reviewer"', 'fallback = "engineer"'),
          "a fallback that is not a review role", "must be another review role"),
+        (ROLES_TOML.replace('prefix = "B"', 'prefix = "B"\nreplaces = ["engineer"]'),
+         "a replaced name that is a current role", "replaces 'engineer', which is a current role"),
+        (ROLES_TOML.replace('prefix = "B"', 'prefix = "B"\nreplaces = ["worker"]'),
+         "one retired name replaced by two roles", "'worker' is replaced by both engineer and bug-reviewer"),
+        (ROLES_TOML.replace('replaces = ["worker"]', 'replaces = "worker"'), "a replaces that is not a list", "replaces is a list"),
+        (ROLES_TOML.replace("brief = true", 'brief = "yes"'), "a brief that is not a boolean", "brief is true or false"),
     ):
         (kit / "roles.toml").write_text(bad)
         rc, out = render()
@@ -502,7 +538,8 @@ def main() -> int:
         root = Path(tempfile.mkdtemp(prefix="agent-kit-test."))
     try:
         sb = Sandbox(root)
-        for case in (first_render, ui_changes, absent_and_take, guarded, doctor, state_per_target, registry, mcp):
+        for case in (first_render, ui_changes, absent_and_take, guarded, doctor, state_per_target, registry, mcp,
+                     user_layer):
             logger.info("--- %s", case.__name__)
             try:
                 case(sb)

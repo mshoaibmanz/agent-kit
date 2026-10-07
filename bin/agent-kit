@@ -7,6 +7,9 @@
       its {"$keychain": {service, account}} references resolved. --take writes the source over the
       named leaves (dotted paths), --all over every drifted leaf.
   adopt <key.path> [--delete]   copy a live settings value into settings.base.json
+  A user's own settings go in local/settings.json (gitignored), merged over settings.base.json
+  (objects key by key, anything else replaced); the same refusals apply to the merged result.
+  agent-setup applies the same layer on a Claude install with the hooks component.
   doctor               drift per key, MCP drift, broken links, `claude-account check`
   sync [--dry-run]     an agent-setup install: its source checkout's `agent-setup sync`, which
                        reapplies every saved choice and lists what changed
@@ -50,7 +53,7 @@ Roles (roles.toml, the one source for model and effort per role; see its header)
   agent-body <role> [--host H]   print agents/<role>.md's body filled for H (agent-run's prompt)
 
 Placeholders: agent bodies, host rules (rules/hosts/<host>.md) and installed skill text may hold
-{{NAME}}, filled per host by bin/lib/hosts.py fill:
+{{NAME}}, filled per host by bin/lib/kit_text.py fill:
   AGENT_KIT_DIR, KIT_DIR  the kit           SKILLS_DIR  <kit>/skills     OVERLAY_DIR  <kit>/local
   RULES_FILE              the host's instructions file (CLAUDE.md, AGENTS.md, rules/agent-kit.mdc)
   SUBAGENT_RESUME_MAX_K   kit.env SUBAGENT_RESUME_MAX (default 300000) in thousands
@@ -61,6 +64,7 @@ none) and state/rendered/claude-host-rules.md, the filled rules/hosts/claude.md.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import ctypes
 import difflib
@@ -74,6 +78,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -102,15 +107,18 @@ from kit_env import kit_root  # noqa: E402
 KIT = kit_root(__file__)
 # This script's own lib, the code it was written against; KIT may be a kit of sources only.
 LIB = Path(__file__).resolve().parent / "lib"
+sys.path.insert(0, str(LIB))
 HOST_DIR = KIT / "hosts/claude"
 BASE = HOST_DIR / "settings.base.json"
+# Settings-layer keys agent-setup applies as their own kinds (environment, plugins, marketplaces).
+LAYER_OBJECTS = ("env", "enabledPlugins", "extraKnownMarketplaces")
 REGISTRY = KIT / "hooks/registry.json"
 SERVERS = KIT / "mcp/servers.json"
 STATE = KIT / "state/rendered"
 ROLES = Path(os.environ.get("AGENT_KIT_ROLES", str(KIT / "roles.toml")))
 AGENT_SRC = KIT / "agents"
 MISSING = object()
-# Catalog fields only the dashboard reads; no host gets them. hosts.CATALOG_ONLY is the same tuple
+# Catalog fields only the dashboard reads; no host gets them. kit_text.CATALOG_ONLY is the same tuple
 # (a test pins them equal): a bare agent-kit cannot import bin/lib.
 CATALOG_ONLY = ("credentials", "description")
 # A leaf here that goes missing live is restored, and drift here fails the render.
@@ -211,6 +219,8 @@ class Role:
     prefix: str = ""
     fallback: str = ""
     timeout: int = 900
+    replaces: tuple[str, ...] = ()
+    brief: bool = False
 
 
 @dataclass
@@ -247,7 +257,7 @@ def _role(name: str, spec: Any, bad: list[str]) -> Role | None:
     if not isinstance(spec, dict):
         bad.append(f"{where} is not a table")
         return None
-    unknown = sorted(set(spec) - {"model", "effort", "prefix", "fallback", "timeout"})
+    unknown = sorted(set(spec) - {"model", "effort", "prefix", "fallback", "timeout", "replaces", "brief"})
     if unknown:
         bad.append(f"{where}: unknown keys {unknown}")
     model = spec.get("model")
@@ -264,7 +274,15 @@ def _role(name: str, spec: Any, bad: list[str]) -> Role | None:
     timeout = spec.get("timeout", 900)
     if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
         bad.append(f"{where}: timeout is a positive number of seconds (got {timeout!r})")
-    return Role(name, provider, mid, str(effort), prefix or "", spec.get("fallback", "") or "", timeout)
+    replaces = spec.get("replaces", [])
+    if not isinstance(replaces, list) or not all(isinstance(n, str) and ROLE_NAME.fullmatch(n) for n in replaces):
+        bad.append(f"{where}: replaces is a list of retired role names (got {replaces!r})")
+        replaces = []
+    brief = spec.get("brief", False)
+    if not isinstance(brief, bool):
+        bad.append(f"{where}: brief is true or false (got {brief!r})")
+        brief = False
+    return Role(name, provider, mid, str(effort), prefix or "", spec.get("fallback", "") or "", timeout, tuple(replaces), brief)
 
 
 def load_roles(path: Path | None = None) -> Roles | None:
@@ -315,6 +333,13 @@ def load_roles(path: Path | None = None) -> Roles | None:
     for key in ("round1", "later"):
         if key in review and not set(review[key]) - set(review.get("once", [])):
             bad.append(f"[review] {key} names no correctness reviewer (a role not in once): its round could never complete")
+    retired: dict[str, str] = {}
+    for role in roles.values():
+        for old in role.replaces:
+            if old in roles:
+                bad.append(f"[roles.{role.name}] replaces {old!r}, which is a current role")
+            elif retired.setdefault(old, role.name) != role.name:
+                bad.append(f"{old!r} is replaced by both {retired[old]} and {role.name}")
     seen: dict[str, str] = {}
     for role in roles.values():
         if role.prefix and seen.setdefault(role.prefix, role.name) != role.name:
@@ -352,6 +377,9 @@ def roles_sh(roles: Roles, host: str) -> str:
         *(f"RV_{key.upper()}={shlex.quote(' '.join(roles.review.get(key, [])))}" for key in REVIEW_LISTS),
         "# role provider model effort invoke prefix fallback timeout",
         f"RV_ROLE_TABLE={shlex.quote(chr(10).join(rows))}",
+        "# retired role names as old=new, and the roles whose spawn prompt names a briefs/*.md (agent-type-guard)",
+        f"RV_RETIRED={shlex.quote(' '.join(f'{old}={r.name}' for r in roles.roles.values() for old in r.replaces))}",
+        f"RV_BRIEF_ROLES={shlex.quote(' '.join(r.name for r in roles.roles.values() if r.brief))}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -370,11 +398,10 @@ def role_settings(roles: Roles, host: str) -> dict[str, Any]:
 
 def fill_for_host(text: str, kit: str | None = None, host: str = "claude", host_root: str | None = None,
                   what: str = "text", resume: int | None = None, strict: bool = True) -> str:
-    """hosts.fill with this kit as the default kit: an unknown placeholder refuses the render (strict)."""
+    """kit_text.fill with this kit as the default kit: an unknown placeholder refuses the render (strict)."""
     if "{{" not in text:
         return text  # no lib needed: a synthetic kit without bin/lib renders placeholder-free text
-    sys.path.insert(0, str(LIB))
-    from hosts import fill
+    from kit_text import fill
 
     return fill(text, kit or str(KIT), host, host_root, what, resume, strict)
 
@@ -387,7 +414,6 @@ def rules_root(host: str) -> str | None:
         return str(expand(os.environ["AGENT_KIT_RULES"]).parent)
     if not (LIB / "hosts.py").is_file():
         return None  # a synthetic kit without bin/lib, as in fill_for_host
-    sys.path.insert(0, str(LIB))
     from hosts import host_root_for
 
     root = host_root_for(KIT, host)
@@ -547,21 +573,54 @@ def render_hooks(entries: list[dict[str, Any]], host: str) -> dict[str, Any]:
     return hooks
 
 
+def merged(base: Any, over: Any) -> Any:
+    """over laid on base: objects merge key by key, anything else in over replaces base's."""
+    if isinstance(base, dict) and isinstance(over, dict):
+        return {**base, **{key: merged(base.get(key), value) for key, value in over.items()}}
+    return copy.deepcopy(over)
+
+
+class SettingsRefused(ValueError):
+    """The settings layer holds a key the kit refuses: render exits on it, doctor and setup report it."""
+
+
+def base_settings(root: Path = KIT, *, ui_owned: Iterable[str] = (), roles: bool = False) -> dict[str, Any]:
+    """The settings layer render and agent-setup apply: settings.base.json with the user's own
+    <root>/local/settings.json merged over it. Refused: a UI-owned key, a hooks key, the [roles.main]
+    keys when roles render, and a non-object value under a key setup applies on its own. The refusal
+    names the file that sets the key: the user's, else the kit's own by its path in the kit (agent-setup
+    reads the kit from a temporary view)."""
+    user_settings = root / "local/settings.json"
+    base = json.loads(BASE.read_text()) if BASE.is_file() else {}
+    user = json.loads(user_settings.read_text()) if user_settings.is_file() else {}
+    if not isinstance(user, dict):
+        raise SettingsRefused(f"{user_settings} must hold a JSON object")
+    if not isinstance(base, dict):
+        raise SettingsRefused(f"the kit's {BASE.relative_to(KIT)} must hold a JSON object")
+    layer = merged(base, user)
+
+    def owner(keys: list[str]) -> str:
+        return str(user_settings) if set(keys) & set(user) else f"the kit's {BASE.relative_to(KIT)}"
+
+    clash = sorted(set(layer) & set(ui_owned))
+    if clash:
+        raise SettingsRefused(f"{owner(clash)} sets UI-owned keys {clash}; remove them or drop them from uiOwned")
+    if "hooks" in layer:
+        raise SettingsRefused(f"{owner(['hooks'])} has a hooks key; hooks come from hooks/registry.json")
+    clash = sorted(set(layer) & set(ROLE_SETTINGS)) if roles else []
+    if clash:
+        raise SettingsRefused(f"{owner(clash)} sets {clash}; they come from roles.toml [roles.main]")
+    bad = [key for key in LAYER_OBJECTS if not isinstance(layer.get(key, {}), dict)]
+    if bad:
+        raise SettingsRefused(f"{owner(bad)}: {', '.join(bad)} must each be an object")
+    return layer
+
+
 def source_settings(host: dict[str, Any], components: set[str] | None = None) -> dict[str, Any]:
     selected = components or {"hooks", "roles"}
-    base = json.loads(BASE.read_text()) if "hooks" in selected else {}
-    clash = sorted(set(base) & set(host["uiOwned"]))
-    if clash:
-        raise SystemExit(
-            f"agent-kit: {BASE} sets UI-owned keys {clash}; remove them or drop them from uiOwned"
-        )
-    if "hooks" in base:
-        raise SystemExit(f"agent-kit: {BASE} has a hooks key; hooks come from {REGISTRY}")
     roles = load_roles() if "roles" in selected else None
+    base = base_settings(ui_owned=host["uiOwned"], roles=roles is not None) if "hooks" in selected else {}
     if roles is not None:
-        clash = sorted(set(base) & set(ROLE_SETTINGS))
-        if clash:
-            raise SystemExit(f"agent-kit: {BASE} sets {clash}; they come from {ROLES} [roles.main]")
         for key, value in role_settings(roles, "claude").items():
             if key not in host["uiOwned"]:
                 base[key] = value
@@ -824,17 +883,25 @@ def mcp_catalog() -> dict[str, Any]:
     servers = catalog.get("mcpServers")
     if not isinstance(servers, dict):
         return catalog
-    # Dropped here, not by hosts.fill_servers: a kit copied without bin/lib (a bare agent-kit) needs
-    # bin/lib only to fill placeholders.
+    # Dropped here, not by kit_text.fill_servers: a kit copied without bin/lib (a bare agent-kit) needs
+    # bin/lib only to fill placeholders and to expand a `sentry` server.
     servers = {
         name: {k: v for k, v in spec.items() if k not in CATALOG_ONLY} if isinstance(spec, dict) else spec
         for name, spec in servers.items()
     }
     if "{{" in json.dumps(servers):
-        sys.path.insert(0, str(LIB))
-        from hosts import fill_servers
+        from kit_text import fill_servers
 
         servers = fill_servers(servers, str(KIT))
+    # One server per Sentry instance (bin/lib/sentry.py), each beyond the catalog's own only once
+    # it has a token.
+    if any(name.lower() == "sentry" for name in servers):
+        from sentry import expand_servers
+
+        try:
+            servers = expand_servers(KIT, servers)
+        except ValueError as e:
+            raise SystemExit(f"agent-kit: {e}; nothing written") from e
     catalog["mcpServers"] = servers
     return catalog
 
@@ -909,7 +976,6 @@ def refuse_foreign_kit(dry_run: bool) -> None:
 def claude_install_targets() -> None:
     """An agent-setup install renders Claude into the root it recorded (CLAUDE_CONFIG_DIR or
     --host-root at setup), not ~/.claude: the targets the environment leaves unset default there."""
-    sys.path.insert(0, str(LIB))
     from hosts import host_root_for
 
     root = host_root_for(KIT, "claude")
@@ -925,7 +991,6 @@ def claude_install_targets() -> None:
 
 def cmd_render(args: argparse.Namespace) -> int:
     if args.host != "claude":
-        sys.path.insert(0, str(LIB))
         from hosts import render
 
         return render(sys.modules[__name__], args)
@@ -942,7 +1007,10 @@ def cmd_render(args: argparse.Namespace) -> int:
         expected_agents(roles, "claude")
     rc = 0
     if components & {"hooks", "roles"}:
-        rc = render_settings(host, args.dry_run, args.take or [], args.all, components)
+        try:
+            rc = render_settings(host, args.dry_run, args.take or [], args.all, components)
+        except SettingsRefused as e:
+            raise SystemExit(f"agent-kit: {e}; nothing written") from None
     if "mcp" in components:
         rc = render_mcp(host, args.dry_run, args.force_mcp) or rc
     if roles is not None:
@@ -1133,7 +1201,6 @@ def source_diff(src: Any, live: Any, path: str, out: list[Drift]) -> None:
 
 
 def account_dirs() -> list[Path]:
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
     from hosts import account_dirs as listed
 
     return listed(Path.home() / ".claude/bin/claude-account") or [Path.home() / ".claude"]
@@ -1158,7 +1225,6 @@ def team_pack_line() -> str | None:
     record = state.get("configuration", {}).get("preset")
     if not record:
         return None
-    sys.path.insert(0, str(LIB))
     from pack import kept_records, pack_label
     from preset import source_status
 
@@ -1236,7 +1302,10 @@ def claude_findings(mcp: Literal["values", "names"] = "values", host: dict[str, 
         _text, live = read_live(host["settings_path"])
         owned_live = {k: v for k, v in live.items() if k not in host["uiOwned"]}
         diffs: list[Drift] = []
-        source_diff(source_settings(host), owned_live, "", diffs)
+        try:
+            source_diff(source_settings(host), owned_live, "", diffs)
+        except SettingsRefused as e:
+            out.append(Finding("settings", f"settings refused: {e}"))
         out += [
             Finding("settings", f"settings drift: {d.key} ({'absent live' if d.absent else 'source != live'})")
             for d in diffs
@@ -1302,7 +1371,8 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
         drifted = sum(finding.kind == "settings" for finding in findings)
         print(f"settings: {drifted} kit-owned key(s) differ from the source")
         extra: list[str] = []
-        live_only({k: v for k, v in live.items() if k not in host["uiOwned"]}, source_settings(host), "", extra)
+        with contextlib.suppress(SettingsRefused):  # already a finding above
+            live_only({k: v for k, v in live.items() if k not in host["uiOwned"]}, source_settings(host), "", extra)
         for key in extra:
             print(f"settings: live-only key, not in the source (render keeps it): {key}")
     if not any(finding.kind == "mcp" for finding in findings):
@@ -1336,7 +1406,6 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     if args.host is None and args.components is None:
         return cmd_doctor_claude(args)
-    sys.path.insert(0, str(LIB))
     from hosts import HOSTS, inventory
 
     if args.host not in (None, "all", *HOSTS):
@@ -1371,7 +1440,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    sys.path.insert(0, str(LIB))
     from dashboard import cmd_dashboard as dashboard
 
     return dashboard(sys.modules[__name__], args)

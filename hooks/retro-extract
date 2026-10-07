@@ -17,8 +17,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
 try:
     import agent_task as at
+    from retro import record_retro
 except ImportError as e:
-    print(json.dumps({"systemMessage": f"retro-extract is off: hooks/lib/agent_task.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
+    print(json.dumps({"systemMessage": f"retro-extract is off: hooks/lib/agent_task.py or retro.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
     sys.exit(0)
 
 CORRECTION = re.compile(r"^(no\b|nope\b|don'?t\b|do not\b|stop\b|wrong\b|that'?s (not|wrong)|not (that|what)|why did you|you (should|shouldn'?t|didn'?t|forgot)|actually\b|instead\b|undo\b|revert\b)", re.I)
@@ -153,7 +154,7 @@ def main() -> None:
         if "--print" in sys.argv:
             print(f"- [auto] {at.today()} {sid[:8]} {where} {tag} {text}")
         else:
-            at.record_retro(text, source="auto", tag=tag, session=sid, where=where)
+            record_retro(text, source="auto", tag=tag, session=sid, where=where)
 
 
 if __name__ == "__main__":

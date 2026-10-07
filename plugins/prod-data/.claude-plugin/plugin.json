@@ -1,9 +1,0 @@
-{
-  "name": "prod-data",
-  "description": "Read-only production data. DENIES raw MySQL clients by any spelling, MySQL drivers from scripts, a swapped ro-mysql client and Keychain secret reads. Ships ro-mysql (one read-only statement per call over the ~/.ssh/config db-tunnel-* forwards, Keychain credentials, staging/prod labels) and bqro (dry-run, SELECT-only, byte cap) on PATH, the debug skill (RCA method and data-reading traps), and a nudge to load it on prod-data prompts. Company schemas and hosts come from ~/.claude/local/.",
-  "version": "2.0.0",
-  "license": "MIT",
-  "author": {
-    "name": "Shoaib Manzoor"
-  }
-}

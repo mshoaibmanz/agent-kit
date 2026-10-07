@@ -28,6 +28,7 @@
       "read-streak",
       "retro-extract",
       "session-context",
+      "subagent-context",
       "worktree-hint"
     ],
     "python-hygiene": [

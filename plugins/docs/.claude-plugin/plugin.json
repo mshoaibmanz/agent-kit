@@ -1,9 +1,0 @@
-{
-  "name": "docs",
-  "description": "The process-doc skill: a self-contained standalone HTML process guide (industrial design system, numbered floor steps, gate chips, config flow, screenshots from a reusable catalog). The screenshot catalog and company config notes live in ~/.claude/local/process-doc/.",
-  "version": "2.0.0",
-  "license": "MIT",
-  "author": {
-    "name": "Shoaib Manzoor"
-  }
-}

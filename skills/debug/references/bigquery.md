@@ -5,6 +5,7 @@ Rules and patterns for querying production data with `bqro`. This is the **fallb
 reachable MySQL DB, and always for binlog forensics, cross-day aggregation and analytics.
 
 Projects, datasets, the system-to-dataset map and the binlog location are company data:
+the `bigquery.md` of a skill that extends debug (SKILL.md lists them), else
 `~/.claude/local/debug/bigquery.md` when present. Read it too; the placeholders below
 (`<jobs_project>`, `<data_project>`, `<dataset>`, `<binlog_project>`, `<binlog_dataset>`,
 `<binlog_table>`) come from there.

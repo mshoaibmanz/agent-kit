@@ -20,6 +20,18 @@ import tomllib
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1]
+_PLUGINS: list[Path] = []
+
+
+def built_plugins() -> Path:
+    """The plugin packages, built once per run into a scratch folder: main does not track plugins/."""
+    if not _PLUGINS:
+        scratch = tempfile.TemporaryDirectory(prefix='setup-plugins-', dir=os.environ.get('TMPDIR'))
+        unittest.addModuleCleanup(scratch.cleanup)
+        subprocess.run([sys.executable, str(SOURCE / 'scripts/build_plugins.py'), '--out', scratch.name + '/plugins'],
+                       env={**os.environ, 'AGENT_KIT_DIR': str(SOURCE)}, capture_output=True, text=True, check=True)
+        _PLUGINS.append(Path(scratch.name) / 'plugins')
+    return _PLUGINS[0]
 # The last release before the role renames: upgrade tests install it first, then this checkout.
 BASE = '2b07c10017f87e354d8dc1aa8b578a7b041b385b'
 # The last release whose Codex sandbox roots sat in the mcp block.
@@ -221,7 +233,8 @@ class SetupTests(unittest.TestCase):
         preset.write_text('[mcp.servers.docs]\ncommand = "{{NOPE}}/bin/server"\n')
         self.root, self.host = self.home / 'kit refused', self.home / 'host refused'
         result = self.run_setup('--preset', str(preset), '--hosts', 'claude', '--components', 'mcp', '--apply', success=False)
-        self.assertIn('unknown placeholder {{NOPE}}', result.stderr)
+        # The preset check refuses it before any render, naming the placeholders a command may use.
+        self.assertIn('unknown command placeholder NOPE', result.stderr)
         self.assertFalse(self.root.exists() or self.host.exists(), 'a refused placeholder wrote nothing')
 
     def test_a_later_render_fills_the_installed_catalog_from_the_installed_kit(self) -> None:
@@ -374,6 +387,27 @@ class SetupTests(unittest.TestCase):
         self.run_setup('rollback', self.state()['id'])
         self.assertIn('selected', json.loads((self.host / 'mcp.json').read_text())['mcpServers'])
 
+    def test_rendered_rules_stay_within_the_budget_the_rules_file_states(self) -> None:
+        budget = re.search(r'^Budget: \*\*≤(\d+) words\*\*', (SOURCE / 'rules/AGENTS.md').read_text(), re.MULTILINE)
+        self.assertIsNotNone(budget, 'rules/AGENTS.md states no word budget')
+        rules_files = {'claude': 'CLAUDE.md', 'codex': 'AGENTS.md', 'cursor': 'rules/agent-kit.mdc'}
+        for host, name in rules_files.items():
+            with self.subTest(host=host):
+                self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
+                self.run_setup('--hosts', host, '--components', 'rules', '--apply')
+                text = (self.host / name).read_text()
+                if host == 'cursor':
+                    block = re.fullmatch(r'---\n.*?\n---\n(.*)', text, re.DOTALL).group(1)
+                else:
+                    block = re.search(r'<!-- BEGIN agent-kit setup -->\n(.*)<!-- END agent-kit setup -->', text, re.DOTALL).group(1)
+                if host == 'claude':
+                    imports = [line[1:] for line in block.splitlines() if line.startswith('@')]
+                    self.assertEqual(len(imports), 2, block)
+                    block = '\n'.join(Path(path).read_text() for path in imports)
+                self.assertIn('# Shared working rules', block)
+                self.assertNotIn('{{', block)
+                self.assertLessEqual(len(block.split()), int(budget.group(1)))
+
     def test_cursor_project_rules_separate_from_global_hook_config(self) -> None:
         project = self.home / 'project with spaces'
         self.run_setup('--hosts', 'cursor', '--components', 'rules', 'hooks', '--project-root', str(project),
@@ -404,6 +438,26 @@ class SetupTests(unittest.TestCase):
         config = json.loads((self.host / 'settings.json').read_text())
         self.assertNotIn('GIT_CONFIG_VALUE_0', config['env'])
         self.assertEqual(config['env']['AGENT_GIT_HOOKS'], 'off')
+
+    def test_claude_git_layer_joins_the_users_git_config_entries(self) -> None:
+        self.host.mkdir()
+        user = {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.fsmonitor', 'GIT_CONFIG_VALUE_0': 'false'}
+        (self.host / 'settings.json').write_text(json.dumps({'env': user}))
+        layer = {'GIT_CONFIG_COUNT': '2', 'GIT_CONFIG_KEY_1': 'core.hooksPath',
+                 'GIT_CONFIG_VALUE_1': str(self.root / 'git-hooks')}
+        self.run_setup('--components', 'hooks', '--blocking-hooks', '--apply')
+        env = json.loads((self.host / 'settings.json').read_text())['env']
+        self.assertEqual({key: env.get(key) for key in [*user, *layer]}, {**user, **layer})
+        self.run_setup('--components', 'hooks', '--apply')
+        self.assertEqual(json.loads((self.host / 'settings.json').read_text())['env'], env, 'a rerun is a no-op')
+        self.run_setup('--components', 'hooks', '--no-blocking-hooks', '--apply')
+        env = json.loads((self.host / 'settings.json').read_text())['env']
+        self.assertEqual({key: value for key, value in env.items() if key.startswith('GIT_CONFIG_')}, user)
+        self.run_setup('--components', 'hooks', '--blocking-hooks', '--apply')
+        self.run_setup('rollback', self.state()['id'])
+        env = json.loads((self.host / 'settings.json').read_text())['env']
+        self.assertEqual({key: value for key, value in env.items() if key.startswith('GIT_CONFIG_')}, user,
+                         'rollback restores the user count')
 
     def test_codex_mcp_upgrade_preserves_previous_hook_shell(self) -> None:
         self.run_setup('--hosts', 'codex', '--components', 'hooks', '--blocking-hooks', '--apply')
@@ -645,7 +699,7 @@ class SetupTests(unittest.TestCase):
             fixture = self.commands / command
             fixture.write_text('#!/bin/sh\ntouch "' + str(marker) + '"\nexit 97\n')
             fixture.chmod(0o755)
-        plugin = SOURCE / 'plugins/prod-data'
+        plugin = built_plugins() / 'prod-data'
         env = dict(self.env, PATH=str(plugin / 'bin') + ':' + self.env['PATH'])
         result = subprocess.run(['bash', '-c', 'command -v ro-mysql; ro-mysql'], env=env,
                                 capture_output=True, text=True, timeout=10)
@@ -655,7 +709,7 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_plugin_scoped_review_agent_is_recognized(self) -> None:
-        helper = SOURCE / 'plugins/auto-review/kit/hooks/lib/review-state'
+        helper = built_plugins() / 'auto-review/kit/hooks/lib/review-state'
         script = '. "$1"; rv_review_agent auto-review:bug-reviewer'
         result = subprocess.run(['bash', '-c', script, 'probe', str(helper)], env=self.env,
                                 capture_output=True, text=True, timeout=10)

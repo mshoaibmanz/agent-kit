@@ -144,6 +144,17 @@ class DevInstallTests(PackRepos):
         self.assertEqual(len(problems), 1, problems)
         self.assertTrue(problems[0].startswith('agent-kit sync cannot preview this install: SyntaxError: '), problems)
 
+    def test_a_refused_settings_key_is_a_doctor_problem_and_a_setup_refusal(self) -> None:
+        self.install(*FLAGS, '--dev', '--apply')
+        user = self.root / 'local/settings.json'
+        user.write_text('{"theme": "dark"}\n')
+        result = self.installed('doctor', code=1)
+        problems = json.loads(result.stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(f"{user} sets UI-owned keys ['theme']", problems[0])
+        refused = self.install(*FLAGS, '--dev', '--apply', code=2)
+        self.assertEqual(refused.stderr.strip(), f"agent-setup: {user} sets UI-owned keys ['theme']; remove them or drop them from uiOwned")
+
     def test_dev_mode_switches_from_copies_and_rollback_survives_a_broken_checkout(self) -> None:
         self.install(*FLAGS, '--apply')
         copy = (self.root / 'bin/agent-kit').read_bytes()
@@ -407,6 +418,9 @@ class DevInstallTests(PackRepos):
         # The installed tools and hooks import from the checkout; none may leave bytecode in it.
         environment.pop('PYTHONDONTWRITEBYTECODE', None)
         run(str(self.root / 'bin/agent-kit'), 'roles')
+        # ro-mysql is a link into the checkout here: it finds bin/lib (secret_store) beside its target.
+        self.assertTrue((self.root / 'bin/ro-mysql').is_symlink())
+        self.assertIn('usage: ro-mysql', run(str(self.root / 'bin/ro-mysql')))
         run(str(self.root / 'hooks/host-adapter'), 'codex', 'edit-guard', payload=json.dumps(
             {'hook_event_name': 'PreToolUse', 'tool_name': 'apply_patch', 'cwd': str(self.home),
              'tool_input': {'command': '*** Begin Patch\n*** Add File: notes.txt\n+x\n*** End Patch\n'}}))

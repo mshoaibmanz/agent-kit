@@ -209,9 +209,10 @@ class ReviewTests(unittest.TestCase):
                 "tool_response": "nothing to commit; failed",
             },
         )
-        marker = self.root / ".claude/tmp/claude-commit" / f"last-{sid}"
+        markers = self.root / ".claude/tmp/claude-commit"
         self.assertFalse(
-            marker.exists(), "Unknown status with unchanged HEAD must not consume commit allowance"
+            any(markers.glob(f"last-{sid}-*")),
+            "Unknown status with unchanged HEAD must not consume commit allowance",
         )
         self.hook("commit-cohesion", {**common, "hook_event_name": "PreToolUse"})
         (repo / "a.py").write_text("x=1\n")
@@ -224,7 +225,10 @@ class ReviewTests(unittest.TestCase):
                 "tool_response": "string response without exit status",
             },
         )
-        self.assertTrue(marker.exists(), "Changed HEAD proves the attempted commit landed")
+        self.assertTrue(
+            any(markers.glob(f"last-{sid}-main-*")),
+            "Changed HEAD proves the attempted commit landed",
+        )
 
     def test_CX5_retired_cursor_server_and_user_edits(self):
         self.assertEqual(self.render("cursor").returncode, 0)

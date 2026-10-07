@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,75 @@ EVENTS = {
     "subagentStop": "SubagentStop",
     "sessionStart": "SessionStart",
 }
+
+
+def git_layer_env(
+    env: Mapping[str, str], hooks_dir: str, owned: Iterable[str] = (), enabled: bool = True
+) -> dict[str, str]:
+    """The GIT_CONFIG_* keys that put core.hooksPath=hooks_dir into an agent's shell beside the
+    command-scope entries env already holds; with enabled false, the keys that take it out again.
+
+    Git applies the entries in index order and the last core.hooksPath wins, so the layer's entry
+    must be the last one: then it wins over a core.hooksPath of the user's and the dispatcher chains
+    to that one. Its entry (its value, or a GIT_CONFIG_KEY_n named in owned, an earlier render's;
+    the last such) keeps its index while no core.hooksPath follows it, else it becomes a no-op entry
+    and the layer's goes after all the others. Removing or moving an entry would renumber the user's
+    keys, so a dropped one stays as a no-op instead. ValueError: a GIT_CONFIG_COUNT that git itself
+    would reject.
+    """
+    raw = str(env.get("GIT_CONFIG_COUNT", "") or "0")
+    if not raw.isdigit():
+        raise ValueError(f"GIT_CONFIG_COUNT is not a count: {raw!r}")
+    count, owned = int(raw), set(owned)
+
+    def hooks_path(i: int) -> bool:
+        return env.get(f"GIT_CONFIG_KEY_{i}", "").lower() == "core.hookspath"
+
+    mine = [
+        i
+        for i in range(count)
+        if f"GIT_CONFIG_KEY_{i}" in owned or (hooks_path(i) and env.get(f"GIT_CONFIG_VALUE_{i}") == hooks_dir)
+    ]
+    index = mine[-1] if mine else count
+    key, value = f"GIT_CONFIG_KEY_{index}", f"GIT_CONFIG_VALUE_{index}"
+    if enabled:
+        if any(hooks_path(i) for i in range(index + 1, count)):
+            return {
+                "GIT_CONFIG_COUNT": str(count + 1),
+                key: "agent-kit.gitHooks",
+                value: "off",
+                f"GIT_CONFIG_KEY_{count}": "core.hooksPath",
+                f"GIT_CONFIG_VALUE_{count}": hooks_dir,
+            }
+        return {
+            "GIT_CONFIG_COUNT": str(max(count, index + 1)),
+            key: "core.hooksPath",
+            value: hooks_dir,
+        }
+    if index == count:
+        return {}
+    if index + 1 < count:
+        return {"GIT_CONFIG_COUNT": str(count), key: "agent-kit.gitHooks", value: "off"}
+    return {"GIT_CONFIG_COUNT": str(index)} if index else {}
+
+
+
+def beside_user_layer(user: Mapping[str, str], values: dict[str, str]) -> dict[str, str]:
+    """values (a shell block git_layer_env laid out over the user's own variables) for a host whose
+    own settings (user) already set GIT_CONFIG_COUNT. The block cannot hold a second count, and
+    setup never edits the user's lines: the layer's keys are left out once the user's lines carry
+    its entry. ValueError naming the lines the user adds while they do not."""
+    if "GIT_CONFIG_COUNT" not in user or "GIT_CONFIG_COUNT" not in values:
+        return values
+    if values["GIT_CONFIG_COUNT"] != user["GIT_CONFIG_COUNT"]:
+        index = user["GIT_CONFIG_COUNT"]
+        raise ValueError(
+            f"your shell_environment_policy.set has its own GIT_CONFIG_COUNT. Add "
+            f'GIT_CONFIG_KEY_{index} = "core.hooksPath" and GIT_CONFIG_VALUE_{index} = '
+            f'"{values[f"GIT_CONFIG_VALUE_{index}"]}" there, set GIT_CONFIG_COUNT = '
+            f'"{values["GIT_CONFIG_COUNT"]}", and rerun'
+        )
+    return {key: value for key, value in values.items() if not key.startswith("GIT_CONFIG_")}
 
 
 def detect_host(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:

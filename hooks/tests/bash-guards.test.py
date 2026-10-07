@@ -753,6 +753,24 @@ BG_CASES = [
 ]
 
 
+# A deny names the corrected command: agents repeated these four denials when the reason only
+# said what was wrong.
+REASON_CASES = [
+    ("sed -i '' 's/a/b/' x.py", ("`# sweep` at the end", "with Edit/Write instead"), "inplace-edit: override first, then the edit tool"),
+    ("ls $HOME:h", ("`${HOME}:h", '`$(dirname "${HOME}")`'), "zsh-modifier: :h names the brace and dirname forms"),
+    ("echo $f:t", ('`$(basename "${f}")`',), "zsh-modifier: :t names basename"),
+    ("git -C /r push origin HEAD:feat-x", ("Re-run as: git -C /r push -u origin HEAD:feat-x",),
+     "destructive-git: push without -u gets the filled-in -u form"),
+]
+
+
+def reason(cmd):
+    r = subprocess.run([H], input=json.dumps({"cwd": FIX, "tool_input": {"command": cmd}}),
+                       capture_output=True, text=True, cwd=FIX)
+    out = r.stdout.strip()
+    return json.loads(out)["hookSpecificOutput"].get("permissionDecisionReason", "") if out else ""
+
+
 def decision(cmd, kit=None, timeout=None, bg=False):
     env = None if kit is None else {**os.environ, "KIT_ENV": kit}
     try:
@@ -803,6 +821,13 @@ def main():
             fails += got != want
             print(f"{'ok  ' if got == want else 'FAIL'} want={want:<5} got={got:<5} {label}")
         cases += [(None, *c) for c in bg_cases]
+        reason_cases = REASON_CASES if want_section is None else []
+        for cmd, fragments, label in reason_cases:
+            why = reason(cmd)
+            ok = all(f in why for f in fragments) and len(why.splitlines()) <= 2
+            fails += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} reason {label}" + ("" if ok else f"\n     got: {why!r}"))
+        cases += reason_cases
         for want, cmd, bound, label in timed:
             start = time.monotonic()
             got = decision(cmd, timeout=bound + 20)

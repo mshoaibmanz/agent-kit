@@ -1,11 +1,11 @@
 ---
 name: sentry-fix-issues
-description: Find and fix issues reported in Sentry, via the Sentry MCP. Use when given a Sentry issue ID or link, or asked to fix Sentry errors, triage the Sentry inbox, or investigate an exception that Sentry captured. Methodically analyzes stack traces, breadcrumbs, traces, and context to identify root causes. For a prod issue with no Sentry event, use `debug`.
+description: Find and fix issues reported in Sentry, via the Sentry MCP. Use when given a Sentry issue ID or link, or asked to fix Sentry errors, triage the Sentry inbox, investigate an exception that Sentry captured, or find which Sentry instance, org and project a service or repo reports to. Methodically analyzes stack traces, breadcrumbs, traces, and context to identify root causes. For a prod issue with no Sentry event, use `debug`.
 license: Apache-2.0
 ---
 
 <!-- Modified from getsentry/sentry-agent-skills (Apache-2.0; see LICENSES/Apache-2.0.txt and NOTICE
-at the repo root): description rewritten, "MCP traps" section added. -->
+at the repo root): description rewritten, "Step 0" and "MCP traps" sections added. -->
 
 # Fix Sentry Issues
 
@@ -22,6 +22,34 @@ Discover, analyze, and fix production issues using Sentry's full debugging capab
 
 - Sentry MCP server configured and connected
 - Access to the Sentry project/organization
+
+## Step 0: Find the project (never guess a slug)
+
+A team may run more than one Sentry instance (self-hosted and sentry.io, say), and projects move
+between them. When the kit has instances configured (`mcp/sentry-instances.json`), run this before
+any MCP call:
+
+```sh
+"$AGENT_KIT_DIR/bin/sentry-map" find <service|repo|keyword>
+```
+
+Each line gives a status, the label (prod/staging), project slug, instance, its MCP server,
+regionUrl, org, platform, environments and the last error date. `--json` gives the same fields.
+Then:
+
+- **Use the `live` row for each label.** The same slug can sit on several instances and orgs; the
+  `live` copy has the newest error for that label. `older` and `stale` (no error in 90 days) copies
+  are leftovers: don't read issues from them unless the user asks. `label unknown` means the org
+  has no prod/staging label in the instance config; say so rather than guess its environment.
+- Call the **MCP server the line names**, passing that `organizationSlug` and `regionUrl`. A
+  server that is not in your tool list was not configured when the session started.
+- **Prod vs staging comes from the label and the environment**, not from the project name. The
+  same slug can exist in a prod and a staging org; name the org a finding came from.
+- A warning line means an instance was skipped (no token, unreachable). It prints the one command
+  that enables it; tell the user rather than guessing the project lives elsewhere.
+- A token stored after the last render does not add that instance's server by itself: the host
+  lists it once `agent-kit render` (or `agent-setup sync`) has run and a new session starts.
+- No match: `sentry-map list` shows everything; `--refresh` re-crawls (the cache is 24h).
 
 ## Security Constraints
 

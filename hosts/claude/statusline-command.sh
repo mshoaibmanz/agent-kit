@@ -3,8 +3,8 @@
 # ONE jq call and one git call per render (the previous version forked jq seven times plus bc).
 # Tokens are what the context holds: input + cache creation + cache read of the last call
 # (current_usage.input_tokens alone is the uncached tail, a few hundred tokens). Colour is absolute:
-# yellow from 450K, red from CONTEXT_HANDOFF_AT (kit.env, default 600K: context-watch's handoff
-# point); the old percentage steps stay for windows too small to reach those.
+# yellow from 450K, red from context-watch's handoff point (hook-io context_points: CONTEXT_HANDOFF_AT,
+# else derived from autoCompactWindow); the old percentage steps stay for windows too small to reach those.
 input=$(cat)
 # The prompt cache (prompt_cache, Claude Code 2.1.251+): `cache ● 47m` while warm, green above a
 # quarter of the TTL left, yellow at or under it (m:ss under 5 minutes); red `cache ○ cold` once it
@@ -51,8 +51,8 @@ IFS=$'\t' read -r model cwd used_pct used_tok window cost five_hr seven_day cach
     $cache[0], $cache[1] ] | @tsv' 2>/dev/null)
 
 red_at=600000
-{ . "$HOME/.claude/hooks/lib/hook-io" && kit_env; } 2>/dev/null
-case ${CONTEXT_HANDOFF_AT:-} in '' | 0 | *[!0-9]*) ;; *) red_at=$CONTEXT_HANDOFF_AT ;; esac
+{ . "$HOME/.claude/hooks/lib/hook-io" && context_points; } 2>/dev/null
+case ${HANDOFF_AT:-} in '' | 0 | *[!0-9]*) red_at=${HANDOFF_DEFAULT:-$red_at} ;; *) red_at=$HANDOFF_AT ;; esac
 yellow_at=450000
 [ "$yellow_at" -lt "$red_at" ] || yellow_at=$((red_at * 3 / 4))
 

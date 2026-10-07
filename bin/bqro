@@ -35,6 +35,10 @@ BLOCKED_FLAGS = (
     "--flagfile",
     "--bigqueryrc",
 )
+# An expired gcloud login: the refresh cannot prompt from a non-interactive shell, and agents
+# retried it instead of handing it to the user.
+REAUTH_MARKERS = ("Reauthentication failed", "invalid_grant", "RefreshError")
+REAUTH_HINT = "bqro: gcloud login expired: the user runs `gcloud auth login` in their own terminal, then retry once"
 
 
 def die(msg: str) -> None:
@@ -86,6 +90,8 @@ def main() -> None:
     dry = subprocess.run([*base, "--dry_run", sql], capture_output=True, text=True)
     if dry.returncode != 0:
         sys.stderr.write(dry.stderr or dry.stdout)
+        if any(marker in dry.stderr + dry.stdout for marker in REAUTH_MARKERS):
+            print(REAUTH_HINT, file=sys.stderr)
         sys.exit(dry.returncode or 1)
     try:
         stats = json.loads(dry.stdout)["statistics"]["query"]

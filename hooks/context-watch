@@ -4,7 +4,8 @@
 #
 #   PostToolUse (all tools), Stop
 #       context = input + cache creation + cache read of the latest assistant usage in the
-#       transcript tail. At CONTEXT_HANDOFF_AT (kit.env; default 600000, 0 turns it off) or more,
+#       transcript tail. At CONTEXT_HANDOFF_AT (kit.env; 0 turns it off; unset: hook-io's
+#       context_points, from the host's autoCompactWindow) or more,
 #       once per session and 100K band: PostToolUse injects additionalContext; Stop blocks once
 #       with the same text (deferred while stop_hook_active). The marker
 #       <state>/context-watch/<sid> holds the band; its mtime is the nudge time pre-compact reads.
@@ -17,8 +18,9 @@
 #       when CONTEXT_HANDOFF_AT=0, which turns off only the nudge.
 #
 # WHY. Measured over 2026-09-26..10-03: the 8 compactions were all manual at 512-870K, and a
-# simulated cut at 600K with a handoff saves about 16% of main-session spend. autoCompactWindow
-# 680000 compacts near 657K; this nudge leaves the model about 57K to write the handoff first.
+# simulated cut at 600K with a handoff saves about 16% of main-session spend. The host compacts
+# COMPACT_RESERVE under autoCompactWindow; the default nudge leaves HANDOFF_ROOM before that for the
+# handoff (both in hooks/lib/handoff.py).
 #
 # COST. This runs on every tool call of every live session, so the common path is builtins plus
 # one `cat`, one `tail -c` and one awk (no jq, no Python): a few ms. jq and agent-task run only when
@@ -56,9 +58,8 @@ field tp transcript_path
 case $tp in '~/'*) tp="$HOME/${tp#'~/'}" ;; esac
 [ -n "$sid" ] && [ -f "$tp" ] && [ -r "$tp" ] || exit 0
 
-kit_env
-at=${CONTEXT_HANDOFF_AT:-600000}
-case $at in '' | *[!0-9]*) at=600000 ;; esac
+context_points
+at=$HANDOFF_AT
 [ "$at" -gt 0 ] || [ "$event" = UserPromptSubmit ] || exit 0
 
 # ctx ts model of the last main-chain assistant line with a non-zero usage.
@@ -115,7 +116,9 @@ re='"stop_hook_active"[[:space:]]*:[[:space:]]*true'
 
 field cwd cwd
 text=$("${0%/*}/../bin/agent-task" nudge --session "$sid" --ctx "$ctx" --at "$at" --cwd "${cwd:-$PWD}" 2>/dev/null)
-[ -n "$text" ] || text="CONTEXT $((ctx / 1000))K: past the $((at / 1000))K handoff point; auto-compaction follows near 657K. At the next natural break, update your HANDOFF.md (state, next steps, decisions) and INDEX.md, record up to 3 learnings with \`agent-task retro\`, then carry on."
+near=.
+[ "$COMPACT_AT" -gt 0 ] && near="; auto-compaction follows near $((COMPACT_AT / 1000))K."
+[ -n "$text" ] || text="CONTEXT $((ctx / 1000))K: past the $((at / 1000))K handoff point${near} At the next natural break, update your HANDOFF.md (state, next steps, decisions) and INDEX.md, record up to 3 learnings with \`agent-task retro\`, then carry on."
 # Output first, then the band marker: a nudge that could not be emitted fires on the next call.
 # stop_block exits 0 with JSON, or 2 with the reason on stderr when jq is missing.
 rc=0

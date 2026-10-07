@@ -116,7 +116,7 @@ if [ "$bg" != true ] && printf '%s' "$_bgcmd" | grep -Eq '(^|[^&<>|])&([^&>]|$)|
 fi
 logdir=$(host_noun logdir)
 if [ "$bg" = "true" ] && ! printf '%s' "$CMD_BARE" | grep -Eq '>[[:space:]]*[^[:space:]&|;]+'; then
-  deny "Do not run tests in the background. Run them in the FOREGROUND so feedback is immediate (≤1 min). Scope tightly with a path and/or -k plus -x. If the run genuinely needs >600s, redirect stdout to a log in $logdir — a redirected run may be backgrounded.$doc"
+  deny "Do not run tests in the background ($(host_noun bgform)). Run them in the FOREGROUND so feedback is immediate (≤1 min). Scope tightly with a path and/or -k plus -x. If the run genuinely needs >600s, redirect stdout to a log in $logdir — a redirected run may be backgrounded.$doc"
 fi
 
 # 2. Everywhere in this repo: a refused form or bare pytest is wrong — require the runner.
@@ -137,7 +137,7 @@ tr_state "$sid" "$aid" "$top"
 if [ "$TR_STATE" = clean ] && ! cmd_flag rerun && tr_covered "$(tr_scope "$cmd")"; then
   deny "You already ran tests over these same paths and -k in this worktree and have not edited a source file since. Every invocation pays the same fixture floor regardless of scope, so a second call buys nothing a batched first call would not have.
  - Testing more files? Put them in ONE invocation: \`$TEST_RUNNER a.py b.py c.py -k \"x or y\"\`. pytest takes many paths.
- - Want to see more of the output? Do not re-run — redirect next time (\`$TEST_RUNNER … > <scratchpad>/t.log 2>&1\`, scratchpad dir is in your system prompt) and read the file.
+ - Want to see more of the output? Do not re-run — redirect next time (\`$TEST_RUNNER … > <dir>/t.log 2>&1\`, <dir> being $logdir) and read the file.
  - Previous run gave no verdict (timed out / infra error / wrong branch)? Re-issue with a narrower scope AND append \`# rerun\`.$doc"
 fi
 exit 0

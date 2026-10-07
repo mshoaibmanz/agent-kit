@@ -1256,7 +1256,7 @@ _hb_markers=' (CLAUDECODE|AI_AGENT|AGENT_HOST) '
 _hb_unset=' (GIT_CONFIG_[A-Z0-9_]*|CLAUDECODE|AI_AGENT|AGENT_HOST) '
 # Each git command walked here is kept (_gc_sub, _gc_args) for destructive-git, so a long command
 # is walked once: 5400 `git status;` segments took 6.8s with two walks, against a 10s timeout.
-_gc_sub=(); _gc_args=()
+_gc_sub=(); _gc_args=(); _gc_gopts=()
 if [ -z "$_hb_why" ]; then
   while IFS= read -r _hb; do
     case $_hb in *[Gg][Ii][Tt]*|*GIT_*|*AGENT_*|*CI_WATCH_ACTIVE*|*CLAUDECODE*|*AI_AGENT*) ;;
@@ -1264,7 +1264,7 @@ if [ -z "$_hb_why" ]; then
     esac
     _seg_walk "$_hb"
     if [ "$SW_CMD" = git ]; then
-      _gc_n=${#_gc_sub[@]}; _gc_sub[$_gc_n]=$SW_SUB; _gc_args[$_gc_n]=$SW_ARGS
+      _gc_n=${#_gc_sub[@]}; _gc_sub[$_gc_n]=$SW_SUB; _gc_args[$_gc_n]=$SW_ARGS; _gc_gopts[$_gc_n]=$SW_GOPTS
     fi
     if [[ $SW_SET =~ $_hb_set ]]; then
       _hb_why='setting GIT_CONFIG_*, AGENT_GIT_HOOKS or CI_WATCH_ACTIVE in the command replaces or switches off the agent git hooks'
@@ -1311,6 +1311,7 @@ if [ "${#_gc_sub[@]}" -gt 0 ]; then
   while [ "$_dg_k" -lt "${#_gc_sub[@]}" ]; do
     _dg_sub=${_gc_sub[$_dg_k]}
     _dg_args=${_gc_args[$_dg_k]}
+    _dg_gopts=${_gc_gopts[$_dg_k]}
     _dg_k=$((_dg_k + 1))
     read -r _dg_first _ <<<"$_dg_args"   # stash and worktree take their verb first
     _dg_arg() { [[ $_dg_args =~ [[:space:]]($1)[[:space:]] ]]; }
@@ -1323,8 +1324,8 @@ if [ "${#_gc_sub[@]}" -gt 0 ]; then
         # ci-watch and unfinished-work resolve the PR with a bare `gh pr view`, which follows the
         # branch's upstream. HEAD:<other-branch> without -u leaves that on the old branch and its PR.
         _dg_arg 'HEAD:[A-Za-z0-9._/-]+' && ! _dg_arg '-u|--set-upstream' \
-          && deny "Pushing HEAD:<branch> without -u leaves this branch tracking its old upstream, so the CI hooks watch the wrong PR.
-Re-run as: git push -u origin HEAD:<branch>" ;;
+          && deny "Denied: pushing HEAD:<branch> without -u leaves this branch tracking its old upstream, so the CI hooks watch the wrong PR.
+Re-run as: git${_dg_gopts% } push -u${_dg_args% }" ;;
       reset)
         _dg_arg '--hard' \
           && confirm "\`git reset --hard\` discards every uncommitted change in the worktree, with no recovery path. If the intent is only to move the branch pointer, \`--soft\`/\`--mixed\` keep the edits." ;;
@@ -1513,7 +1514,8 @@ if ! printf '%s' "$cmd" | grep -Eq '#[[:space:]]*sweep([[:space:]]|$)'; then
   _ip_sed="${_pos}g?sed${_words}(-[EnrsuzlE]*i|--in-place)"
   _ip_perl="${_pos}perl${_words}-[pnlaw0-9]*i([^A-Za-z]|e|\$)"
   if printf '%s' "$_code" | grep -Eq "$_ip_sed" || printf '%s' "$_code" | grep -Eq "$_ip_perl"; then
-    _ip_exempt || deny "In-place sed/perl rewrite refused: edit the file with $(host_noun edit) ($(host_noun rules): Tooling). For a deliberate multi-file sweep, append \`# sweep\` to the command."
+    _ip_exempt || deny "\`# sweep\` at the end of the command overrides, for a deliberate multi-file sweep only.
+Denied: an in-place sed/perl rewrite. Make this change with $(host_noun edit) instead (Read the file first; $(host_noun rules): Tooling)."
   fi
 fi
 
@@ -1526,8 +1528,17 @@ fi
 _unquoted=$(printf '%s\n' "$cmd" | drop_heredocs 0 | sed -E -e "s/'[^']*'//g" -e 's/\\\$//g')
 _zmod=$(printf '%s' "$_unquoted" | grep -Eo '\$[A-Za-z_][A-Za-z0-9_]*:[hrtelqQuxaAPsgc&]' | head -1)
 if [ -n "$_zmod" ]; then
-  _zname=${_zmod%%:*}
-  deny "zsh reads \`${_zmod}\` as a history modifier on ${_zname}, not a literal colon. Brace it: \`\${${_zname#\$}}:${_zmod##*:}…\`."
+  _zname=${_zmod%%:*}; _zv=${_zname#\$}; _zl=${_zmod##*:}
+  # Agents reach for :h/:t on purpose too ($HOME:h for a parent dir), so name the portable spelling.
+  case $_zl in
+    h) _zalt="; for the parent directory use \`\$(dirname \"\${$_zv}\")\`" ;;
+    t) _zalt="; for the last path part use \`\$(basename \"\${$_zv}\")\`" ;;
+    r) _zalt="; to drop the extension use \`\${$_zv%.*}\`" ;;
+    e) _zalt="; for the extension use \`\${$_zv##*.}\`" ;;
+    *) _zalt='' ;;
+  esac
+  deny "Denied: zsh reads \`${_zmod}\` as a history modifier on ${_zname}, not a literal colon.
+For a literal colon brace it: \`\${$_zv}:${_zl}…\`${_zalt}."
 fi
 
 # ---- foreground-poll ---------------------------------------------------------------

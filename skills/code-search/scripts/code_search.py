@@ -265,12 +265,13 @@ def gh_file(cfg, repo, path, ref):
 
 
 def gh_repos(cfg, pattern):
-    args = ['search', 'repos', pattern, '--limit', '50', '--json', 'nameWithOwner,pushedAt,isArchived']
+    # `gh search repos` names the field fullName; nameWithOwner is `gh repo view`'s and is refused here.
+    args = ['search', 'repos', pattern, '--limit', '50', '--json', 'fullName,pushedAt,isArchived']
     if cfg.get('CODE_SEARCH_GH_OWNER'):
         args += ['--owner', cfg['CODE_SEARCH_GH_OWNER']]
     repos = json.loads(_gh(*args) or '[]')
     for r in repos:
-        print(f"{r['nameWithOwner']}  pushed {r['pushedAt'][:10]}{'  ARCHIVED' if r['isArchived'] else ''}")
+        print(f"{r['fullName']}  pushed {r['pushedAt'][:10]}{'  ARCHIVED' if r['isArchived'] else ''}")
     print(f'[gh] {len(repos)} repos')
 
 

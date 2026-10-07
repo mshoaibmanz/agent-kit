@@ -15,6 +15,8 @@ BLOCKING = frozenset(
         "pre-compact",
         "project-bind",
         "ci-watch-on-push",
+        "agent-type-guard",
+        "resume-guard",
     }
 )
 

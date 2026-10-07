@@ -73,6 +73,15 @@ echo "--- lib: cmd-view, notify ---"
 ) > "$T/cv.out" 2>&1
 [ "$(tr '\n' ' ' < "$T/cv.out")" = "ok1 ok2 ok3 " ] && ok "cmd_view masks quotes and comments; cmd_flag reads only comments" \
   || bad "cmd_view/cmd_flag: $(tr '\n' ' ' < "$T/cv.out")"
+# cmd-tokens: a redirect holding `&` is neither a separator nor a command (2>&1 read as `1` reset
+# read-streak on every such call), and what is glued around it still parses.
+tok() { printf '%s\n' "$1" | awk -f "$H/lib/cmd-tokens" | tr '\n' ' '; }
+for pair in 'grep -rn foo src 2>&1 | head=grep head ' 'make test >&2=make ' 'cmd &> log=cmd ' 'echo a 2>&-=echo ' \
+    'ls 2>&1;rm x=ls rm ' 'x=$(git log 2>&1)=git ' "x>&2;$DB -e 1=$DB " "true&>/dev/null&&$DB -e 1=$DB " \
+    'nohup run-tests >log 2>&1 &=run-tests '; do
+  got=$(tok "${pair%=*}")
+  [ "$got" = "${pair##*=}" ] && ok "cmd-tokens: ${pair%=*} -> ${pair##*=}" || bad "cmd-tokens: ${pair%=*} -> '$got', want '${pair##*=}'"
+done
 (
   . "$H/lib/notify" || exit 1
   _notify_esc 'say "hi" \ now'; echo
@@ -186,6 +195,14 @@ gate allow "trun-ci tests/z.py"
 out=$(printf '%s' "$(pre "pytest -k foo" $SID "$REPO")" | "$H/test-exec-gate")
 printf '%s' "$out" | grep -q 'run via `trun <path>.*`make test`, `dev t`.*Each run costs 5s\.' \
   && ok "the refusal names the overlay's runner, refused forms and note" || bad "refusal text: $(printf '%s' "$out" | head -c 300)"
+out=$(printf '%s' "$(pre "trun tests/q.py" $SID "$REPO" "$BG")" | "$H/test-exec-gate")
+check "the background refusal names how this host backgrounds" "$out" 'in the background \(run_in_background, a trailing &, nohup or setsid\)'
+out=$(printf '%s' "$(pre "trun tests/q.py &" $SID "$REPO")" | AGENT_HOST=codex "$H/test-exec-gate")
+check "...and on a shell-only host, not run_in_background" "$out" 'in the background \(a trailing &, nohup or setsid\)'
+ran "trun tests/q.py -k r"
+out=$(printf '%s' "$(pre "trun tests/q.py -k r" $SID "$REPO")" | "$H/test-exec-gate")
+check "the re-run refusal names this host's log dir" "$out" '<dir>/t\.log 2>&1`, <dir> being the scratchpad dir named in your system prompt'
+rm -f "$M/lastrun-$SID" "$M/lastrun-$SID".* "$M/lastrun-$SID"-* "$M/$SID"
 
 echo "--- test-exec-gate + tests-ran-mark: the overlay this suite started with ---"
 overlay "$START_KIT"
@@ -213,6 +230,19 @@ overlay "$T/kit.env"
 out=$(CLAUDE_PROJECT_DIR=$REPO "$H/session-context" </dev/null)
 check "fixture overlay: session-context TESTS line names the runner" "$out" '^TESTS: `trun a\.py.*Each run costs 5s\. `make test`, `dev t` and bare `pytest` are blocked'
 
+echo "--- session-context: pyright import resolution ---"
+PY=$T/pyrepo; mkdir -p "$PY/src/pkg" "$PY/.venv" "$T/pybin"; touch "$PY/src/pkg/__init__.py"
+printf '[project]\nname = "x"\n' > "$PY/pyproject.toml"; git -C "$PY" init -q
+printf '#!/bin/sh\n' > "$T/pybin/pyright-langserver"; chmod +x "$T/pybin/pyright-langserver"
+pyctx() { PATH="$T/pybin:$PATH" CLAUDE_PROJECT_DIR=$1 "$H/session-context" </dev/null; }
+check "pyright: no config warns about venv and extraPaths" "$(pyctx "$PY")" 'lacks venv, extraPaths'
+printf '{"venvPath": ".", "venv": ".venv", "extraPaths": ["src"]}\n' > "$PY/pyrightconfig.json"
+check "pyright: a complete config is silent" "$(pyctx "$PY")" 'Pyright config' absent
+git -C "$PY" add pyproject.toml
+git -C "$PY" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m init
+git -C "$PY" worktree add -q "$PY/wt" 2>/dev/null
+check "pyright: a worktree without the local config gets the copy hint" "$(pyctx "$PY/wt")" 'pyrightconfig.json is local to'
+
 echo "--- session-context: the session's OUT DIR, created lazily ---"
 OUTR=$T/out; rm -rf "$OUTR" "$T/state" "$T/labels"
 sess() { jq -cn --arg s "$1" --arg src "${3:-startup}" '{session_id:$s,hook_event_name:"SessionStart",source:$src}' | KIT_ENV=/dev/null CLAUDE_OUT_ROOT=$OUTR CLAUDE_STATE_DIR=$T/state TAB_LABEL_DIR=$T/labels ITERM_SESSION_ID=$SID-tab CLAUDE_PROJECT_DIR=${2:-$REPO} "$H/session-context"; }
@@ -228,10 +258,10 @@ check "no payload: no OUT DIR line" "$out" '^OUT DIR:' absent
 echo "--- session-context + agent-task: projects, legacy task folders, /clear ---"
 TR=$T/task-repo; git init -q -b DEMO-42-widget-fix "$TR" && git -C "$TR" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 out=$(sess 11111111-0000-4000-8000-000000000000 "$TR")
-check "a ticket branch does not bind at start; the first prompt does" "$out" "^OUT DIR: .*the branch names DEMO-42, so the first prompt binds it"
+check "a ticket branch with no item does not bind at start (only a worktree or /bind creates one)" "$out" "^OUT DIR: .*the branch names DEMO-42, which maps to no single item"
 git -C "$TR" checkout -q -b CORE-118-REL-TEST
 out=$(sess 33333333-0000-4000-8000-000000000000 "$TR")
-check "a release branch names no task" "$out" "No project is bound: a ticket key in a prompt binds it, or /bind"
+check "a release branch names no task" "$out" "No project is bound: /bind <project>"
 CT="$H/../bin/claude-task"
 if [ -x "$CT" ]; then
   ct() { KIT_ENV=/dev/null CLAUDE_OUT_ROOT=$OUTR CLAUDE_STATE_DIR=$T/state TAB_LABEL_DIR=$T/labels ITERM_SESSION_ID=$SID-tab "$CT" "$@"; }
@@ -249,14 +279,14 @@ if [ -x "$CT" ]; then
   check "a legacy folder keeps its TASK DIR line" "$out" "^TASK DIR: $OUTR/tasks/DEMO-42-widget-fix\. "
   check "...and surfaces its handoff with its first lines" "$out" "^HANDOFF: $OUTR/tasks/DEMO-42-widget-fix/HANDOFF.md\. Read it"
   out=$(sess 55555555-0000-4000-8000-000000000000 "$TR" clear)
-  check "/clear inherits the tab's binding" "$out" "Kept this tab's binding to DEMO-42-widget-fix across /clear"
+  check "/clear inherits the tab's binding" "$out" "^bound: DEMO-42-widget-fix .rule: tab.* Kept this tab's binding across /clear"
   out=$(sess 66666666-0000-4000-8000-000000000000 "$TR" startup)
   check "a fresh startup in the same tab does not inherit" "$out" "^OUT DIR: "
   mkdir -p "$OUTR/projects/DEMO-77/scripts"
   i=0; while [ $i -lt 300 ]; do printf '"""Script %s with a long docstring that fills the index quickly and then some more words."""\n' $i > "$OUTR/projects/DEMO-77/scripts/s$i.py"; i=$((i+1)); done
   ct index DEMO-77 >/dev/null
   out=$(sess 33333333-0000-4000-8000-000000000000 "$TR" compact)
-  [ "$(printf '%s' "$out" | wc -c | tr -d ' ')" -le 9500 ] && printf '%s' "$out" | grep -q "more lines" \
+  [ "$(printf '%s' "$out" | wc -c | tr -d ' ')" -le 9500 ] && printf '%s' "$out" | grep -q "^bound: DEMO-77/DEMO-77" \
     && ok "session-context with a big project stays under its 9500B budget" || bad "session-context output $(printf '%s' "$out" | wc -c)B"
   check "...without the over-budget warning" "$out" '^!! session-context emitted' absent
 else
@@ -394,8 +424,8 @@ rm -f "$T/ci-watch.arg"
 # Its own repo: what the push hook leaves running in the background must not race the review-state
 # cases below on $CR (seen once in CI as a lost "review edit marked").
 CRP="$T/cr-push-repo"; rm -rf "$CRP"; git init -q -b cr "$CRP"
-printf '%s' "$(post "git -C \"$CRP\" push -u origin HEAD" $SID-crp /)" | env -u CI_WATCH_ACTIVE "$HC/ci-watch-on-push"
-n=0; until [ -f "$T/ci-watch.arg" ] || [ "$n" -ge 20 ]; do sleep 0.1; n=$((n+1)); done
+# The fake ci-watch runs under nohup and inherits fd 9: the $(...) returns once it has exited.
+: "$(printf '%s' "$(post "git -C \"$CRP\" push -u origin HEAD" $SID-crp /)" | env -u CI_WATCH_ACTIVE "$HC/ci-watch-on-push" 9>&1)"
 [ "$(cat "$T/ci-watch.arg" 2>/dev/null)" = "$CRP" ] && ok "ci-watch-on-push: git -C <wt> push watches <wt>" \
   || bad "ci-watch-on-push: git -C <wt> push watches <wt>" "$(cat "$T/ci-watch.arg" 2>/dev/null)"
 rm -rf "$HC" "$T/ci-watch.arg"
@@ -487,7 +517,8 @@ EOF
 # A running waiter on the status file means the session is correctly idle: no block.
 printf 'running 123 on abcdef12\n' > "$SF"
 /bin/bash -c "until grep -q never-matches $SF; do sleep 1; done" & wpid=$!
-sleep 1
+# The hook finds the waiter by pgrep; wait until it can, not a fixed second.
+n=0; until pgrep -f "ci-watch-$PRN\.status" >/dev/null || [ "$n" -ge 300 ]; do sleep 0.1; n=$((n+1)); done
 run unfinished-work allow "$(stop "$SID-uw-w" "$R")"
 kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
 run unfinished-work deny "$(stop "$SID-uw-w" "$R")"
@@ -499,12 +530,14 @@ echo "--- ci-watch: one watcher per PR ---"
 # released together: exactly one may pass, and it removes the lock on exit.
 CL=$T/ciwatch-lock; mkdir -p "$CL"
 sed -n '/^# One watcher per PR/,/^trap /p' "$H/ci-watch" > "$CL/block.sh"
-printf '%s\n' 'lock=$1/ci-watch-1.lock; tag=1' 'until [ -e "$1/go" ]; do :; done' '. "$1/block.sh"' 'echo took; sleep 1' > "$CL/starter.sh"
+printf '%s\n' 'lock=$1/ci-watch-1.lock; tag=1' ': > "$1/ready.$$"' 'until [ -e "$1/go" ]; do :; done' '. "$1/block.sh"' 'echo took; sleep 1' > "$CL/starter.sh"
 multi=0
 for r in 1 2 3; do
-  rm -f "$CL/go" "$CL"/out.*
+  rm -f "$CL/go" "$CL"/out.* "$CL"/ready.*
   for i in 1 2 3 4 5 6; do /bin/bash "$CL/starter.sh" "$CL" > "$CL/out.$i" 2>&1 & done
-  sleep 0.3; touch "$CL/go"; wait
+  # Release them only once all six are up: a late starter would find the lock already freed.
+  until [ "$(ls "$CL" | grep -c '^ready\.')" -ge 6 ]; do sleep 0.05; done
+  touch "$CL/go"; wait
   [ "$(cat "$CL"/out.* | grep -c '^took')" = 1 ] || multi=$((multi + 1))
 done
 [ -s "$CL/block.sh" ] && [ "$multi" = 0 ] && [ ! -e "$CL/ci-watch-1.lock" ] \
@@ -530,12 +563,12 @@ check "...and no --mcp-config, so it loads no MCP server" "${args:-none}" '^--mc
 
 echo "--- CI_WATCH_ACTIVE: stop-chime, retro-extract ---"
 SB="${TMPDIR:-/tmp}/claude-stop-block"; mkdir -p "$SB"; touch "$SB/$SID-chime"
-printf '{"session_id":"%s"}' "$SID-chime" | CI_WATCH_ACTIVE=1 "$H/stop-chime"; rc=$?
-sleep 3
+# The hook defers its check to a background subshell. That subshell inherits fd 9, so each
+# $(...) below returns only once it has finished, however loaded the machine is.
+rc=$(printf '{"session_id":"%s"}' "$SID-chime" | CI_WATCH_ACTIVE=1 "$H/stop-chime" 9>&1 >/dev/null; echo "$?")
 [ "$rc" = 0 ] && [ -f "$SB/$SID-chime" ] && ok "stop-chime skips under CI_WATCH_ACTIVE" || bad "stop-chime ran under CI_WATCH_ACTIVE (rc=$rc)"
 # Control: without the env the (fresh) marker is consumed silently, no chime.
-printf '{"session_id":"%s"}' "$SID-chime" | "$H/stop-chime"
-sleep 3
+: "$(printf '{"session_id":"%s"}' "$SID-chime" | "$H/stop-chime" 9>&1)"
 [ ! -f "$SB/$SID-chime" ] && ok "stop-chime consumes the block marker without the env" || bad "stop-chime control: marker not consumed"
 rm -f "$SB/$SID-chime"
 # retro-extract at SessionEnd.
@@ -635,6 +668,31 @@ check "...but not the idle-resume notice (90 min at 605K)" "$out" '"systemMessag
 printf 'CONTEXT_HANDOFF_AT=700000\n' > "$CW/high.env"
 out=$(CW_KIT=$CW/high.env cw "$(cwp cw-s6 "$CW/t1.jsonl")")
 check "context-watch: the overlay's threshold is used (605K under 700K)" "$(flat "$out")" '^<rc 0>$'
+mkdir -p "$CW/cfg" "$CW/copy/hooks"
+printf '{"autoCompactWindow": 623000}\n' > "$CW/cfg/settings.json"
+aline 0 0 575000 > "$CW/t575.jsonl"; aline 0 0 565000 > "$CW/t565.jsonl"
+out=$(CW_KIT=/dev/null CLAUDE_CONFIG_DIR=$CW/cfg cw "$(cwp cw-s20 "$CW/t565.jsonl")")
+check "context-watch: autoCompactWindow 623000, no overlay value: 565K is under the derived 570K" "$(flat "$out")" '^<rc 0>$'
+out=$(CW_KIT=/dev/null CLAUDE_CONFIG_DIR=$CW/cfg cw "$(cwp cw-s20 "$CW/t575.jsonl")")
+check "...575K nudges before compaction, which it places near 600K" "$out" 'CONTEXT 575K: past the 570K handoff point; auto-compaction follows near 600K\.'
+cp "$H/context-watch" "$CW/copy/hooks/"; ln -s "$H/lib" "$CW/copy/hooks/lib"
+out=$(printf '%s' "$(cwp cw-s21 "$CW/t575.jsonl")" | KIT_ENV=/dev/null CLAUDE_CONFIG_DIR=$CW/cfg CLAUDE_STATE_DIR=$CW/state CLAUDE_PROJECT_DIR= bash "$CW/copy/hooks/context-watch")
+check "context-watch: the fallback text (no agent-task) takes the same compaction point" "$out" 'past the 570K handoff point; auto-compaction follows near 600K\. At the next'
+out=$(printf '%s' "$(cwp cw-s22 "$CW/t1.jsonl")" | KIT_ENV=/dev/null CLAUDE_STATE_DIR=$CW/state CLAUDE_PROJECT_DIR= bash "$CW/copy/hooks/context-watch")
+check "...and leaves the compaction point out when autoCompactWindow is unset" "$out" 'past the 600K handoff point\. At the next'
+check "...naming no number for it" "$out" 'near' absent
+# context_points' cache: an edit in the cache's own second (bash 3.2's -nt sees whole seconds; touch -r
+# makes it exact) is read again, and two config dirs sharing a state dir keep one cache each.
+pts() { ( export KIT_ENV=/dev/null CLAUDE_CONFIG_DIR=$1 CLAUDE_STATE_DIR=$CW/pts-state; unset CONTEXT_HANDOFF_AT
+  . "$H/lib/hook-io" && context_points && printf '%s %s' "$HANDOFF_AT" "$COMPACT_AT" ) }
+mkdir -p "$CW/pts-a" "$CW/pts-b"
+printf '{"autoCompactWindow": 680000}\n' > "$CW/pts-a/settings.json"
+check "context_points: autoCompactWindow 680000 hands off at 627K, compacts near 657K" "$(pts "$CW/pts-a")" '^627000 657000$'
+printf '{"autoCompactWindow": 623000}\n' > "$CW/pts-a/settings.json"
+touch -r "$(ls "$CW/pts-state/context-watch/".points*pts_a)" "$CW/pts-a/settings.json"
+check "...an edit stamped the cache's own mtime is read: 570K, 600K" "$(pts "$CW/pts-a")" '^570000 600000$'
+check "...another config dir on the same state dir has its own answer" "$(pts "$CW/pts-b")" '^600000 0$'
+check "...one cache file per config dir" "$(ls -a "$CW/pts-state/context-watch" | grep -c '^\.points')" '^2$'
 { aline 0 0 650000; aline 0 0 640000 2026-10-03T10:00:00.000Z claude-opus-5-5 true; aline 0 0 0; } > "$CW/t2.jsonl"
 out=$(cw "$(cwp cw-s7 "$CW/t2.jsonl")")
 check "context-watch: a sidechain line and a zero (synthetic) usage are skipped" "$out" 'CONTEXT 650K'
@@ -681,6 +739,81 @@ check "context-watch idle: 59 minutes is silent" "$(flat "$out")" '^<rc 0>$'
 { aline 0 0 150000; } > "$CW/t6.jsonl"
 out=$(CW_NOW=$now cw "$(cwp cw-i4 "$CW/t6.jsonl" UserPromptSubmit)")
 check "context-watch idle: 150K is silent" "$(flat "$out")" '^<rc 0>$'
+
+echo "--- resume-guard: a one-time refusal before resuming a subagent past SUBAGENT_RESUME_MAX ---"
+RG=$T/rg; mkdir -p "$RG/proj/rg-s1/subagents"
+: > "$RG/proj/rg-s1.jsonl"
+# Subagent lines are isSidechain:true; the guard reads them all.
+{ aline 1 1 1 2026-10-03T10:00:00.000Z claude-opus-5-5 true; aline 2 10000 400000 2026-10-03T10:05:00.000Z claude-opus-5-5 true; } > "$RG/proj/rg-s1/subagents/agent-abig.jsonl"
+aline 2 1000 120000 2026-10-03T10:05:00.000Z claude-opus-5-5 true > "$RG/proj/rg-s1/subagents/agent-asmall.jsonl"
+rgp() { jq -cn --arg s "${3:-rg-s1}" --arg t "$RG/proj/rg-s1.jsonl" --arg to "$1" --arg tool "${2:-SendMessage}" \
+  '{session_id:$s,transcript_path:$t,cwd:"/",hook_event_name:"PreToolUse",tool_name:$tool,tool_input:{to:$to,message:"one more thing"}}'; }
+rg() { printf '%s' "$1" | KIT_ENV=${RG_KIT:-/dev/null} CLAUDE_STATE_DIR=$RG/state "$H/resume-guard"; echo "<rc $?>"; }
+out=$(rg "$(rgp abig)")
+check "resume-guard: 410K past the 300K default is refused, override first" "$out" '"permissionDecisionReason": "Send the same message again to resume anyway'
+check "...naming the size and the limit" "$out" 'abig is at 410K context, past SUBAGENT_RESUME_MAX 300K'
+check "...rc 0" "$out" '<rc 0>$'
+out=$(rg "$(rgp abig)")
+check "resume-guard: the second send to the same agent goes through" "$(flat "$out")" '^<rc 0>$'
+out=$(rg "$(rgp abig SendMessage rg-s2)")
+check "resume-guard: the marker is per session" "$out" '"deny"'
+out=$(rg "$(rgp asmall)")
+check "resume-guard: 121K is under the limit, silent" "$(flat "$out")" '^<rc 0>$'
+printf 'SUBAGENT_RESUME_MAX=100000\n' > "$RG/low.env"
+out=$(RG_KIT=$RG/low.env rg "$(rgp asmall SendMessage rg-s3)")
+check "resume-guard: the overlay's SUBAGENT_RESUME_MAX is used (121K past 100K)" "$out" 'past SUBAGENT_RESUME_MAX 100K'
+printf 'SUBAGENT_RESUME_MAX=lots\n' > "$RG/bad.env"
+out=$(RG_KIT=$RG/bad.env rg "$(rgp asmall SendMessage rg-s4)")
+check "resume-guard: a non-numeric value falls back to 300000" "$(flat "$out")" '^<rc 0>$'
+for p in "$(rgp nosuch)" "$(rgp abig Agent rg-s5)" "$(rgp '../abig' SendMessage rg-s6)" '' 'not json' '{}'; do
+  out=$(rg "$p")
+  check "resume-guard: ${p:0:60} passes silently, rc 0" "$(flat "$out")" '^<rc 0>$'
+done
+
+echo "--- agent-type-guard: the kit's roles only, a brief role names its brief ---"
+# The role names come from roles.toml as agent-kit renders them for claude.
+"$H/../bin/agent-kit" roles --host claude --format sh > "$T/roles-claude.sh" 2>/dev/null \
+  && ok "agent-type-guard: agent-kit renders the roles fixture" || bad "agent-kit roles --format sh failed"
+atp() { jq -cn --arg t "$1" --arg p "${2:-look around}" --arg tool "${3:-Agent}" \
+  '{session_id:"s",cwd:"/",hook_event_name:"PreToolUse",tool_name:$tool,tool_input:({description:"d",prompt:$p} + (if $t == "<none>" then {} else {subagent_type:$t} end))}'; }
+atg() { printf '%s' "$1" | AGENT_ROLES_SH=${ATG_ROLES:-$T/roles-claude.sh} "$H/agent-type-guard"; echo "<rc $?>"; }
+for t in '<none>' general-purpose Explore; do
+  out=$(atg "$(atp "$t")")
+  check "agent-type-guard: $t is refused with the kit's roles named" "$(flat "$out")" '"deny".*this kit.s roles: engineer, researcher, web-browser, second-opinion\.'
+done
+for pair in worker:engineer scout:researcher adversary:second-opinion thermo-bugs:bug-reviewer review-cross:cross-reviewer; do
+  out=$(atg "$(atp "${pair%%:*}")")
+  check "agent-type-guard: retired ${pair%%:*} names ${pair#*:}" "$out" "renamed to \\\\\"${pair#*:}\\\\\""
+done
+out=$(atg "$(atp worker x Task)")
+check "agent-type-guard: the legacy Task tool name is checked too" "$out" '"deny"'
+out=$(atg "$(atp engineer 'fix the bug in foo.py')")
+check "agent-type-guard: an engineer without a brief path is refused" "$out" 'names no brief file'
+out=$(atg "$(atp engineer 'Work from the brief /w/items/x/briefs/brief-fix.md. Read it first.')")
+check "agent-type-guard: an engineer naming briefs/*.md passes" "$(flat "$out")" '^<rc 0>$'
+for t in researcher web-browser bug-reviewer quality-reviewer task-reviewer second-opinion claude-code-guide \
+    statusline-setup codex:codex-rescue; do
+  out=$(atg "$(atp "$t")")
+  check "agent-type-guard: $t passes silently" "$(flat "$out")" '^<rc 0>$'
+done
+for p in "$(atp worker x SendMessage)" '' 'not json' '{}' '{"hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":"x"}'; do
+  out=$(atg "$p")
+  check "agent-type-guard: ${p:0:50} passes silently, rc 0" "$(flat "$out")" '^<rc 0>$'
+done
+# Names are data: another kit's roles.toml renames and brief roles are honoured, the defaults are not.
+{ printf '%s\n' "RV_ROLE_TABLE='main anthropic opus high agent - - 900"; printf '%s\n' "fixer anthropic opus high agent - - 900'"
+  printf '%s\n' "RV_RETIRED='mender=fixer'" "RV_BRIEF_ROLES=fixer"; } > "$T/roles-other.sh"
+out=$(ATG_ROLES=$T/roles-other.sh atg "$(atp mender)")
+check "agent-type-guard: another kit's retired name names its successor" "$out" 'renamed to \\"fixer\\"'
+out=$(ATG_ROLES=$T/roles-other.sh atg "$(atp fixer 'no brief here')")
+check "agent-type-guard: another kit's brief role needs a brief" "$out" 'a fixer spawn names no brief file'
+out=$(ATG_ROLES=$T/roles-other.sh atg "$(atp general-purpose)")
+check "...and the generic refusal names that kit's roles" "$out" "this kit's roles: fixer\."
+out=$(ATG_ROLES=$T/roles-other.sh atg "$(atp worker)")
+check "...while this kit's retired worker passes there" "$(flat "$out")" '^<rc 0>$'
+printf '%s\n' "RV_ROLE_TABLE='main anthropic opus high agent - - 900" "engineer openai m high run - - 900'" > "$T/roles-run.sh"
+out=$(ATG_ROLES=$T/roles-run.sh atg "$(atp general-purpose)")
+check "agent-type-guard: a host that spawns no role natively passes everything" "$(flat "$out")" '^<rc 0>$'
 
 echo "--- pre-compact: HANDOFF.auto.md only when HANDOFF.md is stale ---"
 PC=$CW/pcrepo; mkdir -p "$PC"
@@ -759,7 +892,7 @@ sl() {
       context_window:{used_percentage:45,total_input_tokens:450000,context_window_size:1000000,
         current_usage:{input_tokens:2,cache_creation_input_tokens:0,cache_read_input_tokens:449998}}}
      + (if $pc == null then {} else {prompt_cache:$pc} end)) * ($x // {})' \
-    | KIT_ENV=/dev/null STATUSLINE_NOW=$N bash "$SL"
+    | KIT_ENV=/dev/null CLAUDE_STATE_DIR=$T/sl-state STATUSLINE_NOW=$N bash "$SL"
 }
 plain() { printf '%s' "$1" | sed "s/${ESC}\[[0-9;]*m//g"; }
 warm() { printf '{"warm":true,"caching_observed":true,"ttl":"%s","expires_at":%s}' "$1" "$2"; }
@@ -789,6 +922,11 @@ out=$(sl "$(warm 1h $((N - 5)))")
 check "status line: warm with expires_at already past reads cold" "$(plain "$out")" 'cache ○ cold · \$3\.60 to rewarm$'
 out=$(sl '{"warm":false,"caching_observed":false,"ttl":"1h","expires_at":null}')
 check "status line: caching never observed shows no cache segment" "$(plain "$out")" 'cache' absent
+at575='{"context_window":{"current_usage":{"input_tokens":5,"cache_read_input_tokens":574995}}}'
+out=$(sl none "$at575")
+check "status line: 575K is yellow under the default handoff point" "$out" "${ESC}\[33m45%"
+out=$(CLAUDE_CONFIG_DIR=$CW/cfg sl none "$at575")
+check "status line: with autoCompactWindow 623000, 575K is past the derived 570K and red" "$out" "${ESC}\[31m45%"
 
 echo "--- session-context payload size (each repo with a local invariants doc under CODE_DIRS) ---"
 b=$(sed -n 's/^BUDGET=\([0-9]*\).*/\1/p' "$H/session-context" | head -1)

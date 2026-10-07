@@ -13,10 +13,28 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'bin/lib'))
-from hosts import SUBAGENT_RESUME_MAX, install_text  # noqa: E402
+from kit_text import SUBAGENT_RESUME_MAX, install_text  # noqa: E402
 MATRIX = json.loads((ROOT / '.claude-plugin/components.json').read_text())
 HOOKS = {name: set(hooks) for name, hooks in MATRIX['hook_plugins'].items()}
 SKILLS = MATRIX['skill_plugins']
+MARKETPLACE = ROOT / '.claude-plugin/marketplace.json'
+# Every marketplace entry installs plugins/<name> from the dist branch of this repository, which the
+# dist workflow publishes (scripts/publish_dist.sh). --marketplace writes these into marketplace.json.
+REPO_URL = 'https://github.com/mshoaibmanz/agent-kit.git'
+DIST_REF = 'dist'
+
+
+def plugin_source(name: str) -> dict[str, str]:
+    return {'source': 'git-subdir', 'url': REPO_URL, 'path': f'plugins/{name}', 'ref': DIST_REF}
+
+
+def marketplace_text() -> str:
+    """marketplace.json with each plugin's source as plugin_source gives it."""
+    market = json.loads(MARKETPLACE.read_text())
+    market['plugins'] = [{'name': row['name'], 'source': plugin_source(row['name']),
+                          **{key: value for key, value in row.items() if key not in ('name', 'source')}}
+                         for row in market['plugins']]
+    return json.dumps(market, indent=2, ensure_ascii=False) + '\n'
 
 
 def files(root: Path) -> dict[str, bytes | str]:
@@ -54,7 +72,8 @@ def build(destination: Path) -> None:
         plugin = destination / name
         (plugin / '.claude-plugin').mkdir(parents=True)
         copy_licenses(plugin)
-        manifest = {'name': name, 'description': descriptor['description'], 'version': '2.0.0',
+        # No version: a fixed number would pin installs; without one an update follows the dist commit.
+        manifest = {'name': name, 'description': descriptor['description'],
                     'license': 'MIT', 'author': market['owner']}
         (plugin / '.claude-plugin/plugin.json').write_text(json.dumps(manifest, indent=2) + '\n')
         chosen = core_skills if name == 'skills-core' else SKILLS.get(name, [])
@@ -120,20 +139,32 @@ def build(destination: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--check', action='store_true')
+    parser.add_argument('--check', action='store_true',
+                        help='compare a fresh build with --out, and marketplace.json with its sources; write nothing')
+    parser.add_argument('--marketplace', action='store_true',
+                        help="write each marketplace.json entry's source, then exit")
+    # main does not track plugins/: CI builds it and commits it to the dist branch (scripts/publish_dist.sh).
+    parser.add_argument('--out', type=Path, default=ROOT / 'plugins', help='the packages folder (default: plugins/)')
     args = parser.parse_args()
+    if args.marketplace:
+        MARKETPLACE.write_text(marketplace_text())
+        return 0
+    out = args.out.resolve()
     with tempfile.TemporaryDirectory(prefix='public-plugin-build-') as temporary:
         desired = Path(temporary) / 'plugins'
         build(desired)
         if args.check:
-            expected, actual = files(desired), files(ROOT / 'plugins')
+            expected, actual = files(desired), files(out) if out.is_dir() else {}
             drift = sorted(key for key in expected.keys() | actual.keys() if expected.get(key) != actual.get(key))
+            if MARKETPLACE.read_text() != marketplace_text():
+                drift.append(str(MARKETPLACE.relative_to(ROOT)) + ' (run scripts/build_plugins.py --marketplace)')
             sys.stdout.write(json.dumps({'generated_files': len(expected), 'drift': drift}, indent=2) + '\n')
             return bool(drift)
-        for plugin in (ROOT / 'plugins').iterdir():
+        out.mkdir(parents=True, exist_ok=True)
+        for plugin in out.iterdir():
             if plugin.is_dir():
                 shutil.rmtree(plugin)
-        shutil.copytree(desired, ROOT / 'plugins', dirs_exist_ok=True, symlinks=True)
+        shutil.copytree(desired, out, dirs_exist_ok=True, symlinks=True)
     return 0
 
 

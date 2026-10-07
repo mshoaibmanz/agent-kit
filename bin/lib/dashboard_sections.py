@@ -41,10 +41,7 @@ from dashboard_html import (
 )
 from hosts import (
     HOSTS,
-    RULES_FILES,
     account_dirs,
-    default_host_root,
-    fill_servers,
     frontmatter,
     host_root_for,
     inventory,
@@ -52,13 +49,13 @@ from hosts import (
     skill_hosts,
 )
 from kit_env import KEYS, kit_env, layers, parse
+from kit_text import RULES_FILES, default_host_root, fill_servers
 from mcp_describe import Described
 from mcp_describe import read_cache as read_described
+import secret_store
 
 LIB = Path(__file__).resolve().parent
 ENGINE = LIB.parents[1]
-# The presence check runs this binary, never one from PATH; tests point it at a fixture.
-SECURITY = os.environ.get("AGENT_KIT_SECURITY", "/usr/bin/security")
 TableRows = list[Row | tuple[Cell, ...]]
 
 
@@ -96,14 +93,15 @@ def run(command: list[str]) -> subprocess.CompletedProcess[str] | None:
 
 @functools.cache
 def keychain_present(item: Credential) -> State:
-    """present, missing, or unknown (no Keychain tool, or it failed to run). No -w or -g: the item's
-    attributes are found, its secret is never asked for, and the output is discarded."""
-    if not Path(SECURITY).exists():
+    """present, missing, or unknown (no Keychain, or it failed to answer). Read through secret_store
+    without reveal: the item's attributes are found, its secret is never asked for. secret-tool has
+    no such read, so on Linux the state is unknown. AGENT_KIT_SECURITY (a test's fixture) replaces
+    the security binary for this existence check alone."""
+    security = os.environ.get("AGENT_KIT_SECURITY", "")
+    if not security and secret_store.store() != "keychain":
         return "unknown"
-    proc = run([SECURITY, "find-generic-password", "-s", item.service, "-a", item.account])
-    if proc is None:
-        return "unknown"
-    return "present" if proc.returncode == 0 else "missing"
+    code, _ = secret_store.lookup(item.service, item.account, reveal=False, security=security)
+    return "present" if code == 0 else "missing" if code == secret_store.ITEM_NOT_FOUND else "unknown"
 
 
 def keychain_add(item: Credential) -> str:
@@ -839,9 +837,9 @@ def work_section(setup: Setup, sec: Section) -> None:
                 (s for s in [mtime(item), *(mtime(c) for c in item.iterdir())] if s), default=None
             )
             items.append(
-                (item.name, agent_task._item_status(item), touched, bound[f"{key}/{item.name}"])
+                (item.name, agent_task.item_status(item), touched, bound[f"{key}/{item.name}"])
             )
-        open_items = [i for i in items if i[1] not in agent_task.DONE_STATUSES]
+        open_items = project.open_items()
         open_total += len(open_items)
         touched = max([mtime(project.path) or 0] + [i[2] or 0 for i in items]) or None
         detail: Cell = Muted("-")

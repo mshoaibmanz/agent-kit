@@ -19,7 +19,7 @@ BR="rgtest-$$"
 # The branch -> PR pointer's on-disk contract with ci-watch (lib/state).
 PRFILE="$HOME/.claude/tmp/ci-branch-$BR.pr"
 TESTS="$HOME/.claude/tmp/claude-tests/$SID"; TESTS2="$TESTS-2"
-cleanup() { rm -rf "$FX"; rm -f "$TESTS2" "$PRFILE" "$HOME/.claude/tmp/ci-branch-$BR-3.pr" "$TESTS" "$HOME/.claude/tmp/claude-commit/turn-$SID" "$HOME/.claude/tmp/claude-commit/last-$SID"; }
+cleanup() { rm -rf "$FX"; rm -f "$TESTS2" "$PRFILE" "$HOME/.claude/tmp/ci-branch-$BR-3.pr" "$TESTS" "$HOME/.claude/tmp/claude-commit/turn-$SID" "$HOME/.claude/tmp/claude-commit/last-$SID"-*; }
 trap cleanup EXIT
 
 REPO="$FX/repo"; REMOTE="$FX/remote.git"
@@ -239,6 +239,19 @@ out=$(pre "git commit -m two" "$SID" "$LR" | "$H/commit-cohesion"); empty "no re
 out=$(pre "git commit --amend --no-edit" "$SID" "$LR" | "$H/commit-cohesion"); empty "no remote: an amend passes" "$out"
 out=$(pre "git commit -m two" "$SID" "$LR" '{"agent_id":"agent-1"}' | "$H/commit-cohesion")
 check "no remote: a subagent still may not commit onto the parent's HEAD" "$out" 'you are a subagent'
+# The marker is per repo and per committer: the parent's commit in LR says nothing about LR2, and a
+# subagent's own commit does not hold back the next subagent commit in the same repo.
+LR2="$FX/local2"; git init -q -b main "$LR2"
+echo a > "$LR2/f"; git -C "$LR2" add f; git -C "$LR2" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm one
+out=$(pre "git commit -m two" "$SID" "$LR2" '{"agent_id":"agent-1"}' | "$H/commit-cohesion")
+empty "no remote: the parent's commit in another repo does not deny a subagent's" "$out"
+post "git commit -m two" "$SID" "$LR2" '{"agent_id":"agent-1"}' | "$H/commit-cohesion"
+out=$(pre "git commit -m three" "$SID" "$LR2" '{"agent_id":"agent-2"}' | "$H/commit-cohesion")
+empty "no remote: a sibling subagent's commit does not deny the next subagent's" "$out"
+out=$(pre "git commit -m three" "$SID" "$LR2" '{"agent_id":"agent-1"}' | "$H/commit-cohesion")
+check "no remote: a subagent's own second commit in one turn denies" "$out" 'you are a subagent'
+out=$(pre "git commit -m two" "$SID" "$LR" '{"agent_id":"agent-3"}' | "$H/commit-cohesion")
+check "no remote: the parent's own repo still holds back a subagent" "$out" 'you are a subagent'
 # B-8: `git -C "$WT"` names a repo cmd-repo cannot resolve; the no-remote cwd is only a guess.
 out=$(pre 'git -C "$WT" commit -m two' "$SID" "$LR" | "$H/commit-cohesion"); check "no remote, \$var repo: a second commit in one turn denies" "$out" 'hides which repo'
 out=$(pre "git -C \"$LR\" commit -m two" "$SID" / | "$H/commit-cohesion"); empty "...a literal no-remote repo still passes" "$out"
@@ -558,6 +571,8 @@ out=$(issue "$RC" "$SC2" CODEX_BIN="$FK")
 check "a sensitive delta (models/tables.py): bug-reviewer joins cross-reviewer" "$out" 'Review round 3 of.*subagent_type "bug-reviewer".*agent-run cross-reviewer'
 out=$(cxr "$SC2" FAKE_JSON="$FX/cx0.json")
 out=$(gpush "$SC2" "$RC" CODEX_BIN="$FK"); check "codex returned, bug-reviewer still out: the round waits" "$out" 'has not returned'
+check "...naming the round and only the reviewer whose output is missing" "$out" 'review round 3 \(tree [0-9a-f]{12}\).*no output yet from bug-reviewer \(record: '
+check "...not the one that returned" "$out" 'no output yet from[^(]*cross-reviewer' absent
 sstopin "$RC" "$SC2" bug-reviewer "No findings."
 workin "$RC" "$SC2" c 60
 out=$(issue "$RC" "$SC2" CODEX_BIN="$FX/no-codex")

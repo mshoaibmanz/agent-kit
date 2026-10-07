@@ -6,7 +6,8 @@ state, sync debugging and sensitive tables: live data, no scan cost. Use BigQuer
 cross-day aggregation and heavy analytics.
 
 Company specifics (which schema lives on which tunnel, the DB users, replica and credential
-caveats, worked examples) are in `~/.claude/local/debug/mysql.md` when present. Read it too.
+caveats, worked examples) are in the `mysql.md` of a skill that extends debug (SKILL.md lists them),
+else in `~/.claude/local/debug/mysql.md` when present. Read it too.
 
 > **The session is read-only; the credential may not be.** Before relying on the server to stop
 > a write, know what the DB user can do (`SHOW GRANTS`) and whether the target is a replica

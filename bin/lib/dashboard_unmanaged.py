@@ -3,14 +3,13 @@ Names and paths only; no value from these files reaches the page."""
 
 from __future__ import annotations
 
-import json
 import os
 import tomllib
 from pathlib import Path
 from dashboard_html import Action, Fold, Para, Section, Strong, Table
 from dashboard_sections import ENGINE, Setup, TableRows, read_json
 from hosts import RENDERED_FILES, claude_state_file
-from kit_env import kit_env
+from kit_env import code_dirs
 
 # Per host: the config-root entries that change behaviour, and why. A render writes RENDERED_FILES;
 # anything else here comes from the user, the host or another tool.
@@ -206,12 +205,10 @@ def claude_mcp_rows(setup: Setup) -> TableRows:
 def repo_roots(setup: Setup) -> list[Path]:
     roots = setup.config.get("repo_roots") or []
     if not roots:
-        values = kit_env()
         try:
-            roots = json.loads(values.get("CODE_DIRS_JSON") or "[]")
+            roots = code_dirs()
         except ValueError:
             roots = []
-        roots = roots or (values.get("CODE_DIRS") or "").split()
     return [Path(os.path.expanduser(str(r))) for r in roots if str(r).strip()]
 
 

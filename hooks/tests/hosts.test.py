@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -96,6 +97,113 @@ class HostTests(unittest.TestCase):
         )
         self.assertEqual(self.run_kit("codex").returncode, 0)
         self.assertEqual(text, (root / "config.toml").read_text())
+
+    def test_git_layer_env_joins_and_leaves_the_users_entries(self) -> None:
+        spec = importlib.util.spec_from_file_location(f"host_{id(self)}", self.kit / "hooks/lib/host.py")
+        host = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(self.kit / "hooks/lib"))
+        try:
+            spec.loader.exec_module(host)
+        finally:
+            sys.path.remove(str(self.kit / "hooks/lib"))
+        layer = host.git_layer_env
+        user = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "false"}
+        mine = {"GIT_CONFIG_KEY_1": "core.hooksPath", "GIT_CONFIG_VALUE_1": "/kit/git-hooks"}
+        self.assertEqual(layer({}, "/kit/git-hooks"), {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath",
+                                                       "GIT_CONFIG_VALUE_0": "/kit/git-hooks"})
+        self.assertEqual(layer(user, "/kit/git-hooks"), {"GIT_CONFIG_COUNT": "2", **mine})
+        both = {**user, "GIT_CONFIG_COUNT": "2", **mine}
+        self.assertEqual(layer(both, "/kit/git-hooks"), {"GIT_CONFIG_COUNT": "2", **mine}, "already there: same index")
+        moved = layer(both, "/new/git-hooks", owned=["GIT_CONFIG_KEY_1"])
+        self.assertEqual(moved["GIT_CONFIG_VALUE_1"], "/new/git-hooks", "an owned entry keeps its index")
+        self.assertEqual(layer(both, "/kit/git-hooks", enabled=False), {"GIT_CONFIG_COUNT": "1"})
+        self.assertEqual(layer(user, "/kit/git-hooks", enabled=False), {}, "no layer entry: nothing to take out")
+        followed = {**both, "GIT_CONFIG_COUNT": "3", "GIT_CONFIG_KEY_2": "user.name", "GIT_CONFIG_VALUE_2": "x"}
+        self.assertEqual(
+            layer(followed, "/kit/git-hooks", enabled=False),
+            {"GIT_CONFIG_COUNT": "3", "GIT_CONFIG_KEY_1": "agent-kit.gitHooks", "GIT_CONFIG_VALUE_1": "off"},
+            "an entry the user's follow stays, as a no-op, so their keys keep their numbers",
+        )
+        with self.assertRaises(ValueError):
+            layer({"GIT_CONFIG_COUNT": "two"}, "/kit/git-hooks")
+
+        # The user appended their own core.hooksPath after the kit's entry: the kit's moves last.
+        later = {**both, "GIT_CONFIG_COUNT": "4", "GIT_CONFIG_KEY_2": "core.hooksPath", "GIT_CONFIG_VALUE_2": "/user/hooks",
+                 "GIT_CONFIG_KEY_3": "user.name", "GIT_CONFIG_VALUE_3": "x"}
+        moved = layer(later, "/kit/git-hooks", owned=["GIT_CONFIG_KEY_1"])
+        self.assertEqual(moved, {"GIT_CONFIG_COUNT": "5", "GIT_CONFIG_KEY_1": "agent-kit.gitHooks", "GIT_CONFIG_VALUE_1": "off",
+                                 "GIT_CONFIG_KEY_4": "core.hooksPath", "GIT_CONFIG_VALUE_4": "/kit/git-hooks"})
+        merged = {**later, **moved}
+        self.assertEqual(layer(merged, "/kit/git-hooks", owned=["GIT_CONFIG_KEY_1", "GIT_CONFIG_KEY_4"]),
+                         {"GIT_CONFIG_COUNT": "5", "GIT_CONFIG_KEY_4": "core.hooksPath", "GIT_CONFIG_VALUE_4": "/kit/git-hooks"},
+                         "the next render keeps the moved entry where it is")
+        git_env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", **merged}
+        for name in [k for k in git_env if k.startswith("GIT_CONFIG_") and k not in merged and k not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")]:
+            git_env.pop(name)
+        effective = subprocess.run(["git", "config", "--get", "core.hooksPath"], capture_output=True, text=True,
+                                   env=git_env, cwd=self.root, check=False).stdout.strip()
+        self.assertEqual(effective, "/kit/git-hooks", "git reads the kit's entry, not the user's later one")
+        self.assertEqual({k: merged[k] for k in ("GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_2", "GIT_CONFIG_VALUE_2", "GIT_CONFIG_KEY_3")},
+                         {"GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_KEY_2": "core.hooksPath",
+                          "GIT_CONFIG_VALUE_2": "/user/hooks", "GIT_CONFIG_KEY_3": "user.name"}, "the user's entries keep their numbers")
+
+    def test_codex_git_layer_joins_a_users_own_entries(self) -> None:
+        root = self.root / ".codex"
+        root.mkdir()
+        user = (
+            '[shell_environment_policy.set]\nGIT_CONFIG_COUNT = "1"\n'
+            'GIT_CONFIG_KEY_0 = "core.fsmonitor"\nGIT_CONFIG_VALUE_0 = "false"\n'
+        )
+        (root / "config.toml").write_text(user)
+        result = self.run_kit("codex")
+        self.assertNotEqual(result.returncode, 0)
+        hooks_dir = self.kit / "git-hooks"
+        self.assertIn(f'GIT_CONFIG_KEY_1 = "core.hooksPath" and GIT_CONFIG_VALUE_1 = "{hooks_dir}"', result.stderr)
+        self.assertEqual((root / "config.toml").read_text(), user, "refused: nothing written")
+        joined = user.replace('COUNT = "1"', 'COUNT = "2"')
+        joined += f'GIT_CONFIG_KEY_1 = "core.hooksPath"\nGIT_CONFIG_VALUE_1 = "{hooks_dir}"\n'
+        (root / "config.toml").write_text(joined)
+        result = self.run_kit("codex")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shell = tomllib.loads((root / "config.toml").read_text())["shell_environment_policy"]["set"]
+        self.assertEqual(shell["AGENT_HOST"], "codex")
+        self.assertEqual(
+            {key: value for key, value in shell.items() if key.startswith("GIT_CONFIG_")},
+            {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "false",
+             "GIT_CONFIG_KEY_1": "core.hooksPath", "GIT_CONFIG_VALUE_1": str(hooks_dir)},
+        )
+
+    def test_cursor_session_env_joins_the_inherited_git_entries(self) -> None:
+        inherited = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_VALUE_0": "false"}
+        result = subprocess.run(
+            [str(self.kit / "hooks/host-adapter"), "cursor", "host-session-context"],
+            input=json.dumps({"hook_event_name": "sessionStart", "session_id": "c1", "conversation_id": "c1",
+                              "workspace_roots": [str(self.root)]}),
+            env={**self.env, **inherited},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = json.loads(result.stdout)["env"]
+        self.assertEqual(
+            {key: value for key, value in env.items() if key.startswith("GIT_CONFIG_")},
+            {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_1": "core.hooksPath",
+             "GIT_CONFIG_VALUE_1": str(self.kit / "git-hooks")},
+        )
+
+    def test_session_context_survives_an_agent_task_that_cannot_run(self) -> None:
+        repo = self.root / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+        (self.kit / "bin/agent-task").unlink()
+        result = subprocess.run(
+            [str(self.kit / "hooks/host-session-context")],
+            input=json.dumps({"session_id": "s1", "cwd": str(repo)}),
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(context.startswith("Personal repository guidance"), context)
 
     def test_cursor_native_schema_and_secret_free_mcp(self) -> None:
         result = self.run_kit("cursor")

@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from host import EVENTS, cursor_output, detect_host, normalize
+from host import EVENTS, cursor_output, detect_host, git_layer_env, normalize
 from kit_env import kit_root
 
 KIT = kit_root(__file__)
@@ -84,13 +84,17 @@ def main() -> int:
     if host == "cursor":
         out = cursor_output(out, event)
         if event == "SessionStart" and os.environ.get("AGENT_GIT_HOOKS") != "off":
+            hooks_dir = str(KIT / "git-hooks")
+            try:
+                # After the GIT_CONFIG_* entries Cursor's own environment already carries.
+                layer = git_layer_env(os.environ, hooks_dir)
+            except ValueError:
+                layer = git_layer_env({}, hooks_dir)  # git rejects that count anyway
             out["env"] = {
                 "AGENT_SESSION_ID": items[0]["session_id"],
                 "AI_AGENT": host,
                 "AGENT_HOST": host,
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "core.hooksPath",
-                "GIT_CONFIG_VALUE_0": str(KIT / "git-hooks"),
+                **layer,
             }
     elif (out.get("hookSpecificOutput") or {}).get("permissionDecision") == "ask":
         # Codex currently treats an unsupported ask as a failed hook and continues the tool call.

@@ -1,9 +1,0 @@
-{
-  "name": "workflow",
-  "description": "Ticket-to-merge-ready commands: /kickoff (Jira ticket, worktree, one commit, PR, CI and review comments to green; takeover and sync modes), /jira (find/create/transition, driven by per-user prefs in ~/.claude/local/jira-prefs.md) and /address-review. Needs the Atlassian MCP and gh.",
-  "version": "2.0.0",
-  "license": "MIT",
-  "author": {
-    "name": "Shoaib Manzoor"
-  }
-}

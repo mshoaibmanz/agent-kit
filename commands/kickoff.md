@@ -15,7 +15,10 @@ Standing rules for every mode (on top of CLAUDE.md's one-PR-per-ticket, handoff 
   decisions, next steps, open questions). Merge-ready: harvest (phase 5), then APPEND the summary;
   never overwrite the handoff with a one-liner. INDEX.md regenerates itself; add `use`/`proved` lines.
 - Worktrees live in `<repo>/.claude/worktrees/`, never under the work root.
-- Delegate a whole phase, never a fragment.
+- Delegate: code discovery (callers, flows, "where is X") to the `researcher` agent, one question
+  each; implementing, test-fix, CI-red and review-fix loops to ONE `engineer` from a brief
+  (`"${AGENT_KIT_DIR}/bin/agent-task" brief <project>/<KEY> --name <phase>`), a whole phase, never a
+  fragment. The ticket, git, PR, CI waits and production-data reads stay in this session.
 
 ## Build mode
 
@@ -34,9 +37,9 @@ ticket key `<KEY>-N` and its title. Transition it to In Progress and assign it t
 
 ### 3. Build
 
-- Implement. Tests per the SessionStart TESTS line (one test-runner invocation per turn,
-  redirected to the scratchpad). Add or extend a test for every behaviour change; prove a
-  regression test fails on the pre-fix code.
+- An `engineer` implements from the brief (worktree, TESTS line, done criteria, "one commit, no
+  push"): one test-runner invocation per turn, redirected to the scratchpad; a test added or
+  extended for every behaviour change; a regression test proven to fail on the pre-fix code.
 - ONE commit, subject `<KEY>-N: <imperative>`, required trailers. Do not push yet.
 - The review happens at push: the first `git push` refuses with the review instruction (round 1:
   bug-reviewer plus Codex, and quality-reviewer once, in one message). Reproduce each finding before
@@ -62,8 +65,8 @@ ticket key `<KEY>-N` and its title. Transition it to In Progress and assign it t
   with `run_in_background: true` (the same waiter the unfinished-work Stop hook hands out). The
   completion notification wakes you; do not poll.
 - RED: read `tail -80 $TMPDIR/ci-watch-<pr>.agent.log` for what the repair agent tried;
-  separate your regression from a pre-existing flake (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/ci-rules.md`); fix;
-  batch into ONE new commit; push; wait again.
+  separate your regression from a pre-existing flake (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local/ci-rules.md`); an
+  `engineer` brief names the failing job and fixes it in ONE new commit; push; wait again.
 - GREEN: if `gh pr checks <pr> --json name,bucket` shows `Cursor Bugbot` as `pending`, run one
   background wait until it is not. Then run `"${AGENT_KIT_DIR}/commands/address-review.md"` with
   `pr:<pr>` yourself: fix every unresolved thread you agree with, resolve the `cursor[bot]`
@@ -97,9 +100,9 @@ Adopt started work and carry it to merge-ready. Replaces phases 1-3:
    `git diff origin/<base>...origin/<head>` over a handoff older than the last push.
 2. Workspace: `git worktree list` first and reuse a worktree that holds the branch; otherwise
    `EnterWorktree` on it. Confirm `HEAD` equals `origin/<head>` before reading code.
-3. Deep review of the whole PR diff; fix correctness and quality findings in scope and finish
-   the open items the handoff lists. The PR is pushed: new work is ONE new commit on top, never
-   a history rewrite.
+3. Deep review of the whole PR diff (a `researcher` maps what you need not read); an `engineer`
+   brief fixes the correctness and quality findings in scope and finishes the handoff's open
+   items. The PR is pushed: new work is ONE new commit on top, never a history rewrite.
 
 Then phase 4 (update the PR body and labels; do not open a new PR), phase 5 and phase 6.
 
@@ -125,12 +128,15 @@ Per target, in order:
 6. If the user asks to deploy, use the project's documented deployment procedure and the PR's
    ROLLOUT. Confirm the target environment and authorization before changing it.
    a. Confirm each running revision is contained in the proposed revision with
-      `git merge-base --is-ancestor <running> <new>`. If it is not, identify missing unique patches
-      and stop until their owner confirms the replacement.
-   b. Run the project's schema compatibility checks. Report required migrations and unchecked
-      areas; deployment waits for migrations this change requires.
-   c. Preview the deployment with the configured project tooling. Complete any interactive
-      authentication in the user's trusted session before applying the approved deployment.
+      `git merge-base --is-ancestor <running> <new>`. If it is not: `git branch -r --contains
+      <running>`, then `git log --cherry-pick --right-only --no-merges <new>...<running>` and find
+      each subject in `<new>`. Replace only when every unique patch landed under another SHA;
+      otherwise stop and name the owner.
+   b. Run the project's schema compatibility checks. A gap this change owns: its migration goes
+      in `You need to:` and the deployment waits; name other changes' gaps, never apply them.
+      Anything the check could not verify is listed as unverified, never as clean.
+   c. Preview the deployment with the configured project tooling. Tell the user to approve any
+      interactive authentication before the first call; it must never run unattended.
    d. Observe the project's soak period and configured health/error dashboards. Report the
       environment, revision, checks and any targets requiring manual action.
 

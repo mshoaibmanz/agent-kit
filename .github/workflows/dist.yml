@@ -1,0 +1,59 @@
+name: dist
+# The Claude plugin packages are generated, never committed to main. Once ci has passed on a push to
+# main, this builds them from that commit and commits the plugins/ tree onto the dist branch, which
+# .claude-plugin/marketplace.json installs from. A red or still-running ci never publishes.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: write
+concurrency:
+  group: dist
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Only a green ci run of a push to main in this repository (not a pull request whose branch is
+    # named main, not a fork).
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Skip a commit main has moved past (its own ci run publishes the newer one)
+        id: current
+        run: |
+          git fetch --quiet --no-tags origin refs/heads/main
+          if [ "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA" ]; then
+            echo "publish=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "main is at $(git rev-parse FETCH_HEAD), past $SOURCE_SHA: not publishing an older build"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.current.outputs.publish == '1'
+        with:
+          python-version: "3.12"
+      - name: Build the plugin packages
+        if: steps.current.outputs.publish == '1'
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/build.sh
+      - name: Commit them onto dist (a new commit; never a force-push)
+        if: steps.current.outputs.publish == '1'
+        env:
+          TMPDIR: ${{ runner.temp }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: bash scripts/publish_dist.sh "$SOURCE_SHA"

@@ -70,6 +70,8 @@ Report the refreshed checkout's path, branch and SHA. A successful pull updates 
 
 If local files answer the question, stop. Continue to GitHub for missing files, default-branch confirmation, repos absent locally, or a claim that requires coverage beyond the checked-out clones.
 
+A repo you need to read in depth but have no clone of gets a full `gh repo clone` into the first configured clone root, never the scratchpad or a temp directory, and is then searched like any other clone.
+
 ## 2. GitHub org
 
 The existing helper uses the user's authenticated `gh` CLI. Pass `--backend gh` explicitly. Its legacy `auto` mode prefers configured Zoekt, so omit neither the backend nor the local step.

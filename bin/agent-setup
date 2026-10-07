@@ -41,26 +41,33 @@ from typing import Any
 sys.dont_write_bytecode = True
 SOURCE = Path(__file__).resolve().parent.parent
 COMPONENTS = {'rules', 'hooks', 'roles', 'skills', 'mcp', 'data-wrappers', 'commands'}
+# Change kinds that own named entries of one JSON field (each entry the user's or setup's), and the
+# hook kinds, which own groups inside each event. 'settings' owns top-level keys of the document
+# itself (field ''): the settings layer, settings.base.json with the user's local/settings.json over it.
+ENTRY_FIELDS = {'environment': 'env', 'servers': 'mcpServers', 'plugins': 'enabledPlugins',
+                'marketplaces': 'extraKnownMarketplaces', 'settings': ''}
+# Top-level settings keys another kind owns entry by entry: the settings layer's values for them merge
+# into that kind's entries instead.
+LAYER_ELSEWHERE = {'env': 'environment', 'enabledPlugins': 'plugins', 'extraKnownMarketplaces': 'marketplaces'}
+DOC_FIELDS = {**ENTRY_FIELDS, 'hooks': 'hooks', 'cursor-hooks': 'hooks'}
 SECRET_NAMES = {'auth.json', 'credentials.json', 'kit.env', 'settings.local.json', '.env'}
 TEXT_BEGIN = '<!-- BEGIN agent-kit setup -->'
 TEXT_END = '<!-- END agent-kit setup -->'
 TOML_BEGIN = '# BEGIN agent-kit setup'
 TOML_END = '# END agent-kit setup'
-# Role names before 2026-10-05, as a saved install's role_model / role_effort may still hold them.
-ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'second-opinion',
-                'reviewer': 'task-reviewer', 'thermo-bugs': 'bug-reviewer',
-                'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
 from blocking import BLOCKING  # noqa: E402
 import checkout  # noqa: E402
-from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root, fill_servers,  # noqa: E402
-                   install_text, keep_host_tables, resume_max, skill_hosts, strip_legacy_sandbox)
-from kit_env import kit_env  # noqa: E402
+from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, git_layer_env,  # noqa: E402
+                   keep_host_tables, skill_hosts, strip_legacy_sandbox)
+from kit_env import code_dir, kit_env  # noqa: E402
+from kit_text import default_host_root, fill_servers, install_text, resume_max  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
-                       detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
-                       server_runtime)
-from pack import PACK_DIR, PACK_SKILLS, installed_pack  # noqa: E402
-from preset import Preset, apply_preset, kit_skills, source_status, validate_catalog  # noqa: E402
+                       detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary)
+from pack import (PACK_DIR, PACK_SKILLS, McpPlan, extension_lists, installed_pack, mcp_plan,  # noqa: E402
+                  sync_pack_mcp)
+from preset import Preset, apply_preset, kit_skills, plugin_settings, source_status, validate_catalog  # noqa: E402
+from sentry import INSTANCES_FILE, expand_servers, merge_instances, read_instances  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
 MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
 # The answers a run saves and the next one starts from, with their defaults before detection. A
@@ -105,6 +112,21 @@ def load_json(path: Path, default: Any = None) -> Any:
         raise ValueError(f'Reconcile the existing configuration link first: {path}')
     text = path.read_text().strip() if path.exists() else ''
     return json.loads(text) if text else default
+
+
+def doc_field(document: dict[str, Any], field: str) -> dict[str, Any]:
+    """The object a DOC_FIELDS kind owns entries of: one field, or the document itself ('')."""
+    return document if not field else document.get(field, {})
+
+
+def with_field(document: dict[str, Any], field: str, value: dict[str, Any], keep_empty: bool = True) -> dict[str, Any]:
+    if not field:
+        return value
+    if value or keep_empty:
+        document[field] = value
+    else:
+        document.pop(field, None)
+    return document
 
 
 def safe_catalog(path: Path, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -213,6 +235,16 @@ def kit_api(source: Path) -> Any:
     return module
 
 
+def retired_roles() -> dict[str, str]:
+    """old name -> role, from roles.toml `replaces`. A kit agent-kit cannot load gives none: doctor
+    reports that kit rather than failing here."""
+    try:
+        roles = kit_api(SOURCE).load_roles()
+    except (OSError, SyntaxError, SystemExit):
+        return {}
+    return {old: role.name for role in roles.roles.values() for old in role.replaces} if roles else {}
+
+
 def host_target(args: argparse.Namespace, host: str, home: Path) -> Path:
     if args.host_root:
         if len(args.hosts) != 1:
@@ -230,7 +262,7 @@ def resolve_values(value: Any, view: Path, root: Path, host_view: Path, target: 
     if isinstance(value, list):
         return [resolve_values(item, view, root, host_view, target) for item in value]
     if isinstance(value, str):
-        # Placeholders were filled at render (hosts.fill) with the view's paths; these map them.
+        # Placeholders were filled at render (kit_text.fill) with the view's paths; these map them.
         return value.replace(str(view), str(root)).replace(str(host_view), str(target))
     return value
 
@@ -267,12 +299,14 @@ def validate_toml_boundary(text: str) -> None:
         raise ValueError('TOML scalar keys after the managed END retain its table context; move them before the block or add an explicit table header')
 
 
-def overlay_text(args: argparse.Namespace, from_preset: set[str]) -> str:
+def overlay_text(args: argparse.Namespace, from_preset: set[str], answered: set[str]) -> str:
     """local/setup-paths.env: setup's own answers, the top overlay layer. An answer the preset
-    supplied stays in the preset's layer (local/preset.env, under the user's kit.env), not here."""
+    supplied stays in the preset's layer (local/preset.env, under the user's kit.env), not here, and
+    so do repository roots nobody gave: an empty CODE_DIRS_JSON would hide the user's CODE_DIRS."""
     if any('\n' in value or '\r' in value for value in [*args.repo_roots, args.work_root]):
         raise ValueError('Repository and work roots must fit on one line')
-    overlay = '' if 'repo_roots' in from_preset else 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
+    unset = 'repo_roots' in from_preset or (not args.repo_roots and 'repo_roots' not in answered)
+    overlay = '' if unset else 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
     if args.work_root:
         overlay += 'AGENT_WORK_ROOT=' + args.work_root + '\n'
     if args.github_owner and 'github_owner' not in from_preset:
@@ -325,7 +359,7 @@ def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view:
 
 
 def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, overlays: dict[str, str],
-                 resume: int, preset: Preset) -> list[Change]:
+                 resume: int, preset: Preset, mcp: McpPlan) -> list[Change]:
     root = Path(args.root_dir).expanduser().absolute()
     target = host_target(args, host, home)
     components = set(args.components)
@@ -334,6 +368,9 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
         components.add('roles')
     if host == 'claude':
         api = kit_api(view)
+        # The settings layer comes with the hooks component, as `agent-kit render` applies it.
+        layer = api.base_settings(root, ui_owned=api.host_paths()['uiOwned'],
+                                  roles='roles' in components) if 'hooks' in components else {}
         if 'rules' in components:
             # rules/AGENTS.md is imported as is; the host rules through their filled copy.
             host_rules = root / api.CLAUDE_HOST_RULES.relative_to(view)
@@ -359,16 +396,34 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                      'KIT_ENV': str(root / 'local/setup-paths.env'), 'AGENT_KIT_DIR': str(root),
                      'CLAUDE_CONFIG_DIR': str(target),
                      'AGENT_GIT_HOOKS': 'on' if args.blocking_hooks else 'off'}
-            if args.blocking_hooks:
-                shell.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='core.hooksPath',
-                             GIT_CONFIG_VALUE_0=str(root / 'git-hooks'))
-            changes.append(Change('environment', target / 'settings.json', shell, 0o600))
+            # The settings layer's env first; the kit's keys win over it.
+            shell = {**layer.get('env', {}), **shell}
+            # The layer's GIT_CONFIG_* entry joins the user's own; taking it out keeps theirs.
+            settings = target / 'settings.json'
+            current = (load_json(settings, {}) or {}).get('env', {})
+            owned = prior_record(root, settings, 'environment').get('owned', {})
+            shell.update(git_layer_env(current if isinstance(current, dict) else {}, str(root / 'git-hooks'),
+                                       owned, enabled=args.blocking_hooks))
+            changes.append(Change('environment', settings, shell, 0o600))
         if 'mcp' in components:
-            servers = fill_servers(safe_catalog(view / 'mcp/servers.json')['mcpServers'], str(view))
+            servers = fill_servers(mcp.runnable, str(view), code_dir(args.repo_roots))
+            # One server per Sentry instance, as `agent-kit render` lists them (bin/lib/sentry.py).
+            servers = expand_servers(view, servers, overlay=root / 'local')
             servers = resolve_values(servers, view, root, target, target)
             servers = {name: {**spec, 'type': 'stdio' if 'command' in spec else 'http'}
                        for name, spec in servers.items()}
             changes.append(Change('servers', target / 'mcp.json', servers, 0o600))
+        # A preset's [plugins]: enabled, and their GitHub marketplaces known. Written while a plugin is
+        # listed or an earlier install wrote one, so a plugin the preset drops is taken out again.
+        enabled, markets = plugin_settings(preset.plugins)
+        enabled = {**layer.get('enabledPlugins', {}), **enabled}
+        markets = {**layer.get('extraKnownMarketplaces', {}), **markets}
+        # The rest of the layer: each top-level key is setup's while the layer holds it, so a key the
+        # user adds in the host's own settings.json stays and a key the layer drops goes again.
+        rest = {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}
+        for kind, wanted in (('plugins', enabled), ('marketplaces', markets), ('settings', rest)):
+            if wanted or prior_record(root, target / 'settings.json', kind):
+                changes.append(Change(kind, target / 'settings.json', wanted, 0o600))
     else:
         selected = [name for name in ('hooks', 'rules', 'roles', 'mcp') if name in components]
         if selected:
@@ -492,11 +547,14 @@ def catalog_path(args: argparse.Namespace) -> Path:
     return Path(args.mcp_catalog).expanduser() if args.mcp_catalog else Path(args.source).expanduser().resolve() / 'mcp/servers.json'
 
 
-def installation_view(args: argparse.Namespace, view: Path, preset: Preset, servers: dict[str, Any]) -> set[Path]:
+def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
+                      servers: dict[str, Any]) -> tuple[set[Path], McpPlan]:
     """The kit as this install selects it, in view; returns the paths in it that setup derived rather
-    than copied from the source (the team pack's included), which a dev install keeps as copies."""
+    than copied from the source (the team pack's included), which a dev install keeps as copies, and
+    the MCP plan (pack.mcp_plan) whose servers it installs."""
     source = Path(args.source).expanduser().resolve()
     derived = {Path('hooks/registry.json')}
+    mcp = McpPlan({}, (), None)
     for name in ('bin', 'hooks', 'git-hooks', 'agents', 'commands', 'rules', 'hosts', 'skills', 'references'):
         path = source / name
         if path.is_dir():
@@ -524,27 +582,31 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
         derived.add(Path('roles.toml'))
     kit_api(view).load_roles()
     if 'mcp' in args.components:
-        # A server whose runtime is missing is left out, so no host starts a command that cannot run.
-        # Its descriptor stays in the catalog or preset: a rerun after installing the runtime adds it.
-        # The catalog keeps its kit placeholders: it is installed as is, and a later render fills them
-        # from the installed kit. Filled with the view here for the runtime check only.
-        filled = fill_servers(servers, str(view))
-        runnable = {name: servers[name] for name, spec in filled.items()
-                    if not server_runtime(spec) or shutil.which(spec['command'])}
+        mcp = mcp_plan(servers, view=view, root=Path(args.root_dir).expanduser().absolute(), pack=preset.pack,
+                       local=code_dir(args.repo_roots))
         (view / 'mcp').mkdir()
-        (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': runnable}, indent=2) + '\n')
+        (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': mcp.runnable}, indent=2) + '\n')
         derived.add(Path('mcp/servers.json'))
-    return derived
+        # Sentry instances: the source's, then the preset's [sentry.instances] over them field by
+        # field; the user's overlay copy applies over both when the wrapper or a render reads them.
+        instances = merge_instances(read_instances(source / 'mcp' / INSTANCES_FILE), preset.sentry)
+        if instances:
+            (view / 'mcp' / INSTANCES_FILE).write_text(json.dumps({'instances': instances}, indent=2) + '\n')
+            derived.add(Path('mcp') / INSTANCES_FILE)
+    return derived, mcp
 
 
-def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str], servers: dict[str, Any]) -> list[Change]:
-    derived = installation_view(args, view, preset, servers)
+def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str], answered: set[str],
+         servers: dict[str, Any]) -> tuple[list[Change], McpPlan]:
+    """The changes this install makes, and its MCP plan."""
+    derived, mcp = installation_view(args, view, preset, servers)
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
     home = Path.home()
     changes = []
     selected = selected_skills(args, preset)
     pack_skills = preset.pack.skills if preset.pack is not None else []
+    extensions = extension_lists(view / 'skills', selected, str(root / 'skills')) if 'skills' in args.components else {}
     for path in sorted(view.rglob('*')):
         if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
             continue
@@ -566,7 +628,8 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.suffix == '.md':
                 filled = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
-                                      strict=relative.parts[1] not in pack_skills).encode()
+                                      strict=relative.parts[1] not in pack_skills,
+                                      extensions=extensions.get(relative.parts[1], [])).encode()
                 if filled != content:
                     derived.add(relative)
                 content = filled
@@ -575,7 +638,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
                 continue
             changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
     # The preset's layer is written when it has values or an earlier install wrote one.
-    overlays = {'preset.env': preset.env_text(), 'setup-paths.env': overlay_text(args, from_preset)}
+    overlays = {'preset.env': preset.env_text(), 'setup-paths.env': overlay_text(args, from_preset, answered)}
     for name, text in overlays.items():
         if text or name == 'setup-paths.env' or (root / 'local' / name).is_file():
             changes.append(Change('file', root / 'local' / name, text.encode(), 0o600))
@@ -587,7 +650,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         changes.append(Change('file', root / 'state/rendered' / ('roles-' + host + '.sh'), api.roles_sh(roles, host).replace(str(view), str(root)).encode()))
     resume = setup_resume(root, overlays) if args.hosts else 0
     for host in args.hosts:
-        changes.extend(host_changes(args, view, host, home, overlays, resume, preset))
+        changes.extend(host_changes(args, view, host, home, overlays, resume, preset, mcp))
     previous = load_json(root / '.install-state/current.json', {})
     for record in previous.get('managed', {}).values():
         target = Path(record['target'])
@@ -600,7 +663,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         if identity in unique and unique[identity] != change:
             raise ValueError(f'Two selected components conflict: {change.target}')
         unique[identity] = change
-    return list(unique.values())
+    return list(unique.values()), mcp
 
 
 def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change], preset: Preset) -> list[Change]:
@@ -709,22 +772,26 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
             inline = tomllib.loads(config.read_text()).get('hooks', {})
             if set(inline) - {'state'}:
                 raise Collision('Existing inline Codex event hooks are preserved; choose one event-definition source before installing hooks.json', backup=False)
-    if change.kind in ('hooks', 'cursor-hooks', 'servers', 'environment'):
+    if change.kind in DOC_FIELDS:
         document = load_json(target, {})
-        field = 'env' if change.kind == 'environment' else 'mcpServers' if change.kind == 'servers' else 'hooks'
+        field = DOC_FIELDS[change.kind]
         if change.kind == 'cursor-hooks' and document.get('version', 1) != 1:
             raise Collision(f'Existing Cursor hook version is preserved: {target}', backup=False)
-        current = document.get(field, {})
+        current = doc_field(document, field)
         wanted = change.wanted
         previous = prior.get('owned', {})
-        if change.kind in ('servers', 'environment'):
+        if change.kind in ENTRY_FIELDS:
+            # The planned GIT_CONFIG_COUNT already counts the user's entries (git_layer_env), and a
+            # rollback restores the user's own value.
+            merged = {'GIT_CONFIG_COUNT'} if change.kind == 'environment' else set()
             for name, old in previous.items():
-                if name in current and current[name] != old and not backup:
+                if name in current and current[name] != old and name not in merged and not backup:
                     raise Collision(f'User edited a previously managed entry; it is preserved: {target}')
             replaced = {name for name, server in wanted.items()
                         if name in current and current[name] not in (server, previous.get(name))}
-            if replaced and not backup:
-                raise Collision(f'Existing MCP server {", ".join(sorted(replaced))} is preserved: {target}')
+            if replaced - merged and not backup:
+                what = 'MCP server' if change.kind == 'servers' else (field or 'settings') + ' entry'
+                raise Collision(f'Existing {what} {", ".join(sorted(replaced - merged))} is preserved: {target}')
             updated = {name: server for name, server in current.items() if name not in previous}
             updated.update(wanted)
             # Under backup the record keeps each entry it replaces, so rollback restores the user's.
@@ -742,7 +809,7 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
                     updated.pop(event, None)
         record['cas_names'] = sorted(set(previous) | set(wanted))
         record['cas_before_digest'] = digest(json.dumps({name: current[name] for name in record['cas_names'] if name in current}, sort_keys=True).encode())
-        record.update(owned=wanted, previous={name: current[name] for name in kept if name in current} if change.kind in ('servers', 'environment') else previous,
+        record.update(owned=wanted, previous={name: current[name] for name in kept if name in current} if change.kind in ENTRY_FIELDS else previous,
                       existed=present, noop=updated == current)
         record['before_document_hash'] = digest(target.read_bytes()) if present else None
         if change.kind == 'cursor-hooks':
@@ -783,10 +850,10 @@ def validate_planned_change(change: Change, record: dict) -> None:
         actual_type = 'link' if target.is_symlink() else 'file' if target.is_file() else 'directory' if target.is_dir() else 'absent'
         if present != record['present'] or actual_type != record.get('before_type', actual_type) or file_digest(target) != record.get('before_hash'):
             raise ValueError(f'File changed after preflight; user content is preserved: {target}')
-    elif change.kind in ('servers', 'environment', 'hooks', 'cursor-hooks'):
+    elif change.kind in DOC_FIELDS:
         document = load_json(target, {})
-        field = 'env' if change.kind == 'environment' else 'mcpServers' if change.kind == 'servers' else 'hooks'
-        current = document.get(field, {})
+        field = DOC_FIELDS[change.kind]
+        current = doc_field(document, field)
         selected = {name: current[name] for name in record['cas_names'] if name in current}
         if digest(json.dumps(selected, sort_keys=True).encode()) != record['cas_before_digest']:
             raise ValueError(f'Configuration changed after preflight; user entries are preserved: {target}')
@@ -821,14 +888,15 @@ def apply_change(change: Change, record: dict, journal: Path, number: int) -> No
             target.symlink_to(change.wanted, target_is_directory=True)
         elif change.kind != 'remove':
             atomic(target, change.wanted, change.mode)
-    elif change.kind in ('hooks', 'cursor-hooks', 'servers', 'environment'):
+    elif change.kind in DOC_FIELDS:
         document = load_json(target, {})
-        field = 'env' if change.kind == 'environment' else 'mcpServers' if change.kind == 'servers' else 'hooks'
+        field = DOC_FIELDS[change.kind]
         if change.kind == 'cursor-hooks':
             document['version'] = 1
-        current = document.get(field, {})
-        if change.kind in ('servers', 'environment'):
-            document[field] = {**{name: server for name, server in current.items() if name not in record['previous']}, **change.wanted}
+        current = doc_field(document, field)
+        if change.kind in ENTRY_FIELDS:
+            document = with_field(document, field, {**{name: server for name, server in current.items()
+                                                       if name not in record['previous']}, **change.wanted})
         else:
             updated = dict(current)
             for event in set(record['previous']) | set(change.wanted):
@@ -866,15 +934,15 @@ def rollback_preflight(record: dict) -> bool:
         if current != record['hash']:
             raise ValueError(f'Changed installed file is preserved during rollback: {target}')
         return False
-    if kind in ('servers', 'environment', 'hooks', 'cursor-hooks'):
+    if kind in DOC_FIELDS:
         document = load_json(target, {})
-        field = 'env' if kind == 'environment' else 'mcpServers' if kind == 'servers' else 'hooks'
-        current = document.get(field, {})
+        field = DOC_FIELDS[kind]
+        current = doc_field(document, field)
         names = record.get('cas_names', sorted(set(record['previous']) | set(record['owned'])))
         selected = {name: current[name] for name in names if name in current}
         if digest(json.dumps(selected, sort_keys=True).encode()) == record.get('cas_before_digest'):
             return True
-        if kind in ('servers', 'environment'):
+        if kind in ENTRY_FIELDS:
             for name, value in record['owned'].items():
                 if name not in current or current[name] != value:
                     raise ValueError(f'Changed managed entry is preserved during rollback: {target}')
@@ -918,16 +986,16 @@ def rollback_record(record: dict) -> None:
         target.unlink()
         if record.get('backup'):
             os.replace(record['backup'], target)
-    elif kind in ('hooks', 'cursor-hooks', 'servers', 'environment'):
+    elif kind in DOC_FIELDS:
         document = load_json(target, {})
-        field = 'env' if kind == 'environment' else 'mcpServers' if kind == 'servers' else 'hooks'
+        field = DOC_FIELDS[kind]
         if kind == 'cursor-hooks':
             if record['previous_version'] is None:
                 document.pop('version', None)
             else:
                 document['version'] = record['previous_version']
-        current = document.get(field, {})
-        if kind in ('servers', 'environment'):
+        current = doc_field(document, field)
+        if kind in ENTRY_FIELDS:
             for name, server in record['owned'].items():
                 if current.get(name) != server:
                     raise ValueError(f'Changed MCP entry is preserved during rollback: {target}')
@@ -946,10 +1014,7 @@ def rollback_record(record: dict) -> None:
             for event, previous in record['previous'].items():
                 current.setdefault(event, []).extend(entry for entry in previous if entry not in current.get(event, []))
             current = {event: entries for event, entries in current.items() if entries}
-        if current:
-            document[field] = current
-        else:
-            document.pop(field, None)
+        document = with_field(document, field, current, keep_empty=False)
         if document or record['existed']:
             atomic(target, (json.dumps(document, indent=2) + '\n').encode(), 0o600)
         else:
@@ -1011,12 +1076,14 @@ def plugin_conflicts(args: argparse.Namespace) -> list[str]:
 @dataclass(frozen=True)
 class Plan:
     """A previewed install: its summary rows, the changes apply makes (prepared), every record, no-ops
-    included, that current.json keeps, and the full plan --json prints (report)."""
+    included, that current.json keeps, the full plan --json prints (report), and the command that
+    syncs the team pack's mcp/ project once apply wrote it (none when no server installed runs it)."""
     rows: list[Row]
     prepared: list[tuple[Change, dict]]
     records: list[tuple[Change, dict]]
     collisions: list[tuple[str, bool]]
     report: dict[str, Any]
+    sync: tuple[str, ...] | None = None
 
     @property
     def blocked(self) -> bool:
@@ -1031,7 +1098,8 @@ def show_plan(args: argparse.Namespace, planned: Plan) -> None:
         print_summary(planned.rows, planned.prepared, args, Path(args.root_dir).expanduser().absolute())
 
 
-def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], notes: list[Row]) -> Plan:
+def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], answered: set[str],
+            notes: list[Row]) -> Plan:
     """Plan the install and check it against what is on disk; prints nothing (show_plan does)."""
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
@@ -1053,7 +1121,7 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
     with tempfile.TemporaryDirectory(prefix='agent-kit-install-view-') as folder:
         view = Path(folder) / 'kit source'
         view.mkdir()
-        changes = plan(args, view, preset, from_preset, servers)
+        changes, mcp = plan(args, view, preset, from_preset, answered, servers)
         records, collisions, skipped = [], [], []
         for change in changes:
             try:
@@ -1069,7 +1137,8 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
         routes = role_plan(args, view)
     prepared = [(change, record) for change, record in records if not record.get('noop')]
     deps = dependencies(args, servers)
-    notes = [*notes, *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped)]
+    notes = [*notes, *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped),
+             *(Row('Skipped', line) for line in mcp.skipped)]
     if preset.record and args.github_owner:
         notes.append(org_access(args.github_owner, args.zoekt_url))
     for rows in routes.values():
@@ -1097,7 +1166,9 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
             'auth': 'Reuse each provider login; no auth files are read or copied.',
             'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
             'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'}
-    return Plan(summary, prepared, records, collisions, report)
+    if mcp.sync:
+        report['mcp_sync'] = list(mcp.sync)
+    return Plan(summary, prepared, records, collisions, report, mcp.sync)
 
 
 def configured(args: argparse.Namespace, preset: Preset, answered: set[str], preset_owned: set[str]) -> dict[str, Any]:
@@ -1184,10 +1255,13 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
         raise
     # The install's own copy: it rolls back while the checkout is mid-rebase or gone.
     undo = shlex.join([sys.executable, str(root / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
+    synced = sync_pack_mcp(planned.sync)
     if args.json:
-        output({'installed': len(records), 'journal': identifier, 'rollback': undo})
+        output({'installed': len(records), 'journal': identifier, 'rollback': undo,
+                **({'mcp_sync': synced} if synced else {})})
     else:
-        sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n')
+        sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n'
+                         + (f'MCP: {synced}\n' if synced else ''))
     return 0
 
 
@@ -1238,8 +1312,8 @@ def managed_drift(records: Iterable[dict[str, Any]]) -> list[str]:
                 drift.append(str(target))
         else:
             document = load_json(target, {})
-            field = 'env' if record['kind'] == 'environment' else 'mcpServers' if record['kind'] == 'servers' else 'hooks'
-            current = document.get(field, {})
+            field = DOC_FIELDS[record['kind']]
+            current = doc_field(document, field)
             for key, value in record['owned'].items():
                 if record['kind'] in ('hooks', 'cursor-hooks'):
                     mismatch = any(entry not in current.get(key, []) for entry in value)
@@ -1296,8 +1370,8 @@ def sync_pending(root: Path, state: dict[str, Any]) -> str | None:
     are what an edit to a derived file or a new kit file waits for."""
     args = parser().parse_args(['sync', '--root-dir', str(root)])
     try:
-        preset, _, from_preset, notes = resolve(args, root, state, state.get('configuration', {}))
-        planned = preview(args, preset, from_preset, notes)
+        preset, answered, from_preset, notes = resolve(args, root, state, state.get('configuration', {}))
+        planned = preview(args, preset, from_preset, answered, notes)
     except Exception as error:  # noqa: BLE001 (doctor diagnoses: a checkout mid-merge breaks the preview in any way)
         return f'agent-kit sync cannot preview this install: {type(error).__name__}: {" ".join(str(error).split())}'
     if planned.blocked:
@@ -1443,6 +1517,11 @@ def resolve_answers(args: argparse.Namespace, given: set[str], saved: dict[str, 
         else:
             value = saved.get(key, default)
         setattr(args, key, value)
+    # A preset's MCP servers and Sentry instances install only with the mcp component, so unless the
+    # user chose the components, a preset that declares either adds it.
+    if 'components' not in answered and (preset.servers or preset.sentry) and 'mcp' not in args.components:
+        args.components = [*args.components, 'mcp']
+        from_preset.add('components')
     return answered, from_preset
 
 
@@ -1477,7 +1556,7 @@ def main() -> int:
         return interactive(args, root, preset, answered, from_preset, notes)
     if args.action == 'doctor':
         return doctor(args)
-    planned = preview(args, preset, from_preset, notes)
+    planned = preview(args, preset, from_preset, answered, notes)
     if args.action == 'sync':
         return sync(args, planned, preset, answered, from_preset)
     show_plan(args, planned)
@@ -1542,12 +1621,14 @@ def resolve(args: argparse.Namespace, root: Path, state: dict[str, Any], saved: 
         args.project_roots['cursor'] = saved['project_root']
     if args.project_root is None and 'cursor' in args.hosts:
         args.project_root = args.project_roots.get('cursor')
-    # The user's own role overrides; the preset's sit under them (installation_view).
+    # The user's own role overrides; the preset's sit under them (installation_view). A saved install
+    # may hold a role's retired name (roles.toml `replaces`).
+    renamed = retired_roles() if any(saved.get(key) or getattr(args, key) for key in ('role_model', 'role_effort')) else {}
     for key in ('role_model', 'role_effort'):
         values = {}
         for value in [*saved.get(key, []), *getattr(args, key)]:
             name, separator, setting = value.partition('=')
-            name = ROLE_ALIASES.get(name, name)
+            name = renamed.get(name, name)
             values[name] = name + separator + setting
         setattr(args, key, [value for value in values.values() if value.partition('=')[2]])
     if args.interactive and args.action == 'setup':
@@ -1561,13 +1642,13 @@ def interactive(args: argparse.Namespace, root: Path, preset: Preset, answered: 
     answers = {key: getattr(args, key) for key in (*SAVED_KEYS, 'collision', 'host_roots')}
     answers['answered'] = sorted(answered)
     args.apply = False
-    planned = preview(args, preset, from_preset - answered, notes)
+    planned = preview(args, preset, from_preset - answered, answered, notes)
     show_plan(args, planned)
     if args.collision == 'refuse' and planned.collisions:
         choice = ask('Some paths hold your own content: [b]ackup and replace, [s]kip them, or [a]bort? [a]: ', args).lower()
         if choice[:1] in ('b', 's'):
             args.collision = answers['collision'] = 'backup' if choice[:1] == 'b' else 'skip'
-            planned = preview(args, preset, from_preset - answered, notes)
+            planned = preview(args, preset, from_preset - answered, answered, notes)
             show_plan(args, planned)
     if planned.blocked:
         # Saved only when the run stops here: the rerun after the fix offers them as defaults.
@@ -1605,6 +1686,10 @@ def sync(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[
         print(f'  {"configuration":12} {", ".join(changed)}')
     if not planned.prepared and not changed:
         print(f'sync: nothing changed; {root} matches {Path(args.source).expanduser().resolve()}')
+        # An earlier sync of the pack's mcp/ project failed or its lock moved on: retried on its own.
+        if planned.sync:
+            print('MCP: ' + ('team pack mcp/ project to sync; rerun without --dry-run' if args.dry_run
+                             else str(sync_pack_mcp(planned.sync))))
         return 0
     if args.dry_run:
         print(f'sync: {len(planned.prepared) or 1} change(s) to apply; rerun without --dry-run to apply them')

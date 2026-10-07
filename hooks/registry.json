@@ -67,6 +67,36 @@
     ]
   },
   {
+    "event": "PreToolUse",
+    "matcher": "SendMessage",
+    "command": "~/.claude/hooks/resume-guard",
+    "description": "Refuses the first resume of a subagent whose context is past SUBAGENT_RESUME_MAX; the second goes through.",
+    "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "PreToolUse",
+    "matcher": "Agent",
+    "command": "~/.claude/hooks/agent-type-guard",
+    "description": "Refuses a generic or retired subagent type, and a briefed role's spawn that names no brief.",
+    "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "PreToolUse",
+    "matcher": "Read|Grep|Glob|LSP|Bash",
+    "command": "~/.claude/hooks/read-streak",
+    "description": "Refuses the main session's discovery reads once a streak runs well past the researcher nudge.",
+    "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
     "event": "PostToolUse",
     "matcher": "Edit|Write|MultiEdit",
     "command": "~/.claude/hooks/python-format",
@@ -126,6 +156,16 @@
     "command": "~/.claude/hooks/worktree-hint",
     "description": "Tells the model what a worktree-isolated session refuses from now on.",
     "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "PostToolUse",
+    "matcher": "EnterWorktree",
+    "command": "~/.claude/hooks/project-bind",
+    "description": "Binds an unbound session to its item as soon as it enters a ticket worktree.",
+    "timeout": 10,
     "hosts": [
       "claude"
     ]
@@ -196,7 +236,7 @@
   },
   {
     "event": "PostToolUse",
-    "matcher": "Read|Grep|Glob|LSP|Bash|Edit|Write|MultiEdit|NotebookEdit|Agent",
+    "matcher": "Read|Grep|Glob|LSP|Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task|SendMessage",
     "command": "~/.claude/hooks/read-streak",
     "description": "Counts read-only calls and points the main session at the researcher agent after a long streak.",
     "timeout": 5,
@@ -221,7 +261,9 @@
     "description": "Binds the session to a project when the prompt or branch names a ticket.",
     "timeout": 10,
     "hosts": [
-      "claude"
+      "claude",
+      "codex",
+      "cursor"
     ]
   },
   {
@@ -305,6 +347,16 @@
     "description": "Rings the done bell only when the turn really ends.",
     "timeout": 5,
     "async": true,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "SubagentStart",
+    "matcher": null,
+    "command": "~/.claude/hooks/subagent-context",
+    "description": "Gives each subagent its parent's work folder, the item's HANDOFF.md path and the project slice.",
+    "timeout": 10,
     "hosts": [
       "claude"
     ]

@@ -97,6 +97,7 @@ rv_is_code() {
 # second-opinion, is not one: its return must not close a round.
 rv_review_agent() {
   case "$1" in auto-review:*) set -- "${1#auto-review:}" ;; esac
+  rv_roles
   set -- "$(rv_role_name "$1")"
   case "$1" in
     task-reviewer|bug-reviewer|quality-reviewer|thermos:thermo-nuclear-review-subagent|thermos:thermo-nuclear-code-quality-review-subagent) return 0 ;;
@@ -124,7 +125,7 @@ rv_roles() {
   else
     RV_ROUND1=bug-reviewer; RV_LATER=bug-reviewer; RV_ONCE=quality-reviewer; RV_SENSITIVE_ADDS=bug-reviewer; RV_ROLE_TABLE=''
   fi
-  : "${RV_ROUND1=}" "${RV_LATER=}" "${RV_ONCE=}" "${RV_SENSITIVE_ADDS=}" "${RV_ROLE_TABLE=}"
+  : "${RV_ROUND1=}" "${RV_LATER=}" "${RV_ONCE=}" "${RV_SENSITIVE_ADDS=}" "${RV_ROLE_TABLE=}" "${RV_RETIRED=}"
   RV_ROLES_LOADED=1
 }
 
@@ -183,16 +184,28 @@ rv_available() {
 _rv_once() { rv_roles; case " $RV_ONCE " in *" $1 "*) return 0 ;; esac; return 1; }
 # _rv_thermos: the thermos plugin is enabled, so bug-reviewer and quality-reviewer have their rubric.
 _rv_thermos() { grep -Eq '"thermos@[^"]*"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null; }
-# Role names from before the renames (old:new), as session state and branch records may still hold
-# them: codex (session state) and codex-review (branch record) before review-cross, then the
-# pre-2026-10-05 names. Both live at most a pending TTL (2h) or a branch's life: delete after 2026-10-19.
-_RV_ALIASES='codex:cross-reviewer codex-review:cross-reviewer review-cross:cross-reviewer thermo-bugs:bug-reviewer thermo-quality:quality-reviewer reviewer:task-reviewer'
+# Old role names (old=new), as session state and branch records may still hold them: the renames are
+# roles.toml's `replaces` (RV_RETIRED); these two are the cross reviewer's names before review-cross,
+# codex (session state) and codex-review (branch record), not renames. They live at most a pending
+# TTL (2h) or a branch's life: delete after 2026-10-19.
+_RV_SESSION_ALIASES='codex=cross-reviewer codex-review=cross-reviewer'
 # rv_role_name <role>: today's name for an old one.
-rv_role_name() { local p; for p in $_RV_ALIASES; do [ "$1" = "${p%%:*}" ] && { printf '%s' "${p#*:}"; return; }; done; printf '%s' "$1"; }
+rv_role_name() {
+  local p
+  rv_roles
+  for p in $_RV_SESSION_ALIASES $RV_RETIRED; do [ "$1" = "${p%%=*}" ] && { printf '%s' "${p#*=}"; return; }; done
+  printf '%s' "$1"
+}
 # rv_role_drop <role>: a JSON list of the role and its old names, for removing it from a record.
-rv_role_drop() { local p o="\"$1\""; for p in $_RV_ALIASES; do [ "${p#*:}" = "$1" ] && o="$o,\"${p%%:*}\""; done; printf '[%s]' "$o"; }
+rv_role_drop() {
+  local p o="\"$1\""
+  rv_roles
+  for p in $_RV_SESSION_ALIASES $RV_RETIRED; do [ "${p#*=}" = "$1" ] && o="$o,\"${p%%=*}\""; done
+  printf '[%s]' "$o"
+}
 _rv_legacy() {
   local w o=''
+  rv_roles
   for w in ${!1}; do
     w=$(rv_role_name "$w")
     case " $o " in *" $w "*) ;; *) o="${o:+$o }$w" ;; esac
@@ -673,6 +686,7 @@ _rv_complete() {
     thermos:thermo-nuclear-review-subagent) ag=bug-reviewer ;;
     thermos:thermo-nuclear-code-quality-review-subagent) ag=quality-reviewer ;;
   esac
+  rv_roles
   ag=$(rv_role_name "$ag")
   _rv_load "$sid"
   # Counted once: a foreground agent fires PostToolUse and SubagentStop.
@@ -1017,7 +1031,10 @@ rv_push_decide() {
       _rv_set "$sid" "issued.$rk=$RV_REC_PTREE" "ihead.$rk=$RV_REC_PHEAD" "tier.$rk=2" "pending.$rk=1" \
         "proot.$rk=$root" "branch.$rk=$br" "ragents.$rk=$RV_REC_AGENTS"
     fi
-    RV_TEXT="the review round issued for this branch $(( (now - RV_REC_PSINCE) / 60 )) min ago has not returned. Wait for its agents (spawn them now if you never did: ${RV_REC_AGENTS:-bug-reviewer}, in ONE message, in the foreground), reproduce and fix their findings, end with the TALLY line, then push."
+    # Say WHY it waits: the round, the tree and the reviewers whose output never arrived (the record
+    # drops each one as it returns). A round a subagent's push issued, or one whose return went
+    # unrecorded, otherwise reads as a gate stuck for no reason.
+    RV_TEXT="review round $((RV_REC_ROUNDS + 1)) (tree $(rv_short "$RV_REC_PTREE")), issued for this branch $(( (now - RV_REC_PSINCE) / 60 )) min ago, has not returned: no output yet from ${RV_REC_AGENTS:-bug-reviewer} (record: $RV_REC_FILE). Wait for those agents (spawn them now if you never did, in ONE message, in the foreground), reproduce and fix their findings, end with the TALLY line, then push."
     for a in $RV_REC_AGENTS; do
       rv_role "$a" && [ "$RV_R_INVOKE" = run ] || continue
       RV_TEXT="$RV_TEXT $a is not an Agent: run \`$(printf '%q' "${AGENT_KIT_DIR:-${BASH_SOURCE[0]%/*}/../..}/bin/agent-run") $a $(printf '%q' "$root")${RV_REC_TREE:+ --since $RV_REC_TREE}\` $(host_noun bg)."

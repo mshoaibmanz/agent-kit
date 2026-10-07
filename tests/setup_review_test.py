@@ -407,10 +407,11 @@ module.main()
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_fresh_roots_are_empty_and_explicit_empty_clears_saved(self) -> None:
+    def test_fresh_roots_write_no_line_and_explicit_empty_clears_saved(self) -> None:
         self.run_setup("--components", "rules", "--apply")
         overlay = (self.root / "local/setup-paths.env").read_text()
-        self.assertIn("CODE_DIRS_JSON=[]\n", overlay)
+        # Nobody gave roots: the user's legacy CODE_DIRS (kit.env) still counts.
+        self.assertNotIn("CODE_DIRS_JSON", overlay)
         self.run_setup(
             "--components",
             "rules",
@@ -498,7 +499,11 @@ module.main()
                     chunks.append(chunk)
                 if process.poll() is not None and not ready:
                     break
-            self.assertIsNotNone(process.poll(), "interactive setup did not finish")
+            # The terminal reports EOF as the child exits, which can be before it is reaped.
+            try:
+                process.wait(timeout=max(deadline - time.monotonic(), 0))
+            except subprocess.TimeoutExpired:
+                self.fail("interactive setup did not finish")
             self.assertEqual(
                 process.returncode, 0, b"".join(chunks).decode(errors="replace")[-1000:]
             )

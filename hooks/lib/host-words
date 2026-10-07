@@ -2,8 +2,8 @@
 # hooks without the adapter). hook-io sources this; lib/review-state sources it when hook-io has not
 # (bin/agent-run). Defines functions only.
 
-# host_noun <edit|read|search|rules|bg|fixer|logdir|main|delegate>: the host's name for a tool, file
-# or habit.
+# host_noun <edit|read|search|rules|bg|bgform|fixer|logdir|main|delegate>: the host's name for a
+# tool, file or habit.
 host_noun() {
   case "${AGENT_HOST:-claude}:$1" in
     claude:edit) printf 'Edit/Write' ;;
@@ -19,6 +19,8 @@ host_noun() {
     *:rules) printf 'the agent rules' ;;
     claude:bg) printf 'through Bash with run_in_background: true' ;;
     *:bg) printf 'as a shell command (it runs for minutes; let it finish rather than backgrounding it)' ;;
+    claude:bgform) printf 'run_in_background, a trailing &, nohup or setsid' ;;
+    *:bgform) printf 'a trailing &, nohup or setsid' ;;
     claude:fixer) printf 'one subagent_type "engineer"' ;;
     *:fixer) printf 'one engineer agent where your host can delegate' ;;
     claude:logdir) printf 'the scratchpad dir named in your system prompt' ;;
