@@ -608,7 +608,7 @@ class SetupTests(unittest.TestCase):
         repo = self.home / 'context-fixture'
         repo.mkdir()
         subprocess.run(['git', '-C', str(repo), 'init', '-b', 'main'], env=self.env, capture_output=True, check=True)
-        (self.host / 'local').mkdir()
+        self.assertEqual((self.host / 'local').readlink(), self.root / 'local', "the host's local is the kit's overlay")
         (self.host / 'local/context-fixture-rules.md').write_text('selected host guidance\n')
         legacy = self.home / '.claude/local'
         legacy.mkdir(parents=True)

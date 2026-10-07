@@ -501,6 +501,66 @@ class DevInstallTests(PackRepos):
             {'hook_event_name': 'PreToolUse', 'tool_name': 'apply_patch', 'cwd': str(self.home),
              'tool_input': {'command': '*** Begin Patch\n*** Add File: notes.txt\n+x\n*** End Patch\n'}}))
         self.assertEqual(sorted(str(path) for path in self.checkout.rglob('__pycache__')), [])
+        # edit-guard, run with no AGENT_KIT_DIR, reads the install's records: Claude's rules file is setup's.
+        self.assertTrue((self.root / 'hooks/edit-guard').is_symlink())
+        guarded = run(str(self.root / 'hooks/edit-guard'), payload=json.dumps(
+            {'hook_event_name': 'PreToolUse', 'tool_name': 'Write', 'cwd': str(self.home),
+             'tool_input': {'file_path': str(self.home / '.claude/CLAUDE.md'), 'content': 'x\n'}}))
+        self.assertIn('"permissionDecision": "deny"', guarded)
+
+    def test_the_sentry_tools_in_a_dev_install_read_the_installs_instances_and_route_each_token(self) -> None:
+        """sentry-map and sentry-mcp are links into the checkout, whose instances file is empty: they
+        read the install's (the preset's main) and its overlay's (other), and each instance's token
+        reaches only its own host. `security` is a fake, so no case reads a real Keychain."""
+        preset = self.home / 'sentry-preset.toml'
+        preset.write_text(
+            '[mcp.servers.sentry]\ncommand = "{{KIT_DIR}}/bin/sentry-mcp"\nargs = ["--disable-skills=seer"]\n'
+            '[sentry.instances.main]\nhost = "sentry.main.invalid"\nkeychain = "agent-kit-test/sentry-main"\n'
+            'server = "sentry"\n')
+        self.install(*FLAGS, '--preset', str(preset), '--dev', '--apply')
+        (self.root / 'local/sentry-instances.json').write_text(json.dumps({'instances': {'other': {
+            'host': 'sentry.other.invalid', 'keychain': 'agent-kit-test/sentry-other', 'server': 'sentry-other'}}}))
+        for name in ('sentry-map', 'sentry-mcp'):
+            self.assertEqual((self.root / 'bin' / name).readlink(), self.checkout / 'bin' / name)
+        self.assertEqual(json.loads((self.checkout / 'mcp/sentry-instances.json').read_text())['instances'], {})
+        tokens = {'main': 'main-token-0123456789', 'other': 'other-token-9876543210'}
+        items = self.home / 'items'
+        items.write_text(''.join(f'agent-kit-test/sentry-{name}={token}\n' for name, token in tokens.items()))
+        security = self.home / 'fake-security'
+        security.write_text('#!/bin/sh\nservice= reveal=\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n'
+                            '    -s) service=$2; shift ;;\n    -w) reveal=1 ;;\n  esac\n  shift\ndone\n'
+                            f'line=$(grep -F "$service=" {shlex.quote(str(items))} | head -n 1)\n'
+                            '[ -n "$line" ] || exit 44\n[ -z "$reveal" ] || printf \'%s\\n\' "${line#*=}"\n')
+        security.chmod(0o755)
+        # The linked tools import the bin/lib beside their target: the checkout's.
+        store = self.checkout / 'bin/lib/secret_store.py'
+        store.write_text(store.read_text().replace('SECURITY = "/usr/bin/security"', f'SECURITY = "{security}"'))
+        log = self.home / 'npx.log'
+        npx = self.shim / 'npx'
+        npx.write_text(f'#!/bin/sh\n{{ printf "token=%s\\n" "$SENTRY_ACCESS_TOKEN"; printf "host=%s\\n" "$SENTRY_HOST"; }}'
+                       f' > {shlex.quote(str(log))}\n')
+        npx.chmod(0o755)
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith(('AGENT_', 'KIT_', 'CLAUDE', 'SENTRY'))}
+        environment.update(HOME=str(self.home), PATH=f'{self.shim}:/usr/bin:/bin', TMPDIR=str(self.tmp))
+
+        def launch(*arguments: str) -> list[str]:
+            log.unlink(missing_ok=True)
+            result = subprocess.run([str(self.root / 'bin/sentry-mcp'), *arguments], capture_output=True, text=True,
+                                    env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(tokens['main'], result.stdout + result.stderr)
+            self.assertNotIn(tokens['other'], result.stdout + result.stderr)
+            return log.read_text().splitlines()
+
+        self.assertEqual(launch('--instance', 'other'), [f'token={tokens["other"]}', 'host=sentry.other.invalid'])
+        self.assertEqual(launch(), [f'token={tokens["main"]}', 'host=sentry.main.invalid'])
+        listed = subprocess.run([str(self.root / 'bin/sentry-map'), 'instances'], capture_output=True, text=True,
+                                env=environment)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        lines = listed.stdout.splitlines()
+        self.assertEqual([line.split(':')[0] for line in lines], ['main', 'other'], listed.stdout)
+        self.assertTrue(all('(token present)' in line for line in lines), listed.stdout)
 
     def test_agent_kit_loads_its_own_modules_in_an_older_agent_setup(self) -> None:
         """An older installed agent-setup runs the checkout's agent-kit in its own process (kit_api) after
@@ -564,6 +624,11 @@ class DevInstallTests(PackRepos):
         self.assertEqual(self.git(self.checkout, 'rev-parse', 'HEAD'), head)
         self.assertEqual(self.state()['id'], journal)
         self.assertEqual(self.state()['configuration']['mcp_catalog'], str(catalog))
+
+    def test_an_overlay_skill_replaces_a_linked_kit_skill_and_gives_it_back(self) -> None:
+        self.overlay_round_trip(self.install, '--dev')
+        self.assertEqual((self.root / 'skills/typescript-best-practices/SKILL.md').readlink(),
+                         self.checkout / 'skills/typescript-best-practices/SKILL.md')
 
 
 if __name__ == '__main__':

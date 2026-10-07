@@ -32,8 +32,14 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-KIT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(KIT / "bin" / "lib"))
+# Code beside the script's target; the instances and cache of the kit it runs from (kit_root: a dev
+# install links this file into its checkout, which holds neither).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "hooks", "lib"))
+
+from kit_env import kit_root  # noqa: E402
+
+KIT = kit_root(__file__)
 
 from sentry import LABELS, Instance, KeychainDenied, KeychainMissing, load_instances, read_token  # noqa: E402
 
