@@ -1,5 +1,6 @@
 """The dashboard's one renderer: typed section data (plain values) to escaped HTML, laid into the
-dashboard.html template beside this file. Nothing else in the dashboard writes markup."""
+dashboard.html template beside this file. Nothing else in the dashboard writes markup but
+dashboard_diagrams.py, which draws the How the kit works view's SVG figures."""
 
 from __future__ import annotations
 
@@ -109,8 +110,31 @@ class AddHelper:
     patterns: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class Prose:
+    """Hand-written text: blank lines part paragraphs, lines starting "- " make a list, `x` is code
+    and **x** bold. Everything else is escaped."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class Figure:
+    """An inline SVG diagram dashboard_diagrams drew (its values already escaped) and its caption."""
+
+    svg: str
+    caption: str = ""
+
+
+@dataclass(frozen=True)
+class Steps:
+    """An ordered flow: (title, text, command) per step; text is Prose markup, command may be empty."""
+
+    items: tuple[tuple[str, str, str], ...]
+
+
 Cell = Union[str, int, Path, Badge, Strong, Muted, Code, Command, Fold, Lines, Table, tuple]
-Block = Union[Table, Para, Pre, AddHelper]
+Block = Union[Table, Para, Pre, AddHelper, Prose, Figure, Steps]
 
 
 @dataclass(frozen=True)
@@ -140,6 +164,19 @@ class Section:
     actions: list[Action] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     attention: list[Action] = field(default_factory=list)
+
+
+@dataclass
+class DocPart:
+    """One part of the How the kit works view: key is its element id (docs-<name>), lead the Prose
+    under its title, sources the files it is generated from."""
+
+    key: str
+    title: str
+    lead: str = ""
+    blocks: list[Block] = field(default_factory=list)
+    sources: list[Path] = field(default_factory=list)
+    alerts: list[str] = field(default_factory=list)
 
 
 def anchor(view: str, name: str) -> str:
@@ -267,6 +304,32 @@ def add_helper(value: AddHelper) -> str:
     )
 
 
+def inline(text: str) -> str:
+    """One line of Prose markup: escaped, then `code` and **bold**."""
+    out = esc(text)
+    out = re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
+    return re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", out)
+
+
+def prose(text: str) -> str:
+    out = []
+    for chunk in re.split(r"\n\s*\n", text.strip()):
+        lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+        if lines and all(line.startswith("- ") for line in lines):
+            out.append("<ul>" + "".join(f"<li>{inline(line[2:])}</li>" for line in lines) + "</ul>")
+        elif lines:
+            out.append(f"<p>{inline(' '.join(lines))}</p>")
+    return f'<div class="prose">{"".join(out)}</div>' if out else ""
+
+
+def steps(value: Steps) -> str:
+    items = "".join(
+        f"<li><b>{esc(title)}</b>{prose(text)}{cell(Command(command)) if command else ''}</li>"
+        for title, text, command in value.items
+    )
+    return f'<ol class="steps">{items}</ol>'
+
+
 def block(value: Block) -> str:
     if isinstance(value, Table):
         return table(value)
@@ -274,6 +337,13 @@ def block(value: Block) -> str:
         return f"<pre>{esc(value.text)}</pre>"
     if isinstance(value, AddHelper):
         return add_helper(value)
+    if isinstance(value, Prose):
+        return prose(value.text)
+    if isinstance(value, Figure):
+        caption = f"<figcaption>{inline(value.caption)}</figcaption>" if value.caption else ""
+        return f'<figure class="fig"><div class="fig-body">{value.svg}</div>{caption}</figure>'
+    if isinstance(value, Steps):
+        return steps(value)
     return "<p>" + " ".join(cell(v) for v in value.items) + "</p>"
 
 
@@ -329,9 +399,50 @@ def inline_hash(text: str, tag: str) -> str:
     return "'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'"
 
 
-def page(sections: list[Section], needs: list[Action], kit: Path, engine: Path) -> str:
+def doc_part(value: DocPart) -> str:
+    sources = "".join(path_html(p) for p in value.sources)
+    sources = f'<div class="src"><span class="muted">From</span> {sources}</div>' if sources else ""
+    alerts = "".join(f'<p class="alert">{esc(a)}</p>' for a in value.alerts)
+    body = "".join(block(b) for b in value.blocks)
+    return (
+        f'<section id="{esc(value.key)}" class="doc"><h2>{esc(value.title)}</h2>{sources}'
+        f"{prose(value.lead)}{alerts}{body}</section>"
+    )
+
+
+DOCS_INTRO = (
+    "What the kit is made of and how it reaches each agent host, generated from the kit's own files "
+    "each time this page is built. The concept text is short and fixed; every list, table and "
+    "diagram below is read from the source named beside it."
+)
+
+
+def docs_view(parts: list[DocPart]) -> str:
+    """The How the kit works view: an article beside the setup cards, one doc section per part."""
+    if not parts:
+        return ""
+    return (
+        '<article id="docs" class="view"><header class="docs-head"><h1>How the kit works</h1>'
+        f"{prose(DOCS_INTRO)}</header>{''.join(doc_part(p) for p in parts)}</article>"
+    )
+
+
+def toc(parts: list[DocPart]) -> str:
+    links = "".join(f'<a href="#{esc(p.key)}">{esc(p.title)}</a>' for p in parts)
+    return f'<nav class="toc" aria-label="How the kit works">{links}</nav>' if parts else ""
+
+
+def page(
+    sections: list[Section],
+    needs: list[Action],
+    kit: Path,
+    engine: Path,
+    docs: list[DocPart] | None = None,
+) -> str:
     links = [nav_link("attention", "Needs attention", len(needs), "warn" if needs else "")]
     links += [nav_link(s.key, s.title, s.count, level(s)) for s in sections]
+    docs = docs or []
+    tab = '<a class="tab" href="#docs" data-v="docs">How the kit works</a>' if docs else ""
     text = TEMPLATE.read_text()
     return Template(text).substitute(
         script_hash=inline_hash(text, "script"),
@@ -343,4 +454,7 @@ def page(sections: list[Section], needs: list[Action], kit: Path, engine: Path) 
         nav="".join(links),
         attention=attention(needs),
         sections="".join(section(s) for s in sections),
+        docs_tab=tab,
+        toc=toc(docs),
+        docs=docs_view(docs),
     )
