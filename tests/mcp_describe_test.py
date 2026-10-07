@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -68,9 +69,11 @@ class FakeHttp(http.server.BaseHTTPRequestHandler):
     the Authorization token and scheme with `echo`) and tools/list as an event stream kept open with
     heartbeats, the reply first unless `silent`. `pad` puts the Authorization token 20 characters
     before the end of each field's limit (serverInfo name, instructions, the tool name). `redirect`
-    answers every POST with a 307; `drip` sends one byte every 0.5 s inside the status line
-    (`headers`), the stream's first line (`body`), or the first chunk-size line of a chunked
-    `Connection: close` stream (`chunked`). Each request's headers go to cfg['seen']."""
+    answers every POST with a 307; `drip` is (where, connection): one byte every 0.5 s inside a
+    header line (`headers`), the tools/list stream's first line (`body`: unframed with close, a
+    Content-Length body with keep-alive), or the first chunk-size line of a chunked stream
+    (`chunked`), the response saying `Connection: <connection>`. Each request's headers go to
+    cfg['seen']."""
 
     protocol_version = 'HTTP/1.1'
 
@@ -103,12 +106,13 @@ class FakeHttp(http.server.BaseHTTPRequestHandler):
         message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         if cfg.get('redirect'):
             return self.send(307, headers={'Location': cfg['redirect']})
-        if cfg.get('drip') == 'headers':
-            self.wfile.write(b'HTTP/1.1 200 OK\r\nX-Slow: ')
+        where, connection = cfg.get('drip', ('', ''))
+        if where == 'headers':
+            self.wfile.write(f'HTTP/1.1 200 OK\r\nConnection: {connection}\r\nX-Slow: '.encode())
             return self.drip()
-        if cfg.get('drip') == 'chunked':
-            self.wfile.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n'
-                             b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n')
+        if where == 'chunked':
+            self.wfile.write(f'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n'
+                             f'Transfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n'.encode())
             return self.drip()
         if self.headers.get('X-Team') != cfg.get('team', 'static-1'):
             return self.send(401)
@@ -132,10 +136,12 @@ class FakeHttp(http.server.BaseHTTPRequestHandler):
             return self.send(400)
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
-        self.send_header('Connection', 'close')
+        if where == 'body' and connection == 'keep-alive':
+            self.send_header('Content-Length', '4096')
+        self.send_header('Connection', connection or 'close')
         self.close_connection = True
         self.end_headers()
-        if cfg.get('drip') == 'body':
+        if where == 'body':
             return self.drip()
         try:
             if not cfg.get('silent'):
@@ -150,11 +156,20 @@ class FakeHttp(http.server.BaseHTTPRequestHandler):
             pass
 
 
+class LocalServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer's own adds socket.getfqdn(host), a reverse DNS lookup that took ~35 s on the
+        # macOS CI runner; FakeHttp never reads server_name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = str(self.server_address[0]), int(self.server_address[1])
+
+
 def serve(test: unittest.TestCase, **cfg) -> tuple[str, dict]:
     """(the URL of a FakeHttp server configured by cfg, that cfg, which collects `seen`)."""
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), FakeHttp)
+    server = LocalServer(('127.0.0.1', 0), FakeHttp)
     server.cfg = cfg  # type: ignore[attr-defined]
-    server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     test.addCleanup(server.server_close)
     test.addCleanup(server.shutdown)
@@ -248,8 +263,14 @@ class McpDescribeUnitTests(unittest.TestCase):
         return mcp_describe.describe(self.api, spec, 20)
 
     def http(self, headers: dict, timeout: float = 20, **cfg) -> Described:
+        return self.timed(headers, timeout, **cfg)[0]
+
+    def timed(self, headers: dict, timeout: float, **cfg) -> tuple[Described, float]:
+        """(describe's entry, the seconds describe took), the server started off the clock."""
         url, _ = serve(self, **cfg)
-        return mcp_describe.describe(self.api, {'url': url, 'headers': headers}, timeout)
+        started = time.monotonic()
+        entry = mcp_describe.describe(self.api, {'url': url, 'headers': headers}, timeout)
+        return entry, time.monotonic() - started
 
     def test_a_child_that_ignores_sigterm_is_killed_with_the_group(self) -> None:
         mark = self.dir / 'child.pid'
@@ -294,26 +315,20 @@ class McpDescribeUnitTests(unittest.TestCase):
         self.assertEqual(seen.get('seen', []), [], 'the redirect target got a request')
 
     def test_an_open_event_stream_returns_on_the_reply_and_heartbeats_cannot_outlast_the_deadline(self) -> None:
-        started = time.monotonic()
-        self.assertEqual(self.http({'X-Team': 'static-1'}).tools, ('lookup',))
-        self.assertLess(time.monotonic() - started, 10)
-        started = time.monotonic()
-        self.assertEqual(self.http({'X-Team': 'static-1'}, 2, silent=True), Described('error', error='timeout'))
-        self.assertLess(time.monotonic() - started, 4)
-
-    def test_a_byte_drip_inside_one_line_or_the_headers_stops_at_the_deadline(self) -> None:
-        for where in ('body', 'headers'):
-            with self.subTest(where):
-                started = time.monotonic()
-                entry = self.http({'X-Team': 'static-1'}, 2, drip=where)
-                self.assertEqual(entry, Described('error', error='timeout'))
-                self.assertLess(time.monotonic() - started, 3)
-
-    def test_a_closing_chunked_stream_that_drips_its_chunk_size_line_stops_at_the_deadline(self) -> None:
-        started = time.monotonic()
-        entry = self.http({'X-Team': 'static-1'}, 2, drip='chunked')
+        entry, took = self.timed({'X-Team': 'static-1'}, 20)
+        self.assertEqual(entry.tools, ('lookup',))
+        self.assertLess(took, 10)
+        entry, took = self.timed({'X-Team': 'static-1'}, 2, silent=True)
         self.assertEqual(entry, Described('error', error='timeout'))
-        self.assertAlmostEqual(time.monotonic() - started, 2, delta=0.5)
+        self.assertLess(took, 4)
+
+    def test_a_byte_drip_in_the_headers_or_the_body_stops_at_the_deadline_with_keep_alive_or_close(self) -> None:
+        for where in ('headers', 'body', 'chunked'):
+            for connection in ('keep-alive', 'close'):
+                with self.subTest(where=where, connection=connection):
+                    entry, took = self.timed({'X-Team': 'static-1'}, 2, drip=(where, connection))
+                    self.assertEqual(entry, Described('error', error='timeout'))
+                    self.assertAlmostEqual(took, 2, delta=0.5)
 
     def test_the_cache_reader_validates_every_entry(self) -> None:
         good = Described('ok', 'today', '', 'n', '2', 'Hi', ('t',))
