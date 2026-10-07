@@ -34,24 +34,28 @@ RELOAD_JS = (
     f".then(function(t){{if(t!==v){{location.reload()}}else{{setTimeout(poll,{POLL_SECONDS * 1000})}}}},"
     f"function(){{setTimeout(poll,{POLL_SECONDS * 1000})}})}}setTimeout(poll,{POLL_SECONDS * 1000})}})();\n"
 )
+# Host files the page reads that setup does not render: Claude's own local settings.
+HOST_EXTRAS = {"claude": ("settings.local.json",)}
 POLICY = re.compile(r'(http-equiv="Content-Security-Policy" content=")([^"]*)(")')
 
 Fingerprint = dict[str, tuple[int, int]]
 
 
-def watched(kit: Path, overlay: Path, host_roots: Mapping[str, Path]) -> list[Path]:
-    """The config files the page is generated from: the kit's own, the kit's local/ folder and the
-    overlay folder with their top-level files (a folder's own mtime moves when a file is added or
-    removed), and each configured host's rendered files plus settings.local.json."""
-    paths = [kit / name for name in KIT_FILES]
-    for folder in sorted({kit / "local", overlay}):
+def watched(kit: Path, layers: Iterable[Path], host_roots: Mapping[str, Path]) -> list[Path]:
+    """The config files the page is generated from: the kit's own; the overlay layers kit_env reads
+    (kit_env.layers()), each with its folder and that folder's top-level files, and the kit's local/
+    the same way (a folder's own mtime moves when a file is added or removed); and each configured
+    host's rendered files plus its HOST_EXTRAS."""
+    layers = list(layers)
+    paths = [kit / name for name in KIT_FILES] + layers
+    for folder in sorted({kit / "local", *(layer.parent for layer in layers)}):
         paths.append(folder)
         try:
             paths += sorted(p for p in folder.iterdir() if p.is_file())
         except OSError:
             pass
     for host, root in sorted(host_roots.items()):
-        paths += [root / name for name in (*RENDERED_FILES[host], "settings.local.json")]
+        paths += [root / name for name in (*RENDERED_FILES[host], *HOST_EXTRAS.get(host, ()))]
     return paths
 
 
@@ -126,7 +130,7 @@ def watch(
     opener: Callable[[str], object] | None,
 ) -> int:
     """Serve rebuild()'s page until Ctrl-C, rebuilding it when a file of paths() changes. paths() runs
-    on every poll, so a file created since is watched; a failed rebuild keeps the last page."""
+    on every poll, so a file created since is watched; a failed rebuild keeps the last page and is retried on the next poll."""
     # Each fingerprint is taken before its rebuild, so an edit made during one is caught by the next poll.
     seen = fingerprint(paths())
     version = 1
@@ -145,8 +149,9 @@ def watch(
                 now = fingerprint(paths())
                 if now == seen:
                     continue
-                changed, seen = first_change(now, seen), now
+                # seen moves only once the rebuild succeeds, so a failed one is retried on the next poll.
                 current[0] = (live_page(rebuild(), str(version + 1)), str(version + 1))
+                changed, seen = first_change(now, seen), now
                 version += 1
             except Exception as error:  # noqa: BLE001  a half-written file must not end the watch
                 if f"{error!r}" != failure:

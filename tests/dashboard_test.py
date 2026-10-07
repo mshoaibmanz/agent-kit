@@ -625,15 +625,20 @@ class DashboardScenarioTests(Fixture):
         try:
             (self.root / 'local/settings.json').write_text('{"includeCoAuthoredBy": false}\n')
             self.assertEqual(self.next_version(url, '1'), '2', 'a file created in local/ was not seen')
+            # With no kit.env in the kit, the user layer kit_env reads is the config dir's.
+            user_layer = self.home / '.claude/local/kit.env'
+            user_layer.parent.mkdir(parents=True, exist_ok=True)
+            user_layer.write_text('REVIEW_BASE=trunk\n')
+            self.assertEqual(self.next_version(url, '2'), '3', 'the effective user layer was not watched')
             # The page's folder gone: the rebuild fails, and the last page stays served.
             shutil.rmtree(self.home / 'out')
             (self.root / 'local/kit.env').write_text('REVIEW_BASE=main\n')
             time.sleep(5)
             self.assertIsNone(proc.poll(), 'the watch died with its rebuild')
-            self.assertEqual(FETCH(url + 'version', timeout=10).read().decode(), '2')
+            self.assertEqual(FETCH(url + 'version', timeout=10).read().decode(), '3')
+            # The folder back and nothing else edited: the next poll retries the rebuild.
             (self.home / 'out').mkdir()
-            (self.root / 'local/kit.env').write_text('REVIEW_BASE=develop\n')
-            self.assertEqual(self.next_version(url, '2'), '3')
+            self.assertEqual(self.next_version(url, '3'), '4', 'a failed rebuild was not retried')
             self.assertTrue((self.home / 'out/index.html').is_file())
         finally:
             rest, err = self.stop_watch(proc)
@@ -643,10 +648,12 @@ class DashboardScenarioTests(Fixture):
         from dashboard_watch import watched
 
         kit, roots = self.home / 'kit', {'claude': self.home / '.claude', 'cursor': self.home / '.cursor'}
-        paths = set(watched(kit, self.home / 'overlay', roots))
+        paths = set(watched(kit, [self.home / 'overlay/kit.env'], roots))
         for wanted in ('.claude/settings.json', '.claude/settings.local.json', '.claude/CLAUDE.md',
-                       '.cursor/rules/agent-kit.mdc', '.cursor/mcp.json', '.cursor/hooks.json'):
+                       '.cursor/rules/agent-kit.mdc', '.cursor/mcp.json', '.cursor/hooks.json',
+                       'overlay/kit.env', 'overlay'):
             self.assertIn(self.home / wanted, paths)
+        self.assertNotIn(self.home / '.cursor/settings.local.json', paths, 'a Claude-only file')
         self.assertIn(kit / 'local', paths, 'the folder itself, so a new file in it counts')
 
     def test_doctor_reports_a_hook_removed_since_setup(self) -> None:

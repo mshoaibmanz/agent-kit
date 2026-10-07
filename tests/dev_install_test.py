@@ -178,6 +178,16 @@ class DevInstallTests(PackRepos):
                       'extraKnownMarketplaces.own)', problems[0], 'removed, changed and dropped entries')
         self.install('--apply')
         self.assertEqual(self.doctor()['problems'], [])
+        # A GIT_CONFIG_* entry of the user's own is compared like any env key; the kit's hooks entry is not.
+        user.write_text('{"env": {"GIT_CONFIG_GLOBAL": "/dev/null"}}\n')
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        user.write_text('{}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('(env.GIT_CONFIG_GLOBAL)', problems[0])
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
         user.write_text('{"theme": "dark"}\n')
         problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
         self.assertEqual(len(problems), 1, problems)

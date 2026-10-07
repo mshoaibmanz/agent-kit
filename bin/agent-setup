@@ -1393,12 +1393,19 @@ def settings_layer_problem(args: argparse.Namespace, root: Path, state: dict[str
         return [prefix + key for key in sorted(set(want) | set(have))
                 if key not in want or key not in have or want[key] != have[key]]
 
-    # As host_changes builds them: the kit's own env keys and the GIT_CONFIG_* entry are not the
-    # layer's, and a preset's plugins and marketplaces win over the layer's.
-    kit_keys = kit_shell(args, root, target)
+    # As host_changes builds them: the kit's own env keys and its core.hooksPath entry (with the count)
+    # are not the layer's, while a GIT_CONFIG_* entry of the user's is; a preset's plugins and
+    # marketplaces win over the layer's.
+    live = load_json(target / 'settings.json', {}) or {}
+    live_env = live.get('env', {}) if isinstance(live.get('env'), dict) else {}
+    try:
+        hooks_entry = git_layer_env(live_env, str(root / 'git-hooks'), owned('environment'), enabled=args.blocking_hooks)
+    except ValueError as error:
+        return f'the settings env cannot be checked: {error}'
+    kit_keys = {*kit_shell(args, root, target), *hooks_entry, 'GIT_CONFIG_COUNT'}
 
     def layer_env(env: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in env.items() if key not in kit_keys and not key.startswith('GIT_CONFIG_')}
+        return {key: value for key, value in env.items() if key not in kit_keys}
 
     enabled, markets = plugin_settings(state.get('configuration', {}).get('preset_values', {}).get('plugins', {}))
     stale = differ('', {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}, owned('settings'))

@@ -129,7 +129,7 @@ def cmd_dashboard(api: ModuleType, args: argparse.Namespace) -> int:
 
 
 def watch_paths(api: ModuleType) -> list[Path]:
-    from kit_env import kit_env_path
+    from kit_env import layers
 
     setup = Setup(api, False)
-    return watched(setup.kit, Path(kit_env_path()).parent, {h: setup.roots[h] for h in setup.configured})
+    return watched(setup.kit, layers(), {h: setup.roots[h] for h in setup.configured})

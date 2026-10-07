@@ -273,21 +273,32 @@ class Sweep(Fixture):
         fake_ssh = self.base / "fake-ssh"
         fake_ssh.write_text(f'#!/bin/sh\necho "$*" >> {ssh_log}\nexit 255\n')
         fake_ssh.chmod(0o755)
-        self.env["GIT_SSH_COMMAND"] = str(fake_ssh)
+        # The checkout's own ssh command is the one asked, in batch mode; with none, GIT_SSH is.
+        git("config", "core.sshCommand", str(fake_ssh), cwd=over_ssh)
+        over_git_ssh = self.clone(origin, tmp / "git-ssh-tag")
+        git("tag", "mine", cwd=over_git_ssh)
+        git("remote", "set-url", "origin", "ssh://git.example.invalid/repo.git", cwd=over_git_ssh)
+        git_ssh_log = self.base / "git-ssh.log"
+        fake_git_ssh = self.base / "fake git ssh"
+        fake_git_ssh.write_text(f'#!/bin/sh\necho "$*" >> "{git_ssh_log}"\nexit 255\n')
+        fake_git_ssh.chmod(0o755)
+        self.env.pop("GIT_SSH_COMMAND", None)
+        self.env["GIT_SSH"] = str(fake_git_ssh)
         age(d)
 
         proc = self.gc()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         lines = {Path(p).relative_to(d).as_posix(): v for p, v in self.lines().items() if Path(p).is_relative_to(d)}
         self.assertEqual(lines["tmp/pushed-tag"], ("delete", "git checkout"), "a pushed tag is settled")
-        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag", "tmp/ssh-tag"):
+        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag", "tmp/ssh-tag", "tmp/git-ssh-tag"):
             self.assertEqual(lines[name], ("keep", "git checkout with unpushed work"), name)
         self.assertIn("-o BatchMode=yes", ssh_log.read_text())
+        self.assertIn("-o BatchMode=yes", git_ssh_log.read_text(), "GIT_SSH, quoted (its path has spaces)")
 
         proc = self.gc("--sweep-tmp", "--report-sha256", hashlib.sha256(self.report().read_bytes()).hexdigest())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertFalse(pushed.exists())
-        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag", "tmp/ssh-tag"):
+        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag", "tmp/ssh-tag", "tmp/git-ssh-tag"):
             self.assertTrue((d / name).exists(), name)
 
     def test_git_bookkeeping_neither_delays_nor_refuses_a_clean_checkout(self) -> None:

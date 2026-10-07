@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -92,15 +93,21 @@ def tree_size(path: Path) -> int:
     return total
 
 
-def git_out(folder: Path, *args: str) -> str | None:
-    """git's stdout, or None when it fails or times out. Never prompts: a remote that wants a password
-    or an ssh passphrase fails instead."""
-    ssh = os.environ.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes"
+def git_out(folder: Path, *args: str, env: dict[str, str] | None = None) -> str | None:
+    """git's stdout, or None when it fails or times out. Never prompts for a password."""
     try:
-        proc = git(folder, *args, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": ssh})
+        proc = git(folder, *args, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(env or {})})
     except (OSError, subprocess.TimeoutExpired):
         return None
     return proc.stdout if proc.returncode == 0 else None
+
+
+def batch_ssh(folder: Path) -> dict[str, str]:
+    """The ssh command git would run here, in git's order (GIT_SSH_COMMAND, core.sshCommand, GIT_SSH,
+    ssh), in batch mode: a passphrase or host-key prompt fails instead of waiting."""
+    command = (os.environ.get("GIT_SSH_COMMAND") or (git_out(folder, "config", "--get", "core.sshCommand") or "").strip()
+               or shlex.quote(os.environ.get("GIT_SSH") or "ssh"))
+    return {"GIT_SSH_COMMAND": command + " -o BatchMode=yes"}
 
 
 def tags_pushed(folder: Path) -> bool:
@@ -112,9 +119,9 @@ def tags_pushed(folder: Path) -> bool:
     wanted = set(local.split("\n")) - {""}
     if not wanted:
         return True
-    remotes = git_out(folder, "remote")
+    remotes, ssh = git_out(folder, "remote"), batch_ssh(folder)
     for remote in (remotes or "").split():
-        listed = git_out(folder, "ls-remote", "--tags", "--refs", remote)
+        listed = git_out(folder, "ls-remote", "--tags", "--refs", remote, env=ssh)
         if listed is not None:
             wanted -= {line.replace("\t", " ") for line in listed.split("\n")}
         if not wanted:
