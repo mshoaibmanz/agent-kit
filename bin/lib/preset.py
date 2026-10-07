@@ -271,10 +271,8 @@ def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
     except tomllib.TOMLDecodeError as error:
         raise ValueError(f'preset {spec}: not valid TOML: {error}') from None
     validate_preset(preset, spec)
-    total = hashlib.sha256(text.encode())
-    for relative, (data, mode) in sorted(pack.files.items() if pack else []):
-        total.update(f'\0{relative}\0{int(bool(mode & 0o111))}\0{len(data)}\0'.encode() + data)
-    return LoadedPreset(preset, total.hexdigest(), pack, commit)
+    sha = pack.digest(text.encode()) if pack else hashlib.sha256(text.encode()).hexdigest()
+    return LoadedPreset(preset, sha, pack, commit)
 
 
 def recorded_head(record: dict[str, Any] | None, spec: str) -> tuple[str | None, bool]:
@@ -323,6 +321,8 @@ class Preset:
     notes: list[tuple[str, str]] = field(default_factory=list)
     pack: Pack | None = None
     pack_skills: list[str] = field(default_factory=list)
+    # The personal overlay (overlay.read_overlay), read once per run and installed after the pack.
+    overlay: Pack | None = None
     table: dict[str, Any] | None = None
     plugins: dict[str, Any] = field(default_factory=dict)
     sentry: dict[str, Any] = field(default_factory=dict)

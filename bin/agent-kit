@@ -1039,10 +1039,18 @@ def claude_host_rules(path: Path | None = None, resume: int | None = None) -> st
 
 def with_team_rules(rules: str, host: str, host_root: str | None = None, resume: int | None = None) -> str:
     """rules (filled) with the team pack's rules block appended, when a pack installed one, then the
-    personal overlay's (local/rules.md): their kit placeholders filled, any other {{...}} left as
-    written."""
-    for path in (TEAM_RULES, OVERLAY_RULES):
-        block = read_or_empty(path).strip()
+    personal overlay's (local/rules.md, read as setup reads it; an invalid overlay stops the render):
+    their kit placeholders filled, any other {{...}} left as written."""
+    blocks = {TEAM_RULES: read_or_empty(TEAM_RULES)}
+    if os.path.lexists(OVERLAY_RULES):
+        from overlay import read_overlay  # here: a kit copied without bin/lib has no overlay to read
+
+        try:
+            blocks[OVERLAY_RULES] = getattr(read_overlay(OVERLAY_RULES.parent), "rules", "")
+        except ValueError as error:
+            raise SystemExit(f"agent-kit: {error}") from None
+    for path, block in blocks.items():
+        block = block.strip()
         if block:
             block = fill_for_host(block, host=host, host_root=host_root, what=str(path), resume=resume, strict=False)
             rules = rules.rstrip("\n") + "\n\n" + block + "\n"

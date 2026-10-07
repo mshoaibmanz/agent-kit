@@ -88,6 +88,13 @@ def normal_mode(mode: int) -> int:
     return 0o755 if mode & 0o111 else 0o644
 
 
+def write_pack_file(path: Path, data: bytes, mode: int) -> None:
+    """A pack or overlay file written where setup stages it, with the mode setup installs it with."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(normal_mode(mode))
+
+
 def gh_api(arguments: list[str], repo: str, timeout: int, spool: IO[bytes] | None = None) -> bytes:
     """`gh api` output with the user's own login (written to spool instead when given);
     PresetUnavailable when it cannot answer."""
@@ -177,10 +184,10 @@ def folder_entries(folder: Path) -> Iterator[Entry]:
                     yield found
 
 
-def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
+def pack_files(entries: Iterable[Entry], spec: str, allow_links: bool = True) -> PackFiles:
     """Every file of a pack (path -> content, mode). A link that names a file in the pack reads as
-    that file; a link out of the pack or to a folder, a special file, or two paths that differ only
-    in case or Unicode normalization (one file on macOS) refuses."""
+    that file (any link refuses without allow_links); a link out of the pack or to a folder, a special
+    file, or two paths that differ only in case or Unicode normalization (one file on macOS) refuses."""
     files: PackFiles = {}
     links: dict[str, str] = {}
     folded: dict[str, str] = {}
@@ -194,6 +201,8 @@ def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
                 raise ValueError(f'preset {spec}: {other} and {path} differ only in case or Unicode form')
         if kind == 'other':
             raise ValueError(f'preset {spec}: {relative} is not a regular file or link')
+        if kind == 'link' and not allow_links:
+            raise ValueError(f'preset {spec}: {relative} is a link; it holds files only')
         if kind == 'link':
             link = data.decode(errors='replace')
             target = PurePosixPath(os.path.normpath(os.path.join(os.path.dirname(relative), link))).as_posix()
@@ -238,6 +247,13 @@ class Pack:
     def skill_files(self, name: str) -> PackFiles:
         return {path: value for path, value in self.files.items() if path.startswith(f'{PACK_SKILLS}/{name}/')}
 
+    def digest(self, prefix: bytes = b'') -> str:
+        """sha256 over prefix (a preset's text) and every file: its path, executable bit and content."""
+        total = hashlib.sha256(prefix)
+        for relative, (data, mode) in sorted(self.files.items()):
+            total.update(f'\0{relative}\0{int(bool(mode & 0o111))}\0{len(data)}\0'.encode() + data)
+        return total.hexdigest()
+
 
 def utf8_text(data: bytes, relative: str, spec: str) -> str:
     """data of a pack text file (Markdown, the preset), which setup reads as UTF-8."""
@@ -247,10 +263,10 @@ def utf8_text(data: bytes, relative: str, spec: str) -> str:
         raise ValueError(f'preset {spec}: {relative} is not UTF-8 text') from None
 
 
-def build_pack(files: PackFiles, spec: str, commit: str | None) -> Pack | None:
+def build_pack(files: PackFiles, spec: str, commit: str | None, words: int = PACK_RULES_WORDS) -> Pack | None:
     """The pack in files (skills/ and rules.md), None when it has neither. Refused when a file looks
     like a credential (by name, a token format or a private key), a skill is malformed, or rules.md is
-    over PACK_RULES_WORDS words."""
+    over words words."""
     if not files:
         return None
     for relative, (data, _) in sorted(files.items()):
@@ -275,9 +291,9 @@ def build_pack(files: PackFiles, spec: str, commit: str | None) -> Pack | None:
             skill_hosts(Path(f'{PACK_SKILLS}/{name}/SKILL.md'), skill[0].decode())
         except ValueError as error:
             raise ValueError(f'preset {spec}: {error}') from None
-    words = len(pack.rules.split())
-    if words > PACK_RULES_WORDS:
-        raise ValueError(f'preset {spec}: rules.md has {words} words, over the cap of {PACK_RULES_WORDS}; '
+    count = len(pack.rules.split())
+    if count > words:
+        raise ValueError(f'preset {spec}: rules.md has {count} words, over the cap of {words}; '
                          'move the detail into a pack skill')
     return pack
 

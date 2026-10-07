@@ -26,13 +26,9 @@ set -uo pipefail
 
 BASE="$HOME/.claude"
 # The kit this script runs from (hooks/lib/kit-root.sh: a dev install links it into its checkout),
-# when the caller's environment does not name one.
+# when the caller's environment does not name one; a copy without hooks/lib beside it: its parent.
 src=${BASH_SOURCE[0]}
-KIT_DIR=${AGENT_KIT_DIR:-}
-if [ -z "$KIT_DIR" ] && . "$(dirname "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")")/../hooks/lib/kit-root.sh" 2>/dev/null; then
-  KIT_DIR=$(kit_root "$src") || KIT_DIR=''
-fi
-[ -n "$KIT_DIR" ] || KIT_DIR=$(cd -P "$(dirname "$src")/.." 2>/dev/null && pwd)
+KIT_DIR=${AGENT_KIT_DIR:-$( (. "$(dirname "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")")/../hooks/lib/kit-root.sh" && kit_root "$src") 2>/dev/null || (cd -P "$(dirname "$src")/.." && pwd))}
 ROUTES="$BASE/local/accounts"
 MCP="$BASE/mcp.json"
 MARK=".claude-account"

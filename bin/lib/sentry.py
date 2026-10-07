@@ -209,6 +209,21 @@ def read_token(inst: Instance, instances: Iterable[Instance]) -> str:
     raise KeychainDenied(inst.keychain)
 
 
+def host_key(host: str) -> str:
+    """A host or URL as one comparable name: no scheme, path or case."""
+    return re.sub(r"^https?://", "", host.strip().lower()).split("/", 1)[0]
+
+
+def host_values(args: list) -> list:
+    """The hosts --host/--url name in server args."""
+    out = []
+    for at, arg in enumerate(args):
+        option, _, value = arg.partition("=")
+        if option in HOST_OPTIONS:
+            out.append(value if "=" in arg else (args[at + 1] if at + 1 < len(args) else ""))
+    return out
+
+
 def _server_args(spec: Dict[str, Any]) -> list:
     """The template's options without its npx package prefix and host, for a per-instance clone."""
     args = list(spec.get("args", []))

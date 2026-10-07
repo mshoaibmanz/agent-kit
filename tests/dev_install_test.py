@@ -549,6 +549,11 @@ class DevInstallTests(PackRepos):
         self.assertEqual(self.state()['id'], journal)
         self.assertEqual(self.state()['configuration']['mcp_catalog'], str(catalog))
 
+    def test_an_overlay_skill_replaces_a_linked_kit_skill_and_gives_it_back(self) -> None:
+        self.overlay_round_trip(self.install, '--dev')
+        self.assertEqual((self.root / 'skills/typescript-best-practices/SKILL.md').readlink(),
+                         self.checkout / 'skills/typescript-best-practices/SKILL.md')
+
 
 if __name__ == '__main__':
     unittest.main()

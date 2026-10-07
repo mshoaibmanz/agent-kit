@@ -259,6 +259,33 @@ class Wrapper(Fixture):
         self.assertEqual(lines[0], "argv=-y @sentry/mcp-server@0.37.0 --disable-skills=seer")
         self.assertEqual(lines[1:], [f"token={TOKEN}", "host=sentry.beta.invalid"])
 
+    def test_no_token_reaches_another_instances_host(self) -> None:
+        """The default instance's token goes to its own host whatever SENTRY_HOST the client inherits,
+        a host argument naming another is refused, and the legacy item never reaches a configured host."""
+        self.items.write_text(f"agent-kit-test/sentry-alpha={TOKEN}\n{sentry.LEGACY_SERVICE}=legacy-token\n")
+        script(self.root / "path/npx", FAKE_NPX)
+        log = self.root / "npx.log"
+        env = {"PATH": f"{self.root / 'path'}:/usr/bin:/bin", "NPX_LOG": str(log), "SENTRY_HOST": "sentry.beta.invalid"}
+        proc = self.run_bin("sentry-mcp", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.read_text().splitlines()[1:], [f"token={TOKEN}", "host=sentry.alpha.invalid"])
+        for args in (["--host=sentry.beta.invalid"], ["--url", "https://sentry.beta.invalid/"]):
+            log.unlink(missing_ok=True)
+            proc = self.run_bin("sentry-mcp", *args, env=env)
+            with self.subTest(args=args):
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("instance alpha is configured for sentry.alpha.invalid", proc.stderr)
+                self.assertFalse(log.exists())
+        self.assertEqual(self.run_bin("sentry-mcp", "--host", "https://sentry.alpha.invalid", env=env).returncode, 0)
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {"beta": {"host": "sentry.beta.invalid", "keychain": self.beta_item}})
+        log.unlink()
+        for args in ([], ["--host", "sentry.beta.invalid"]):
+            proc = self.run_bin("sentry-mcp", *args, env={**env, "SENTRY_HOST": "sentry.beta.invalid" if not args else ""})
+            with self.subTest(legacy=args):
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("sentry.beta.invalid is instance beta's host", proc.stderr)
+                self.assertFalse(log.exists())
+
     def test_runs_under_the_system_python(self) -> None:
         if not Path("/usr/bin/python3").exists():
             self.skipTest("no /usr/bin/python3")

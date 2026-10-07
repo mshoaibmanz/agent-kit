@@ -31,6 +31,8 @@ from sentry import (  # noqa: E402
     KeychainDenied,
     KeychainMissing,
     default_instance,
+    host_key,
+    host_values,
     load_instances,
     read_token,
 )
@@ -85,11 +87,18 @@ def main() -> None:
             "Check access in your trusted terminal before importing or rotating a credential."
         )
     env = {k: v for k, v in os.environ.items() if not k.startswith(TOKEN_ENV)}
-    if inst.host and not host_arg:
-        if name is not None:
-            env["SENTRY_HOST"] = inst.host
-        else:
-            env.setdefault("SENTRY_HOST", inst.host)
+    # A token goes to its own instance's host only: a configured instance (the default included) sets
+    # its host over any inherited one, and the legacy item never reaches a configured instance's host.
+    hosts = host_values(args)
+    if inst.host:
+        other = next((host for host in hosts if host_key(host) != host_key(inst.host)), None)
+        if other is not None:
+            die(f"instance {inst.name} is configured for {inst.host}; drop --host/--url {other}")
+        env["SENTRY_HOST"] = inst.host
+    owners = {host_key(i.host): i.name for i in instances.values()}
+    for host in (*hosts, env.get("SENTRY_HOST", "")):
+        if host and inst.name != owners.get(host_key(host), inst.name):
+            die(f"{host} is instance {owners[host_key(host)]}'s host; launch it with --instance {owners[host_key(host)]}")
     if check:
         print(f"sentry-mcp: instance {inst.name} ok (host {env.get('SENTRY_HOST', 'from args')}, item {inst.keychain})")
         return
