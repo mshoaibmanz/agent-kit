@@ -164,7 +164,7 @@ EVIL_SECURITY = script(os.path.join(TMP, "evil", "security"), EVIL_BODY)
 EMPTY_DIR = os.path.join(TMP, "empty")
 os.makedirs(EMPTY_DIR)
 
-m.SECURITY = FAKE_SECURITY
+m.secret_store.SECURITY = FAKE_SECURITY
 m.AUTH_FAILED = os.path.join(TMP, "db-auth-failed")
 # Their defaults were bound to the real state file at import; a successful fake run clears through them.
 m.note_auth_failure.__defaults__ = (m.AUTH_FAILED,)

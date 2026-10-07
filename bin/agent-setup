@@ -62,14 +62,14 @@ ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'secon
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
 from blocking import BLOCKING  # noqa: E402
 import checkout  # noqa: E402
-from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, code_dir, default_host_root,  # noqa: E402
+from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root,  # noqa: E402
                    fill_servers, git_layer_env, install_text, keep_host_tables, resume_max, skill_hosts,
                    strip_legacy_sandbox)
-from kit_env import kit_env  # noqa: E402
+from kit_env import code_dir, kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
                        server_runtime)
-from pack import PACK_DIR, PACK_SKILLS, installed_pack  # noqa: E402
+from pack import PACK_DIR, PACK_MCP, PACK_SKILLS, extension_lists, installed_pack, render_extensions  # noqa: E402
 from preset import Preset, apply_preset, kit_skills, plugin_settings, source_status, validate_catalog  # noqa: E402
 from sentry import INSTANCES_FILE, expand_servers, merge_instances, read_instances  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
@@ -556,11 +556,58 @@ def catalog_path(args: argparse.Namespace) -> Path:
     return Path(args.mcp_catalog).expanduser() if args.mcp_catalog else Path(args.source).expanduser().resolve() / 'mcp/servers.json'
 
 
-def installation_view(args: argparse.Namespace, view: Path, preset: Preset, servers: dict[str, Any]) -> set[Path]:
+def mcp_selection(args: argparse.Namespace, view: Path, preset: Preset,
+                  servers: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The catalog servers this install can start, and a line for each one it leaves out and why.
+
+    A server whose runtime is missing is left out, so no host starts a command that cannot run. Its
+    descriptor stays in the catalog or preset: a rerun after installing the runtime adds it. The
+    catalog keeps its kit placeholders: it is installed as is, and a later render fills them from the
+    installed kit. Filled with the view here for the checks only. A server run from a local clone
+    ({{CODE_DIR}}/<repo>/...) is left out the same way until that clone has it, and one run from the
+    team pack's mcp/ project ({{PACK_DIR}}) while uv, which syncs it, is missing. A pack server's bare
+    command is written as its absolute path: a host started from the Dock lacks ~/.local/bin on PATH."""
+    local = code_dir(args.repo_roots)
+    uv = shutil.which('uv')
+    runnable, skipped = {}, []
+    for name, spec in servers.items():
+        text = json.dumps(spec)
+        clone, packed = '{{CODE_DIR}}' in text, '{{PACK_DIR}}' in text
+        if clone and not local:
+            skipped.append(f'MCP server {name}: {{{{CODE_DIR}}}} needs a repository root (CODE_DIRS_JSON)')
+            continue
+        if packed and (preset.pack is None or not preset.pack.has_mcp):
+            skipped.append(f'MCP server {name}: the team pack has no mcp/ project for {{{{PACK_DIR}}}}')
+            continue
+        if packed and not uv:
+            skipped.append(f'MCP server {name}: uv is missing, which syncs the team pack\'s mcp/ project. '
+                           f'Fix: {install_hint("uv")}, then rerun agent-setup')
+            continue
+        filled = fill_servers({name: spec}, str(view), local)[name]
+        command = filled.get('command', '')
+        if packed and command and '/' not in command:
+            if not (found := shutil.which(command)):
+                skipped.append(f'MCP server {name}: {command} is missing. Fix: {install_hint(command)}')
+                continue
+            spec = {**spec, 'command': found}
+        elif server_runtime(filled) and not shutil.which(command):
+            continue
+        elif clone and '{{CODE_DIR}}' in str(spec.get('command')) and not os.access(command, os.X_OK):
+            skipped.append(f'MCP server {name}: {command} is not an executable in your clone yet; '
+                           'rerun agent-setup once it is')
+            continue
+        runnable[name] = spec
+    return runnable, skipped
+
+
+def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
+                      servers: dict[str, Any]) -> tuple[set[Path], list[str]]:
     """The kit as this install selects it, in view; returns the paths in it that setup derived rather
-    than copied from the source (the team pack's included), which a dev install keeps as copies."""
+    than copied from the source (the team pack's included), which a dev install keeps as copies, and
+    a line for each MCP server it leaves out (mcp_selection)."""
     source = Path(args.source).expanduser().resolve()
     derived = {Path('hooks/registry.json')}
+    skipped: list[str] = []
     for name in ('bin', 'hooks', 'git-hooks', 'agents', 'commands', 'rules', 'hosts', 'skills', 'references'):
         path = source / name
         if path.is_dir():
@@ -588,18 +635,7 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
         derived.add(Path('roles.toml'))
     kit_api(view).load_roles()
     if 'mcp' in args.components:
-        # A server whose runtime is missing is left out, so no host starts a command that cannot run.
-        # Its descriptor stays in the catalog or preset: a rerun after installing the runtime adds it.
-        # The catalog keeps its kit placeholders: it is installed as is, and a later render fills them
-        # from the installed kit. Filled with the view here for the runtime check only. A server run
-        # from a local clone ({{CODE_DIR}}/<repo>/...) is left out the same way until that clone has it.
-        local = code_dir(args.repo_roots)
-        clones = {name for name, spec in servers.items() if '{{CODE_DIR}}' in json.dumps(spec)}
-        filled = fill_servers({name: spec for name, spec in servers.items() if local or name not in clones},
-                              str(view), local)
-        runnable = {name: servers[name] for name, spec in filled.items()
-                    if (not server_runtime(spec) or shutil.which(spec['command']))
-                    and (name not in clones or os.access(spec['command'], os.X_OK))}
+        runnable, skipped = mcp_selection(args, view, preset, servers)
         (view / 'mcp').mkdir()
         (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': runnable}, indent=2) + '\n')
         derived.add(Path('mcp/servers.json'))
@@ -609,17 +645,20 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
         if instances:
             (view / 'mcp' / INSTANCES_FILE).write_text(json.dumps({'instances': instances}, indent=2) + '\n')
             derived.add(Path('mcp') / INSTANCES_FILE)
-    return derived
+    return derived, skipped
 
 
-def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str], servers: dict[str, Any]) -> list[Change]:
-    derived = installation_view(args, view, preset, servers)
+def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str],
+         servers: dict[str, Any]) -> tuple[list[Change], list[str]]:
+    """The changes this install makes, and a line for each MCP server it leaves out."""
+    derived, skipped = installation_view(args, view, preset, servers)
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
     home = Path.home()
     changes = []
     selected = selected_skills(args, preset)
     pack_skills = preset.pack.skills if preset.pack is not None else []
+    extensions = extension_lists(view / 'skills', selected, str(root / 'skills')) if 'skills' in args.components else {}
     for path in sorted(view.rglob('*')):
         if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
             continue
@@ -641,7 +680,10 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.suffix == '.md':
                 filled = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
-                                      strict=relative.parts[1] not in pack_skills).encode()
+                                      strict=relative.parts[1] not in pack_skills)
+                if relative.parts[2:] == ('SKILL.md',):
+                    filled = render_extensions(filled, relative.parts[1], extensions.get(relative.parts[1], []))
+                filled = filled.encode()
                 if filled != content:
                     derived.add(relative)
                 content = filled
@@ -675,7 +717,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         if identity in unique and unique[identity] != change:
             raise ValueError(f'Two selected components conflict: {change.target}')
         unique[identity] = change
-    return list(unique.values())
+    return list(unique.values()), skipped
 
 
 def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change], preset: Preset) -> list[Change]:
@@ -1088,12 +1130,14 @@ def plugin_conflicts(args: argparse.Namespace) -> list[str]:
 @dataclass(frozen=True)
 class Plan:
     """A previewed install: its summary rows, the changes apply makes (prepared), every record, no-ops
-    included, that current.json keeps, and the full plan --json prints (report)."""
+    included, that current.json keeps, the full plan --json prints (report), and the command that
+    syncs the team pack's mcp/ project once apply wrote it (none when no server installed runs it)."""
     rows: list[Row]
     prepared: list[tuple[Change, dict]]
     records: list[tuple[Change, dict]]
     collisions: list[tuple[str, bool]]
     report: dict[str, Any]
+    sync: list[str] | None = None
 
     @property
     def blocked(self) -> bool:
@@ -1130,7 +1174,8 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
     with tempfile.TemporaryDirectory(prefix='agent-kit-install-view-') as folder:
         view = Path(folder) / 'kit source'
         view.mkdir()
-        changes = plan(args, view, preset, from_preset, servers)
+        changes, left_out = plan(args, view, preset, from_preset, servers)
+        installed = json.loads((view / 'mcp/servers.json').read_text())['mcpServers'] if 'mcp' in args.components else {}
         records, collisions, skipped = [], [], []
         for change in changes:
             try:
@@ -1146,7 +1191,10 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
         routes = role_plan(args, view)
     prepared = [(change, record) for change, record in records if not record.get('noop')]
     deps = dependencies(args, servers)
-    notes = [*notes, *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped)]
+    notes = [*notes, *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped),
+             *(Row('Skipped', line) for line in left_out)]
+    packed = [spec for spec in installed.values() if '{{PACK_DIR}}' in json.dumps(spec)]
+    sync = [str(shutil.which('uv')), 'sync', '--frozen', '--no-dev', '--project', str(root / PACK_DIR / PACK_MCP)] if packed else None
     if preset.record and args.github_owner:
         notes.append(org_access(args.github_owner, args.zoekt_url))
     for rows in routes.values():
@@ -1174,7 +1222,9 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
             'auth': 'Reuse each provider login; no auth files are read or copied.',
             'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
             'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'}
-    return Plan(summary, prepared, records, collisions, report)
+    if sync:
+        report['mcp_sync'] = sync
+    return Plan(summary, prepared, records, collisions, report, sync)
 
 
 def configured(args: argparse.Namespace, preset: Preset, answered: set[str], preset_owned: set[str]) -> dict[str, Any]:
@@ -1261,11 +1311,30 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
         raise
     # The install's own copy: it rolls back while the checkout is mid-rebase or gone.
     undo = shlex.join([sys.executable, str(root / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
+    synced = sync_pack_mcp(planned.sync)
     if args.json:
-        output({'installed': len(records), 'journal': identifier, 'rollback': undo})
+        output({'installed': len(records), 'journal': identifier, 'rollback': undo,
+                **({'mcp_sync': synced} if synced else {})})
     else:
-        sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n')
+        sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n'
+                         + (f'MCP: {synced}\n' if synced else ''))
     return 0
+
+
+def sync_pack_mcp(command: list[str] | None) -> str | None:
+    """Run command, uv sync of the team pack's mcp/ project, and say how it went (None: nothing to
+    sync). The environment uv creates there (.venv) belongs to no record: neither drift nor a
+    collision. A failed sync leaves the install as it is; the server's own `uv run` retries it."""
+    if not command:
+        return None
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f'team pack mcp/ project not synced ({error}); rerun: {shlex.join(command)}'
+    if result.returncode:
+        reason = (result.stderr.strip().splitlines() or ['uv sync failed'])[-1]
+        return f'team pack mcp/ project not synced ({reason}); rerun: {shlex.join(command)}'
+    return f'team pack mcp/ project synced ({command[-1]})'
 
 
 def rollback(args: argparse.Namespace) -> int:

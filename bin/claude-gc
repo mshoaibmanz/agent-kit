@@ -82,21 +82,11 @@ fi
 
 roots_file="$artifacts/roots"
 discovery_incomplete="$artifacts/discovery-incomplete"
-if [ -n "${CODE_DIRS_JSON:-}" ]; then
-  python3 -c '
-import json,sys
-try:
-    roots=json.loads(sys.argv[1])
-    if not isinstance(roots,list) or not all(
-        isinstance(root,str) and root and not any(c in root for c in "\0\t\n\r")
-        for root in roots
-    ): raise ValueError()
-    sys.stdout.write("".join(root + "\n" for root in roots))
-except (ValueError,TypeError): sys.exit(1)
-' "$CODE_DIRS_JSON" > "$roots_file" || { log "invalid CODE_DIRS_JSON; housekeeping refused"; exit 1; }
+if [ -n "${CODE_DIRS_JSON:-}${CODE_DIRS:-}" ]; then
+  python3 "$KIT/hooks/lib/kit_env.py" code-dirs "${CODE_DIRS_JSON:-}" "${CODE_DIRS:-}" > "$roots_file" ||
+    { log "invalid CODE_DIRS_JSON; housekeeping refused"; exit 1; }
 else
   : > "$roots_file"
-  for root in ${CODE_DIRS:-}; do printf '%s\n' "$root" >> "$roots_file"; done
 fi
 
 # First file under a worktree matching a find predicate, skipping dependency and cache trees

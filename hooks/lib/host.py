@@ -73,6 +73,25 @@ def git_layer_env(
     return {"GIT_CONFIG_COUNT": str(index)} if index else {}
 
 
+
+def beside_user_layer(user: Mapping[str, str], values: dict[str, str]) -> dict[str, str]:
+    """values (a shell block git_layer_env laid out over the user's own variables) for a host whose
+    own settings (user) already set GIT_CONFIG_COUNT. The block cannot hold a second count, and
+    setup never edits the user's lines: the layer's keys are left out once the user's lines carry
+    its entry. ValueError naming the lines the user adds while they do not."""
+    if "GIT_CONFIG_COUNT" not in user or "GIT_CONFIG_COUNT" not in values:
+        return values
+    if values["GIT_CONFIG_COUNT"] != user["GIT_CONFIG_COUNT"]:
+        index = user["GIT_CONFIG_COUNT"]
+        raise ValueError(
+            f"your shell_environment_policy.set has its own GIT_CONFIG_COUNT. Add "
+            f'GIT_CONFIG_KEY_{index} = "core.hooksPath" and GIT_CONFIG_VALUE_{index} = '
+            f'"{values[f"GIT_CONFIG_VALUE_{index}"]}" there, set GIT_CONFIG_COUNT = '
+            f'"{values["GIT_CONFIG_COUNT"]}", and rerun'
+        )
+    return {key: value for key, value in values.items() if not key.startswith("GIT_CONFIG_")}
+
+
 def detect_host(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
     env = os.environ if env is None else env
     if "cursor_version" in payload or "conversation_id" in payload:

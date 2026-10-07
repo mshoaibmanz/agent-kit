@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
-from host import HOSTS, git_layer_env  # noqa: E402,F401  (the one host list; hooks/lib needs it standalone)
-from kit_env import kit_env, work_root  # noqa: E402
+from host import HOSTS, beside_user_layer, git_layer_env  # noqa: E402,F401  (the one host list; hooks/lib needs it standalone)
+from kit_env import code_dir, kit_env, work_root  # noqa: E402
 
 EVENTS = {
     "PreToolUse": "preToolUse",
@@ -36,6 +36,7 @@ SANDBOX_END = "# END agent-kit sandbox"
 # The components whose Codex render writes the sandbox block: both need the work root writable.
 SANDBOX_COMPONENTS = frozenset({"hooks", "mcp"})
 PLACEHOLDER = re.compile(r"\{\{([^{}]*)\}\}")
+PACK_DIR = "pack"  # the installed kit's copy of its team pack: {{PACK_DIR}}
 SUBAGENT_RESUME_MAX = 300000
 # Each host's global instructions file under its config root, the one the kit's rules reach.
 RULES_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "cursor": "rules/agent-kit.mdc"}
@@ -466,14 +467,15 @@ def fill(
     extra: dict[str, str] | None = None,
 ) -> str:
     """text with every {{NAME}} filled: AGENT_KIT_DIR and KIT_DIR (the kit), SKILLS_DIR, OVERLAY_DIR
-    (<kit>/local), RULES_FILE (the host's instructions file; host text only) and
-    SUBAGENT_RESUME_MAX_K, plus extra (an MCP command's CODE_DIR). An unknown one refuses: a literal
+    (<kit>/local), PACK_DIR (<kit>/pack), RULES_FILE (the host's instructions file; host text only),
+    SUBAGENT_RESUME_MAX_K, and extra (an MCP command's CODE_DIR). An unknown one refuses: a literal
     {{...}} would reach the model as a path it cannot open. Not strict (a team pack's text, where
     {{...}} is often a CI or template example), an unknown one stays as written."""
     names = {match.group(1) for match in PLACEHOLDER.finditer(text)}
     if not names:
         return text
     values = {"AGENT_KIT_DIR": kit, "KIT_DIR": kit, "SKILLS_DIR": f"{kit}/skills", "OVERLAY_DIR": f"{kit}/local"}
+    values["PACK_DIR"] = f"{kit}/{PACK_DIR}"
     values.update(extra or {})
     if host:
         values["RULES_FILE"] = rules_file(host, host_root)
@@ -489,21 +491,6 @@ def fill(
             + "; known: " + ", ".join("{{" + name + "}}" for name in known)
         )
     return PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), text)
-
-
-def code_dir(roots: list[str] | None = None) -> str:
-    """{{CODE_DIR}}: the first repository parent folder (roots, else the overlay's CODE_DIRS_JSON,
-    else its CODE_DIRS), ~ expanded; '' when none is set."""
-    if roots is None:
-        env = kit_env()
-        try:
-            roots = json.loads(env.get("CODE_DIRS_JSON") or "null") or env.get("CODE_DIRS", "").split()
-        except ValueError:
-            roots = []
-    if not isinstance(roots, list):
-        roots = []
-    first = next((root for root in roots or [] if isinstance(root, str) and root.strip()), "")
-    return os.path.expanduser(first.strip()).rstrip("/") if first else ""
 
 
 def fill_servers(servers: dict[str, Any], kit: str, code: str | None = None) -> dict[str, Any]:
@@ -556,9 +543,7 @@ def install_text(
 
 
 def toml_sandbox(roots: list[str]) -> str:
-    if not roots:
-        return ""
-    return f"[sandbox_workspace_write]\nwritable_roots = {json.dumps(roots)}\n"
+    return f"[sandbox_workspace_write]\nwritable_roots = {json.dumps(roots)}\n" if roots else ""
 
 
 def toml_servers(servers: dict[str, Any]) -> str:
@@ -761,18 +746,10 @@ def render(api: Any, args: Any) -> int:
             policy = config.get("shell_environment_policy", {})
             user_set = policy.get("set", {}) if isinstance(policy.get("set"), dict) else {}
             values = shell_env(api.KIT, host, user_set)
-            if "GIT_CONFIG_COUNT" in user_set and "GIT_CONFIG_COUNT" in values:
-                # The kit's block cannot hold a GIT_CONFIG_COUNT beside the user's own, and setup
-                # never edits the user's lines: the user adds the layer's entry to theirs.
-                if values["GIT_CONFIG_COUNT"] != user_set["GIT_CONFIG_COUNT"]:
-                    index = user_set["GIT_CONFIG_COUNT"]
-                    raise SystemExit(
-                        f"agent-kit: your shell_environment_policy.set has its own GIT_CONFIG_COUNT. Add "
-                        f'GIT_CONFIG_KEY_{index} = "core.hooksPath" and GIT_CONFIG_VALUE_{index} = '
-                        f'"{values[f"GIT_CONFIG_VALUE_{index}"]}" there, set GIT_CONFIG_COUNT = '
-                        f'"{values["GIT_CONFIG_COUNT"]}", and rerun; nothing written'
-                    )
-                values = {key: value for key, value in values.items() if not key.startswith("GIT_CONFIG_")}
+            try:
+                values = beside_user_layer(user_set, values)
+            except ValueError as error:
+                raise SystemExit(f"agent-kit: {error}; nothing written") from None
             filters = policy.get("filters", {})
             if filters and any(key in policy for key in ("include_only", "exclude")):
                 raise SystemExit(

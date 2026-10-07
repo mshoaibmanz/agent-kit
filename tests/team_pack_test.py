@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -545,10 +546,20 @@ exit 1''')
             'a bare clone root': ('[mcp.servers.x]\ncommand = "{{CODE_DIR}}/server"\n', 'a local clone command is'),
             'an unknown placeholder': ('[mcp.servers.x]\ncommand = "{{HOME}}/bin/server"\n',
                                        'unknown command placeholder HOME'),
+            'an unknown placeholder in an arg': ('[mcp.servers.x]\ncommand = "uv"\nargs = ["{{HOME}}/mcp"]\n',
+                                                 'unknown command placeholder HOME'),
+            'a pack path that climbs out': ('[mcp.servers.x]\ncommand = "uv"\nargs = ["--project", "{{PACK_DIR}}/../../bin"]\n',
+                                            'a team pack path is {{PACK_DIR}}/<path>, without ..'),
+            'a bare pack root': ('[mcp.servers.x]\ncommand = "{{PACK_DIR}}"\n', 'a team pack path is'),
             'a Sentry instance without a keychain service': ('[sentry.instances.main]\nhost = "sentry.example.com"\n',
-                                                             '[sentry] takes [sentry.instances.<name>]'),
+                                                             '[sentry]: Sentry instance main needs a keychain service'),
             'a Sentry keychain service a shell would split': (
-                '[sentry.instances.main]\nhost = "sentry.example.com"\nkeychain = "k; curl x"\n', '[sentry] takes'),
+                '[sentry.instances.main]\nhost = "sentry.example.com"\nkeychain = "k; curl x"\n',
+                '[sentry]: Sentry instance main needs a keychain service'),
+            'two Sentry instances on one server': (
+                '[sentry.instances.a]\nhost = "a.example.com"\nkeychain = "k"\nserver = "Sentry-X"\n'
+                '[sentry.instances.b]\nhost = "b.example.com"\nkeychain = "k2"\nserver = "sentry-x"\n',
+                '[sentry]: Sentry instances must each name a different MCP server'),
             'a token in a Sentry instance': (
                 f'[sentry.instances.main]\nhost = "sentry.example.com"\nkeychain = "k"\nnote = "{TOKEN}"\n',
                 '[sentry] looks like it holds an inline secret'),
@@ -627,6 +638,111 @@ exit 1''')
                 self.gh_archive([skill, ('skills/team-a/Notes.md', b'one\n'), ('skills/team-a/Nótes.md', b'one\n'), extra])
                 self.refused(GH, expected)
 
+
+    def test_a_skill_that_extends_debug_is_listed_in_debug_on_every_host(self) -> None:
+        hosts = ('claude', 'codex', 'cursor')
+        for host in hosts:
+            self.host_cli(host)
+        pack = self.pack()
+        (pack / 'skills/team-data').mkdir()
+        (pack / 'skills/team-data/SKILL.md').write_text(
+            '---\nname: team-data\nextends: debug\ndescription: >\n  Team schemas and\n  tunnels.\n---\n')
+        flags = ('--hosts', *hosts, '--components', 'rules', 'skills', '--apply')
+        self.setup('--preset', str(pack), *flags)
+        line = f'- `team-data`: Team schemas and tunnels. Read {self.root}/skills/team-data/SKILL.md.'
+        for host in hosts:
+            with self.subTest(host):
+                debug = (self.home / f'.{host}/skills/debug/SKILL.md').read_text()
+                self.assertIn(line, debug)
+                self.assertNotIn('<!-- agent-kit: extensions -->', debug)
+                self.assertNotIn('team-howto', debug, 'a skill that does not extend debug is listed')
+        (pack / 'skills/team-data/SKILL.md').write_text('---\nname: team-data\ndescription: Team data.\n---\n')
+        self.setup('--preset', str(pack), *flags)
+        self.assertIn('No installed skill extends debug.', (self.home / '.codex/skills/debug/SKILL.md').read_text())
+
+    def test_a_server_left_out_for_a_missing_command_is_listed_under_skipped(self) -> None:
+        self.host_cli('claude')
+        code = self.home / 'Code'
+        code.mkdir()
+        pack = self.pack()
+        (pack / 'agent-kit-preset.toml').write_text(
+            f'[kit]\nCODE_DIRS_JSON = ["{code}"]\n'
+            '[mcp.servers.absent]\ncommand = "{{CODE_DIR}}/absent-mcp/.venv/bin/absent-mcp"\n'
+            '[mcp.servers.packed]\ncommand = "uv"\nargs = ["run", "--project", "{{PACK_DIR}}/mcp", "packed-mcp"]\n')
+        result = self.setup('--preset', str(pack), '--hosts', 'claude', '--components', 'rules', 'mcp')
+        skipped = result.stdout.split('Skipped:\n')[1]
+        self.assertIn(f'MCP server absent: {code}/absent-mcp/.venv/bin/absent-mcp is not an executable in your clone yet', skipped)
+        self.assertIn('MCP server packed: the team pack has no mcp/ project for {{PACK_DIR}}', skipped)
+        self.write_mcp_project(pack / 'mcp')
+        result = self.setup('--preset', str(pack), '--hosts', 'claude', '--components', 'rules', 'mcp', '--apply')
+        self.assertIn("MCP server packed: uv is missing, which syncs the team pack's mcp/ project", result.stdout)
+        self.assertFalse((self.home / '.claude/mcp.json').exists(), 'a server that cannot start was installed')
+
+    def write_mcp_project(self, folder: Path, lock: bool = False) -> None:
+        """A uv project whose console script answers an MCP initialize request on stdin, with the
+        local leftovers a pack copy leaves out; its uv.lock written by the real uv when lock."""
+        (folder / 'src/team_tools_mcp').mkdir(parents=True)
+        (folder / 'pyproject.toml').write_text(
+            '[project]\nname = "team-tools-mcp"\nversion = "0.1.0"\nrequires-python = ">=3.9"\n'
+            '[project.scripts]\nteam-tools-mcp = "team_tools_mcp:main"\n'
+            '[build-system]\nrequires = ["uv_build>=0.8"]\nbuild-backend = "uv_build"\n')
+        (folder / 'src/team_tools_mcp/__init__.py').write_text(
+            'import json\nimport sys\n\n\ndef main() -> None:\n    request = json.loads(sys.stdin.readline())\n'
+            '    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"protocolVersion": '
+            'request["params"]["protocolVersion"], "capabilities": {}, "serverInfo": {"name": "team-tools", "version": "0.1.0"}}}))\n')
+        if not lock:
+            (folder / 'uv.lock').write_text('version = 1\n')
+        if lock:
+            subprocess.run([shutil.which('uv') or 'uv', 'lock', '--project', str(folder)], check=True, capture_output=True,
+                           env={**self.uv_env(), 'PATH': '/usr/bin:/bin'})
+        for leftover in ('.venv/bin/python', '__pycache__/x.pyc', '.ruff_cache/x', '.pytest_cache/x'):
+            (folder / leftover).parent.mkdir(parents=True, exist_ok=True)
+            (folder / leftover).write_text('local\n')
+
+    def uv_env(self) -> dict[str, str]:
+        """uv offline from a Python download, with a TMPDIR of its own: it keeps a lock file there."""
+        (self.home / 'tmp').mkdir(exist_ok=True)
+        return {'HOME': str(self.home), 'UV_PYTHON': sys.executable, 'UV_PYTHON_DOWNLOADS': 'never',
+                'TMPDIR': str(self.home / 'tmp')}
+
+    def test_a_pack_bundled_mcp_server_is_synced_and_runs_from_its_rendered_command(self) -> None:
+        if not shutil.which('uv'):
+            if os.environ.get('CI'):
+                self.fail('uv is not installed on this CI runner')
+            self.skipTest('uv is not installed')
+        self.host_cli('claude')
+        self.link('uv')
+        pack = self.pack()
+        self.write_mcp_project(pack / 'mcp', lock=True)
+        (pack / 'agent-kit-preset.toml').write_text(
+            '[mcp.servers.pack-tools]\ncommand = "uv"\n'
+            'args = ["run", "--project", "{{PACK_DIR}}/mcp", "--frozen", "--no-dev", "team-tools-mcp"]\n')
+        flags = ('--preset', str(pack), '--hosts', 'claude', '--components', 'rules', 'mcp', '--apply')
+        result = self.setup(*flags, env=self.uv_env())
+        project = self.root / 'pack/mcp'
+        self.assertIn(f'MCP: team pack mcp/ project synced ({project})', result.stdout)
+        kept = [record['target'] for record in self.state()['managed'].values() if str(project) in record['target']]
+        self.assertEqual(sorted(Path(target).relative_to(project).as_posix() for target in kept),
+                         ['pyproject.toml', 'src/team_tools_mcp/__init__.py', 'uv.lock'])
+        server = json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers']['pack-tools']
+        self.assertEqual(server['command'], str(self.shim / 'uv'), 'not the uv setup found on its PATH')
+        self.assertEqual(server['args'][:3], ['run', '--project', str(project)])
+        request = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                   'params': {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 't', 'version': '0'}}}
+        # A host started from the Dock: no ~/.local/bin on PATH.
+        answer = subprocess.run([server['command'], *server['args']], input=json.dumps(request) + '\n', capture_output=True,
+                                text=True, timeout=120, env={**self.uv_env(), 'PATH': '/usr/bin:/bin'})
+        self.assertEqual(answer.returncode, 0, answer.stderr)
+        self.assertEqual(json.loads(answer.stdout)['result']['serverInfo']['name'], 'team-tools')
+
+        # The environment uv made in the pack copy is neither drift nor a collision.
+        self.assertTrue((project / '.venv').is_dir())
+        self.assertEqual(self.doctor()['drift'], [])
+        rerun = self.setup(*flags, env=self.uv_env())
+        self.assertIn('Installed 0 changes', rerun.stdout)
+        self.assertEqual(self.doctor()['drift'], [])
+        self.assertEqual([path.name for path in (self.home / 'tmp').iterdir() if not path.name.startswith('uv-')], [],
+                         'setup left files in TMPDIR')
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(TeamPackTests)

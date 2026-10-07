@@ -39,6 +39,14 @@ url = "https://mcp.example.com/mcp"
 # [mcp.servers.tools]
 # command = "{{CODE_DIR}}/tools-mcp/.venv/bin/tools-mcp"
 
+# A server the team pack bundles: its mcp/ folder is a uv project (pyproject.toml and uv.lock).
+# {{PACK_DIR}} is the pack's copy in each user's kit. Setup runs `uv sync --frozen --no-dev` on it,
+# writes uv's absolute path as the command (an app started from the Dock has no ~/.local/bin on its
+# PATH), and leaves the server out, listed under Skipped, while uv is missing.
+# [mcp.servers.pack-tools]
+# command = "uv"
+# args = ["run", "--project", "{{PACK_DIR}}/mcp", "--frozen", "--no-dev", "team-tools-mcp"]
+
 # [mcp.servers.sentry]
 # command = "{{KIT_DIR}}/bin/sentry-mcp"
 # args = ["--host=sentry.example.com", "--disable-skills=seer"]

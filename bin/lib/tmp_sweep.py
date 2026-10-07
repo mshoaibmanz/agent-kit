@@ -21,6 +21,7 @@ from typing import Iterator, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
 from agent_task import DONE_STATUSES, read_task  # noqa: E402
+from kit_env import kit_env, work_root as overlay_work_root  # noqa: E402
 
 DEFAULT_DAYS = 14
 MAX_SALVAGE = 1024 * 1024
@@ -45,18 +46,14 @@ class Entry(NamedTuple):
 
 
 def work_root() -> Path:
-    from kit_env import work_root as resolve
-
-    return Path(resolve())
+    return Path(overlay_work_root())
 
 
 def sweep_days() -> int:
     """TMP_SWEEP_DAYS from the overlay, else DEFAULT_DAYS."""
     try:
-        from kit_env import kit_env
-
         raw = kit_env().get("TMP_SWEEP_DAYS", "")
-    except (ImportError, OSError):
+    except OSError:
         raw = ""
     return int(raw) if raw.strip().isdigit() else DEFAULT_DAYS
 

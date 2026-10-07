@@ -48,6 +48,11 @@ import time
 from collections.abc import Callable, Iterator
 from typing import Any, NamedTuple, NoReturn
 
+sys.dont_write_bytecode = True
+# bin/lib beside this script, through any link to it (a plugin's bin/, a dev install's link).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import secret_store  # noqa: E402
+
 ALLOWED_FIRST = {"select", "show", "explain", "describe", "desc", "with"}
 
 SSH_CONFIG = os.path.expanduser("~/.ssh/config")
@@ -65,7 +70,6 @@ SYSTEM_SCHEMAS = {"information_schema", "mysql", "performance_schema", "sys"}
 CACHE_COLUMNS = ("alias", "port", "kind", "checked", "via", "databases")
 LOCAL_HOSTS = {"127.0.0.1", "localhost"}
 SSH_TIMEOUT_S = 30
-SECURITY = "/usr/bin/security"
 # The only clients ro-mysql runs. A binary picked from the environment or PATH would receive the
 # credential (a Keychain password, or a login path whose user can write) after every check passed.
 CLIENT_CANDIDATES = (
@@ -73,22 +77,6 @@ CLIENT_CANDIDATES = (
     "/usr/local/opt/mysql-client/bin/mysql",
     "/usr/bin/mysql",  # Linux distribution packages: root-owned, not picked from PATH
 )
-SECRET_TOOL_PATHS = ("/usr/bin/secret-tool", "/usr/local/bin/secret-tool")
-
-
-def secret_store() -> str:
-    """Where passwords live: the macOS Keychain, libsecret's secret-tool on Linux, else environment
-    variables (env_name). A store without the item also falls back to the variable."""
-    if os.path.exists(SECURITY):
-        return "keychain"
-    if any(os.path.exists(path) for path in SECRET_TOOL_PATHS):
-        return "secret-tool"
-    return "env"
-
-
-def secret_tool() -> str:
-    return next(path for path in SECRET_TOOL_PATHS if os.path.exists(path))
-
 
 def env_name(account: str) -> str:
     """RO_MYSQL_PASSWORD_ plus the account with letters and digits kept and every other byte as _XX
@@ -459,39 +447,26 @@ def keychain_get(account: str) -> str | None:
 
 
 def store_get(account: str) -> str | None:
-    store = secret_store()
-    if store == "env":
+    """The account's password from the store (secret_store), without the newline the store ends it with."""
+    code, raw = secret_store.lookup(KEYCHAIN_SERVICE, account, reveal=True)
+    if code != 0:
         return None
-    if store == "secret-tool":
-        command = [secret_tool(), "lookup", "service", KEYCHAIN_SERVICE, "account", account]
-        try:
-            r = subprocess.run(command, capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        return (r.stdout.rstrip("\n") or None) if r.returncode == 0 else None
-    try:
-        r = subprocess.run(
-            [SECURITY, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if r.returncode != 0:
-        return None
-    return r.stdout[:-1] if r.stdout.endswith("\n") else r.stdout
+    if secret_store.store() == "secret-tool":
+        return raw.rstrip("\n") or None
+    return raw[:-1] if raw.endswith("\n") else raw
 
 
 def keychain_set(account: str, password: str) -> bool:
     """Store via `security -i` on stdin, hex-encoded, so the password never enters argv."""
     if not DB_USER_RE.fullmatch(account):
         return False
-    store = secret_store()
+    store = secret_store.store()
     if store == "env":
         print(f"  no Keychain or secret-tool here: export {env_name(account)} in your shell profile instead", file=sys.stderr)
         return False
     if store == "secret-tool":
         try:
-            r = subprocess.run([secret_tool(), "store", f"--label=ro-mysql {account}", "service", KEYCHAIN_SERVICE,
+            r = subprocess.run([secret_store.secret_tool(), "store", f"--label=ro-mysql {account}", "service", KEYCHAIN_SERVICE,
                                 "account", account], input=password, capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             return False
@@ -499,7 +474,7 @@ def keychain_set(account: str, password: str) -> bool:
     line = f"add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -X {password.encode().hex()}\n"
     try:
         r = subprocess.run(
-            [SECURITY, "-i"], input=line, capture_output=True, text=True, timeout=10
+            [secret_store.SECURITY, "-i"], input=line, capture_output=True, text=True, timeout=10
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -1003,16 +978,9 @@ def refresh(tunnels: list[Tunnel], path: str = CACHE) -> None:
 
 
 def keychain_has(account: str) -> bool:
-    if secret_store() != "keychain":
+    if secret_store.store() != "keychain":
         return keychain_get(account) is not None
-    try:
-        r = subprocess.run(
-            [SECURITY, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account],
-            capture_output=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return r.returncode == 0
+    return secret_store.lookup(KEYCHAIN_SERVICE, account, reveal=False)[0] == 0
 
 
 def show_tunnels(tunnels: list[Tunnel], do_refresh: bool) -> None:

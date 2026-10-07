@@ -71,8 +71,8 @@ class Fixture(unittest.TestCase):
         self.security = script(self.root / "fake/security", FAKE_SECURITY)
         self.saved = {k: os.environ.get(k) for k in ("KIT_ENV", "FAKE_ITEMS")}
         os.environ.update(KIT_ENV=str(self.overlay / "kit.env"), FAKE_ITEMS=str(self.items))
-        self.saved_security = sentry.SECURITY
-        sentry.SECURITY = str(self.security)
+        self.saved_security = sentry.secret_store.SECURITY
+        sentry.secret_store.SECURITY = str(self.security)
         self.beta_item = "agent-kit-test/sentry-beta"
         self.write(
             self.kit / "mcp" / sentry.INSTANCES_FILE,
@@ -84,7 +84,7 @@ class Fixture(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        sentry.SECURITY = self.saved_security
+        sentry.secret_store.SECURITY = self.saved_security
         for key, value in self.saved.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -203,9 +203,9 @@ class Preset(unittest.TestCase):
 
 class Wrapper(Fixture):
     def install(self, *names: str) -> None:
-        for name in (*names, "lib/sentry.py"):
+        for name in (*names, "lib/sentry.py", "lib/secret_store.py"):
             shutil.copy2(SOURCE / "bin" / name, self.kit / "bin" / name)
-        lib = self.kit / "bin/lib/sentry.py"
+        lib = self.kit / "bin/lib/secret_store.py"
         text = lib.read_text().replace('SECURITY = "/usr/bin/security"', f'SECURITY = "{self.security}"')
         self.assertIn(str(self.security), text)
         lib.write_text(text)

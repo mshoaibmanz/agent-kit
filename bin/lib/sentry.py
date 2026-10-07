@@ -8,10 +8,12 @@ import copy
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
+
+import secret_store
+from secret_store import ITEM_NOT_FOUND
 
 SAFE_ENV = frozenset(("SENTRY_HOST", "MCP_URL", "MCP_SKILLS", "MCP_DISABLE_SKILLS", "EMBEDDED_AGENT_PROVIDER"))
 TOKEN_OPTIONS = frozenset(("--access-token", "--token"))
@@ -22,27 +24,11 @@ TEMPLATE_SERVER = "sentry"
 LEGACY_SERVICE = "agent-kit/mcp/sentry"
 ACCOUNT = "sentry"
 TOKEN_ENV = "SENTRY_ACCESS_TOKEN"
-# Root-owned fixed paths, never one from PATH (bin/ro-mysql keeps the same two lists).
-SECURITY = "/usr/bin/security"
-SECRET_TOOL_PATHS = ("/usr/bin/secret-tool", "/usr/local/bin/secret-tool")
-# `security` exits 44 (errSecItemNotFound) when no item matches; any other failure is a denial or a
-# locked Keychain.
-ITEM_NOT_FOUND = 44
 LABELS = ("prod", "staging")
 INSTANCE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 # The service name is printed inside a shell command the user copies, so it stays shell-safe.
 SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 HOST = re.compile(r"(https?://)?[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?")
-
-
-def secret_store() -> str:
-    """Where tokens live: the macOS Keychain, libsecret's secret-tool on Linux, else environment
-    variables. A store without the item also falls back to the variable."""
-    if os.path.exists(SECURITY):
-        return "keychain"
-    if any(os.path.exists(path) for path in SECRET_TOOL_PATHS):
-        return "secret-tool"
-    return "env"
 
 
 @dataclass
@@ -69,7 +55,7 @@ class Instance:
             c.upper() if c.isascii() and c.isalnum() else f"_{ord(c):02X}" for c in self.name)
 
     def enable_command(self, store: Optional[str] = None) -> str:
-        store = store or secret_store()
+        store = store or secret_store.store()
         if store == "keychain":
             return f"security add-generic-password -s {self.keychain} -a {ACCOUNT} -w"
         if store == "secret-tool":
@@ -77,7 +63,7 @@ class Instance:
         return f"export {self.env_name}=<token> in your shell profile"
 
     def missing(self, store: Optional[str] = None) -> str:
-        store = store or secret_store()
+        store = store or secret_store.store()
         if store == "keychain":
             return f"no Keychain item {self.keychain}"
         if store == "secret-tool":
@@ -179,24 +165,10 @@ def default_instance(instances: Dict[str, Instance]) -> Instance:
 
 
 def _store_lookup(service: str, reveal: bool) -> "tuple[int, str]":
-    """(exit code, secret or "") from the store; 0 means found. Without reveal the Keychain is
-    asked for attributes only, never the secret."""
-    store = secret_store()
-    if store == "env":
-        return ITEM_NOT_FOUND, ""
-    if store == "keychain":
-        command = [SECURITY, "find-generic-password", "-s", service, "-a", ACCOUNT, *(["-w"] if reveal else [])]
-    else:
-        tool = next(path for path in SECRET_TOOL_PATHS if os.path.exists(path))
-        command = [tool, "lookup", "service", service, "account", ACCOUNT]
-    try:
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=120 if reveal else 10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return 1, ""
-    secret = proc.stdout.strip()
-    if store == "secret-tool" and (proc.returncode != 0 or not secret):
-        return ITEM_NOT_FOUND, ""  # secret-tool exits 1 for a missing item and for a refusal alike
-    return proc.returncode, secret if reveal else ""
+    """(exit code, token or ""); 0 means found (secret_store.lookup). A revealing read may wait on
+    a Keychain prompt."""
+    code, raw = secret_store.lookup(service, ACCOUNT, reveal, timeout=120 if reveal else 10)
+    return code, raw.strip()
 
 
 def token_present(inst: Instance) -> bool:

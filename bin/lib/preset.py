@@ -30,9 +30,13 @@ KEY_FORMS = {
 }
 PRESET_KIT_KEYS = (*PRESET_ANSWERS, 'REVIEW_BASE', 'RELEASE_BRANCH_RE', 'BQRO_PROJECT', 'GIT_AUTHOR',
                    'SUBAGENT_RESUME_MAX', *KEY_FORMS)
-# MCP command placeholders: the kit, and a local clone under the first repository root.
-COMMAND_PLACEHOLDERS = {'KIT_DIR', 'AGENT_KIT_DIR', 'CODE_DIR'}
-CODE_DIR_COMMAND = re.compile(r'\{\{CODE_DIR\}\}(/[A-Za-z0-9_.-]+){2,}')
+# MCP command placeholders: the kit, a local clone under the first repository root, and the team
+# pack's kept copy (its mcp/ project).
+COMMAND_PLACEHOLDERS = {'KIT_DIR', 'AGENT_KIT_DIR', 'CODE_DIR', 'PACK_DIR'}
+# Each a path in its folder: a clone's command is <repo>/<path>, a pack path any path below the pack.
+PLACEHOLDER_PATHS = {'CODE_DIR': (re.compile(r'\{\{CODE_DIR\}\}(/[A-Za-z0-9_.-]+){2,}'), '{{CODE_DIR}}/<repo>/<path>'),
+                     'PACK_DIR': (re.compile(r'\{\{PACK_DIR\}\}(/[A-Za-z0-9_.-]+)+'), '{{PACK_DIR}}/<path>')}
+PLACED_PATH = re.compile(r'\{\{[A-Z_]+\}\}/[A-Za-z0-9_.-]+')
 # [plugins.<name>]: a Claude Code plugin setup enables, from a marketplace that is a GitHub repo.
 PLUGIN_NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 PLUGIN_SOURCE = re.compile(rf'github:{_NAME}/{_NAME}')
@@ -42,18 +46,26 @@ def inline_secret(text: str) -> bool:
     return holds_secret(text)
 
 
-def check_command(name: str, command: Any) -> None:
-    """Refuse an MCP command placeholder other than COMMAND_PLACEHOLDERS, and a {{CODE_DIR}} command
-    that is not {{CODE_DIR}}/<repo>/<path> or climbs out of it with `..`."""
-    if not isinstance(command, str):
-        return
-    names = set(re.findall(r'\{\{([^{}]*)\}\}', command))
-    if names - COMMAND_PLACEHOLDERS:
-        raise ValueError(f'MCP {name}: unknown command placeholder {", ".join(sorted(names - COMMAND_PLACEHOLDERS))}; '
-                         f'known: {", ".join(sorted(COMMAND_PLACEHOLDERS))}')
-    if 'CODE_DIR' in names and (not CODE_DIR_COMMAND.fullmatch(command) or '..' in command.split('/')):
-        raise ValueError(f'MCP {name}: a local clone command is {{{{CODE_DIR}}}}/<repo>/<path to the server>, '
-                         f'without .. ({command})')
+def check_command(name: str, command: Any, arguments: Any = ()) -> None:
+    """Refuse an MCP command or argument placeholder other than COMMAND_PLACEHOLDERS, a {{CODE_DIR}} or
+    {{PACK_DIR}} command that is not a path in its folder, and either one followed by no path or
+    beside a `..` that climbs out of it."""
+    values = [command, *(arguments if isinstance(arguments, list) else [])]
+    for index, value in enumerate(values):
+        if not isinstance(value, str):
+            continue
+        names = set(re.findall(r'\{\{([^{}]*)\}\}', value))
+        if names - COMMAND_PLACEHOLDERS:
+            raise ValueError(f'MCP {name}: unknown command placeholder {", ".join(sorted(names - COMMAND_PLACEHOLDERS))}; '
+                             f'known: {", ".join(sorted(COMMAND_PLACEHOLDERS))}')
+        for placeholder, (form, shape) in PLACEHOLDER_PATHS.items():
+            if placeholder not in names:
+                continue
+            starts = [match.start() for match in re.finditer(re.escape(f'{{{{{placeholder}}}}}'), value)]
+            placed = form.fullmatch(value) if index == 0 else all(PLACED_PATH.match(value, start) for start in starts)
+            if not placed or '..' in re.split(r'[/=]', value):
+                what = 'a local clone command' if placeholder == 'CODE_DIR' else 'a team pack path'
+                raise ValueError(f'MCP {name}: {what} is {shape}, without .. ({value})')
 
 
 def plugin_table(table: dict[str, Any]) -> bool:
@@ -97,7 +109,7 @@ def validate_catalog(catalog: Any) -> dict[str, Any]:
         if 'args' in normalized and ('command' not in normalized or not isinstance(normalized['args'], list)
                                     or not all(isinstance(value, str) for value in normalized['args'])):
             raise ValueError('MCP args must be strings on a command transport')
-        check_command(name, normalized.get('command'))
+        check_command(name, normalized.get('command'), normalized.get('args', []))
         servers[name] = normalized
     return {'mcpServers': servers}
 
@@ -113,16 +125,16 @@ def _kit(table: dict[str, Any]) -> bool:
 
 
 def sentry_table(table: dict[str, Any]) -> bool:
-    """[sentry.instances.<name>]: each instance as mcp/sentry-instances.json holds it."""
+    """[sentry.instances.<name>]: each instance as mcp/sentry-instances.json holds it. ValueError
+    (check_instance's) for a malformed one, or two that name the same server."""
     instances = table.get('instances', {})
     if set(table) - {'instances'} or not isinstance(instances, dict):
         return False
-    try:
-        for name, spec in instances.items():
-            check_instance(name, spec if isinstance(spec, dict) else {})
-    except ValueError:
-        return False
-    return len({str(spec.get('server') or f'sentry-{name}').lower() for name, spec in instances.items()}) == len(instances)
+    servers = [check_instance(name, spec if isinstance(spec, dict) else {}).server.lower()
+               for name, spec in instances.items()]
+    if len(set(servers)) != len(servers):
+        raise ValueError('Sentry instances must each name a different MCP server')
+    return True
 
 
 def check_forms(table: dict[str, Any], spec: str) -> None:
@@ -159,7 +171,11 @@ def validate_preset(preset: dict[str, Any], spec: str) -> None:
         raise ValueError(f'preset {spec}: unknown table(s) {", ".join(sorted(unknown))}; expected {", ".join(PRESET_SCHEMA)}')
     for table, value in preset.items():
         takes, check = PRESET_SCHEMA[table]
-        if not isinstance(value, dict) or not check(value):
+        try:
+            valid = isinstance(value, dict) and check(value)
+        except ValueError as error:
+            raise ValueError(f'preset {spec}: [{table}]: {error}') from None
+        if not valid:
             raise ValueError(f'preset {spec}: [{table}] takes {takes}')
     for key, value in preset.get('kit', {}).items():
         if any(inline_secret(item) for item in (value if isinstance(value, list) else [value])):

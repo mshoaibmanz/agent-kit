@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import sys
 
 _HOOK_IO = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hook-io")
 
@@ -105,3 +107,39 @@ def kit_env(path: str | None = None) -> dict[str, str]:
             continue
         out.update((key, value) for key, value in parse(text).items() if key in out)
     return out
+
+
+def code_dirs(values: dict[str, str] | None = None) -> list[str]:
+    """The repository parent folders as the overlay writes them (values, else kit_env()): the JSON
+    list CODE_DIRS_JSON when it is set, [] included, else the legacy space-separated CODE_DIRS; ~ is
+    not expanded. ValueError: a CODE_DIRS_JSON that is not a list of non-empty one-line strings."""
+    values = kit_env() if values is None else values
+    if not values.get("CODE_DIRS_JSON"):
+        return (values.get("CODE_DIRS") or "").split()
+    roots = json.loads(values["CODE_DIRS_JSON"])
+    if not isinstance(roots, list) or not all(
+        isinstance(root, str) and root and not any(c in root for c in "\0\t\n\r") for root in roots
+    ):
+        raise ValueError("CODE_DIRS_JSON must be a JSON list of folder paths")
+    return roots
+
+
+def code_dir(roots: list[str] | None = None) -> str:
+    """{{CODE_DIR}}: the first repository parent folder (roots, else code_dirs(), '' when that is
+    invalid), ~ expanded; '' when none is set."""
+    if roots is None:
+        try:
+            roots = code_dirs()
+        except ValueError:
+            roots = []
+    first = next((root for root in roots if isinstance(root, str) and root.strip()), "")
+    return os.path.expanduser(first.strip()).rstrip("/") if first else ""
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["code-dirs"]:
+    # Shell callers (claude-gc): CODE_DIRS_JSON and CODE_DIRS as given, one root per line; exit 1
+    # when CODE_DIRS_JSON is invalid.
+    try:
+        sys.stdout.write("".join(root + "\n" for root in code_dirs(dict(zip(("CODE_DIRS_JSON", "CODE_DIRS"), sys.argv[2:4])))))
+    except (ValueError, TypeError):
+        sys.exit(1)

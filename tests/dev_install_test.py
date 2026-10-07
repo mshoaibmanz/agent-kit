@@ -407,6 +407,9 @@ class DevInstallTests(PackRepos):
         # The installed tools and hooks import from the checkout; none may leave bytecode in it.
         environment.pop('PYTHONDONTWRITEBYTECODE', None)
         run(str(self.root / 'bin/agent-kit'), 'roles')
+        # ro-mysql is a link into the checkout here: it finds bin/lib (secret_store) beside its target.
+        self.assertTrue((self.root / 'bin/ro-mysql').is_symlink())
+        self.assertIn('usage: ro-mysql', run(str(self.root / 'bin/ro-mysql')))
         run(str(self.root / 'hooks/host-adapter'), 'codex', 'edit-guard', payload=json.dumps(
             {'hook_event_name': 'PreToolUse', 'tool_name': 'apply_patch', 'cwd': str(self.home),
              'tool_input': {'command': '*** Begin Patch\n*** Add File: notes.txt\n+x\n*** End Patch\n'}}))

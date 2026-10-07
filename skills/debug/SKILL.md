@@ -12,11 +12,16 @@ is the cost-free current-state source. **Fall back to BigQuery** (`bqro`, see
 `references/bigquery.md`) when no MySQL connection exists for that system, and always for binlog
 history, cross-day aggregation and heavy analytics.
 
-## Company knowledge lives in the overlay
+## Company knowledge lives in the skills that extend this one
 
 This skill holds the method. Hosts, schemas, datasets, business keys, enum codes and ready-made
-queries are company data and live in `~/.claude/local/debug/`. Before the first query, list that
-directory and read every `*.md` in it:
+queries are company data. They live in skills that declare `extends: debug` in their frontmatter,
+usually a team pack's. Setup lists the installed ones here:
+
+<!-- agent-kit: extensions -->
+
+Before the first query, read the SKILL.md of every skill listed and the files it names. A company
+extension typically carries:
 
 - `domain.md`: the systems, the schema source of truth, the business keys that bridge systems,
   and worked examples behind the traps below.
@@ -25,7 +30,10 @@ directory and read every `*.md` in it:
 - `query-catalog.md`: ready composites. Lead with one over N single-table lookups.
 - `scripts/`: company tools the catalog names. Run the script rather than re-deriving its queries.
 
-On a company fact the overlay wins; the safety rules in this skill always hold. With no overlay,
+The older overlay folder `~/.claude/local/debug/` is a fallback: when it exists, list it and read
+every `*.md` in it too; an extension skill wins where they differ.
+
+On a company fact the extension wins; the safety rules in this skill always hold. With neither,
 say so, ask the user for the schema source and for the tunnel or dataset that carries the system,
 and never guess a table, database or project name.
 

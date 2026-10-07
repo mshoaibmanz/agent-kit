@@ -42,6 +42,8 @@ platform, environments and the last error date. Then:
   same slug can exist in a prod and a staging org; name the org a finding came from.
 - A warning line means an instance was skipped (no token, unreachable). It prints the one command
   that enables it; tell the user rather than guessing the project lives elsewhere.
+- A token stored after the last render does not add that instance's server by itself: the host
+  lists it once `agent-kit render` (or `agent-setup sync`) has run and a new session starts.
 - No match: `sentry-map list` shows everything; `--refresh` re-crawls (the cache is 24h).
 
 ## Security Constraints

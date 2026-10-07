@@ -4,7 +4,6 @@ each finding a row whose fix is this OS's command."""
 from __future__ import annotations
 
 import argparse
-import ast
 from dataclasses import dataclass
 import json
 import os
@@ -16,6 +15,7 @@ import sys
 from typing import Any
 
 from hosts import HOSTS, default_host_root
+import secret_store
 
 KIT = Path(__file__).resolve().parents[2]
 REPO_PARENTS = ('Code', 'src', 'dev', 'projects')
@@ -77,22 +77,6 @@ def host_login(host: str, command: str, target: Path) -> tuple[bool | None, str]
     if target.is_dir():
         return True, f'configured ({target} exists)'
     return None, 'open Cursor once and sign in, then rerun'
-
-
-def secret_tool_paths() -> tuple[str, ...]:
-    """bin/ro-mysql's SECRET_TOOL_PATHS, the one list: root-owned fixed paths, never one from PATH."""
-    for line in (KIT / 'bin/ro-mysql').read_text().splitlines():
-        if line.startswith('SECRET_TOOL_PATHS = '):
-            return ast.literal_eval(line.split('=', 1)[1].strip())
-    return ()
-
-
-def secret_store() -> str:
-    """Where the wrappers read credentials first: the macOS Keychain, secret-tool, else environment
-    variables (also their fallback when a store has no item)."""
-    if Path('/usr/bin/security').exists():
-        return 'keychain'
-    return 'secret-tool' if any(Path(path).exists() for path in secret_tool_paths()) else 'env'
 
 
 def detect_cli(host: str) -> str:
@@ -251,7 +235,7 @@ def preflight(args: argparse.Namespace, targets: dict[str, Path], deps: dict, su
     if shutil.which('gh') and 'gh' in deps and run_text(['gh', 'auth', 'status'])[0] != 0:
         rows.append(Row('Skipped', 'GitHub search and PR flows off: gh is not logged in. Fix: gh auth login'))
     if 'data-wrappers' in args.components:
-        store = secret_store()
+        store = secret_store.store()
         rows.append(Row('Ready' if store != 'env' else 'Skipped', {
             'keychain': 'credentials: wrappers read the macOS Keychain, else env vars',
             'secret-tool': 'credentials: no Keychain here; wrappers read secret-tool (libsecret), else env vars',

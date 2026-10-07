@@ -19,7 +19,7 @@ from urllib.parse import quote
 import zlib
 
 from checkout import git
-from hosts import skill_hosts
+from hosts import HOSTS, PACK_DIR, frontmatter, skill_hosts
 from preflight import install_hint
 
 TOKEN_FORMATS = (r'gh[opsur]_[A-Za-z0-9]{8,}|github_pat_\w{8,}|sk-(?:ant-)?[\w-]{8,}|[sr]k_live_[A-Za-z0-9]{16,}'
@@ -41,9 +41,13 @@ PACK_SKILLS = 'skills'
 PACK_RULES_WORDS = 300
 PACK_MAX_BYTES = 20 * 1024 * 1024
 PACK_SKILL_NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-PACK_DIR = 'pack'
-# Never part of a pack: git's own folder and the files macOS and Windows leave in folders.
-NOT_PACK = re.compile(r'\.git|\.DS_Store|Thumbs\.db|\._.*')
+# A pack's MCP server project (a uv project setup syncs into the kept copy; README "Team packs").
+PACK_MCP = 'mcp'
+# Never part of a pack: git's own folder, the files macOS and Windows leave in folders, and what a
+# local run of the MCP project leaves (its environment and tool caches).
+NOT_PACK = re.compile(r'\.git|\.DS_Store|Thumbs\.db|\._.*|\.venv|__pycache__|\.pytest_cache|\.ruff_cache')
+# The line of a kit SKILL.md that setup replaces with the installed skills extending it (`extends:`).
+EXTENSIONS_MARKER = '<!-- agent-kit: extensions -->'
 GH_ARCHIVE_TIMEOUT = 120
 
 PackFiles = dict[str, tuple[bytes, int]]
@@ -71,8 +75,8 @@ def holds_token(text: str) -> bool:
 
 
 def in_pack(path: str) -> bool:
-    return (path in (PACK_RULES, PACK_TOML, PACK_SKILLS) or path.startswith(PACK_SKILLS + '/')) and not any(
-        NOT_PACK.fullmatch(part) for part in path.split('/'))
+    return (path in (PACK_RULES, PACK_TOML, PACK_SKILLS, PACK_MCP) or path.startswith((PACK_SKILLS + '/', PACK_MCP + '/'))
+            ) and not any(NOT_PACK.fullmatch(part) for part in path.split('/'))
 
 
 def normal_mode(mode: int) -> int:
@@ -147,7 +151,7 @@ def gh_entries(repo: str, commit: str, root: str, spec: str) -> Iterator[Entry]:
 
 
 def folder_entries(folder: Path) -> Iterator[Entry]:
-    """The pack in a local folder: its skills/, rules.md and agent-kit-preset.toml, nothing else of it."""
+    """The pack in a local folder: its skills/, mcp/, rules.md and agent-kit-preset.toml, nothing else of it."""
     def entry(path: Path) -> Entry | None:
         relative = path.relative_to(folder).as_posix()
         if path.is_symlink():
@@ -156,17 +160,17 @@ def folder_entries(folder: Path) -> Iterator[Entry]:
             return Entry(relative, 'file', path.read_bytes(), normal_mode(path.stat().st_mode))
         return None if path.is_dir() else Entry(relative, 'other', b'', 0)
 
-    for name in (PACK_RULES, PACK_TOML, PACK_SKILLS):
+    for name in (PACK_RULES, PACK_TOML, PACK_SKILLS, PACK_MCP):
         if os.path.lexists(folder / name) and (found := entry(folder / name)):
             yield found
-    skills = folder / PACK_SKILLS
-    if skills.is_symlink():
-        return
-    for directory, folders, names in os.walk(skills):
-        folders[:] = sorted(name for name in folders if not NOT_PACK.fullmatch(name))
-        for name in [*folders, *sorted(name for name in names if not NOT_PACK.fullmatch(name))]:
-            if found := entry(Path(directory) / name):
-                yield found
+    for tree in (folder / PACK_SKILLS, folder / PACK_MCP):
+        if tree.is_symlink():
+            continue
+        for directory, folders, names in os.walk(tree):
+            folders[:] = sorted(name for name in folders if not NOT_PACK.fullmatch(name))
+            for name in [*folders, *sorted(name for name in names if not NOT_PACK.fullmatch(name))]:
+                if found := entry(Path(directory) / name):
+                    yield found
 
 
 def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
@@ -210,7 +214,7 @@ def pack_files(entries: Iterable[Entry], spec: str) -> PackFiles:
 
 @dataclass(frozen=True)
 class Pack:
-    """A team pack's installable content: skills/<name>/... and rules.md, path -> (content, mode),
+    """A team pack's installable content: skills/<name>/..., mcp/... and rules.md, path -> (content, mode),
     and the commit it was read at (None for a folder outside git or with uncommitted changes)."""
     files: PackFiles
     commit: str | None = None
@@ -222,6 +226,10 @@ class Pack:
     @property
     def rules(self) -> str:
         return self.files.get(PACK_RULES, (b'', 0))[0].decode()
+
+    @property
+    def has_mcp(self) -> bool:
+        return any(path == PACK_MCP or path.startswith(PACK_MCP + '/') for path in self.files)
 
     def skill_files(self, name: str) -> PackFiles:
         return {path: value for path, value in self.files.items() if path.startswith(f'{PACK_SKILLS}/{name}/')}
@@ -253,6 +261,8 @@ def build_pack(files: PackFiles, spec: str, commit: str | None) -> Pack | None:
         if relative == PACK_SKILLS or (relative.startswith(PACK_SKILLS + '/') and relative.count('/') == 1):
             raise ValueError(f'preset {spec}: {relative}: a pack skill is a folder skills/<name>/ with a SKILL.md')
     pack = Pack(files, commit)
+    if pack.has_mcp and not all(f'{PACK_MCP}/{name}' in files for name in ('pyproject.toml', 'uv.lock')):
+        raise ValueError(f'preset {spec}: {PACK_MCP}/ is a uv project: it needs pyproject.toml and uv.lock')
     for name in pack.skills:
         skill = files.get(f'{PACK_SKILLS}/{name}/SKILL.md')
         if not PACK_SKILL_NAME.fullmatch(name) or skill is None:
@@ -307,6 +317,38 @@ def installed_pack(root: Path, state: dict[str, Any],
                 record.get('commit'))
 
 
+def skill_extends(text: str) -> set[str]:
+    """The skills a SKILL.md's `extends:` frontmatter names: one name, or an inline list."""
+    value = frontmatter(text).get('extends', '').strip()
+    if value[:1] + value[-1:] == '[]':
+        value = value[1:-1]
+    return {name.strip().strip('\'"') for name in value.split(',')} - {''}
+
+
+def extension_lists(skills: Path, names: Iterable[str], installed: str) -> dict[str, list[str]]:
+    """For each skill one of names extends, a Markdown line per installed extension (names, read from
+    skills/<name>/SKILL.md): its name, its description, its hosts when it is not on every host, and its
+    SKILL.md in the installed skills folder."""
+    lines: dict[str, list[str]] = {}
+    for name in sorted(names):
+        path = skills / name / 'SKILL.md'
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        hosts = skill_hosts(path, text)
+        only = '' if hosts == set(HOSTS) else f' (on {", ".join(sorted(hosts))} only)'
+        line = f'- `{name}`: {frontmatter(text).get("description", "").strip()}{only} Read {installed}/{name}/SKILL.md.'
+        for base in skill_extends(text) - {name}:
+            lines.setdefault(base, []).append(line)
+    return lines
+
+
+def render_extensions(text: str, skill: str, lines: list[str]) -> str:
+    """A SKILL.md with its EXTENSIONS_MARKER line replaced by the installed skills that extend it."""
+    found = '\n'.join(lines) if lines else f'No installed skill extends {skill}.'
+    return text.replace(EXTENSIONS_MARKER, found)
+
+
 def pack_label(commit: str | None) -> str:
     return commit[:12] if commit else 'its working tree'
 
@@ -315,7 +357,8 @@ def pack_summary(source: str, before: Pack | None, after: Pack) -> str:
     """The preview line for a pack: what it installs, or what changed since the installed one."""
     if before is None:
         rules = f'; rules block of {len(after.rules.split())} words' if after.rules.strip() else ''
-        return f'pack {source} at {pack_label(after.commit)}: skills {", ".join(after.skills) or "none"}{rules}'
+        mcp = '; an mcp project' if after.has_mcp else ''
+        return f'pack {source} at {pack_label(after.commit)}: skills {", ".join(after.skills) or "none"}{rules}{mcp}'
     if before.files == after.files:
         return (f'pack {source} at {pack_label(after.commit)}: content unchanged since the install '
                 f'({pack_label(before.commit)})')
@@ -326,6 +369,9 @@ def pack_summary(source: str, before: Pack | None, after: Pack) -> str:
                         ('removed', sorted(set(before.skills) - set(after.skills)))):
         if names:
             changes.append(f'skills {verb} {", ".join(names)}')
+    if {p: v for p, v in before.files.items() if p.startswith(PACK_MCP + '/')} != {
+            p: v for p, v in after.files.items() if p.startswith(PACK_MCP + '/')}:
+        changes.append('mcp project ' + ('removed' if not after.has_mcp else 'added' if not before.has_mcp else 'changed'))
     if before.rules != after.rules:
         changes.append('rules ' + ('removed' if not after.rules.strip() else 'added' if not before.rules.strip() else 'changed'))
     return f'pack {source}: {pack_label(before.commit)} -> {pack_label(after.commit)}: {"; ".join(changes)}'
