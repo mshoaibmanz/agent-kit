@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Discover Sentry orgs, projects and environments across every configured instance.
+
+  sentry-map find <service|repo|keyword>... [--refresh] [--json]
+  sentry-map list [--refresh] [--json]
+  sentry-map instances          each instance, whether it has a token (never the token), how to add one
+  sentry-map refresh
+
+Instances come from mcp/sentry-instances.json and the overlay's copy (bin/lib/sentry.py). Each
+instance's token is read from its store by this tool, the way bin/sentry-mcp reads it, and goes only into the
+Authorization header of requests to that instance. Results are cached in state/sentry-map.json for
+24h; `find` refreshes once on a miss. A missing or failing instance prints a warning and is
+skipped. Last seen is the newest error event in the last 90 days (Discover), per project.
+
+The same project slug can exist on several instances and orgs; each row's status says which copy
+is live: the newest last-seen per slug and label (prod/staging) is `live`, the others `older` or
+`stale` (no error in the window), and a copy in an unlabelled org `label unknown`. Live rows come
+first, per slug, prod before staging; `--json` carries the same `status` field."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+KIT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(KIT / "bin" / "lib"))
+
+from sentry import LABELS, Instance, KeychainDenied, KeychainMissing, load_instances, read_token  # noqa: E402
+
+CACHE = Path(os.environ.get("SENTRY_MAP_CACHE") or KIT / "state" / "sentry-map.json")
+TTL = 24 * 3600
+# A `find` miss refreshes at most this often, so a typo doesn't re-crawl every instance.
+MISS_REFRESH_AFTER = 600
+LAST_SEEN_PERIOD = "90d"
+# Cloudflare in front of a self-hosted Sentry answers urllib's default User-Agent with error 1010.
+USER_AGENT = "agent-kit-sentry-map/1.0"
+# Words too common to identify a project. A team adds its own org or product prefixes in
+# SENTRY_MAP_GENERIC (comma-separated).
+GENERIC = {"api", "app", "apps", "service", "svc", "web", "server", "backend", "frontend"} | {
+    w.strip().lower() for w in os.environ.get("SENTRY_MAP_GENERIC", "").split(",") if w.strip()
+}
+NEXT = re.compile(r'<([^>]+)>;\s*rel="next";\s*results="true"')
+
+
+_warned: set[str] = set()
+
+
+def warn(message: str) -> None:
+    if message not in _warned:
+        _warned.add(message)
+        sys.stderr.write(f"sentry-map: warning: {message}\n")
+
+
+def origin(url: str) -> tuple[str, str, int]:
+    """(scheme, host, port) with the scheme's default port filled in."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    return scheme, (parts.hostname or "").lower(), port or {"https": 443, "http": 80}.get(scheme, -1)
+
+
+class OtherOrigin(RuntimeError):
+    pass
+
+
+class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only within the instance's origin: urllib would otherwise resend the
+    Authorization header to wherever the redirect points (an SSO page, another host)."""
+
+    def __init__(self, allowed: tuple[str, str, int]) -> None:
+        self.allowed = allowed
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if origin(target) != self.allowed:
+            raise OtherOrigin(f"refused a redirect to another origin ({urllib.parse.urlsplit(target).netloc})")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class Client:
+    """The token goes only to the instance's own origin: every request, pagination link, region URL
+    and redirect is checked against it before the Authorization header is sent."""
+
+    def __init__(self, inst: Instance, token: str) -> None:
+        self.inst = inst
+        self._token = token
+        self.origin = origin(inst.base_url)
+        self._opener = urllib.request.build_opener(SameOriginRedirects(self.origin))
+
+    def trusted(self, url: str) -> bool:
+        return origin(url) == self.origin
+
+    def get_all(self, url: str) -> list[Any]:
+        out: list[Any] = []
+        while url:
+            body, link = self._get(url)
+            out.extend(body.get("data", []) if isinstance(body, dict) else body)
+            match = NEXT.search(link)
+            url = match.group(1) if match else ""
+        return out
+
+    def _get(self, url: str) -> tuple[Any, str]:
+        if not self.trusted(url):
+            raise OtherOrigin(f"refused a request to another origin ({urllib.parse.urlsplit(url).netloc})")
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {self._token}", "User-Agent": USER_AGENT}
+        )
+        try:
+            with self._opener.open(req, timeout=60) as resp:
+                return json.loads(resp.read()), resp.headers.get("Link", "")
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).path}") from None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            raise RuntimeError(f"{self.inst.host} unreachable ({reason})") from None
+
+
+def crawl(inst: Instance, instances: Iterable[Instance]) -> dict[str, Any]:
+    try:
+        client = Client(inst, read_token(inst, instances))
+    except KeychainMissing:
+        raise RuntimeError(
+            f"{inst.missing()}; enable with: {inst.enable_command()}"
+        ) from None
+    except KeychainDenied:
+        raise RuntimeError(f"Keychain item {inst.keychain} could not be read (denied or locked)") from None
+    orgs = []
+    for org in client.get_all(f"{inst.base_url}/api/0/organizations/"):
+        slug = org["slug"]
+        region = (org.get("links") or {}).get("regionUrl") or inst.base_url
+        if not client.trusted(region):
+            # sentry.io names a regional host (us.sentry.io); the instance's own origin serves the
+            # same API, and the token never leaves it.
+            region = inst.base_url
+        projects = client.get_all(f"{region}/api/0/organizations/{slug}/projects/?all_projects=1")
+        last_seen: dict[str, str] = {}
+        query = urllib.parse.urlencode(
+            [
+                ("field", "project"),
+                ("field", "max(timestamp)"),
+                ("dataset", "errors"),
+                ("statsPeriod", LAST_SEEN_PERIOD),
+                ("per_page", "100"),
+            ]
+        )
+        try:
+            for row in client.get_all(f"{region}/api/0/organizations/{slug}/events/?{query}"):
+                last_seen[row.get("project", "")] = (row.get("max(timestamp)") or "")[:10]
+        except RuntimeError as e:
+            warn(f"instance {inst.name} org {slug}: last-seen unavailable ({e})")
+        orgs.append(
+            {
+                "slug": slug,
+                "name": org.get("name", slug),
+                "region_url": region,
+                "projects": [
+                    {
+                        "slug": p["slug"],
+                        "platform": p.get("platform") or "",
+                        "environments": sorted(p.get("environments") or []),
+                        "last_seen": last_seen.get(p["slug"], ""),
+                    }
+                    for p in projects
+                ],
+            }
+        )
+    return {"host": inst.host, "fetched_at": time.time(), "orgs": orgs}
+
+
+def read_cache() -> dict[str, Any]:
+    try:
+        return json.loads(CACHE.read_text()).get("instances", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def write_cache(data: dict[str, Any]) -> None:
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=CACHE.parent, prefix=".sentry-map.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"instances": data}, fh, indent=1, sort_keys=True)
+    os.replace(tmp, CACHE)
+
+
+def load(force: bool) -> tuple[dict[str, Instance], dict[str, Any]]:
+    instances = load_instances(KIT)
+    cache = read_cache()
+    changed = False
+    for name, inst in instances.items():
+        entry = cache.get(name)
+        fresh = entry and entry.get("host") == inst.host and time.time() - entry.get("fetched_at", 0) < TTL
+        if fresh and not force:
+            continue
+        try:
+            cache[name] = crawl(inst, instances.values())
+            changed = True
+        except RuntimeError as e:
+            stale = f"; using the cache from {time.strftime('%Y-%m-%d %H:%M', time.localtime(entry['fetched_at']))}" if entry else ""
+            warn(f"instance {name} ({inst.host}) skipped: {e}{stale}")
+    for name in set(cache) - set(instances):
+        del cache[name]
+        changed = True
+    if changed:
+        write_cache(cache)
+    return instances, cache
+
+
+def rows(instances: dict[str, Instance], cache: dict[str, Any]) -> list[dict[str, str]]:
+    out = []
+    for name, inst in instances.items():
+        for org in cache.get(name, {}).get("orgs", []):
+            for p in org["projects"]:
+                out.append(
+                    {
+                        "instance": name,
+                        "server": inst.server,
+                        "region_url": org["region_url"],
+                        "org": org["slug"],
+                        "label": inst.label(org["slug"]),
+                        "project": p["slug"],
+                        "platform": p["platform"] or "-",
+                        "environments": ",".join(p["environments"]) or "-",
+                        "last_seen": p["last_seen"] or "-",
+                    }
+                )
+    return out
+
+
+def norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def tokens(text: str) -> set[str]:
+    return {t for t in re.split(r"[^a-z0-9]+", text.lower()) if t and t not in GENERIC}
+
+
+def match(all_rows: list[dict[str, str]], terms: list[str]) -> tuple[list[dict[str, str]], bool]:
+    """Rows whose project or org contains every term (punctuation ignored); failing that, the rows
+    sharing the most non-generic words with the terms (a repo name like acme-billing-api)."""
+    keys = [norm(t) for t in terms]
+    exact = [r for r in all_rows if all(k in norm(r["project"]) or k == norm(r["org"]) for k in keys)]
+    if exact:
+        return exact, True
+    want = set().union(*(tokens(t) for t in terms))
+    scored = [(len(want & tokens(r["project"])), r) for r in all_rows]
+    best = max((s for s, _ in scored), default=0)
+    return ([r for s, r in scored if s == best] if best else []), False
+
+
+COLUMNS = (
+    "status", "label", "project", "instance", "server", "region_url", "org", "platform", "environments", "last_seen",
+)
+STATUSES = ("live", "older", "stale", "label unknown")
+
+
+def mark_live(found: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Each row with a status, sorted for reading: per project slug, prod then staging then
+    unlabelled orgs, and within a label live, older, stale, newest first. The copy with the newest
+    last error per slug and label is `live` (every copy tied on that date is: last_seen is a day);
+    other copies with an error in the window are `older`, copies with none `stale`. A copy in an
+    org with no label is `label unknown`: which environment it serves is not known."""
+    newest: dict[tuple[str, str], str] = {}
+    for r in found:
+        if r["label"] in LABELS and r["last_seen"] != "-":
+            key = (r["project"], r["label"])
+            newest[key] = max(newest.get(key, ""), r["last_seen"])
+    out = []
+    for r in found:
+        if r["label"] not in LABELS:
+            status = "label unknown"
+        elif r["last_seen"] == "-":
+            status = "stale"
+        else:
+            status = "live" if r["last_seen"] == newest[(r["project"], r["label"])] else "older"
+        out.append({**r, "status": status})
+    out.sort(key=lambda r: (r["instance"], r["org"]))
+    out.sort(key=lambda r: r["last_seen"] if r["last_seen"] != "-" else "", reverse=True)
+    label_rank = {label: i for i, label in enumerate(LABELS)}
+    out.sort(key=lambda r: (r["project"], label_rank.get(r["label"], len(LABELS)), STATUSES.index(r["status"])))
+    return out
+
+
+def show(found: list[dict[str, str]], as_json: bool) -> None:
+    found = mark_live(found)
+    if as_json:
+        print(json.dumps(found, indent=1))
+        return
+    widths = {c: max([len(c)] + [len(r[c]) for r in found]) for c in COLUMNS}
+    print("  ".join(c.ljust(widths[c]) for c in COLUMNS).rstrip())
+    for r in found:
+        print("  ".join(r[c].ljust(widths[c]) for c in COLUMNS).rstrip())
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    instances, cache = load(args.refresh)
+    found, exact = match(rows(instances, cache), args.terms)
+    oldest = min((e.get("fetched_at", 0) for e in cache.values()), default=0)
+    if not exact and not args.refresh and time.time() - oldest > MISS_REFRESH_AFTER:
+        instances, cache = load(True)
+        found, exact = match(rows(instances, cache), args.terms)
+    if not found:
+        warn(f"no project matches {' '.join(args.terms)}; `sentry-map list` shows every project")
+        return 1
+    if not exact:
+        warn(f"no project contains {' '.join(args.terms)}; closest by shared words:")
+    show(found, args.json)
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    instances, cache = load(args.refresh)
+    show(rows(instances, cache), args.json)
+    return 0
+
+
+def cmd_refresh(_args: argparse.Namespace) -> int:
+    instances, cache = load(True)
+    for name in instances:
+        orgs = cache.get(name, {}).get("orgs", [])
+        print(f"{name}: {len(orgs)} org(s), {sum(len(o['projects']) for o in orgs)} project(s)")
+    return 0
+
+
+def cmd_instances(_args: argparse.Namespace) -> int:
+    from sentry import token_present
+
+    instances = load_instances(KIT)
+    for inst in instances.values():
+        state = "token present" if token_present(inst, instances.values()) else f"{inst.missing()}; enable: {inst.enable_command()}"
+        labels = ", ".join(f"{o}={label}" for o, label in inst.orgs.items()) or "-"
+        note = f"  note: {inst.note}" if inst.note else ""
+        print(f"{inst.name}: host {inst.host}, MCP server {inst.server}, item {inst.keychain} ({state}); org labels {labels}{note}")
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="sentry-map", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("find", help="projects matching a service, repo or keyword")
+    f.add_argument("terms", nargs="+")
+    for p in (f, sub.add_parser("list", help="every project on every instance")):
+        p.add_argument("--refresh", action="store_true", help="ignore the 24h cache")
+        p.add_argument("--json", action="store_true")
+    sub.add_parser("refresh", help="re-crawl every instance")
+    sub.add_parser("instances", help="configured instances and whether each has a token")
+    args = ap.parse_args(argv)
+    try:
+        return {"find": cmd_find, "list": cmd_list, "refresh": cmd_refresh, "instances": cmd_instances}[args.cmd](args)
+    except ValueError as e:
+        sys.stderr.write(f"sentry-map: {e}\n")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

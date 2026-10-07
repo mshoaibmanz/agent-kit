@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# PreToolUse(Agent): spawn the kit's named roles, not the generic or retired ones.
+#
+# Denies a spawn whose subagent_type is missing (the harness then runs general-purpose),
+# general-purpose or Explore, naming the kit's spawnable roles; and a role name roles.toml lists
+# under some role's `replaces` (a rename), naming its successor. A spawn of a role with
+# `brief = true` (the engineer) must name its brief, a briefs/*.md path, in the prompt: the agent
+# reads it first and keeps its notes beside it. Every other type passes untouched: host built-ins
+# such as claude-code-guide, plugin agents (<plugin>:<agent>), the reviewers.
+#
+# The names come from roles.toml as `agent-kit render` writes it for this host (lib/review-state
+# rv_roles: RV_ROLE_TABLE, RV_RETIRED, RV_BRIEF_ROLES). With no role this host spawns natively (a
+# kit without rendered roles, or a host that runs every role through agent-run) the hook passes
+# everything: there is nothing better to name.
+#
+# WHY: in one week of sessions the main session spawned general-purpose 31 times, Explore 5 and a
+# retired name 21 times after a role rename. A retired name fails in the harness with no hint of
+# its successor; general-purpose runs on the parent's model with none of the role's tool limits.
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+hook_lib open review-state
+hook_read event='.hook_event_name // ""' tool='.tool_name // ""' \
+  type='if (.tool_input | type) == "object" then (.tool_input.subagent_type // "") else "-" end' \
+  prompt='.tool_input.prompt // ""'
+[ "$event" = PreToolUse ] || exit 0
+case $tool in Agent | Task) ;; *) exit 0 ;; esac
+[ "$type" = - ] && exit 0
+
+rv_roles
+roles=''
+while read -r n _ _ _ i x _; do
+  [ -n "$n" ] && [ "$n" != main ] && [ "$i" = agent ] && [ "$x" = - ] && roles="${roles:+$roles, }$n"
+done <<<"$RV_ROLE_TABLE"
+[ -n "$roles" ] || exit 0
+
+case $type in
+  '' | general-purpose | Explore)
+    deny "Denied: subagent_type \"${type:-<missing>}\" runs a generic agent without a kit role's model and tool limits.
+Set subagent_type to one of this kit's roles: $roles."
+    ;;
+esac
+for pair in ${RV_RETIRED:-}; do
+  [ "${pair%%=*}" = "$type" ] || continue
+  new=${pair#*=}
+  deny "Denied: \"$type\" is a retired role name; it was renamed to \"$new\".
+Re-run with subagent_type: \"$new\" (this kit's roles: $roles)."
+done
+case " ${RV_BRIEF_ROLES:-} " in
+  *" $type "*)
+    [[ $prompt =~ briefs/[^[:space:]]*\.md ]] && exit 0
+    deny "Denied: a $type spawn names no brief file.
+Write the brief to <item>/briefs/brief-<task>.md, then name that path in the prompt (\"Work from the brief <path>\")." ;;
+esac
+exit 0

@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Binds a session to a project item by deterministic rules and keeps project indexes current.
+
+  UserPromptSubmit           unbound: run binding.decide (worktree, branch, new <TICKET>-*
+                             worktree, pasted work-root path, prompt ticket of one existing item,
+                             ticket only one project lists) and bind on its answer, announcing
+                             `bound: <project>/<item> (rule: …)`. Nothing certain: offer this repo's
+                             recent open items once (and again only when the offer changes); stay
+                             unbound. Nothing is created from a prompt.
+                             Bound: sticky, except that the cheap rules re-run when the checkout
+                             changed since the last prompt and move it to another EXISTING item
+                             (announced); nothing is created for a bound session.
+                             A binding /clear inherited is re-resolved on the first prompt a rule
+                             answers. A `/bind` prompt is left to the command.
+  PostToolUse(EnterWorktree) the cheap rules at once, under the same limit: an unbound session's
+                             ticket worktree binds (or creates) its item before the next prompt. A
+                             subagent's payload (agent_id) is ignored.
+  PreToolUse(Write)          unbound, and the first durable file lands under the work root: bind to
+                             the project or item the path is in (silent; no decision).
+  PostToolUse(Write|Edit)    a write under projects/<p>/ re-runs `agent-task index <p>`; a bind made
+                             by the PreToolUse step injects the slice here.
+Never blocks: every path exits 0.
+"""
+
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+try:
+    import agent_task as at
+    import binding as bd
+except ImportError as e:
+    print(json.dumps({"systemMessage": f"project-bind is off: hooks/lib/agent_task.py or binding.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
+    sys.exit(0)
+
+
+def context(event: str, text: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+
+
+def offer_once(sid: str, d: "bd.Decision") -> str:
+    """The fallback offer, unless this session was already shown the same one."""
+    text = bd.offer_text(d, sid)
+    if not text:
+        return ""
+    mark = at.bind_dir() / f"{sid[:8]}.offered"
+    key = ",".join(d.candidates[:3])
+    try:
+        if mark.read_text() == key:
+            return ""
+    except OSError:
+        pass
+    at.atomic_write(mark, key)
+    return text
+
+
+def rebind(sid: str, d: "bd.Decision", pl: "bd.Place", was: "at.Binding | None", event: str, note: str = "") -> None:
+    b = bd.bind(sid, d.target, here=pl, rule=d.rule)
+    if was and was.key == b.key:
+        return
+    context(event, at.slice_text(b, bd.announce(b, d.rule, was) + note))
+
+
+def on_prompt(p: dict) -> None:
+    sid, cwd = p.get("session_id", ""), p.get("cwd") or os.getcwd()
+    prompt = p.get("prompt", "") or ""
+    if not sid or prompt.lstrip().startswith("/bind"):
+        return
+    pl = bd.place(cwd)
+    data = at.binding_file(sid)
+    cur = at.bound(sid)
+    if cur and not data.get(at.INHERITED):
+        if pl.top == data.get("wt", ""):
+            return
+        at.set_binding_wt(sid, pl.top)
+        d = bd.decide("", pl, cheap_only=True)
+        if bd.may_move(d, cur):
+            rebind(sid, d, pl, cur, "UserPromptSubmit")
+        return
+    d = bd.decide(prompt, pl)
+    if cur:
+        # Inherited across /clear: a certain rule moves it; otherwise it stays (and stays inherited
+        # until a prompt names a ticket).
+        if bd.may_move(d, cur):
+            rebind(sid, d, pl, cur, "UserPromptSubmit", " (the old binding was kept from before /clear)")
+        elif d or at.tickets_in(prompt, known=True):
+            at.keep_binding(sid)
+        return
+    if d:
+        rebind(sid, d, pl, None, "UserPromptSubmit")
+        return
+    text = offer_once(sid, d)
+    if text:
+        context("UserPromptSubmit", text)
+
+
+def on_enter_worktree(p: dict) -> None:
+    sid = p.get("session_id", "")
+    # A subagent's payload carries its parent's session_id: its worktree is not the session's.
+    if not sid or p.get("agent_id"):
+        return
+    resp = p.get("tool_response")
+    paths = [s for s in _strings(resp) if "/.claude/worktrees/" in s and os.path.isdir(s)] if resp else []
+    cwd = paths[0] if paths else (p.get("cwd") or os.getcwd())
+    pl = bd.place(cwd)
+    if not pl.linked:
+        return
+    cur = at.bound(sid)
+    at.set_binding_wt(sid, pl.top)
+    d = bd.decide("", pl, cheap_only=True)
+    if bd.may_move(d, cur):
+        rebind(sid, d, pl, cur, "PostToolUse")
+
+
+def _strings(o: object) -> list[str]:
+    if isinstance(o, str):
+        return [o]
+    if isinstance(o, dict):
+        return [s for v in o.values() for s in _strings(v)]
+    if isinstance(o, list):
+        return [s for v in o for s in _strings(v)]
+    return []
+
+
+def durable_target(path: str) -> str:
+    root = os.path.realpath(at.work_root())
+    real = os.path.realpath(path)
+    if not real.startswith(root + os.sep):
+        return ""
+    parts = real[len(root) + 1 :].split(os.sep)
+    if len(parts) >= 3 and parts[0] == "projects":
+        if len(parts) >= 5 and parts[2] == "items":
+            return f"{parts[1]}/{parts[3]}"
+        return parts[1]
+    if len(parts) >= 3 and parts[0] == "tasks":
+        return parts[1]
+    return ""
+
+
+def on_pre_write(p: dict) -> None:
+    sid = p.get("session_id", "")
+    path = (p.get("tool_input") or {}).get("file_path", "")
+    if not sid or not path or at.bound(sid):
+        return
+    target = durable_target(path)
+    if not target:
+        return
+    bd.bind(sid, target, here=bd.place(p.get("cwd") or os.getcwd()), rule="write")
+    (at.bind_dir() / f"{sid[:8]}.fresh").touch()
+
+
+def on_post_write(p: dict) -> None:
+    sid = p.get("session_id", "")
+    path = (p.get("tool_input") or {}).get("file_path", "")
+    root = os.path.realpath(at.work_root())
+    real = os.path.realpath(path) if path else ""
+    parts = real[len(root) + 1 :].split(os.sep) if real.startswith(root + os.sep) else []
+    if len(parts) >= 3 and parts[0] == "projects" and parts[-1] != "INDEX.md":
+        at.index(parts[1])
+    fresh = at.bind_dir() / f"{sid[:8]}.fresh" if sid else None
+    if fresh and fresh.exists():
+        fresh.unlink()
+        b = at.bound(sid)
+        if b:
+            context("PostToolUse", at.slice_text(b, bd.announce(b, "write") + " Bound by this write."))
+
+
+def main() -> None:
+    if os.environ.get("CI_WATCH_ACTIVE"):
+        return
+    try:
+        p = json.load(sys.stdin)
+    except ValueError:
+        return
+    ev = p.get("hook_event_name", "")
+    if ev == "UserPromptSubmit":
+        on_prompt(p)
+    elif ev == "PreToolUse" and p.get("tool_name") == "Write":
+        on_pre_write(p)
+    elif ev == "PostToolUse" and p.get("tool_name") == "EnterWorktree":
+        on_enter_worktree(p)
+    elif ev == "PostToolUse" and p.get("tool_name") in ("Write", "Edit", "MultiEdit"):
+        on_post_write(p)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # an advisory hook never fails the tool call
+        print(json.dumps({"systemMessage": f"project-bind error: {type(e).__name__}: {e}"}))
+    sys.exit(0)

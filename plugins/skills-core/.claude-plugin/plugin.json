@@ -1,0 +1,8 @@
+{
+  "name": "skills-core",
+  "description": "10 passive skills: session-review, grilling, grill-with-docs, domain-modeling, pr-study, prototype, handoff, sentry-fix-issues, unslop, typescript-best-practices. Inert until invoked: installs no hooks.",
+  "license": "MIT",
+  "author": {
+    "name": "Shoaib Manzoor"
+  }
+}

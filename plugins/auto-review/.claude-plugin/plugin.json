@@ -1,0 +1,8 @@
+{
+  "name": "auto-review",
+  "description": "Review at git push with reproduce-first fixes, role-selected providers and a bounded review budget. Explicit installation enables blocking review hooks.",
+  "license": "MIT",
+  "author": {
+    "name": "Shoaib Manzoor"
+  }
+}

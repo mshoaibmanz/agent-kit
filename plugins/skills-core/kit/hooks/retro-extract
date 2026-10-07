@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""SessionEnd: append the session's mechanical learnings to the retro inbox
+(<work root>/retro/<YYYY-Www>.md), one `- [auto] ...` line each: denials by first line, hook
+blocks and hook errors, prompts that correct the model, repeated tool errors, compactions, and
+review rounds past budget. No model cost.
+
+Usage by hand:  retro-extract <transcript.jsonl> [--print]
+"""
+
+import json
+import os
+import re
+import sys
+from collections import Counter
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+try:
+    import agent_task as at
+    from retro import record_retro
+except ImportError as e:
+    print(json.dumps({"systemMessage": f"retro-extract is off: hooks/lib/agent_task.py or retro.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
+    sys.exit(0)
+
+CORRECTION = re.compile(r"^(no\b|nope\b|don'?t\b|do not\b|stop\b|wrong\b|that'?s (not|wrong)|not (that|what)|why did you|you (should|shouldn'?t|didn'?t|forgot)|actually\b|instead\b|undo\b|revert\b)", re.I)
+BUDGET = re.compile(r"already completed (\d+) rounds this session, the budget", re.I)
+
+
+def text_of(content: object) -> str:
+    """Text blocks, and the text inside tool_result blocks (where a denial's reason lives)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif b.get("type") == "tool_result":
+                parts.append(text_of(b.get("content")))
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def first(s: str, n: int = 110) -> str:
+    """First line, with shas and numbers folded so repeats of one message count together."""
+    line = " ".join((s or "").strip().split("\n")[0].split())
+    return re.sub(r"\b[0-9a-f]{7,40}\b|\d+", "#", line)[:n]
+
+
+def extract(path: str) -> list[tuple[str, str]]:
+    notes: list[tuple[str, str]] = []
+    denials: Counter = Counter()
+    blocks: Counter = Counter()
+    errors: Counter = Counter()
+    tool_errs: Counter = Counter()
+    names: dict[str, str] = {}
+    compactions = 0
+    budget_hits = 0
+    last_was_refusal = False
+    for line in open(path, errors="replace"):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        t = d.get("type")
+        if d.get("isSidechain"):
+            continue
+        if t == "system" and d.get("subtype") == "compact_boundary":
+            compactions += 1
+        elif t == "attachment":
+            a = d.get("attachment") or {}
+            if a.get("type") == "hook_blocking_error":
+                be = a.get("blockingError")
+                msg = be.get("blockingError", "") if isinstance(be, dict) else str(be or "")
+                blocks[f"{a.get('hookName', '?')}: {first(msg)}"] += 1
+                if BUDGET.search(msg):
+                    budget_hits += 1
+                # A Stop block ends a turn; the next prompt is usually new work, not a correction.
+                last_was_refusal = last_was_refusal or not str(a.get("hookName", "")).startswith("Stop")
+            elif a.get("type") == "hook_non_blocking_error":
+                errors[f"{a.get('command') or a.get('hookName', '?')} rc={a.get('exitCode')}"] += 1
+        elif t == "assistant":
+            for b in d.get("message", {}).get("content") or []:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    names[b.get("id", "")] = b.get("name", "?")
+                elif isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                    # The model answered after the refusal: the next prompt no longer follows it.
+                    last_was_refusal = False
+        elif t == "user":
+            c = d.get("message", {}).get("content")
+            if d.get("toolDenialKind"):
+                denials[f"{d.get('toolDenialKind')}: {first(text_of(c))}"] += 1
+                last_was_refusal = True
+                continue
+            if isinstance(c, list):
+                for b in c:
+                    if not (isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error")):
+                        continue
+                    tx = text_of(b.get("content")) if not isinstance(b.get("content"), str) else b["content"]
+                    if tx.startswith(("PreToolUse:", "PostToolUse:")):
+                        blocks[first(tx)] += 1
+                        last_was_refusal = True
+                    elif "denied" in tx[:200].lower() and "permission" in tx[:200].lower():
+                        denials[f"permission: {first(tx)}"] += 1
+                        last_was_refusal = True
+                    else:
+                        tool_errs[f"{names.get(b.get('tool_use_id', ''), '?')}: {first(tx, 80)}"] += 1
+                continue
+            if isinstance(c, str) and c.startswith("Stop hook feedback"):
+                if BUDGET.search(c):
+                    budget_hits += 1
+                continue
+            tx = text_of(c).strip()
+            if d.get("isMeta") or not tx or tx.startswith(("<", "/", "[Request interrupted", "Caveat:")):
+                continue
+            if last_was_refusal or CORRECTION.match(tx):
+                notes.append(("correction", " ".join(tx.split())[:140]))
+            last_was_refusal = False
+    for k, n in denials.most_common(6):
+        notes.append(("denial", f"{n}x {k}"))
+    for k, n in blocks.most_common(6):
+        notes.append(("block", f"{n}x {k}"))
+    for k, n in errors.most_common(4):
+        notes.append(("hook-error", f"{n}x {k}"))
+    for k, n in tool_errs.most_common(4):
+        if n >= 3:
+            notes.append(("tool-error", f"{n}x {k}"))
+    if compactions:
+        notes.append(("compaction", f"{compactions} compaction(s)"))
+    if budget_hits:
+        notes.append(("review", f"review rounds past budget: {budget_hits} self-review stop(s) after the agent budget"))
+    return notes
+
+
+def main() -> None:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args:
+        path, sid = args[0], os.path.basename(args[0]).removesuffix(".jsonl")
+    else:
+        if os.environ.get("CI_WATCH_ACTIVE"):
+            return
+        try:
+            p = json.load(sys.stdin)
+        except ValueError:
+            return
+        path, sid = p.get("transcript_path", ""), p.get("session_id", "")
+    if not path or not os.path.isfile(path):
+        return
+    notes = extract(path)
+    where = at.where_label(at.bound(sid)) if sid else "-"
+    for tag, text in notes:
+        if "--print" in sys.argv:
+            print(f"- [auto] {at.today()} {sid[:8]} {where} {tag} {text}")
+        else:
+            record_retro(text, source="auto", tag=tag, session=sid, where=where)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # SessionEnd output is never seen; stay silent and exit 0
+        sys.stderr.write(f"retro-extract: {type(e).__name__}: {e}\n")
+    sys.exit(0)

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Notification hook — put WHICH agent is asking into the notification itself, so a
+# prompt can be answered without cycling tabs. Title = the same frozen label
+# tab-signal writes to the tab; body = the actual question.
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+hook_lib open notify
+hook_read type='.notification_type // ""' sid='.session_id // ""' msg='.message // ""' cwd='.cwd // ""'
+
+# Only requests for input. A finished background agent or a completed login asks nothing,
+# and alerting on them trains the eye to ignore this one.
+case "$type" in
+  agent_completed|auth_success) exit 0 ;;
+esac
+
+label=$(cat "$HOME/.claude/state/tab-label/${sid:-nosession}" 2>/dev/null)
+[ -z "$label" ] && label=$(basename "${cwd:-$PWD}")
+[ -z "$msg" ] && msg="needs your input"
+
+notify "$label" "$msg" Funk
+exit 0

@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/test-exec-gate\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tests-ran-mark\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/ci-watch-on-push\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/tests-ran-mark\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/unfinished-work\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

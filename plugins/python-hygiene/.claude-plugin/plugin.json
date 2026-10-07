@@ -1,0 +1,8 @@
+{
+  "name": "python-hygiene",
+  "description": "Runs ruff on every edited .py file, only in repos that already carry a ruff config (never reformats a repo that has not adopted it). Ships the conventions house-style skill for Python and SQL. No effect on non-Python edits.",
+  "license": "MIT",
+  "author": {
+    "name": "Shoaib Manzoor"
+  }
+}

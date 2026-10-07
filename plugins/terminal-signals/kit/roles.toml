@@ -1,0 +1,100 @@
+# Model and effort per role: the one hand-edited source for every host.
+#
+# `agent-kit render --host claude` applies it:
+#   - agents/<role>.md -> ~/.claude/agents/<role>.md with `model:` and `effort:` from here, for each
+#     role whose provider is the host's (anthropic on Claude). A role on the other provider renders
+#     no agent file: it runs through `bin/agent-run <role> <worktree>` (Bash), which calls that
+#     provider's CLI with the same agent body as its prompt.
+#   - [roles.main] -> settings.json `model`, `effortLevel` and `modelSettings` ([hosts.claude]).
+#   - [review] -> state/rendered/roles-claude.sh, the rounds lib/review-state asks for at push.
+#   The Codex host (phase 20) renders openai roles to ~/.codex/agents/<role>.toml from the same
+#   bodies; [hosts.codex] is its seam. agent-run runs REVIEW roles only (a role with a prefix): on a
+#   host whose provider is not a non-review role's (engineer on Codex), that role has no runner yet.
+#
+# model = "<provider>:<model>". "anthropic:inherit" is the parent session's model (no `model:` line).
+# effort uses the provider's own scale, which render validates:
+#   anthropic: low medium high xhigh max      openai: minimal low medium high xhigh
+# prefix: the id prefix of a review role's findings (B-1, CX-2). TALLY lines and review_precision
+#   attribute by it: keep it when a role is renamed or moved to another model.
+# fallback: the role that takes a run role's place when its provider CLI is missing or fails.
+# timeout: seconds agent-run gives a run role (default 900).
+# replaces: the role's retired names (a rename); agent-type-guard refuses a spawn under one and
+#   names this role instead.
+# brief: true when a spawn's prompt must name its brief (a briefs/*.md path); agent-type-guard
+#   refuses one that names none.
+#
+# Turning Codex off: set cross-reviewer's model to an anthropic one (round 1 is then two Agent spawns),
+# or replace it in the [review] lists with bug-reviewer: round1 and later must each name a
+# correctness reviewer (a role not in once), which render checks.
+#
+# Every role but main needs agents/<role>.md, its prompt on every host; render checks that too.
+
+[roles.main]
+model = "anthropic:opus[1m]"
+effort = "high"
+
+[roles.engineer]
+model = "anthropic:claude-opus-5-5"
+effort = "high"
+replaces = ["worker"]
+brief = true
+
+[roles.researcher]
+model = "anthropic:sonnet"
+effort = "medium"
+replaces = ["scout"]
+
+[roles.web-browser]
+model = "anthropic:sonnet"
+effort = "medium"
+
+[roles.second-opinion]
+model = "anthropic:fable"
+effort = "high"
+replaces = ["adversary"]
+
+[roles.task-reviewer]
+model = "anthropic:opus"
+effort = "high"
+prefix = "R"
+replaces = ["reviewer"]
+
+[roles.bug-reviewer]
+model = "anthropic:inherit"
+effort = "high"
+prefix = "B"
+replaces = ["thermo-bugs"]
+
+[roles.quality-reviewer]
+model = "anthropic:opus"
+effort = "high"
+prefix = "Q"
+replaces = ["thermo-quality"]
+
+[roles.cross-reviewer]
+model = "openai:gpt-6.1-sol"
+effort = "high"
+prefix = "CX"
+fallback = "bug-reviewer"
+timeout = 900
+replaces = ["review-cross"]
+
+[review]
+round1 = ["bug-reviewer", "cross-reviewer"]
+later = ["cross-reviewer"]
+once = ["quality-reviewer"]
+sensitive_adds = ["bug-reviewer"]
+
+[hosts.claude]
+native_agents = false
+provider = "anthropic"
+# Claude Code keeps an effort per model id; render sets each of these to main's effort.
+effort_models = ["claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-opus-5-5"]
+
+[hosts.codex]
+provider = "openai"
+native_agents = false
+
+[hosts.cursor]
+provider = "openai"
+native_agents = false

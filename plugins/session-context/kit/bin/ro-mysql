@@ -1,0 +1,1636 @@
+#!/usr/bin/env python3
+"""Read-only MySQL for agents: one SELECT/SHOW/EXPLAIN/DESCRIBE/WITH statement per call,
+executed in a server-enforced read-only session (works even with RW credentials).
+
+usage: ro-mysql [--tunnel=NAME] [--login-path=X] [-D db] [--vertical] -e 'SELECT ...'
+       ro-mysql [--tunnel=NAME] [-D db] --file=q.sql      the statement read from a file
+       ro-mysql [--tunnel=NAME] [-D db] --each=A,B,C -e "SELECT {} v, COUNT(*) FROM t WHERE c = {}"
+                                        one call per value, `{}` replaced by it as a quoted
+                                        literal; combines with --file
+       ro-mysql --tunnels [--refresh]   every tunnel: kind, DB user, state, databases
+       ro-mysql --rotate                store new DB passwords in the Keychain (own terminal)
+       ro-mysql add --name SVC --user DBUSER --via BASTION --remote HOST:PORT --local-port N
+                    [--staging] [--dry-run]
+                                        add a tunnel to ~/.ssh/config and store its password
+env:   MYSQL_RO_PORT (target when --tunnel is absent), MYSQL_RO_HOST (must be local),
+       MYSQL_RO_LOGIN_PATH (last-resort credentials), MYSQL_RO_MAX_MS (SELECT timeout, default
+       30000)
+
+The only targets are the `Host db-tunnel-*` LocalForwards in ~/.ssh/config and the files it
+Includes. A tunnel or login
+path named *staging*/*stg* is STAGING, anything else PROD, and every call labels its target on
+stderr. Every call runs the Homebrew mysql-client at its fixed path, never one from the
+environment or PATH. A tunnel's DB user is the `# ro-mysql: user=<db user>` line inside its Host
+block, else the single user of the same-kind login paths on its port; a tunnel with neither is
+refused until it is annotated. Passwords are per tunnel (Keychain service ro-mysql, account
+<db user>@<tunnel alias>), since one user's password differs between instances; the password
+reaches the client only through a 0600 option file removed when it exits. Without one, a same-kind
+login path of that user is used. --login-path forces one only if its user is the tunnel's.
+`-h`/`-P` are not accepted.
+
+`add` refuses an alias or local port the config or an Included file already has. The block copies
+the bastion's full `ssh -G` output (its HostName, and every key whose value differs from what a
+host no block names gets) except the keys a tunnel sets itself or must not share: Host, the
+forwards (Local/Remote/DynamicForward, ClearAllForwardings), ExitOnForwardFailure, the
+ServerAlive keys, ControlMaster, ControlPath, ControlPersist and GatewayPorts. It always writes
+`ControlMaster no`, `ControlPath none` and `GatewayPorts no`, and resets a key a wildcard block
+would add but the bastion lacks (`ProxyJump none`, `ProxyCommand none`, `IdentityAgent
+SSH_AUTH_SOCK`). The block goes before the first wildcard Host or Match of ~/.ssh/config, so its
+first values win. add writes the new config to a temporary file and checks that `ssh -G` resolves
+the new alias exactly like the bastion (those keys aside) with the one new forward; a key a
+wildcard block still shadows gets one more line, up to three rounds, and any difference left is
+named and nothing is written. Only then does it prompt for the password. Under a lock beside the
+config (released on SIGTERM or SIGHUP too) it re-reads the config and its Includes and builds again
+if they changed during the prompt, backs the current file up beside it (config.bak-<time>),
+replaces it in one rename and stores the password as --rotate does; the password never reaches
+argv or the screen. --dry-run prints the block and every warning, writes nothing and exits 0. Its
+first word `add` is the subcommand, so a database named add is passed with -D.
+
+On ERROR 2003 the target's tunnel is re-opened and the same validated command re-run once. On
+ERROR 1045 the user and tunnel are recorded in ~/.claude/state/db-auth-failed until that pair next
+succeeds. On ERROR 3024 (the timeout) a SELECT/WITH is EXPLAINed in the same session and two lines
+name the plan and the next step.
+
+--file and --each exist so a SQL file or a list of values needs no `$(cat …)` or shell loop: the
+Claude harness refuses a command whose arguments are computed at runtime in an isolated worktree.
+"""
+
+import collections
+import contextlib
+import dataclasses
+import datetime
+import functools
+import getpass
+import glob
+import itertools
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from typing import Any, NamedTuple, NoReturn
+
+sys.dont_write_bytecode = True
+# bin/lib beside this script, through any link to it (a plugin's bin/, a dev install's link).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import secret_store  # noqa: E402
+
+ALLOWED_FIRST = {"select", "show", "explain", "describe", "desc", "with"}
+
+SSH_CONFIG = os.path.expanduser("~/.ssh/config")
+STATE_DIR = os.path.expanduser("~/.claude/state")
+CACHE = os.path.join(STATE_DIR, "db-tunnels.tsv")
+AUTH_FAILED = os.path.join(STATE_DIR, "db-auth-failed")
+TUNNEL_PREFIX = "db-tunnel-"
+KEYCHAIN_SERVICE = "ro-mysql"
+# Anchored to a name segment so `postgres` does not read as `stg`.
+STAGING_RE = re.compile(r"(?:^|[^a-z])(?:staging|stg)", re.IGNORECASE)
+ANNOTATION_RE = re.compile(r"#\s*ro-mysql:\s*(.*)")
+DB_USER_RE = re.compile(r"[A-Za-z0-9_.@-]+")
+SYSTEM_SCHEMAS = {"information_schema", "mysql", "performance_schema", "sys"}
+CACHE_COLUMNS = ("alias", "port", "kind", "checked", "via", "databases")
+LOCAL_HOSTS = {"127.0.0.1", "localhost"}
+SSH_TIMEOUT_S = 30
+# The only clients ro-mysql runs. A binary picked from the environment or PATH would receive the
+# credential (a Keychain password, or a login path whose user can write) after every check passed.
+CLIENT_CANDIDATES = (
+    "/opt/homebrew/opt/mysql-client/bin/mysql",
+    "/usr/local/opt/mysql-client/bin/mysql",
+    "/usr/bin/mysql",  # Linux distribution packages: root-owned, not picked from PATH
+)
+
+def env_name(account: str) -> str:
+    """RO_MYSQL_PASSWORD_ plus the account as secret_store.env_suffix spells it: one name per account."""
+    return "RO_MYSQL_PASSWORD_" + secret_store.env_suffix(account)
+LSOF_FAILED = "an unknown process (lsof failed)"
+DEFAULT_MAX_MS = 30000
+# Agents answered a 3024 by widening the scan, so the timeout names the plan and the next step.
+TIMEOUT_NEXT = (
+    "ro-mysql: next: chunk by an indexed range (e.g. `id BETWEEN a AND b`, or an indexed date), or run "
+    "it in BigQuery through bqro if the table is replicated there (debug skill, references/bigquery.md)"
+)
+EXPLAIN_TIMEOUT_S = 30
+EXPLAIN_SHOWN = 3
+
+# A leading SELECT/WITH/EXPLAIN does not make a statement a read: MySQL 8 permits
+# `WITH ... UPDATE|DELETE`, EXPLAIN ANALYZE executes its target, and `FOR UPDATE` takes
+# row locks. These same words are string functions when followed by '(' — REPLACE(),
+# INSERT() — so only the statement position is rejected.
+WRITE_TOKENS = {"insert", "update", "delete", "replace"}
+
+# Passthru is an allowlist, not a blocklist: mysql's my_getopt treats '-' and '_' as
+# interchangeable, so any blocklist has to be spelled twice and one spelling always gets
+# missed (--init_command sailing past a --init-command block, and overriding it).
+PASSTHRU_FLAGS = {
+    "--vertical", "-E",
+    "--table", "-t",
+    "--batch", "-B",
+    "--raw", "-r",
+    "--silent", "-s",
+    "--skip-column-names", "-N",
+    "--column-names",
+    "--comments",
+}
+PASSTHRU_VALUED = {"--database", "--default-character-set"}
+PASSTHRU_SHORT_VALUED = {"-D"}
+
+
+class Tunnel(NamedTuple):
+    alias: str
+    port: str
+    user: str | None
+    remote: str = ""  # the forward's target, HOST:PORT
+    hostname: str = ""  # the block's HostName: the bastion it goes through
+
+    @property
+    def name(self) -> str:
+        return self.alias.removeprefix(TUNNEL_PREFIX)
+
+    @property
+    def kind(self) -> str:
+        return kind_of(self.alias)
+
+
+class LoginPath(NamedTuple):
+    name: str
+    user: str | None
+    port: str | None
+
+
+class Creds(NamedTuple):
+    user: str | None
+    password: str | None
+    login_path: str | None
+
+    def describe(self) -> str:
+        if self.password is not None:
+            return f"as {self.user} (keychain)"
+        return f"via login path {self.login_path}"
+
+
+class Plan(NamedTuple):
+    cmd: list[str]
+    env: dict[str, str]
+    password: str | None
+    tunnel: Tunnel
+    port_tunnels: list[Tunnel]  # every tunnel forwarding its port, itself included
+    user: str | None
+    label: str
+
+
+Logins = Callable[[], dict[str, LoginPath]]
+Listeners = Callable[[], dict[str, tuple[str, str]] | None]
+
+
+def die(msg: str) -> NoReturn:
+    print(f"ro-mysql: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def norm(opt: str) -> str:
+    """my_getopt folds '_' to '-' in long option names; compare the way the client does."""
+    return opt.replace("_", "-") if opt.startswith("--") else opt
+
+
+def tokenize(sql: str) -> list[str]:
+    """Emit word/symbol tokens outside strings and comments; string literals become '<str>'.
+
+    Mirrors mysql lexing where it matters: '--' is a comment only when followed by
+    whitespace (so '1--2;DELETE' can't hide a second statement), and '/*!...*/'
+    versioned comments are rejected outright because the server EXECUTES their contents.
+    """
+    tokens: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c in "'\"`":
+            q = c
+            i += 1
+            while i < n:
+                if q != "`" and sql[i] == "\\":
+                    i += 2
+                    continue
+                if sql[i] == q:
+                    if i + 1 < n and sql[i + 1] == q:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            tokens.append("<str>")
+            continue
+        if c == "#":
+            while i < n and sql[i] != "\n":
+                i += 1
+            continue
+        if sql.startswith("--", i) and (i + 2 >= n or sql[i + 2] in " \t\r\n"):
+            while i < n and sql[i] != "\n":
+                i += 1
+            continue
+        if sql.startswith("/*!", i):
+            die("versioned comments (/*!) not allowed")
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        if c.isspace():
+            i += 1
+            continue
+        if c == ";":
+            tokens.append(";")
+            i += 1
+            continue
+        j = i
+        while j < n and (sql[j].isalnum() or sql[j] in "_$"):
+            j += 1
+        if j > i:
+            tokens.append(sql[i:j].lower())
+            i = j
+        else:
+            tokens.append(c)
+            i += 1
+    return tokens
+
+
+def validate(sql: str) -> None:
+    tokens = tokenize(sql)
+    while tokens and tokens[-1] == ";":
+        tokens.pop()
+    if not tokens:
+        die("empty statement")
+    if ";" in tokens:
+        die(
+            "one statement per call (multi-statement rejected): run each statement as its own "
+            "`ro-mysql -e '…'` call; the same SELECT over several values is `--each=A,B -e '… {} …'`"
+        )
+    if "\\" in tokens:
+        die("client backslash-commands (\\! \\. etc) not allowed")
+    if tokens[0] not in ALLOWED_FIRST:
+        die(f"read-only statements only: {', '.join(sorted(ALLOWED_FIRST))}")
+    for a, b in zip(tokens, tokens[1:]):
+        if a == "into" and b in ("outfile", "dumpfile"):
+            die("INTO OUTFILE/DUMPFILE not allowed")
+    for idx, tok in enumerate(tokens):
+        if tok in WRITE_TOKENS and (idx + 1 >= len(tokens) or tokens[idx + 1] != "("):
+            die(
+                f"'{tok.upper()}' in statement position — a leading SELECT/WITH/EXPLAIN does "
+                "not make this a read (WITH ... UPDATE, EXPLAIN ANALYZE and SELECT ... FOR "
+                "UPDATE all write or lock)"
+            )
+
+
+def parse_args(argv: list[str]) -> tuple[str | None, str | None, str | None, list[str]]:
+    """Split argv into (sql, login path, tunnel name, client passthru)."""
+    passthru: list[str] = []
+    sql: str | None = None
+    login_path: str | None = None
+    tunnel: str | None = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        head = norm(a.split("=", 1)[0])
+        if a in ("-e", "--execute"):
+            i += 1
+            if i >= len(argv):
+                die("missing SQL after -e")
+            sql = argv[i]
+        elif head == "--execute":
+            sql = a.split("=", 1)[1]
+        elif head in ("--login-path", "--tunnel"):
+            if "=" in a:
+                value = a.split("=", 1)[1]
+            else:
+                i += 1
+                if i >= len(argv):
+                    die(f"missing value after {head}")
+                value = argv[i]
+            if head == "--tunnel":
+                tunnel = value
+            else:
+                login_path = value
+        elif not a.startswith("-"):
+            passthru.append(a)  # bare positional = database name
+        elif a[:2] in PASSTHRU_SHORT_VALUED:
+            if len(a) > 2:
+                passthru.append(a)
+            else:
+                i += 1
+                if i >= len(argv):
+                    die(f"missing value after {a}")
+                passthru += [a, argv[i]]
+        elif head in PASSTHRU_FLAGS and "=" not in a:
+            passthru.append(a)
+        elif head in PASSTHRU_VALUED:
+            if "=" in a:
+                passthru.append(a)
+            else:
+                i += 1
+                if i >= len(argv):
+                    die(f"missing value after {a}")
+                passthru += [a, argv[i]]
+        elif a.startswith("--password") or (a.startswith("-p") and not a.startswith("--")):
+            die("inline passwords not allowed; ro-mysql reads them from the Keychain")
+        elif head in ("-h", "--host", "-P", "--port"):
+            die(f"{a}: pick the target with --tunnel=<name> or MYSQL_RO_PORT; MYSQL_RO_HOST stays local (ro-mysql --tunnels)")
+        else:
+            allowed = ", ".join(sorted(PASSTHRU_FLAGS | PASSTHRU_VALUED | PASSTHRU_SHORT_VALUED))
+            die(f"arg not allowed: {a}  (permitted: -e, --tunnel, --login-path, {allowed})")
+        i += 1
+    return sql, login_path, tunnel, passthru
+
+
+def kind_of(name: str) -> str:
+    return "STAGING" if STAGING_RE.search(name) else "PROD"
+
+
+CONFIG_LINE_RE = re.compile(r"(\w+)\s*(?:=\s*|\s+)(.*)")
+MAX_INCLUDE_DEPTH = 16  # ssh's own limit
+
+
+def config_args(text: str) -> list[str] | None:
+    """A config line's arguments split as ssh's argv_split does: blanks separate, double or single
+    quotes group, a backslash escapes a quote, a backslash or (unquoted) a space, and an argument
+    starting with `#` ends the line. None: an unclosed quote, which ssh rejects."""
+    args: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] in " \t":
+            i += 1
+            continue
+        if text[i] == "#":
+            break
+        arg, quote = [], ""
+        while i < n:
+            c = text[i]
+            if c == "\\" and i + 1 < n and (text[i + 1] in "'\"\\" or (not quote and text[i + 1] == " ")):
+                arg.append(text[i + 1])
+                i += 1
+            elif not quote and c in " \t":
+                break
+            elif not quote and c in "'\"":
+                quote = c
+            elif quote and c == quote:
+                quote = ""
+            else:
+                arg.append(c)
+            i += 1
+        if quote:
+            return None
+        args.append("".join(arg))
+    return args
+
+
+@dataclasses.dataclass
+class HostBlock:
+    """One `Host` or `Match` block of an ssh config file; the lines before the first are a block with
+    no patterns. `line` is the 0-based index of its Host/Match line in `path` (-1 for that first one)."""
+
+    patterns: list[str]
+    match: bool
+    path: str
+    line: int
+    options: list[tuple[str, list[str]]] = dataclasses.field(default_factory=list)
+    db_user: str | None = None  # its `# ro-mysql: user=` annotation
+
+    def aliases(self) -> list[str]:
+        """The literal names it defines (no wildcard or negation)."""
+        return [] if self.match else [p for p in self.patterns if not set(p) & set("*?!")]
+
+    def wildcard(self) -> bool:
+        return self.match or any(set(p) & set("*?") for p in self.patterns)
+
+    def forwards(self) -> list[tuple[str, str]]:
+        """(local port, remote) of each LocalForward."""
+        out = []
+        for key, args in self.options:
+            if key == "localforward" and args:
+                out.append((args[0].rsplit(":", 1)[-1], args[1] if len(args) > 1 else ""))
+        return out
+
+
+def include_paths(args: list[str]) -> list[str]:
+    """The files an `Include` names, as ssh finds them: ~ expanded, a relative path under ~/.ssh,
+    each glob sorted."""
+    found = []
+    for arg in args:
+        pattern = os.path.expanduser(arg)
+        if not os.path.isabs(pattern):
+            pattern = os.path.join(os.path.expanduser("~/.ssh"), pattern)
+        found += sorted(glob.glob(pattern))
+    return found
+
+
+def config_blocks(path: str = SSH_CONFIG, depth: int = 0) -> list[HostBlock]:
+    """Every block of an ssh config in the order ssh reads it, an Included file's blocks after the
+    block that Includes it. A missing or unreadable file has none."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    block = HostBlock([], False, path, -1)
+    blocks = [block]
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        note = ANNOTATION_RE.fullmatch(line)
+        if note:
+            fields = dict(f.split("=", 1) for f in note.group(1).split() if "=" in f)
+            if DB_USER_RE.fullmatch(fields.get("user", "")):
+                block.db_user = fields["user"]
+            continue
+        m = CONFIG_LINE_RE.match(line)
+        args = config_args(m.group(2)) if m else None
+        if m is None or args is None:
+            continue
+        key = m.group(1).lower()
+        if key in ("host", "match"):
+            block = HostBlock(args if key == "host" else [], key == "match", path, i)
+            blocks.append(block)
+        elif key == "include":
+            if depth < MAX_INCLUDE_DEPTH:
+                for included in include_paths(args):
+                    blocks += config_blocks(included, depth + 1)
+        else:
+            block.options.append((key, args))
+    return blocks
+
+
+def tunnels_of(blocks: list[HostBlock]) -> list[Tunnel]:
+    """Each LocalForward port under a literal `Host db-tunnel-*`, with its block's DB user, remote
+    and HostName."""
+    tunnels: dict[tuple[str, str, str | None], Tunnel] = {}
+    for b in blocks:
+        hostname = next((args[0] for key, args in b.options if key == "hostname" and args), "")
+        for alias in (a for a in b.aliases() if a.startswith(TUNNEL_PREFIX)):
+            for port, remote in b.forwards():
+                # Two binds of one local port (127.0.0.1 and [::1]) are one forward.
+                if port.isdigit():
+                    tunnels.setdefault((alias, port, b.db_user), Tunnel(alias, port, b.db_user, remote, hostname))
+    return list(tunnels.values())
+
+
+def load_tunnels(path: str = SSH_CONFIG) -> list[Tunnel]:
+    return tunnels_of(config_blocks(path))
+
+
+def parse_login_paths(text: str) -> dict[str, LoginPath]:
+    """`mysql_config_editor print --all` output, keyed by login path."""
+    found: dict[str, dict[str, str]] = {}
+    fields: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            fields = found.setdefault(line[1:-1], {})
+        elif "=" in line:
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip().strip('"')
+    return {n: LoginPath(n, f.get("user"), f.get("port")) for n, f in found.items()}
+
+
+@functools.cache
+def login_paths() -> dict[str, LoginPath]:
+    """The user's login paths; only consulted where a tunnel has no annotation or password."""
+    editors = [os.path.join(os.path.dirname(p), "mysql_config_editor") for p in CLIENT_CANDIDATES]
+    editor = next((e for e in editors if os.access(e, os.X_OK)), None)
+    if editor is None:
+        return {}
+    try:
+        out = subprocess.run(
+            [editor, "print", "--all"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    return parse_login_paths(out)
+
+
+def port_users(t: Tunnel, logins: dict[str, LoginPath]) -> set[str]:
+    """The users of the same-kind login paths on t's port."""
+    return {
+        lp.user for lp in logins.values()
+        if lp.port == t.port and lp.user and kind_of(lp.name) == t.kind
+    }
+
+
+def tunnel_user(t: Tunnel, logins: dict[str, LoginPath]) -> str | None:
+    """The annotated DB user, else the single user of same-kind login paths on its port."""
+    if t.user:
+        return t.user
+    users = port_users(t, logins)
+    return users.pop() if len(users) == 1 else None
+
+
+def no_user_reason(t: Tunnel, logins: dict[str, LoginPath]) -> str:
+    """Why t has no DB user, and the annotation that gives it one. Counts users, never names them."""
+    n = len(port_users(t, logins))
+    shared = f" ({n} login-path users share port {t.port})" if n > 1 else ""
+    return (
+        f"{t.alias} has no DB user{shared}: add `# ro-mysql: user=<db user>` under "
+        f"`Host {t.alias}` in ~/.ssh/config"
+    )
+
+
+def fallback_login_paths(t: Tunnel, user: str, logins: dict[str, LoginPath]) -> list[str]:
+    """Same-kind login paths for the tunnel's user, most specific first."""
+    stem = t.name.split("-")[0]
+    fits = [lp for lp in logins.values() if kind_of(lp.name) == t.kind and lp.user == user]
+    fits.sort(key=lambda lp: (lp.port != t.port, not lp.name.startswith(stem), lp.name))
+    return [lp.name for lp in fits]
+
+
+def keychain_account(t: Tunnel, user: str) -> str:
+    """One entry per tunnel: the same DB user has a different password on each instance."""
+    return f"{user}@{t.alias}"
+
+
+def multi_port_aliases(tunnels: list[Tunnel]) -> set[str]:
+    """Aliases forwarding several local ports: they would share one Keychain account, so none is stored."""
+    counts = collections.Counter(alias for alias, _ in {(t.alias, t.port) for t in tunnels})
+    return {alias for alias, n in counts.items() if n > 1}
+
+
+def keychain_get(account: str) -> str | None:
+    """The account's password from the store, else from its environment variable."""
+    return store_get(account) or os.environ.get(env_name(account)) or None
+
+
+def store_get(account: str) -> str | None:
+    """The account's password from the store (secret_store)."""
+    code, secret = secret_store.lookup(KEYCHAIN_SERVICE, account, reveal=True)
+    return secret if code == 0 and secret else None
+
+
+def keychain_set(account: str, password: str) -> bool:
+    """Store the account's password (secret_store.save: never in argv)."""
+    if not DB_USER_RE.fullmatch(account):
+        return False
+    if secret_store.store() == "env":
+        print(f"  no Keychain or secret-tool here: export {env_name(account)} in your shell profile instead", file=sys.stderr)
+        return False
+    return secret_store.save(KEYCHAIN_SERVICE, account, password, label=f"ro-mysql {account}")
+
+
+def note_auth_failure(user: str, alias: str, path: str = AUTH_FAILED) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    with open(path, "w") as f:
+        f.write(f"{user} {alias} {stamp}\n")
+
+
+def auth_failure(path: str = AUTH_FAILED) -> tuple[str, str] | None:
+    """(user, tunnel alias) of the recorded rejected login; None when there is none."""
+    try:
+        with open(path) as f:
+            recorded = f.read().split()
+    except OSError:
+        return None
+    return (recorded[0], recorded[1]) if len(recorded) >= 2 else None
+
+
+def clear_auth_failure(user: str | None, alias: str, path: str = AUTH_FAILED) -> None:
+    """Drop the failure record once the same user authenticates again on the same tunnel."""
+    if user and auth_failure(path) == (user, alias):
+        os.remove(path)
+
+
+def listeners() -> dict[str, tuple[str, str]] | None:
+    """Local TCP port -> (pid, command line) of the process listening on it; None if lsof failed."""
+    try:
+        r = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # lsof exits 1 both for "no listener" and for an error; only empty output makes it the former.
+    if r.returncode != 0 and (r.returncode != 1 or r.stdout.strip()):
+        return None
+    out = r.stdout
+    by_port: dict[str, str] = {}
+    pid = ""
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("n"):
+            by_port.setdefault(line.rsplit(":", 1)[-1], pid)
+    if not by_port:
+        return {}
+    try:
+        ps = subprocess.run(
+            ["ps", "-o", "pid=,command=", "-p", ",".join(sorted(set(by_port.values())))],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        ps = ""
+    commands = {}
+    for line in ps.splitlines():
+        pid_s, _, command = line.strip().partition(" ")
+        commands[pid_s] = command.strip()
+    return {port: (p, commands.get(p, "")) for port, p in by_port.items()}
+
+
+def holder(port: str, tunnels: list[Tunnel], held: dict[str, tuple[str, str]] | None) -> str | None:
+    """The db-tunnel alias (or other command) listening on a local port; None when free."""
+    if held is None:
+        return LSOF_FAILED
+    if port not in held:
+        return None
+    words = held[port][1].split()
+    fallback = os.path.basename(words[0]) if words else "an unknown process"
+    return next((t.alias for t in tunnels if t.alias in words), fallback)
+
+
+def pick_tunnel(
+    tunnels: list[Tunnel], name: str | None, port: str | None, held_by: Callable[[str], str | None]
+) -> Tunnel:
+    """Resolve --tunnel (or else the port) to exactly one tunnel, never guessing on a shared port."""
+    if name:
+        matches = [t for t in tunnels if name in (t.alias, t.name)]
+        if len(matches) > 1:
+            matches = [t for t in matches if t.port == port]
+        if len(matches) != 1:
+            known = ", ".join(sorted({t.name for t in tunnels})) or "none"
+            die(f"unknown tunnel {name!r} (known: {known}); ro-mysql --tunnels lists them")
+        t = matches[0]
+        if shares_port(t, tunnels):
+            h = held_by(t.port)
+            refuse_unknown_holder(t.port, h)
+            if h not in (None, t.alias):
+                die(f"port {t.port} is held by {h}, not {t.alias}; close it first (ro-mysql --tunnels)")
+        return t
+    if not port:
+        die("no target: pass --tunnel=<name> (ro-mysql --tunnels lists them)")
+    matches = [t for t in tunnels if t.port == port]
+    if not matches:
+        die(f"port {port} is not a db-tunnel-* LocalForward in ~/.ssh/config; use --tunnel=<name> (ro-mysql --tunnels)")
+    if len(matches) == 1:
+        return matches[0]
+    h = held_by(port)
+    refuse_unknown_holder(port, h)
+    for t in matches:
+        if t.alias == h:
+            return t
+    names = ", ".join(t.name for t in matches)
+    die(f"port {port} is shared by {names} and none of them holds it; pass --tunnel=<name>")
+
+
+def shares_port(t: Tunnel, tunnels: list[Tunnel]) -> bool:
+    return sum(x.port == t.port for x in tunnels) > 1
+
+
+def refuse_unknown_holder(port: str, h: str | None) -> None:
+    """On a shared port an unknown holder may be a sibling tunnel, so the query would read it."""
+    if h == LSOF_FAILED:
+        die(f"port {port} is shared by several tunnels and lsof could not say which one holds it; retry")
+
+
+def cred_chain(t: Tunnel, login_path: str | None, logins: Logins) -> list[Creds]:
+    """Credentials for t, best first: a forced login path, the Keychain, same-kind login paths."""
+    if login_path:
+        forced = logins().get(login_path)
+        user = forced.user if forced else None
+        # Another same-kind login path may hold a user with write grants, which --login-path would
+        # otherwise hand the client, so it must be the tunnel's reader. An unannotated tunnel whose
+        # port's login paths name no single user has none to check against, and is refused too.
+        reader = tunnel_user(t, {} if t.user else logins())
+        if reader is None:
+            die(f"--login-path needs {t.alias}'s DB user to check it against. {no_user_reason(t, logins())}")
+        if user != reader:
+            die(
+                f"--login-path={login_path} connects as {user or 'an unknown user'}, not "
+                f"{t.alias}'s DB user {reader}. Drop --login-path: ro-mysql uses {reader}'s "
+                "credentials itself."
+            )
+        return [Creds(user, None, login_path)]
+    user = tunnel_user(t, {} if t.user else logins())
+    # The same rule as --login-path: with no user to check against, the first same-port login path
+    # by sort order may be one whose user can write, so there is nothing safe to pick.
+    if user is None:
+        return []
+    password = keychain_get(keychain_account(t, user))
+    if password is not None:
+        return [Creds(user, password, None)]
+    return login_fallbacks(t, user, logins)
+
+
+def login_fallbacks(t: Tunnel, user: str, logins: Logins) -> list[Creds]:
+    """The login paths t's user falls back to without a Keychain password; MYSQL_RO_LOGIN_PATH
+    counts only when no login path is readable."""
+    known = logins()
+    candidates = fallback_login_paths(t, user, known)
+    env_lp = os.environ.get("MYSQL_RO_LOGIN_PATH")
+    if not known and env_lp and kind_of(env_lp) == t.kind:
+        candidates = [env_lp]
+    return [Creds(known[c].user if c in known else None, None, c) for c in candidates]
+
+
+def no_creds_reason(t: Tunnel, logins: Logins) -> str:
+    user = tunnel_user(t, {} if t.user else logins())
+    if user is None:
+        return no_user_reason(t, logins())
+    return (f"Credential access unavailable for {keychain_account(t, user)}: the item may be missing or Keychain access denied. "
+            "Retry from a trusted terminal or approved wrapper before changing credentials; "
+            "use `ro-mysql --rotate` only after confirming the item is missing or expired.")
+
+
+def pick_creds(t: Tunnel, login_path: str | None, logins: Logins) -> Creds:
+    chain = cred_chain(t, login_path, logins)
+    if not chain:
+        die(no_creds_reason(t, logins))
+    return chain[0]
+
+
+def fixed_client() -> str:
+    for path in CLIENT_CANDIDATES:
+        if os.access(path, os.X_OK):
+            return path
+    hint_script = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks/lib/install-hint")
+    try:
+        hint = subprocess.run(["sh", hint_script, "mysql"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        hint = ""
+    hint = hint or "install the mysql client with your package manager"
+    die(f"no mysql client at {' or '.join(CLIENT_CANDIDATES)}: {hint}")
+
+
+def client_cmd(port: str, creds: Creds, extra: list[str], sql: str) -> tuple[list[str], dict[str, str]]:
+    """The client argv and environment; neither ever carries a password (run_client adds it)."""
+    max_ms = int(os.environ.get("MYSQL_RO_MAX_MS", str(DEFAULT_MAX_MS)))
+    init = f"SET SESSION transaction_read_only = ON, SESSION max_execution_time = {max_ms}"
+    env = dict(os.environ)
+    env.pop("MYSQL_PWD", None)
+    auth = f"--login-path={creds.login_path}" if creds.password is None else f"--user={creds.user}"
+    cmd = [fixed_client(), auth]
+    # TCP pins the checked port: `localhost` would otherwise take the local unix socket.
+    cmd += ["--connect-timeout=10", "--protocol=TCP", "-h", "127.0.0.1", "-P", port]
+    # --init-command goes LAST: mysql takes the final occurrence of a repeated option, so
+    # anything that slipped into passthru cannot override the read-only session.
+    cmd += [*extra, f"--init-command={init}", "-e", sql]
+    return cmd, env
+
+
+def cnf_quote(value: str) -> str:
+    """A double-quoted option-file value that my_getopt reads back byte for byte."""
+    escapes = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    return '"' + "".join(escapes.get(c, c) for c in value) + '"'
+
+
+def _exit_on_signal(signum: int, _frame: object) -> NoReturn:
+    raise SystemExit(128 + signum)
+
+
+@contextlib.contextmanager
+def exit_on_signals() -> Iterator[None]:
+    """SIGTERM and SIGHUP raise SystemExit inside the block, so its finally clauses still run."""
+    previous = {s: signal.signal(s, _exit_on_signal) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+
+
+@contextlib.contextmanager
+def password_file(password: str) -> Iterator[str]:
+    """A 0600 [client] option file holding the password, removed when the block exits."""
+    fd, path = tempfile.mkstemp(prefix="ro-mysql-", suffix=".cnf")
+    # SIGTERM/SIGHUP would otherwise skip the finally and leave the password on disk.
+    with exit_on_signals():
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(f"[client]\npassword={cnf_quote(password)}\n")
+            yield path
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+
+
+def run_client(
+    cmd: list[str], env: dict[str, str], password: str | None, **kwargs: Any
+) -> subprocess.CompletedProcess[str]:
+    """Run the client; a password reaches it only through an option file deleted when it exits."""
+    if password is None:
+        return subprocess.run(cmd, env=env, **kwargs)
+    with password_file(password) as path:
+        # The client honours --defaults-extra-file only as its first argument.
+        return subprocess.run([cmd[0], f"--defaults-extra-file={path}", *cmd[1:]], env=env, **kwargs)
+
+
+def plan(
+    argv: list[str],
+    ssh_config: str = SSH_CONFIG,
+    logins: Logins = login_paths,
+    held: Listeners = listeners,
+) -> Plan:
+    """Validate a query call and resolve its tunnel, credentials and client command."""
+    sql, login_path, tunnel_name, passthru = parse_args(argv)
+    if sql is None:
+        die("usage: ro-mysql [--tunnel=NAME] [-D db] -e 'SELECT ...'  (interactive mode disabled)")
+    validate(sql)
+    host = os.environ.get("MYSQL_RO_HOST") or "127.0.0.1"
+    if host not in LOCAL_HOSTS:
+        die(f"MYSQL_RO_HOST={host}: only the local db-tunnel forwards are reachable (ro-mysql --tunnels)")
+    tunnels = load_tunnels(ssh_config)
+    # A bare word is a database name to mysql, so `ro-mysql crossborder-staging -e …` used to reach
+    # the default tunnel (a PROD one) and ask it for a database called crossborder-staging.
+    names = {t.name for t in tunnels} | {t.alias for t in tunnels}
+    prev = ""
+    for word in passthru:
+        if not word.startswith("-") and prev not in PASSTHRU_SHORT_VALUED | PASSTHRU_VALUED and word in names:
+            die(f"'{word}' is a tunnel, not a database: pass --tunnel={word} (ro-mysql --tunnels)")
+        prev = word
+    port = os.environ.get("MYSQL_RO_PORT") or None
+    if not tunnel_name and not port and login_path and login_path in logins():
+        port = logins()[login_path].port
+    t = pick_tunnel(tunnels, tunnel_name, port, lambda p: holder(p, tunnels, held()))
+    if login_path and kind_of(login_path) != t.kind:
+        die(
+            f"--login-path={login_path} is {kind_of(login_path)} but {t.alias} (port {t.port}) is "
+            f"{t.kind}: that reads one environment and labels it the other. Drop --login-path and "
+            "pass --tunnel=<name> (ro-mysql --tunnels)."
+        )
+    creds = pick_creds(t, login_path, logins)
+    cmd, env = client_cmd(t.port, creds, passthru, sql)
+    label = f"{t.kind} {t.name} @{t.port} {creds.describe()}"
+    port_tunnels = [x for x in tunnels if x.port == t.port]
+    return Plan(cmd, env, creds.password, t, port_tunnels, creds.user, label)
+
+
+def explain_line(p: Plan) -> str | None:
+    """One line on the plan of p's SELECT/WITH, EXPLAINed in p's session settings; None when it can't run."""
+    sql = p.cmd[-1]
+    tokens = tokenize(sql)
+    if not tokens or tokens[0] not in ("select", "with"):
+        return None
+    # Same connection, database and --init-command (read-only, max_execution_time); display flags
+    # such as --vertical are dropped so the output parses as one tab-separated table.
+    port_at = p.cmd.index("-P") + 2
+    init_at = next(i for i, a in enumerate(p.cmd) if a.startswith("--init-command="))
+    keep = [a for a in p.cmd[port_at:init_at] if norm(a) not in PASSTHRU_FLAGS]
+    cmd = [*p.cmd[:port_at], *keep, "--batch", p.cmd[init_at], "-e", f"EXPLAIN FORMAT=TRADITIONAL {sql}"]
+    try:
+        r = run_client(
+            cmd, p.env, p.password, capture_output=True, text=True, errors="replace", timeout=EXPLAIN_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or len(lines) < 2:
+        return None
+    header = lines[0].split("\t")
+    rows = [dict(zip(header, line.split("\t"))) for line in lines[1:]]
+    parts = [
+        f"{row.get('table', '?')} type={row.get('type', '?')} key={row.get('key', '?')} rows~{row.get('rows', '?')}"
+        for row in rows[:EXPLAIN_SHOWN]
+    ]
+    more = f"; +{len(rows) - EXPLAIN_SHOWN} more" if len(rows) > EXPLAIN_SHOWN else ""
+    return f"ro-mysql: EXPLAIN {'; '.join(parts)}{more}"
+
+
+def read_sql_file(path: str) -> str:
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return f.read()
+    except OSError as e:
+        die(f"--file={path}: {e.strerror}")
+
+
+def split_extras(argv: list[str]) -> tuple[list[str], str | None, list[str] | None]:
+    """Take --file and --each out of argv: (the rest, the SQL file, the --each values)."""
+    rest: list[str] = []
+    sql_file: str | None = None
+    each: list[str] | None = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        head = norm(a.split("=", 1)[0])
+        if head in ("--file", "--each"):
+            if "=" in a:
+                value = a.split("=", 1)[1]
+            else:
+                i += 1
+                if i >= len(argv):
+                    die(f"missing value after {head}")
+                value = argv[i]
+            if head == "--file":
+                sql_file = value
+            else:
+                each = [v.strip() for v in value.split(",") if v.strip()]
+                if not each:
+                    die("--each needs at least one value: --each=A,B,C")
+        else:
+            rest.append(a)
+        i += 1
+    return rest, sql_file, each
+
+
+def with_sql_file(argv: list[str], sql_file: str | None) -> list[str]:
+    """argv with the --file statement as its -e; plan() validates it like any other."""
+    if sql_file is None:
+        return argv
+    if parse_args(argv)[0] is not None:
+        die("--file and -e both give the statement: pass one")
+    return [*argv, "-e", read_sql_file(sql_file)]
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+def run_each(p: Plan, values: list[str]) -> int:
+    """Run p's statement once per value, `{}` replaced by it as a quoted literal; the first non-zero exit code."""
+    template = p.cmd[-1]
+    if "{}" not in template:
+        die("--each needs a {} placeholder in the statement, e.g. WHERE id = {}")
+    worst = 0
+    for value in values:
+        sql = template.replace("{}", sql_literal(value))
+        validate(sql)
+        print(f"ro-mysql: --each {value}", file=sys.stderr)
+        result = run_plan(p._replace(cmd=[*p.cmd[:-1], sql]))
+        worst = worst or result.returncode
+        if "ERROR 1045" in result.stderr:
+            break  # a rejected password fails every value the same way
+    return worst
+
+
+def run_plan(p: Plan) -> subprocess.CompletedProcess[str]:
+    """Run one validated plan; report an auth failure, or a timeout's plan and next step."""
+    print(f"ro-mysql: {p.label}", file=sys.stderr)
+    result = execute(p)
+    sys.stderr.write(result.stderr)
+    if result.returncode == 0:
+        clear_auth_failure(p.user, p.tunnel.alias)
+    elif "ERROR 1045" in result.stderr and p.user:
+        note_auth_failure(p.user, p.tunnel.alias)
+        print(f"ro-mysql: {p.user} rejected on {p.tunnel.alias}; the user runs `ro-mysql --rotate` in a terminal", file=sys.stderr)
+    elif "ERROR 3024" in result.stderr:
+        line = explain_line(p)
+        if line:
+            print(line, file=sys.stderr)
+        print(TIMEOUT_NEXT, file=sys.stderr)
+    return result
+
+
+def open_tunnel(alias: str) -> str:
+    """Start the ssh forward; returns its last stderr line ('' on success)."""
+    try:
+        # BatchMode fails fast instead of hanging on a prompt; -f backgrounds after the forward binds.
+        r = subprocess.run(
+            ["ssh", "-f", "-N", "-o", "BatchMode=yes", alias],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, timeout=SSH_TIMEOUT_S, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"ssh {alias} timed out after {SSH_TIMEOUT_S}s"
+    lines = r.stderr.strip().splitlines()
+    return "" if r.returncode == 0 else (lines[-1] if lines else f"ssh exited {r.returncode}")
+
+
+def close_tunnel(t: Tunnel, tunnels: list[Tunnel]) -> None:
+    held = listeners()
+    if held is None or holder(t.port, tunnels, held) != t.alias:
+        return
+    os.kill(int(held[t.port][0]), signal.SIGTERM)
+    for _ in range(15):
+        if t.port not in (listeners() or {}):
+            return
+        time.sleep(0.2)
+
+
+@contextlib.contextmanager
+def tunnel_up(t: Tunnel, tunnels: list[Tunnel]) -> Iterator[str | None]:
+    """Yield None while t's forward listens (opened here and closed after if it was down), else why not."""
+    h = holder(t.port, tunnels, listeners())
+    if h == t.alias:
+        yield None
+        return
+    if h is not None:
+        yield f"port {t.port} is held by {h}"
+        return
+    err = open_tunnel(t.alias)
+    if holder(t.port, tunnels, listeners()) != t.alias:
+        yield f"tunnel did not open: {err or 'no listener'}"
+        return
+    try:
+        yield None
+    finally:
+        close_tunnel(t, tunnels)
+
+
+def attempt(t: Tunnel, creds: Creds, sql: str) -> subprocess.CompletedProcess[str]:
+    cmd, env = client_cmd(t.port, creds, ["-N", "-B"], sql)
+    try:
+        return run_client(
+            cmd, env, creds.password, capture_output=True, text=True, errors="replace", timeout=60
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 1, "", f"{sql} timed out after 60s")
+
+
+def last_line(text: str) -> str:
+    lines = text.strip().splitlines()
+    return lines[-1] if lines else "no output"
+
+
+def show_databases(
+    t: Tunnel, tunnels: list[Tunnel], logins: Logins | None = None
+) -> tuple[str, str]:
+    """(how it authenticated, comma-joined databases) for one tunnel, or a '? reason'."""
+    # Looked up per call, not bound as the default: a default is fixed when the def runs.
+    logins = logins or login_paths
+    tries = cred_chain(t, None, logins)
+    if not tries:
+        return "-", f"? {no_creds_reason(t, logins)}"
+    with tunnel_up(t, tunnels) as problem:
+        if problem:
+            return "-", f"? {problem}"
+        reason = ""
+        for creds in tries:
+            r = attempt(t, creds, "SHOW DATABASES")
+            if r.returncode == 0:
+                dbs = [d for d in r.stdout.splitlines() if d and d not in SYSTEM_SCHEMAS]
+                return creds.describe(), ",".join(dbs) or "(none)"
+            reason = last_line(r.stderr)
+            if "ERROR 1045" not in r.stderr:
+                break
+    return "-", f"? {reason}"
+
+
+def read_cache(path: str = CACHE) -> dict[tuple[str, str], dict[str, str]]:
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+    rows = (dict(zip(CACHE_COLUMNS, line.split("\t"))) for line in lines[1:] if line)
+    return {(r["alias"], r["port"]): r for r in rows if "port" in r}
+
+
+class CachedState(NamedTuple):
+    """One --refresh cache row: databases is None when the check failed (reason says why) or never
+    ran (reason "not checked")."""
+
+    checked: str
+    via: str
+    databases: list[str] | None
+    reason: str
+
+
+def cached_state(row: dict[str, str]) -> CachedState:
+    if not row:
+        return CachedState("", "", None, "not checked")
+    checked, via, databases = row.get("checked", ""), row.get("via", ""), row.get("databases", "")
+    if databases.startswith("?"):
+        return CachedState(checked, via, None, databases[1:].strip())
+    return CachedState(checked, via, [d for d in databases.split(",") if d], "")
+
+
+def refresh(tunnels: list[Tunnel], path: str = CACHE) -> None:
+    today = datetime.date.today().isoformat()
+    rows = []
+    for t in tunnels:
+        print(f"ro-mysql: checking {t.alias} @{t.port}", file=sys.stderr)
+        via, dbs = show_databases(t, tunnels)
+        rows.append((t.alias, t.port, t.kind, today, via, dbs))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("\t".join(CACHE_COLUMNS) + "\n")
+        f.writelines("\t".join(row) + "\n" for row in rows)
+
+
+def keychain_has(account: str) -> bool:
+    if secret_store.store() != "keychain":
+        return keychain_get(account) is not None
+    return secret_store.lookup(KEYCHAIN_SERVICE, account, reveal=False)[0] == 0
+
+
+def show_tunnels(tunnels: list[Tunnel], do_refresh: bool) -> None:
+    if not tunnels:
+        die(f"no `Host db-tunnel-*` block with a LocalForward in {SSH_CONFIG}")
+    if do_refresh:
+        refresh(tunnels)
+    cache = read_cache()
+    held = listeners()
+    logins = {} if all(t.user for t in tunnels) else login_paths()
+    rows = [("TUNNEL", "PORT", "KIND", "DB USER", "STATE", "DATABASES")]
+    for t in tunnels:
+        h = holder(t.port, tunnels, held)
+        state = "up" if h == t.alias else "down" if h is None else f"down ({h} holds the port)"
+        if h == LSOF_FAILED:
+            state = "? (lsof failed)"
+        cached = cached_state(cache.get((t.alias, t.port), {}))
+        dbs = ",".join(cached.databases) if cached.databases is not None else f"? {cached.reason}"
+        rows.append((t.name, t.port, t.kind, tunnel_user(t, logins) or "?", state, dbs))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[-1])
+    print()
+    ports: dict[str, list[str]] = {}
+    for t in tunnels:
+        ports.setdefault(t.port, []).append(t.name)
+    for port, names in ports.items():
+        if len(names) > 1:
+            print(f"shared port {port}: {', '.join(names)}; only one can be open, so give each its own port")
+    shared = multi_port_aliases(tunnels)
+    for alias in sorted(shared):
+        print(f"{alias} has several LocalForwards, so it gets no Keychain password: give each forward its own alias")
+    missing = [
+        (t, u) for t in tunnels
+        if t.alias not in shared and (u := tunnel_user(t, logins)) and not keychain_has(keychain_account(t, u))
+    ]
+    via_login = [t.name for t, u in missing if login_fallbacks(t, u, login_paths)]
+    no_creds = [t.name for t, _ in missing if t.name not in via_login]
+    if via_login:
+        print(f"no Keychain password for {', '.join(via_login)} (login path used): run `ro-mysql --rotate` in a terminal")
+    if no_creds:
+        print(f"no Keychain password or login path for {', '.join(no_creds)}: run `ro-mysql --rotate` in a terminal")
+    failed = auth_failure()
+    if failed:
+        print(f"auth failed: {failed[0]} on {failed[1]}; run `ro-mysql --rotate` in a terminal")
+    checked = sorted({r.get("checked", "?") for r in cache.values()})
+    print(f"databases checked {', '.join(checked) or 'never'}; `ro-mysql --tunnels --refresh` re-checks")
+    print("query: ro-mysql --tunnel=<name> -D <db> -e 'SELECT ...'")
+
+
+def db_users(tunnels: list[Tunnel], logins: dict[str, LoginPath]) -> tuple[dict[str, list[Tunnel]], list[Tunnel]]:
+    """Tunnels grouped by DB user, and the tunnels whose user is unknown."""
+    users: dict[str, list[Tunnel]] = {}
+    unknown: list[Tunnel] = []
+    for t in tunnels:
+        user = tunnel_user(t, logins)
+        if user is None:
+            unknown.append(t)
+        else:
+            users.setdefault(user, []).append(t)
+    return users, unknown
+
+
+def rotate(
+    tunnels: list[Tunnel], ask: Callable[[str], str] = getpass.getpass, auth_path: str = AUTH_FAILED
+) -> None:
+    """Prompt once per tunnel, test the password on that tunnel, store it for that tunnel if accepted."""
+    users, unknown = db_users(tunnels, {} if all(t.user for t in tunnels) else login_paths())
+    shared = multi_port_aliases(tunnels)
+    for alias in sorted(shared):
+        print(f"skip {alias}: it has several LocalForwards; give each forward its own alias")
+    for t in unknown:
+        if t.alias not in shared:
+            print(f"skip {t.alias}: add `# ro-mysql: user=<db user>` to its Host block")
+    for user, ts in sorted(users.items()):
+        for t in ts:
+            if t.alias in shared:
+                continue
+            password = ask(f"{t.name} ({user}) password, blank skips: ")
+            if not password:
+                continue
+            with tunnel_up(t, tunnels) as problem:
+                if problem is None:
+                    r = attempt(t, Creds(user, password, None), "SELECT 1")
+                    problem = None if r.returncode == 0 else last_line(r.stderr)
+            account = keychain_account(t, user)
+            if problem:
+                print(f"  not stored: {problem}")
+            elif keychain_set(account, password):
+                clear_auth_failure(user, t.alias, auth_path)
+                print(f"  ok, stored in the Keychain (service {KEYCHAIN_SERVICE}, account {account})")
+            else:
+                print(f"  ok, but the Keychain write failed for {account}")
+
+
+def reopen_tunnel(alias: str) -> None:
+    print(f"ro-mysql: 2003 on {alias}; running `ssh -f -N {alias}`, then retrying once", file=sys.stderr)
+    err = open_tunnel(alias)
+    if err:
+        print(f"ro-mysql: {err}", file=sys.stderr)
+
+
+def run(p: Plan) -> subprocess.CompletedProcess[str]:
+    # stdout streams straight through; only stderr is held to spot 2003/1045.
+    return run_client(p.cmd, p.env, p.password, stderr=subprocess.PIPE, text=True, errors="replace")
+
+
+def execute(
+    p: Plan, held: Listeners = listeners, reopen: Callable[[str], None] = reopen_tunnel
+) -> subprocess.CompletedProcess[str]:
+    """Run the plan; on ERROR 2003 re-open its tunnel and re-run once, if that tunnel then holds the port."""
+    result = run(p)
+    if result.returncode == 0 or "ERROR 2003" not in result.stderr:
+        return result
+    reopen(p.tunnel.alias)
+    # A sibling on a shared port may have taken it meanwhile; the re-run would then read its DB.
+    if len(p.port_tunnels) > 1:
+        h = holder(p.tunnel.port, p.port_tunnels, held())
+        if h != p.tunnel.alias:
+            sys.stderr.write(result.stderr)
+            die(f"port {p.tunnel.port} is held by {h or 'nothing'}, not {p.tunnel.alias}, after the re-open; not re-running")
+    return run(p)
+
+
+TUNNEL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+SSH_ALIAS_RE = re.compile(r"[A-Za-z0-9_.-]+")
+REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9.-]+")
+PORT_RE = re.compile(r"[0-9]{1,5}")
+REMOTE_RE = re.compile(rf"({REMOTE_HOST_RE.pattern}):({PORT_RE.pattern})")
+STAGING_SUFFIX = "-staging"
+LOCAL_PORTS = (1024, 65535)  # the add form reads these patterns and ranges from here
+REMOTE_PORTS = (1, 65535)
+ADD_USAGE = (
+    "usage: ro-mysql add --name SVC --user DBUSER --via BASTION --remote HOST:PORT --local-port N "
+    "[--staging] [--dry-run]"
+)
+
+
+class NewTunnel(NamedTuple):
+    alias: str
+    user: str
+    via: str
+    remote: str
+    local_port: str
+
+
+def parse_add(argv: list[str]) -> tuple[NewTunnel, bool]:
+    """`add`'s flags as a NewTunnel, and --dry-run. Every value is checked here, before ssh runs."""
+    values: dict[str, str] = {}
+    staging = dry_run = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        flag, eq, inline = a.partition("=")
+        if a == "--staging":
+            staging = True
+        elif a == "--dry-run":
+            dry_run = True
+        elif flag in ("--name", "--user", "--via", "--remote", "--local-port"):
+            if not eq:
+                i += 1
+                if i >= len(argv):
+                    die(f"missing value after {flag}\n{ADD_USAGE}")
+                inline = argv[i]
+            values[flag[2:]] = inline
+        elif a.startswith("--password") or a.startswith("-p"):
+            die("add prompts for the password; it never goes on the command line")
+        else:
+            die(f"add: unknown argument {a}\n{ADD_USAGE}")
+        i += 1
+    missing = [f"--{k}" for k in ("name", "user", "via", "remote", "local-port") if not values.get(k)]
+    if missing:
+        die(f"add: missing {', '.join(missing)}\n{ADD_USAGE}")
+    name, user, via, remote = values["name"], values["user"], values["via"], values["remote"]
+    if not TUNNEL_NAME_RE.fullmatch(name):
+        die(f"add: --name {name!r}: lowercase letters, digits and dashes")
+    name = name.removeprefix(TUNNEL_PREFIX)
+    if staging and kind_of(name) != "STAGING":
+        name += STAGING_SUFFIX
+    alias = TUNNEL_PREFIX + name
+    if not staging and kind_of(alias) == "STAGING":
+        die(f"add: {alias} reads as STAGING; pass --staging for a staging instance or pick another name")
+    if not DB_USER_RE.fullmatch(user) or not DB_USER_RE.fullmatch(keychain_account(Tunnel(alias, "", user), user)):
+        die(f"add: --user {user!r}: letters, digits and _.@- only")
+    if not SSH_ALIAS_RE.fullmatch(via) or via.lower().startswith(TUNNEL_PREFIX):
+        die(f"add: --via {via!r} must be the bastion's own Host alias")
+    target = REMOTE_RE.fullmatch(remote)
+    if target is None or not REMOTE_PORTS[0] <= int(target.group(2)) <= REMOTE_PORTS[1]:
+        die(f"add: --remote {remote!r}: HOST:PORT, the port from {REMOTE_PORTS[0]} to {REMOTE_PORTS[1]}")
+    port = values["local-port"]
+    if not PORT_RE.fullmatch(port) or not LOCAL_PORTS[0] <= int(port) <= LOCAL_PORTS[1]:
+        die(f"add: --local-port {port!r}: a number from {LOCAL_PORTS[0]} to {LOCAL_PORTS[1]}")
+    return NewTunnel(alias, user, via, remote, str(int(port))), dry_run
+
+
+UNMATCHED_HOST = "ro-mysql-unmatched-host.invalid"  # no block names it: ssh -G shows the defaults
+# ssh -G keys the new block sets itself, or that only name the host asked about: never copied or compared.
+# A tunnel never shares the bastion's multiplexing socket, nor listens beyond loopback.
+SELF_KEYS = {
+    "host", "localforward", "remoteforward", "dynamicforward", "clearallforwardings",
+    "exitonforwardfailure", "serveraliveinterval", "serveralivecountmax",
+    "controlmaster", "controlpath", "controlpersist", "gatewayports",
+}
+# Written into every block, which sits above the wildcards, so these win over a `Host *` value.
+OWN_LINES = ("ControlMaster no", "ControlPath none", "GatewayPorts no")
+# Keys ssh adds to on every matching block instead of keeping the first value.
+ACCUMULATING = {"identityfile", "certificatefile", "sendenv", "setenv"}
+# The value that sets a key back to "not set", for a key the bastion lacks but a wildcard block
+# would give the new alias; ssh -G prints these the same as an unset key.
+UNSET = {"proxyjump": "none", "proxycommand": "none", "identityagent": "SSH_AUTH_SOCK"}
+# Keys whose ssh -G value is the rest of the line, or several arguments: written unquoted.
+UNQUOTED = {
+    "proxycommand", "remotecommand", "localcommand", "knownhostscommand", "userknownhostsfile",
+    "globalknownhostsfile", "ipqos", "rekeylimit", "canonicaldomains", "permitremoteopen",
+    "channeltimeout", "sendenv", "setenv", "logverbose", "canonicalizepermittedcnames",
+}
+KEYWORDS = {
+    k.lower(): k
+    for k in (
+        "HostName", "User", "Port", "ProxyJump", "ProxyCommand", "IdentityFile", "IdentitiesOnly",
+        "IdentityAgent", "CertificateFile", "HostKeyAlias", "UserKnownHostsFile", "HostKeyAlgorithms",
+        "PubkeyAcceptedAlgorithms", "PreferredAuthentications", "AddKeysToAgent", "ControlMaster",
+        "ControlPath", "ControlPersist", "StrictHostKeyChecking", "ConnectTimeout", "KexAlgorithms",
+        "Ciphers", "MACs", "ForwardAgent", "Compression", "BatchMode",
+    )
+}
+
+
+def resolved(host: str, config: str) -> dict[str, list[str]]:
+    """Every key `ssh -G -F <config> <host>` prints, with its values in order."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-G", "-F", config, host],
+            capture_output=True, text=True, timeout=SSH_TIMEOUT_S, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        die(f"add: ssh -G {host} failed: {e}")
+    if r.returncode != 0:
+        die(f"add: ssh -G {host} failed: {last_line(r.stderr)}")
+    out: dict[str, list[str]] = {}
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        out.setdefault(key, []).append(value.strip())
+    return out
+
+
+def comparable(settings: dict[str, list[str]]) -> dict[str, list[str]]:
+    """ssh -G output without SELF_KEYS, a key set back to its UNSET value counted as not set."""
+    return {k: v for k, v in settings.items() if k not in SELF_KEYS and v != [UNSET.get(k)]}
+
+
+def bastion_settings(bastion: dict[str, list[str]], defaults: dict[str, list[str]]) -> dict[str, list[str]]:
+    """What the new block copies: the bastion's HostName and every key whose value differs from
+    what a host no block names gets; a key only that host gets is set back with its UNSET value."""
+    mine, base = comparable(bastion), comparable(defaults)
+    out = {}
+    keys = ["hostname"] + [k for k in mine if k != "hostname" and mine[k] != base.get(k)]
+    for key in keys + [k for k in base if k not in mine]:
+        if key in mine:
+            out[key] = mine[key]
+        elif key in UNSET:
+            out[key] = [UNSET[key]]
+    return out
+
+
+def config_value(key: str, value: str) -> str:
+    return value if key in UNQUOTED or not re.search(r"\s", value) else f'"{value}"'
+
+
+def tunnel_block(t: NewTunnel, settings: dict[str, list[str]]) -> str:
+    lines = [f"Host {t.alias}", f"  # ro-mysql: user={t.user}"]
+    lines += [f"  {KEYWORDS.get(k, k)} {config_value(k, v)}" for k, values in settings.items() for v in values]
+    lines += [f"  {line}" for line in OWN_LINES]
+    lines += [
+        f"  LocalForward {t.local_port} {t.remote}",
+        "  ExitOnForwardFailure yes",
+        "  ServerAliveInterval 30",
+        "  ServerAliveCountMax 3",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def insert_at(blocks: list[HostBlock], path: str) -> int | None:
+    """The line of the first wildcard Host or Match in the file at path: a new block goes above it,
+    since ssh keeps a key's first value. None: append."""
+    return next((b.line for b in blocks if b.path == path and b.line >= 0 and b.wildcard()), None)
+
+
+def with_block(old: str, block: str, at: int | None) -> str:
+    if at is None:
+        return old + ("" if not old else "\n" if old.endswith("\n") else "\n\n") + block
+    lines = old.splitlines(keepends=True)
+    head = "".join(lines[:at])
+    sep = "" if not head or head.endswith("\n\n") else "\n"
+    return head + sep + block + "\n" + "".join(lines[at:])
+
+
+def forward_of(value: str) -> tuple[str, str]:
+    """(listen, HOST:PORT) of an `ssh -G` localforward value such as `15310 [db]:3306`."""
+    listen, _, target = value.partition(" ")
+    host, _, port = target.rpartition(":")
+    return listen, f"{host.strip('[]')}:{port}"
+
+
+def differences(t: NewTunnel, got: dict[str, list[str]], bastion: dict[str, list[str]]) -> dict[str, str]:
+    """Each key of the full ssh -G output (SELF_KEYS aside) where the new alias resolves otherwise
+    than the bastion, and `localforward` unless the one forward is the new one, with why."""
+    mine, theirs = comparable(got), comparable(bastion)
+    out = {}
+    for key in sorted(set(mine) | set(theirs)):
+        if mine.get(key) != theirs.get(key):
+            gets, has = ", ".join(mine.get(key, [])) or "(not set)", ", ".join(theirs.get(key, [])) or "(not set)"
+            out[key] = f"{key}: {t.alias} would get {gets}; {t.via} has {has}"
+            if key in ACCUMULATING:
+                out[key] += f" (a Host * or Match block adds to every host it matches: exclude {t.alias} there)"
+    forwards = [forward_of(v) for v in got.get("localforward", [])]
+    if forwards != [(t.local_port, t.remote)]:
+        out["localforward"] = f"localforward: {t.alias} would forward {forwards or 'nothing'}, not only {t.remote}"
+    return out
+
+
+def fixable(
+    wrong: dict[str, str], settings: dict[str, list[str]], bastion: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Keys still differing that one more line in the block fixes: a single-valued key the bastion
+    has (a wildcard block named the alias but not the bastion), or one it lacks that UNSET resets."""
+    out = {}
+    for key in wrong:
+        if key in settings or key in ACCUMULATING or key == "localforward":
+            continue
+        if key in comparable(bastion):
+            out[key] = bastion[key]
+        elif key in UNSET:
+            out[key] = [UNSET[key]]
+    return out
+
+
+def backup_config(target: str, old: str, now: datetime.datetime | None = None) -> str:
+    """A 0600 copy of the config beside it, named config.bak-<time>, -<n> added on a collision."""
+    stamp = (now or datetime.datetime.now()).strftime("%Y%m%d-%H%M%S")
+    names = (f"{target}.bak-{stamp}" + (f"-{n}" if n else "") for n in itertools.count())
+    backup, fd = next((name, fd) for name in names if (fd := created(name)) is not None)
+    with os.fdopen(fd, "w") as f:
+        f.write(old)
+    return backup
+
+
+def created(path: str) -> int | None:
+    """A descriptor of path, created 0600 for writing; None when path exists."""
+    try:
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return None
+
+
+@contextlib.contextmanager
+def candidate(target: str, text: str) -> Iterator[str]:
+    """text in a temporary file beside target, with target's mode; removed on exit unless renamed."""
+    folder = os.path.dirname(target)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    try:
+        mode = os.stat(target).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(prefix=".config.", dir=folder)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        yield tmp
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+@contextlib.contextmanager
+def config_lock(target: str) -> Iterator[None]:
+    """A directory beside the config, so two `add` runs never write it at once; SIGTERM and SIGHUP
+    release it too."""
+    lock = f"{target}.ro-mysql-lock"
+    os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+    with exit_on_signals():
+        try:
+            os.mkdir(lock, 0o700)
+        except FileExistsError:
+            die(f"add: another ro-mysql add holds {lock}; if none is running, remove that directory")
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(lock)
+
+
+def read_text(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+class Prepared(NamedTuple):
+    old: str  # the config as read
+    text: str  # the config with the block
+    block: str
+    at: int | None
+    taken: list[str]  # an alias or local port the config already has
+    differ: list[str]  # where ssh -G resolves the new alias otherwise than the bastion
+    seen: dict[str, str]  # every file read, by path: a change since means build again
+
+    def refusal(self, t: NewTunnel, config: str) -> str:
+        hint = f"\nCheck the Host * and Match blocks of {config}; --dry-run prints the block" if self.differ else ""
+        return f"add: {t.alias} not added; nothing changed:\n  " + "\n  ".join(self.taken + self.differ) + hint
+
+
+MAX_FIX_ROUNDS = 3
+
+
+def prepare(t: NewTunnel, config: str, target: str) -> Prepared:
+    """Build the block from the bastion's full ssh -G output and check the new config resolves the
+    alias like the bastion, adding a line per key a wildcard block shadows (MAX_FIX_ROUNDS tries)."""
+    old = read_text(target)  # one snapshot: the build input, and what a later change is judged by
+    blocks = config_blocks(config)
+    seen = {path: read_text(path) for path in {os.path.realpath(b.path) for b in blocks} - {target}}
+    seen[target] = old
+    taken = []
+    if t.alias.lower() in {a.lower() for b in blocks for a in b.aliases()}:
+        taken.append(f"{t.alias} is already in {config} or a file it Includes")
+    if t.local_port in {port for b in blocks for port, _ in b.forwards()}:
+        taken.append(f"local port {t.local_port} is already forwarded in {config} or a file it Includes; "
+                        "pick another --local-port")
+    bastion = resolved(t.via, config)
+    # ssh matches Host patterns case-sensitively; a hostname equal to --via means none matched.
+    named = {a for b in blocks for a in b.aliases()}
+    if t.via not in named and bastion.get("hostname", [t.via])[0].lower() == t.via.lower():
+        die(f"add: no `Host {t.via}` in {config} (ssh matches Host case-sensitively); "
+            "--via names the bastion's alias there")
+    settings = bastion_settings(bastion, resolved(UNMATCHED_HOST, config))
+    at = insert_at(blocks, config)
+    for _ in range(MAX_FIX_ROUNDS):
+        block = tunnel_block(t, settings)
+        text = with_block(old, block, at)
+        with candidate(target, text) as tmp:
+            wrong = differences(t, resolved(t.alias, tmp), bastion)
+        more = fixable(wrong, settings, bastion)
+        if not more:
+            break
+        settings.update(more)
+    return Prepared(old, text, block, at, taken, list(wrong.values()), seen)
+
+
+def unchanged(p: Prepared) -> bool:
+    return all(read_text(path) == text for path, text in p.seen.items())
+
+
+def checked(t: NewTunnel, config: str, target: str) -> Prepared:
+    """prepare, then refuse (nothing written) a taken alias or port or a difference."""
+    p = prepare(t, config, target)
+    if p.taken or p.differ:
+        die(p.refusal(t, config))
+    return p
+
+
+def add(
+    argv: list[str], config: str = SSH_CONFIG, ask: Callable[[str], str] = getpass.getpass
+) -> None:
+    """`ro-mysql add`: build the block from the bastion's settings and check the new config with
+    `ssh -G` (--dry-run prints the block and any problem, and writes nothing), refuse a known alias or
+    port (Includes too) or a difference, ask for the password, then under a lock re-read the config,
+    build again if it changed, back up the current file and replace it, and store the password."""
+    t, dry_run = parse_add(argv)
+    target = os.path.realpath(config)  # a linked config is written at its target
+    if dry_run:
+        p = prepare(t, config, target)
+        print(p.block, end="")
+        where = f"above line {p.at + 1} (its first wildcard Host or Match)" if p.at is not None else "at its end"
+        print(f"ro-mysql: checked with ssh -G; it goes in {config} {where}", file=sys.stderr)
+        for problem in p.taken + p.differ:
+            print(f"ro-mysql: warning: {problem}", file=sys.stderr)
+        return
+    with config_lock(target):
+        p = checked(t, config, target)
+        try:
+            password = ask(f"{t.alias} ({t.user}) password, blank skips storing: ")
+        except (EOFError, KeyboardInterrupt):
+            die("add: cancelled; nothing changed")
+        if not unchanged(p):
+            print(f"ro-mysql: {config} changed during the prompt; building and checking again", file=sys.stderr)
+            p = checked(t, config, target)
+        backup = backup_config(target, p.old) if p.old else None
+        with candidate(target, p.text) as tmp:
+            os.replace(tmp, target)
+    print(f"added {t.alias} to {config}" + (f" (backup {backup})" if backup else ""))
+    account = keychain_account(Tunnel(t.alias, t.local_port, t.user), t.user)
+    if not password:
+        print("  no password stored: run `ro-mysql --rotate` in a terminal")
+    elif keychain_set(account, password):
+        print(f"  stored in the Keychain (service {KEYCHAIN_SERVICE}, account {account})")
+    else:
+        print(f"  the Keychain write failed for {account}: run `ro-mysql --rotate` in a terminal")
+    print("verify: ro-mysql --tunnels --refresh")
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if argv[:1] == ["add"]:
+        if "--dry-run" not in argv[1:] and not sys.stdin.isatty():
+            die("add prompts for the password: the user runs it in their own terminal (or pass --dry-run)")
+        add(argv[1:])
+        return
+    if argv[:1] == ["--tunnels"]:
+        if argv[1:] not in ([], ["--refresh"]):
+            die("usage: ro-mysql --tunnels [--refresh]")
+        show_tunnels(load_tunnels(), do_refresh=argv[1:] == ["--refresh"])
+        return
+    if argv[:1] == ["--rotate"]:
+        if argv[1:] or not sys.stdin.isatty():
+            die("--rotate prompts for passwords: the user runs it in their own terminal")
+        rotate(load_tunnels())
+        return
+    argv, sql_file, each = split_extras(argv)
+    p = plan(with_sql_file(argv, sql_file))
+    sys.exit(run_plan(p).returncode if each is None else run_each(p, each))
+
+
+if __name__ == "__main__":
+    main()

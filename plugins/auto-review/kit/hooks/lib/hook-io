@@ -1,0 +1,190 @@
+# Sourced by every bash hook: read the payload, emit a decision, apply the missing-dependency
+# policy. Defines functions only. Hooks source it as "${0%/*}/lib/hook-io", so a hooks copy under
+# test uses its own libs.
+#
+# Missing-dependency policy (hook_lib): a CLOSED hook guards prod data or a push, and refuses the
+# call with a model-visible reason; an OPEN hook (advisory or a marker) tells the user and exits 0.
+# A silent exit 0 reads as a working guard, which is how a missing lib stayed unnoticed.
+HOOK_LIB=${BASH_SOURCE[0]%/*}
+HOOK_NAME=${0##*/}
+# Host nouns (host_noun, host_trailer, host_can_ask) for every deny/ask text that names a tool or file.
+# Missing, it fails this source like a missing hook-io, so each hook's own missing-lib branch runs.
+. "$HOOK_LIB/host-words" || return 1
+# Every Stop hook that blocks touches <sid> here first; stop-chime (same Stop array, no view of the
+# decision) reads it to skip a false "done" chime.
+STOP_BLOCK_DIR="${TMPDIR:-/tmp}/claude-stop-block"
+
+# hook_lib <open|closed> [lib...]: need jq, then source each lib. jq is checked here because
+# without it every field reads empty and each guard fails open; the refusal is hand-built JSON.
+# errexit is off while sourcing: under bash 3.2 `set -e`, a missing file or a lib whose last
+# command fails kills the hook with rc 1 (a silent UI error row) even inside `&&`. A `set -e`
+# hook therefore sources hook-io itself before its `set -e`.
+hook_lib() {
+  local mode=$1 l errexit=''
+  shift
+  case $- in *e*) errexit=1; set +e ;; esac
+  if ! command -v jq >/dev/null 2>&1; then
+    [ "$mode" = closed ] && _hook_refuse "jq is not installed" "Ask the user to run: $(sh "${BASH_SOURCE[0]%/*}/install-hint" jq 2>/dev/null || echo 'their package manager install of jq')"
+    exit 0
+  fi
+  for l in "$@"; do
+    [ -r "$HOOK_LIB/$l" ] && . "$HOOK_LIB/$l" 2>/dev/null && continue
+    [ "$mode" = closed ] && _hook_refuse "hooks/lib/$l, or a file it reads, is missing or broken" "Restore it: git -C ${HOOK_LIB%/hooks/lib} checkout -- hooks/lib, then retry"
+    jq -n --arg m "$HOOK_NAME is off: hooks/lib/$l, or a file it reads, is missing or broken. Restore it: git -C ${HOOK_LIB%/hooks/lib} checkout -- hooks/lib, then retry" '{systemMessage:$m}'
+    exit 0
+  done
+  [ -z "$errexit" ] || set -e
+}
+
+# _hook_refuse <what is missing> <fix>: a closed hook's refusal, hand-built when jq is the missing
+# piece. A permission deny exists only on PreToolUse; any other named event (commit-cohesion also
+# answers UserPromptSubmit and PostToolUse) gets a user-visible systemMessage. A payload naming no
+# event is read as PreToolUse, the one a closed guard must not let through. Exits 0.
+_hook_refuse() {
+  local re='"hook_event_name"[[:space:]]*:[[:space:]]*"([A-Za-z]*)"' ev=PreToolUse
+  hook_input
+  [[ $HOOK_INPUT =~ $re ]] && ev=${BASH_REMATCH[1]}
+  if [ "$ev" != PreToolUse ]; then
+    printf '{"systemMessage":"%s is off for %s: %s. %s"}\n' "$HOOK_NAME" "$ev" "$1" "$2"
+    exit 0
+  fi
+  set -- "$HOOK_NAME: $1, so this guard cannot check the command and refuses it. $2"
+  command -v jq >/dev/null 2>&1 && deny "$1"
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$1"
+  exit 0
+}
+
+# The overlay's declared keys, the only names it can set. The one list: hooks/lib/kit_env.py reads
+# this line, and README and the kit's kit.env.example document the same keys.
+KIT_KEYS="GIT_AUTHOR RELEASE_BRANCH_RE REVIEW_BASE TEST_GATE_FILE TEST_RUNNER TEST_RUNNER_RE TEST_REFUSED_CMDS TEST_NOTE PROTOTYPE_DIRS CODE_DIRS CODE_DIRS_JSON BQRO_PROJECT AGENT_WORK_ROOT CODEX_SANDBOX_GCLOUD CONTEXT_HANDOFF_AT CODE_SEARCH_ZOEKT_URL CODE_SEARCH_SSO_COOKIE CODE_SEARCH_GH_OWNER CODE_SEARCH_CHROME_PROFILE SUBAGENT_RESUME_MAX TICKET_PREFIXES TMP_SWEEP_DAYS"
+
+# kit_env: load the per-user overlay once ($KIT_ENV, else <config dir>/local/kit.env; KIT_ENV=/dev/null
+# runs with none). Company values live there, never in a hook: an absent key is empty and the check
+# it drives is off, so a hook with no overlay stays inert (prod guards need no key).
+# The contract, shared with hooks/lib/kit_env.py: lines are KEY=value with a trailing CR dropped, the
+# value literal (no expansion, no trailing comment), optionally in one pair of quotes. Only declared
+# keys are read; the file's value wins, and a declared key the file lacks is empty, never taken from
+# the environment (it is unset there, so no child inherits it). Parsed, not sourced: nothing runs.
+kit_env() {
+  [ -z "${_KIT_ENV_READ:-}" ] || return 0
+  _KIT_ENV_READ=1
+  local base=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+  local f=${KIT_ENV:-$base/local/kit.env} l k v
+  if [ -z "${KIT_ENV+x}" ] && [ -n "${AGENT_KIT_DIR:-}" ]; then
+    [ ! -f "$AGENT_KIT_DIR/local/kit.env" ] || f=$AGENT_KIT_DIR/local/kit.env
+    [ ! -f "$AGENT_KIT_DIR/local/setup-paths.env" ] || f=$AGENT_KIT_DIR/local/setup-paths.env
+  fi
+  local overlays=("$f") overlay user_layer
+  case "$f" in */setup-paths.env)
+    user_layer=${f%/*}/kit.env
+    [ -f "$user_layer" ] || user_layer=$base/local/kit.env
+    overlays=("${f%/*}/preset.env" "$user_layer" "$f") ;;
+  esac
+  for k in $KIT_KEYS; do unset "$k"; printf -v "$k" '%s' ''; done
+  for overlay in "${overlays[@]}"; do
+  [ -r "$overlay" ] || continue
+  while IFS= read -r l || [ -n "$l" ]; do
+    l=${l%$'\r'}
+    k=${l%%=*}; v=${l#*=}
+    [ "$k" != "$l" ] || continue
+    case " $KIT_KEYS " in *" $k "*) ;; *) continue ;; esac
+    case $v in \'*\'|\"*\") v=${v:1:${#v}-2} ;; esac
+    printf -v "$k" '%s' "$v"
+  done < "$overlay"
+  done
+  return 0
+}
+
+# context_points: COMPACT_AT (where the host auto-compacts, 0 when unknown) and HANDOFF_DEFAULT, both
+# from `agent-task context-points`, then HANDOFF_AT (CONTEXT_HANDOFF_AT when set, 0 = no nudge, else
+# the default). The answer is cached per config dir, so the hot path forks nothing. The cache is
+# trusted only while STRICTLY newer than settings.json and carries the mtime of a stamp taken before
+# the read: an edit in the same second (`-nt` has 1-second resolution on bash 3.2) or during the read
+# is never newer than settings.json, so the next call reads again. DEFAULT_HANDOFF_AT stands in only
+# when Python cannot answer.
+context_points() {
+  kit_env
+  local dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude} d='' c='' from=''
+  local cfg=$dir/settings.json cache="${CLAUDE_STATE_DIR:-$HOME/.claude/state}/context-watch/.points${dir//[!A-Za-z0-9]/_}"
+  if [ -f "$cache" ] && [ "$cache" -nt "$cfg" ]; then
+    read -r d c from < "$cache" 2>/dev/null
+  fi
+  if [ "$from" != "$cfg" ]; then
+    mkdir -p "${cache%/*}" 2>/dev/null && : > "$cache.$$.t" 2>/dev/null
+    set -f; set -- $("$HOOK_LIB/../../bin/agent-task" context-points 2>/dev/null); set +f
+    d=${1:-} c=${2:-}
+    case $d$c in '' | *[!0-9]*) d='' ;; *)
+      [ ! -f "$cache.$$.t" ] ||
+        { printf '%s %s %s\n' "$d" "$c" "$cfg" > "$cache.$$" && touch -r "$cache.$$.t" "$cache.$$" &&
+          mv -f "$cache.$$" "$cache"; } 2>/dev/null ;;
+    esac
+    rm -f "$cache.$$.t" "$cache.$$" 2>/dev/null
+  fi
+  case $d in '' | *[!0-9]*) d=600000 c=0 ;; esac
+  case $c in '' | *[!0-9]*) c=0 ;; esac
+  COMPACT_AT=$c HANDOFF_DEFAULT=$d HANDOFF_AT=${CONTEXT_HANDOFF_AT:-}
+  case $HANDOFF_AT in '' | *[!0-9]*) HANDOFF_AT=$d ;; esac
+  return 0
+}
+
+# kit_work_root: the one work-root resolver for bash; hooks/lib/kit_env.py work_root() is its twin.
+# CLAUDE_OUT_ROOT (tests), else the overlay's AGENT_WORK_ROOT, else ~/agent-work, else
+# ~/claude-scratch (its old name) when only that exists.
+kit_work_root() {
+  kit_env
+  local r=${CLAUDE_OUT_ROOT:-${AGENT_WORK_ROOT:-}}
+  if [ -n "$r" ]; then r=${r/#\~/$HOME}
+  elif [ ! -e "$HOME/agent-work" ] && [ -d "$HOME/claude-scratch" ]; then r=$HOME/claude-scratch
+  else r=$HOME/agent-work; fi
+  printf '%s' "$r"
+}
+
+unset HOOK_INPUT
+# hook_input: read the payload on stdin into HOOK_INPUT, once. A hook that fires on every Bash
+# call matches the raw JSON against a word its command must contain before paying for jq.
+hook_input() { [ -n "${HOOK_INPUT+x}" ] || HOOK_INPUT=$(cat); }
+
+# hook_read VAR='jq expr' ...: set each VAR from HOOK_INPUT (read first if needed) with ONE jq
+# process. A field the payload lacks, or a payload jq cannot parse, leaves VAR empty.
+hook_read() {
+  local _hr_a _hr_p=''
+  hook_input
+  for _hr_a in "$@"; do
+    eval "${_hr_a%%=*}=''"
+    _hr_p="$_hr_p\"${_hr_a%%=*}=\" + ((${_hr_a#*=}) | tostring | @sh),"
+  done
+  eval "$(jq -r "${_hr_p%,}" <<<"$HOOK_INPUT" 2>/dev/null)"
+}
+
+# decide <deny|ask> <reason> [context]: PreToolUse permission decision; the reason reaches the model.
+decide() {
+  jq -n --arg d "$1" --arg r "$2" --arg c "${3:-}" \
+    '{hookSpecificOutput:({hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}
+      + (if $c == "" then {} else {additionalContext:$c} end))}'
+  exit 0
+}
+deny() { decide deny "$1"; }
+ask()  { decide ask "$1"; }
+
+# confirm <reason> [context]: a destructive op only the user approves. Claude pauses on `ask`; the adapter
+# turns `ask` into `deny` on other hosts, so there the reason says who runs it instead.
+# An optional context goes to the model as additionalContext either way.
+confirm() {
+  if host_can_ask; then decide ask "$1 Confirm only if that is deliberate." "${2:-}"; fi
+  decide deny "$1 Refused on this host, which cannot pause for approval: give the user the exact command to run themselves." "${2:-}"
+}
+
+# add_context <event> <text>: additionalContext for the model with no permissionDecision (an
+# explicit allow would bypass the user's own permission rules). Does not exit.
+add_context() {
+  jq -n --arg e "$1" --arg c "$2" '{hookSpecificOutput:{hookEventName:$e,additionalContext:$c}}'
+}
+
+# stop_block <sid> <reason>: Stop decision:block, after marking STOP_BLOCK_DIR. Without jq, exit 2
+# carries the reason on stderr.
+stop_block() {
+  mkdir -p "$STOP_BLOCK_DIR" 2>/dev/null && touch "$STOP_BLOCK_DIR/${1:-unknown}" 2>/dev/null
+  jq -n --arg r "$2" '{decision:"block",reason:$r}' 2>/dev/null && exit 0
+  printf '%s\n' "$2" >&2
+  exit 2
+}

@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# claude-gc — idempotent housekeeping for ~/.claude state.
+# Run weekly via a launchd agent or by hand. Safe to re-run.
+# Complements Claude Code's own cleanupPeriodDays transcript cleanup.
+#   claude-gc                    sweep state, prune worktree METADATA, write the prunable-worktree
+#                                report. Never removes a worktree.
+#   claude-gc --prune-worktrees  remove exactly the worktrees in that report, nothing else.
+#   --report-file PATH          write or consume this report instead of the shared default.
+#   --report-sha256 HASH        required to consume an explicit reviewed report.
+#   claude-gc --sweep-tmp --report-sha256 HASH
+#                                apply exactly the reviewed work-root tmp/ sweep report the plain run
+#                                writes (bin/lib/tmp_sweep.py: closed items only, bulk deleted, small
+#                                source and data files salvaged to the item's out/salvage/).
+#   --tmp-report-file PATH      write or consume that report instead of state/tmp-sweep.tsv.
+# Repos come from CODE_DIRS_JSON or legacy CODE_DIRS (hooks/lib/hook-io kit_env); without them every
+# repo-based step is skipped, including the dead-worktree transcript prune, which would otherwise
+# read "no live worktree anywhere" and delete every worktree's transcripts.
+set -uo pipefail
+# Preserve caller-selected tools; bare launchd needs the Homebrew runtime first.
+case "$PATH" in
+  ''|/usr/bin:/bin|/usr/bin:/bin:/usr/sbin:/sbin)
+    PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" ;;
+  *) PATH="$PATH:/opt/homebrew/bin:/usr/local/bin" ;;
+esac
+log() { printf '%s claude-gc: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
+usage() { echo "usage: claude-gc [--prune-worktrees | --sweep-tmp] [--report-file PATH] [--tmp-report-file PATH] [--report-sha256 HASH]" >&2; exit 2; }
+src=${BASH_SOURCE[0]}
+. "$(dirname "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")")/../hooks/lib/kit-root.sh" ||
+  { log "cannot load hooks/lib/kit-root.sh beside $src"; exit 1; }
+KIT=$(kit_root "$src") || { log "cannot resolve the kit directory (or its link chain is too long)"; exit 1; }
+export AGENT_KIT_DIR=$KIT
+if ! { . "$KIT/hooks/lib/hook-io" 2>/dev/null && kit_env; }; then
+  log "hooks/lib/hook-io is missing, so the overlay is unread: repo-based steps skipped"
+  CODE_DIRS=''; CODE_DIRS_JSON=''
+fi
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+REPORT="$CLAUDE_DIR/state/prunable-worktrees.txt"
+TMP_REPORT="$CLAUDE_DIR/state/tmp-sweep.tsv"
+mode=''; report_set=0; report_sha=''; tmp_report_set=0
+original_args=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prune-worktrees) [ -z "$mode" ] || usage; mode=prune; shift ;;
+    --sweep-tmp) [ -z "$mode" ] || usage; mode=sweep; shift ;;
+    --tmp-report-file)
+      [ "$tmp_report_set" = 0 ] && [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+      TMP_REPORT=$2; tmp_report_set=1; shift 2 ;;
+    --report-file)
+      [ "$report_set" = 0 ] && [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+      REPORT=$2; report_set=1; shift 2 ;;
+    --report-sha256)
+      [ -z "$report_sha" ] && [ "$#" -ge 2 ] || usage
+      report_sha=$2; [[ $report_sha =~ ^[0-9a-f]{64}$ ]] || usage; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ -z "$report_sha" ] || { [ "$mode" = prune ] && [ "$report_set" = 1 ]; } || [ "$mode" = sweep ] || usage
+[ "$mode" != sweep ] || { [ -n "$report_sha" ] && [ "$report_set" = 0 ]; } || usage
+[ "$mode:$report_set" != prune:1 ] || [ -n "$report_sha" ] || usage
+[ ! -d "$REPORT" ] || { log "report path is a directory: $REPORT"; exit 1; }
+mkdir -p "$(dirname "$REPORT")" || exit 1
+lock_helper="$KIT/hooks/lib/gc-lock.py"
+if [ "${_CLAUDE_GC_GUARD:-}" != "$$" ]; then
+  exec python3 "$lock_helper" hold "$REPORT" "$0" ${original_args[@]+"${original_args[@]}"}
+fi
+owner=${_CLAUDE_GC_OWNER:?}
+artifacts=${_CLAUDE_GC_ARTIFACTS:?}
+tmp=''; snapshot=''
+release_git_locks() {
+  python3 "$lock_helper" clear "$owner"
+}
+cleanup() {
+  python3 "$lock_helper" cleanup "$owner"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$mode" != prune ] && [ "$report_set" = 1 ] && { [ -e "$REPORT" ] || [ -L "$REPORT" ]; }; then
+  log "explicit report already exists; choose a new reviewed report path: $REPORT"
+  exit 1
+fi
+
+roots_file="$artifacts/roots"
+discovery_incomplete="$artifacts/discovery-incomplete"
+if [ -n "${CODE_DIRS_JSON:-}${CODE_DIRS:-}" ]; then
+  python3 "$KIT/hooks/lib/kit_env.py" code-dirs "${CODE_DIRS_JSON:-}" "${CODE_DIRS:-}" > "$roots_file" ||
+    { log "invalid CODE_DIRS_JSON; housekeeping refused"; exit 1; }
+else
+  : > "$roots_file"
+fi
+
+# First file under a worktree matching a find predicate, skipping dependency and cache trees
+# that tooling touches and that are slow to walk. Prints one path, or nothing.
+recent_under() { # $1 dir, then the predicate (e.g. -mmin -10080, or -newer FILE)
+  local d="$1"; shift
+  find "$d" \( -name node_modules -o -name .venv -o -name venv -o -name __pycache__ \
+    -o -name .mypy_cache -o -name .pytest_cache -o -name .ruff_cache \) -prune \
+    -o "$@" -print -quit 2>/dev/null
+}
+
+# repos [any]: repos under the validated configured roots. Main repos only (a .git FILE is a linked worktree whose
+# repo is already listed); `any` adds those linked worktrees.
+repos() {
+  local d g
+  while IFS= read -r d; do
+    case $d in '~/'*) d="$HOME/${d#'~/'}" ;; esac
+    if [ ! -d "$d" ] || [ ! -r "$d" ] || [ ! -x "$d" ]; then
+      : > "$discovery_incomplete"
+      log "configured root unavailable; transcript discovery incomplete: $d" >&2
+      continue
+    fi
+    for g in "$d"/*/.git; do
+      if [ -d "$g" ] || { [ "${1:-}" = any ] && [ -e "$g" ]; }; then printf '%s\n' "${g%/.git}"; fi
+    done
+  done < "$roots_file"
+}
+
+case "$mode" in
+  "") ;;
+  sweep)
+    python3 "$KIT/bin/lib/tmp_sweep.py" apply --report "$TMP_REPORT" --sha256 "$report_sha" 2>&1 |
+      while IFS= read -r line; do log "$line"; done
+    exit "${PIPESTATUS[0]}"
+    ;;
+  prune)
+    [ -f "$REPORT" ] && [ ! -L "$REPORT" ] || { log "no regular report at $REPORT; run claude-gc first"; exit 1; }
+    snapshot="$artifacts/snapshot"
+    cp -p "$REPORT" "$snapshot" || exit 1
+    if [ "$report_set" = 1 ]; then
+      actual_sha=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$snapshot") || exit 1
+      [ "$actual_sha" = "$report_sha" ] || { log "report digest changed; nothing removed: $REPORT"; exit 1; }
+    fi
+    while IFS=$'\t' read -r wt br reason size authorized_head base_ref base_oid proof merge_oid extra; do
+      case "$wt" in ''|'#'*) continue ;; esac
+      [ -d "$wt" ] || { log "skip (already gone): $wt"; continue; }
+      # The report was reviewed as written; a worktree used since then is no longer that entry.
+      [[ $authorized_head =~ ^[0-9a-f]{40}$ ]] && [ -z "$extra" ] \
+        || { log "skip (report lacks exact HEAD authorization; regenerate and review): $wt"; continue; }
+      [ -z "$(recent_under "$wt" -newer "$snapshot")" ] || { log "skip (touched since the report): $wt"; continue; }
+      common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+        || { log "skip (not a git worktree): $wt"; continue; }
+      if [ "$br" != '(detached)' ] && ! git check-ref-format "refs/heads/$br" >/dev/null 2>&1; then
+        log "skip (invalid authorized branch): $wt"; continue
+      fi
+      candidate_lock=$(git -C "$wt" rev-parse --path-format=absolute --git-path HEAD 2>/dev/null) \
+        || { log "skip (HEAD path unavailable): $wt"; continue; }
+      python3 "$lock_helper" git "$owner" "$candidate_lock.lock" 2>/dev/null \
+        || { release_git_locks; log "skip (HEAD lock unavailable or in use): $wt"; continue; }
+      if [ "$br" != '(detached)' ]; then
+        candidate_lock=$(git -C "$wt" rev-parse --path-format=absolute --git-path "refs/heads/$br" 2>/dev/null) \
+          || { release_git_locks; log "skip (branch path unavailable): $wt"; continue; }
+        python3 "$lock_helper" git "$owner" "$candidate_lock.lock" 2>/dev/null \
+          || { release_git_locks; log "skip (branch lock unavailable or in use): $wt"; continue; }
+      fi
+      current_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null)
+      current_branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null) || current_branch='(detached)'
+      if [ "$current_head" != "$authorized_head" ] || [ "$current_branch" != "$br" ]; then
+        release_git_locks; log "skip (HEAD or branch changed since review): $wt"; continue
+      fi
+      case "$proof" in
+        ancestor|squash)
+          valid_proof=0
+          if [[ $base_oid =~ ^[0-9a-f]{40}$ ]] && [ "$(git -C "$wt" rev-parse "$base_ref" 2>/dev/null)" = "$base_oid" ]; then
+            proof_head=$authorized_head
+            [ "$proof" != squash ] || proof_head=$merge_oid
+            [[ $proof_head =~ ^[0-9a-f]{40}$ ]] && git -C "$wt" merge-base --is-ancestor "$proof_head" "$base_oid" 2>/dev/null && valid_proof=1
+          fi ;;
+        *) valid_proof=0 ;;
+      esac
+      if [ "$valid_proof" != 1 ]; then
+        release_git_locks; log "skip (base proof changed or unavailable): $wt"; continue
+      fi
+      # No --force: git refuses a dirty or locked worktree, which is the last safety net.
+      if out=$(git -C "$(dirname "$common")" worktree remove "$wt" 2>&1); then
+        log "removed worktree: $wt ($br; $reason; $size)"
+      else
+        log "FAILED to remove $wt: $(printf '%s' "$out" | tr '\n' ' ')"
+      fi
+      release_git_locks
+    done < "$snapshot"
+    exit 0
+    ;;
+esac
+
+tmp="$artifacts/report"
+prune_command='claude-gc --prune-worktrees'
+if [ "$report_set" = 1 ]; then
+  printf -v prune_command 'claude-gc --prune-worktrees --report-file %q --report-sha256 <approved-sha256>' "$REPORT"
+fi
+
+# Dead-worktree transcript dirs: a project dir whose worktree no longer exists AND untouched
+# for >7 days (guard avoids nuking a just-closed worktree's logs). Liveness is derived from
+# `git worktree list` across ALL repos (any layout — .claude/worktrees/, sibling .worktrees/,
+# etc.). Transcript key encoding varies with paths and hosts: retain both the legacy slash/dot
+# key and a conservative punctuation key, and preserve transcripts on ambiguous or incomplete
+# discovery. Runs BEFORE the worktree metadata prune below, so a worktree whose dir vanished
+# still counts as live for one more week and its transcripts get that grace.
+live="|"
+while IFS= read -r repo; do
+  [ -n "$repo" ] || continue
+  if ! git -C "$repo" worktree list --porcelain -z > "$artifacts/worktrees" 2>/dev/null; then
+    : > "$discovery_incomplete"
+    log "worktree listing failed; transcript discovery incomplete: $repo" >&2
+    continue
+  fi
+  while IFS= read -r -d '' line; do
+    case "$line" in
+      "worktree "*)
+        wt=${line#worktree }
+        legacy_key=$(printf '%s' "$wt" | sed 's#[/.]#-#g')
+        conservative_key=$(printf '%s' "$wt" | LC_ALL=C sed 's/[^[:alnum:]]/-/g')
+        live="${live}${legacy_key}|${conservative_key}|"
+        if printf '%s' "$wt" | LC_ALL=C grep -q '[^ -~]'; then
+          : > "$discovery_incomplete"
+          log "ambiguous worktree path encoding; transcript discovery incomplete: $repo" >&2
+        fi ;;
+    esac
+  done < "$artifacts/worktrees"
+done <<EOF
+$(repos any)
+EOF
+if [ -e "$discovery_incomplete" ]; then
+  log "transcript discovery incomplete; skipped the dead-worktree transcript prune"
+elif [ "$live" = "|" ]; then
+  log "no repos under configured roots (kit overlay); skipped the dead-worktree transcript prune"
+else
+  for d in "$CLAUDE_DIR"/projects/*worktrees-*; do
+    [ -d "$d" ] || continue
+    case "$live" in *"|${d##*/}|"*) continue ;; esac   # matches a live worktree → keep
+    [ -z "$(find "$d" -mtime -7 -print -quit 2>/dev/null)" ] && rm -rf "$d" && log "pruned dead-worktree transcripts: ${d##*worktrees-}"
+  done
+fi
+
+# session-env is per account (bin/claude-account), so every account's config dir has its own.
+while IFS= read -r d; do
+  find "$d"/session-env -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null \
+    && log "pruned empty session-env stubs in $d"
+done <<EOF
+$("$CLAUDE_DIR/bin/claude-account" dirs 2>/dev/null || printf '%s\n' "$CLAUDE_DIR")
+EOF
+
+find "$CLAUDE_DIR"/file-history -type f -mtime +30 -delete 2>/dev/null
+find "$CLAUDE_DIR"/file-history -type d -empty -delete 2>/dev/null
+log "pruned file-history >30d"
+
+# A job dir is an orphan only while no job is pinned.
+if [ -f "$CLAUDE_DIR/jobs/pins.json" ] && [ "$(tr -d ' \n' < "$CLAUDE_DIR/jobs/pins.json")" = "[]" ]; then
+  find "$CLAUDE_DIR"/jobs -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null && log "pruned orphaned jobs (no pins)"
+fi
+
+find "$CLAUDE_DIR" -name .DS_Store -delete 2>/dev/null
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'ci-watch-*' -mtime +7 -delete 2>/dev/null
+# ci-watch's lock is a directory holding a pid, which -delete skips; one left by a killed watcher.
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'ci-watch-*.lock' -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
+find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'cbm-code-discovery-gate-*' -delete 2>/dev/null
+
+# unfinished-work ignores a ci-watch status older than 12h, so a 14-day-old status or
+# branch -> PR pointer is read by nothing.
+n=$(find "$CLAUDE_DIR/tmp" -maxdepth 1 \( -name 'ci-watch-*.status' -o -name 'ci-branch-*.pr' \) -mtime +14 -print -delete 2>/dev/null | wc -l | tr -d ' ')
+log "pruned $n ci-watch status/pointer files >14d"
+
+# Worktree metadata whose directory is gone. Metadata only; never touches a checkout.
+while IFS= read -r repo; do
+  [ -n "$repo" ] || continue
+  git -C "$repo" worktree prune 2>/dev/null || log "worktree prune failed: $repo"
+done <<EOF
+$(repos)
+EOF
+log "pruned stale worktree metadata"
+
+# Prunable-worktree REPORT (removal is the separate --prune-worktrees run). Prunable means:
+# nothing under it modified for 7 days, no uncommitted or untracked (non-ignored) changes, and
+# an exact upstream ancestry or GitHub merged-head proof. A merely closed PR is not proof that
+# its work is retained elsewhere.
+# Cheap checks first: gh is a network call.
+prunable_reason() { # repo, worktree, branch, captured HEAD -> reason and exact proof columns
+  local repo="$1" wt="$2" br="$3" captured="$4" st ref oid metadata pr_head merge base
+  [ -z "$(recent_under "$wt" -mmin -10080)" ] || return 1
+  st=$(git -C "$wt" status --porcelain 2>/dev/null) || return 1
+  [ -z "$st" ] || return 1
+  if [ -z "$br" ]; then
+    while IFS= read -r ref; do
+      oid=$(git -C "$wt" rev-parse "$ref" 2>/dev/null) || continue
+      if git -C "$wt" merge-base --is-ancestor "$captured" "$oid" 2>/dev/null; then
+        printf 'detached, HEAD on a remote branch\t%s\t%s\tancestor\t-\n' "$ref" "$oid"
+        return 0
+      fi
+    done < <(git -C "$wt" for-each-ref --format='%(refname)' refs/remotes)
+    return 1
+  fi
+  ref=$(git -C "$wt" rev-parse --symbolic-full-name '@{u}' 2>/dev/null) || ref=''
+  if [ -n "$ref" ]; then
+    oid=$(git -C "$wt" rev-parse "$ref" 2>/dev/null) || oid=''
+    if [[ $oid =~ ^[0-9a-f]{40}$ ]] && git -C "$wt" merge-base --is-ancestor "$captured" "$oid" 2>/dev/null; then
+      printf 'no commits ahead of upstream\t%s\t%s\tancestor\t-\n' "$ref" "$oid"
+      return 0
+    fi
+  fi
+  metadata=$(cd "$repo" && gh pr view "$br" --json state,headRefOid,mergeCommit,baseRefName 2>/dev/null) || return 1
+  metadata=$(printf '%s' "$metadata" | python3 -c '
+import json,sys
+try:
+    data=json.load(sys.stdin)
+    if data.get("state") != "MERGED": raise ValueError()
+    values=[data["headRefOid"], data["mergeCommit"]["oid"], data["baseRefName"]]
+    if not all(isinstance(v,str) and v and not any(c in v for c in "\t\n\r") for v in values): raise ValueError()
+    print("\t".join(values))
+except (ValueError,TypeError,KeyError): sys.exit(1)
+') || return 1
+  IFS=$'\t' read -r pr_head merge base <<< "$metadata"
+  [ "$pr_head" = "$captured" ] && [[ $merge =~ ^[0-9a-f]{40}$ ]] || return 1
+  ref="refs/remotes/origin/$base"
+  git check-ref-format "$ref" >/dev/null 2>&1 || return 1
+  oid=$(git -C "$wt" rev-parse "$ref" 2>/dev/null) || return 1
+  if [[ $oid =~ ^[0-9a-f]{40}$ ]] && git -C "$wt" merge-base --is-ancestor "$merge" "$oid" 2>/dev/null; then
+    printf 'PR MERGED at captured HEAD\t%s\t%s\tsquash\t%s\n' "$ref" "$oid" "$merge"
+    return 0
+  fi
+  return 1
+}
+
+generation_current() {
+  local wt=$1 head=$2 branch=$3 ref=$4 oid=$5 proof=$6 merge=$7 current
+  [ "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" = "$head" ] || return 1
+  current=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null) || current='(detached)'
+  [ "$current" = "$branch" ] && [ "$(git -C "$wt" rev-parse "$ref" 2>/dev/null)" = "$oid" ] || return 1
+  [ "$proof" != squash ] || head=$merge
+  git -C "$wt" merge-base --is-ancestor "$head" "$oid" 2>/dev/null
+}
+
+{
+  printf '# claude-gc %s: review before removal. TSV v2: path, branch, reason, size, HEAD, base-ref, base-oid, proof, merge-oid.\n' "$(date '+%Y-%m-%d %H:%M')"
+  printf '# Review, then `%s` removes exactly these (git worktree remove, never --force).\n' "$prune_command"
+} > "$tmp"
+count=0
+while IFS= read -r repo; do
+  [ -n "$repo" ] || continue
+  wt=""; br=""; skip=0; first=1
+  # Porcelain blocks end with a blank line; the trailing echo guarantees the last one gets it
+  # (process substitution, not a heredoc of $(...), which strips trailing newlines). The first
+  # block is the main worktree, which is never a candidate.
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) wt="${line#worktree }"; br=""; skip=0 ;;
+      "branch refs/heads/"*) br="${line#branch refs/heads/}" ;;
+      bare|locked*|prunable*) skip=1 ;;
+      "")
+        if [ -n "$wt" ] && [ "$first" = 0 ] && [ "$skip" = 0 ] && [ -d "$wt" ] \
+           && authorized_head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) \
+           && [[ $authorized_head =~ ^[0-9a-f]{40}$ ]] \
+           && metadata=$(prunable_reason "$repo" "$wt" "$br" "$authorized_head" </dev/null); then
+          IFS=$'\t' read -r reason base_ref base_oid proof merge_oid <<< "$metadata"
+          size=$(du -sh "$wt" 2>/dev/null | awk '{print $1}')
+          if generation_current "$wt" "$authorized_head" "${br:-(detached)}" "$base_ref" "$base_oid" "$proof" "$merge_oid"; then
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wt" "${br:-(detached)}" "$reason" "${size:-?}" "$authorized_head" "$base_ref" "$base_oid" "$proof" "$merge_oid" >> "$tmp"
+          fi
+        fi
+        [ -n "$wt" ] && first=0
+        wt="" ;;
+    esac
+  done < <(git -C "$repo" worktree list --porcelain 2>/dev/null; echo)
+done <<EOF
+$(repos)
+EOF
+validated="$artifacts/validated"
+count=0
+while IFS=$'\t' read -r wt br reason size authorized_head base_ref base_oid proof merge_oid; do
+  case "$wt" in '#'*) printf '%s\n' "$wt" >> "$validated"; continue ;; esac
+  if generation_current "$wt" "$authorized_head" "$br" "$base_ref" "$base_oid" "$proof" "$merge_oid"; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wt" "$br" "$reason" "$size" "$authorized_head" "$base_ref" "$base_oid" "$proof" "$merge_oid" >> "$validated"
+    count=$((count + 1))
+  fi
+done < "$tmp"
+tmp="$validated"
+if [ "$report_set" = 1 ]; then
+  report_sha=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$tmp") || exit 1
+  ln "$tmp" "$REPORT" || { log "explicit report publication refused; nothing replaced: $REPORT"; exit 1; }
+  printf -v prune_command 'claude-gc --prune-worktrees --report-file %q --report-sha256 %s' "$REPORT" "$report_sha"
+  log "reviewed report digest: $report_sha"
+else
+  mv "$tmp" "$REPORT" || exit 1
+fi
+log "prunable worktrees: $count (report: $REPORT; remove with $prune_command)"
+
+# Work-root tmp/ sweep REPORT (applying it is the separate --sweep-tmp run).
+sweep_command='claude-gc --sweep-tmp --report-sha256 <sha256>'
+if [ "$tmp_report_set" = 1 ]; then
+  printf -v sweep_command 'claude-gc --sweep-tmp --tmp-report-file %q --report-sha256 <sha256>' "$TMP_REPORT"
+fi
+python3 "$KIT/bin/lib/tmp_sweep.py" scan --report "$TMP_REPORT" --apply-hint "$sweep_command" 2>&1 |
+  while IFS= read -r line; do log "$line"; done
+log "done"

@@ -1,0 +1,27 @@
+# Marker keys and the branch -> PR pointer, shared by the hooks that write and read them. Sourced;
+# defines functions only.
+
+# path_key <path>: a short stable key for a path (a worktree root, a dumped file), used in marker
+# file names. cksum, not shasum: one native process against a perl interpreter's startup.
+path_key() {
+  local k
+  k=$(cksum <<<"$1")
+  printf '%s\n' "${k%% *}"
+}
+
+# The branch -> PR pointer. ci-watch writes ~/.claude/tmp/ci-branch-<branch>.pr, holding the PR
+# number, when `gh pr view` reports the branch's PR OPEN, and removes it when the PR is merged,
+# closed or absent. Present means "a PR is open" as of ci-watch's last run (after `gh pr create`,
+# a push or a label add), so readers need no network call.
+_pr_ptr() { PR_PTR="$HOME/.claude/tmp/ci-branch-${1//\//-}.pr"; }
+pr_open() { _pr_ptr "$1"; [ -f "$PR_PTR" ]; }
+# pr_number <branch>: print the open PR's number; fails when none is recorded.
+pr_number() {
+  local n
+  _pr_ptr "$1"
+  n=$(head -1 "$PR_PTR" 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$n"
+}
+pr_ptr_set()   { _pr_ptr "$1"; printf '%s\n' "$2" > "$PR_PTR" 2>/dev/null || true; }
+pr_ptr_clear() { _pr_ptr "$1"; rm -f "$PR_PTR"; }

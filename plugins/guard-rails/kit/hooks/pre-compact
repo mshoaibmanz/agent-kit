@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""PreCompact (auto and manual): when the session's HANDOFF.md is stale, write HANDOFF.auto.md
+beside it, mechanically from the transcript and git, so the compacted session (session-context
+re-injects both) and the next one keep the state. Never blocks: every path exits 0.
+
+Stale: HANDOFF.md is missing, or unmodified since context-watch's handoff nudge, or in the last
+30 minutes when no nudge fired, or since the last HANDOFF.auto.md (handoff.handoff_stale). The folder is the bound item or
+project, else the session's OUT DIR under the work root.
+
+HANDOFF.auto.md: branch, `git status --short`, the last commits, the last 5 user prompts, the files
+Edit/Write touched, and the open tasks (TaskCreate/TaskUpdate) when there are any.
+
+When HANDOFF.md is fresh (so newer than any HANDOFF.auto.md), an existing HANDOFF.auto.md is renamed
+HANDOFF.auto.prev.md, so the compacted session does not get an earlier compaction's snapshot back as
+current state.
+"""
+
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+try:
+    import agent_task as at
+    import handoff
+except ImportError as e:
+    print(json.dumps({"systemMessage": f"pre-compact is off: hooks/lib/agent_task.py or handoff.py failed to import ({e}). Restore it: git -C {os.path.dirname(os.path.dirname(os.path.realpath(__file__)))} checkout -- hooks/lib"}))
+    sys.exit(0)
+
+PROMPTS = 5
+PROMPT_CHARS = 400
+FILES = 40
+STATUS_LINES = 30
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+# Harness-injected user turns, not something the user typed.
+NOT_PROMPTS = ("<command-", "<local-command", "<system-reminder>", "<task-notification>", "[Request interrupted", "Caveat: ", "This session is being continued from a previous conversation")
+
+
+def git(cwd: str, *args: str) -> str:
+    try:
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=5).stdout.rstrip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def prompt_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+            return ""
+        return "\n".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+    return ""
+
+
+def scan(path: str) -> tuple[list[str], list[str], list[dict]]:
+    """The last user prompts, the edited files (most recent last) and the task list, in creation
+    order. Only lines that can hold one are parsed: a long transcript is tens of MB.
+
+    Tasks (Claude Code 2.1.288; TodoWrite is gone): a TaskCreate tool_use carries
+    {subject, description}, and its tool_result line's toolUseResult {"task": {"id", "subject"}}
+    names the id; TaskUpdate {taskId, status?, subject?} changes one ("deleted" drops it) once its
+    tool_result succeeds (no is_error, toolUseResult.success not false): a failed or unanswered
+    update leaves the task as it was."""
+    prompts: list[str] = []
+    files: dict[str, None] = {}
+    creates: dict[str, dict] = {}
+    updates: dict[str, dict] = {}
+    tasks: dict[str, dict] = {}
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            is_user = '"type":"user"' in line
+            if not is_user and '"tool_use"' not in line:
+                continue
+            if '"isSidechain":true' in line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            msg = e.get("message") or {}
+            if e.get("type") == "user":
+                tur = e.get("toolUseResult")
+                created = tur.get("task") if creates and isinstance(tur, dict) else None
+                if isinstance(created, dict) and created.get("id") is not None:
+                    for c in msg.get("content") or []:
+                        inp = creates.pop(c.get("tool_use_id"), None) if isinstance(c, dict) else None
+                        if inp is not None:
+                            tasks[str(created["id"])] = {"status": "pending", "content": inp.get("subject") or created.get("subject") or ""}
+                    continue
+                if updates:
+                    ok = not (isinstance(tur, dict) and tur.get("success") is False)
+                    for c in msg.get("content") or []:
+                        inp = updates.pop(c.get("tool_use_id"), None) if isinstance(c, dict) else None
+                        if inp is not None and ok and not c.get("is_error"):
+                            apply_update(tasks, inp)
+                if e.get("isMeta") or e.get("isCompactSummary"):
+                    continue
+                text = prompt_text(msg.get("content")).strip()
+                if text and not text.startswith(NOT_PROMPTS):
+                    prompts.append(text)
+                    del prompts[:-PROMPTS]
+                continue
+            for c in msg.get("content") or []:
+                if not isinstance(c, dict) or c.get("type") != "tool_use":
+                    continue
+                inp = c.get("input") or {}
+                if c.get("name") in EDIT_TOOLS:
+                    f = inp.get("file_path") or inp.get("notebook_path") or ""
+                    if f:
+                        files.pop(f, None)
+                        files[f] = None
+                elif c.get("name") == "TaskCreate" and c.get("id"):
+                    creates[c["id"]] = inp
+                elif c.get("name") == "TaskUpdate" and c.get("id"):
+                    updates[c["id"]] = inp
+    return prompts, list(files)[-FILES:], list(tasks.values())
+
+
+def apply_update(tasks: dict[str, dict], inp: dict) -> None:
+    tid = str(inp.get("taskId"))
+    if tid not in tasks:
+        return
+    if inp.get("status") == "deleted":
+        del tasks[tid]
+        return
+    t = tasks[tid]
+    t["status"] = inp.get("status") or t["status"]
+    t["content"] = inp.get("subject") or t["content"]
+
+
+def render(p: dict, folder_note: str) -> str:
+    cwd = p.get("cwd") or os.getcwd()
+    tp = p.get("transcript_path") or ""
+    prompts, files, todos = scan(tp) if tp and os.path.isfile(tp) else ([], [], [])
+    status = git(cwd, "status", "--short").split("\n")
+    out = [
+        f"# HANDOFF.auto ({dt.datetime.now():%Y-%m-%d %H:%M}, {p.get('trigger') or '?'} compaction)",
+        "",
+        f"Written by hooks/pre-compact because {folder_note}. A mechanical snapshot from the transcript and git, not a summary: fold what matters into HANDOFF.md.",
+        f"Session {p.get('session_id', '?')}, cwd {cwd}.",
+        "",
+        "## Git",
+        f"- branch: {git(cwd, 'rev-parse', '--abbrev-ref', 'HEAD') or '(not a git repo)'}",
+    ]
+    if any(status):
+        out += ["- status --short:", *[f"  {s}" for s in status[:STATUS_LINES]]]
+        if len(status) > STATUS_LINES:
+            out.append(f"  ... {len(status) - STATUS_LINES} more")
+    log = git(cwd, "log", "--oneline", "-5")
+    if log:
+        out += ["- last commits:", *[f"  {s}" for s in log.split("\n")]]
+    out += ["", f"## Last {PROMPTS} user prompts"]
+    for t in prompts or ["(none found)"]:
+        t = " ".join(t.split())
+        out.append(f"- {t[:PROMPT_CHARS]}{' ...' if len(t) > PROMPT_CHARS else ''}")
+    out += ["", "## Files Edit/Write touched (most recent last)", *[f"- {f}" for f in files or ["(none)"]]]
+    open_todos = [t for t in todos if isinstance(t, dict) and t.get("status") != "completed"]
+    if open_todos:
+        out += ["", "## Open todos", *[f"- [{t.get('status', '?')}] {t.get('content', '')}" for t in open_todos]]
+    return "\n".join(out) + "\n"
+
+
+def main() -> None:
+    if os.environ.get("CI_WATCH_ACTIVE"):
+        return
+    try:
+        p = json.load(sys.stdin)
+    except ValueError:
+        return
+    if not isinstance(p, dict) or p.get("agent_id"):
+        return
+    sid = p.get("session_id") or ""
+    if not sid:
+        return
+    b, folder = handoff.handoff_folder(sid, p.get("cwd") or os.getcwd())
+    if not handoff.handoff_stale(folder, sid):
+        # HANDOFF.md is current, so an earlier compaction's snapshot would be re-injected as state.
+        auto = folder / "HANDOFF.auto.md"
+        if auto.is_file():
+            os.replace(auto, folder / "HANDOFF.auto.prev.md")
+        return
+    nudged = handoff.nudge_marker(sid).is_file()
+    hf = folder / "HANDOFF.md"
+    if not hf.is_file():
+        note = "this session has no HANDOFF.md"
+    elif handoff.auto_handoff_current(folder):
+        note = "HANDOFF.md was not updated after the previous compaction's snapshot"
+    elif nudged:
+        note = "HANDOFF.md was not updated after the context handoff nudge"
+    else:
+        note = "HANDOFF.md was not updated in the 30 minutes before this compaction"
+    at.atomic_write(folder / "HANDOFF.auto.md", render(p, note))
+    print(json.dumps({"systemMessage": f"pre-compact: {note}; wrote {folder / 'HANDOFF.auto.md'}."}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # a snapshot never stops a compaction
+        print(json.dumps({"systemMessage": f"pre-compact error: {type(e).__name__}: {e}"}))
+    sys.exit(0)

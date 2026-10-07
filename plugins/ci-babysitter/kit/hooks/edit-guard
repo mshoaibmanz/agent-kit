@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""PreToolUse(Edit|Write|MultiEdit): keep edits on the kit sources, not on host outputs.
+
+~/.claude, ~/.claude-<account>, ~/.codex and ~/.cursor hold links into ~/.agents and files that
+`agent-kit render` writes. Two edits there fork the source silently:
+- a path that is itself a link: the tools write a temp file and rename it over the path, which
+  replaces the link with a plain copy, so the kit file stops reaching this host;
+- a rendered file (settings.json, mcp.json): the next render overwrites the edit, or keeps it as
+  drift that no other machine gets.
+A path that only passes through a linked directory (~/.claude/hooks/x) is the kit file itself and
+is allowed. Settings hooks also run for subagents' tool calls, so one registration covers both.
+Native ownership checks require hooks/lib/native_edits.py. Missing ownership support fails closed.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+try:
+    from native_edits import changes_owned, public_records, public_changes_owned
+except ImportError:
+    sys.stderr.write(
+        "edit-guard: ownership support is missing; restore hooks/lib before retrying\n"
+    )
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "The kit edit guard is incomplete; restore hooks/lib before retrying",
+                }
+            }
+        )
+    )
+    raise SystemExit(2)
+
+HOME = os.path.expanduser("~")
+KIT = os.environ.get("AGENT_KIT_DIR") or os.path.dirname(
+    os.path.dirname(os.path.realpath(__file__))
+)
+# The default APFS volume is case-insensitive: ~/.Claude/Settings.json is the rendered file.
+FOLD_CASE = sys.platform == "darwin"
+HOST_ROOT = re.compile(
+    r"^\.(claude[^/]*|codex|cursor)(/|$)", re.IGNORECASE if FOLD_CASE else 0
+)
+RENDER = (
+    f"then run {shlex.quote(os.path.join(KIT, 'bin/agent-kit'))} render --host claude"
+)
+RENDERED = {
+    os.path.join(HOME, ".claude/settings.json"): (
+        f"edit {KIT}/hosts/claude/settings.base.json (hooks: {KIT}/hooks/registry.json), {RENDER}; "
+        "to restore a key from the source: agent-kit render --host claude --take <key>; "
+        f"model, effortLevel and modelSettings come from {KIT}/roles.toml [roles.main]. "
+        "UI-owned keys (theme, voice, ...) change through /config"
+    ),
+    os.path.join(HOME, ".claude/mcp.json"): (
+        f'edit {KIT}/mcp/servers.json (a secret as {{"$keychain": {{"service", "account"}}}}), {RENDER}'
+    ),
+}
+NATIVE_ROOTS = {
+    host: Path(os.environ.get("AGENT_KIT_HOST_ROOT") or os.path.join(HOME, f".{host}"))
+    if os.environ.get("AGENT_HOST") == host
+    else Path(HOME) / f".{host}"
+    for host in ("codex", "cursor")
+}
+NATIVE_FILES = {
+    "codex": ("hooks.json", "config.toml", "AGENTS.md"),
+    "cursor": ("hooks.json", "mcp.json", "rules/agent-kit.mdc"),
+}
+
+
+def deny(reason: str) -> None:
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+    print(json.dumps(out))
+
+
+def fold(path: str) -> str:
+    return os.path.normcase(path).casefold() if FOLD_CASE else path
+
+
+def same_file(a: str, b: str) -> bool:
+    """Same inode when both exist (any case, any link); else the same resolved path."""
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+        return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+    except OSError:
+        return fold(os.path.realpath(a)) == fold(os.path.realpath(b))
+
+
+def public_remedy() -> str:
+    state = json.loads((Path(KIT) / ".install-state/current.json").read_text())
+    configuration = state.get("configuration")
+    source = (
+        configuration.get("source_checkout")
+        if isinstance(configuration, dict)
+        else None
+    )
+    blocking = (
+        configuration.get("blocking_hooks") if isinstance(configuration, dict) else None
+    )
+    if not isinstance(blocking, bool):
+        registry = Path(KIT) / "hooks/registry.json"
+        owned = next(
+            (
+                entry
+                for entry in state.get("managed", {}).values()
+                if entry.get("kind") == "file"
+                and same_file(entry["target"], str(registry))
+            ),
+            None,
+        )
+        if owned and registry.is_file():
+            content = registry.read_bytes()
+            if hashlib.sha256(content).hexdigest() == owned.get("hash"):
+                rows = json.loads(content)
+                if isinstance(rows, list) and all(
+                    isinstance(row, dict) and isinstance(row.get("command"), str)
+                    for row in rows
+                ):
+                    blocking = any(
+                        Path(shlex.split(row["command"])[0]).name == "edit-guard"
+                        for row in rows
+                        if shlex.split(row["command"])
+                    )
+    if not isinstance(blocking, bool):
+        return f"rerun agent-setup from your source checkout with --root-dir {shlex.quote(KIT)} and an explicit previous blocking-hook choice"
+    flags = f"--root-dir {shlex.quote(KIT)}" + (" --blocking-hooks" if blocking else "")
+    if isinstance(source, str) and (Path(source) / "bin/agent-setup").is_file():
+        return (
+            f"preview {shlex.quote(str(Path(source) / 'bin/agent-setup'))} {flags}; "
+            "review the preview, then add --apply to install"
+        )
+    return f"rerun agent-setup from your source checkout with {flags}"
+
+
+def main() -> int:
+    try:
+        data = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    inp = data.get("tool_input") or {}
+    paths = inp.get("file_paths") or [inp.get("file_path") or ""]
+    for path in paths:
+        if path and check_path(path, data.get("cwd") or os.getcwd(), inp):
+            break
+    return 0
+
+
+def check_path(path: str, cwd: str, inp: dict) -> bool:
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(cwd, path)
+    path = os.path.normpath(path)
+    real = os.path.realpath(path)
+    plugin_kit = (Path(KIT).parent / ".claude-plugin/plugin.json").is_file() and Path(
+        KIT
+    ).name == "kit"
+    if fold(path).startswith(fold(os.path.normpath(KIT)) + os.sep) and fold(
+        real
+    ).startswith(fold(os.path.realpath(KIT)) + os.sep):
+        if plugin_kit:
+            deny(
+                f"edit-guard: {path} is a packaged kit asset; edit your source checkout and rebuild the plugin"
+            )
+            return True
+        return False
+    try:
+        records = public_records(Path(KIT), Path(path))
+        if records and (
+            os.path.islink(path) or public_changes_owned(Path(path), inp, cwd, records)
+        ):
+            deny(
+                f"edit-guard: {path} changes kit-owned installed content; edit the kit source and {public_remedy()}"
+            )
+            return True
+        if records:
+            return False
+    except (ValueError, TypeError, OSError):
+        deny(f"edit-guard: could not validate installed ownership for {path}")
+        return True
+    for host, root in NATIVE_ROOTS.items():
+        native = any(
+            same_file(path, str(root / name)) for name in NATIVE_FILES[host]
+        ) or (
+            host == "codex"
+            and fold(path).endswith(".toml")
+            and same_file(os.path.dirname(path), str(root / "agents"))
+        )
+        if not native:
+            continue
+        if os.path.islink(path):
+            deny(
+                f"edit-guard: {path} is a link; edit its source target instead: {real}"
+            )
+            return True
+        try:
+            owned = changes_owned(Path(path), inp, cwd, Path(KIT), host, root)
+        except (ValueError, TypeError, OSError):
+            owned = True
+        if owned:
+            deny(
+                f"edit-guard: {path} changes kit-owned content. Edit the kit source and render; user-owned fields may be edited while preserving the managed content."
+            )
+            return True
+    live_kit = (
+        not plugin_kit
+        and Path(KIT).is_dir()
+        and (
+            (
+                Path(HOME, ".agents").is_dir()
+                and same_file(KIT, os.path.join(HOME, ".agents"))
+            )
+            or (
+                Path(HOME, ".claude/hooks").is_dir()
+                and same_file(
+                    os.path.join(HOME, ".claude/hooks"), os.path.join(KIT, "hooks")
+                )
+            )
+        )
+    )
+    for rendered, how in RENDERED.items() if live_kit else ():
+        if same_file(path, rendered):
+            deny(
+                f"edit-guard: {path} is rendered by agent-kit, so a direct edit is lost or forks.\n{how}."
+            )
+            return True
+    agents = os.path.join(HOME, ".claude/agents")
+    if (
+        path.endswith(".md")
+        and live_kit
+        and not os.path.islink(agents)
+        and same_file(os.path.dirname(path), agents)
+    ):
+        name = os.path.basename(path)
+        deny(
+            f"edit-guard: {path} is rendered by agent-kit, so a direct edit is lost or forks.\n"
+            f"Edit {KIT}/agents/{name} (model and effort: {KIT}/roles.toml), {RENDER}."
+        )
+        return True
+    rel = os.path.relpath(fold(path), fold(HOME))
+    if HOST_ROOT.match(rel) and os.path.islink(path):
+        deny(
+            f"edit-guard: {path} is a link; an edit would replace it with a copy and fork the source.\n"
+            f"Edit the target instead: {real}"
+        )
+    return False
+
+
+if __name__ == "__main__":
+    sys.exit(main())

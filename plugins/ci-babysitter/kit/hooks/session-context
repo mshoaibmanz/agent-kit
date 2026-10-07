@@ -1,0 +1,164 @@
+#!/bin/bash
+# SessionStart hook: per-repo pointers, testing and prod-data facts, the invariants TL;DR, and
+# one-line warnings (stale invariants mirror, expired gcloud auth, prunable worktrees), and the
+# session's task folder with its handoff.
+#
+# Only what CLAUDE.md can't hold goes here: this runs in the main session only, and CLAUDE.md
+# already reaches it. Pointers, never file dumps: the harness spills an oversized SessionStart
+# payload to a file and shows a ~2KB preview (93% of the payload was lost that way in Aug).
+
+# Under the harness's 10K-character limit for hook output; the project slice takes what is left.
+BUDGET=9500
+STATE="${CLAUDE_STATE_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/state}"
+ROOT="${CLAUDE_PROJECT_DIR:-.}"
+REPO_ROOT=$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" 2>/dev/null)
+REPO_NAME=''
+[ -n "$REPO_ROOT" ] && [ "$REPO_ROOT" != "." ] && REPO_NAME=$(basename "$REPO_ROOT")
+LOCAL="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/local"
+# The overlay (TEST_* keys) and the refused-command list; without them there is no TESTS line.
+{ . "${0%/*}/lib/hook-io" && . "${0%/*}/lib/test-run" && kit_env; } 2>/dev/null
+
+# gcloud auth takes ~2.4s to check, so check in the background and report the previous result.
+gcloud_check() {
+  mkdir -p "$STATE"
+  local f="$STATE/gcloud-auth"
+  local to
+  to=$(command -v timeout || command -v gtimeout || ls /opt/homebrew/bin/timeout 2>/dev/null)
+  if [ -z "$(find "$f" -mmin -30 2>/dev/null)" ] && command -v gcloud >/dev/null 2>&1; then
+    ( rc=0; ${to:+$to 15} gcloud auth print-access-token --quiet >/dev/null 2>&1 || rc=$?
+      printf '%s %s\n' "$rc" "$(date '+%H:%M')" > "$f" ) </dev/null >/dev/null 2>&1 &
+  fi
+  local rc at
+  [ -r "$f" ] && read -r rc at < "$f" || return 0
+  [ "$rc" = 0 ] || echo "!! gcloud auth check failed (checked $at). Check credential access and network from a trusted terminal before reauthenticating."
+}
+
+# Without venv/extraPaths pyright resolves no repo or third-party import, and LSP references and
+# call hierarchy silently stop at the current file (one repo: 6 hits where grep found 97).
+# A local, untracked pyrightconfig.json is also absent from every new worktree.
+pyright_check() {
+  command -v pyright-langserver >/dev/null 2>&1 || return 0
+  [ -f "$ROOT/pyproject.toml" ] || return 0
+  local cfg="$ROOT/pyrightconfig.json" missing=""
+  if [ ! -f "$cfg" ] && [ -f "$REPO_ROOT/pyrightconfig.json" ] && [ "$REPO_ROOT" != "$ROOT" ]; then
+    echo "!! pyrightconfig.json is local to $REPO_ROOT and missing here, so LSP can't resolve imports: cp \"$REPO_ROOT/pyrightconfig.json\" \"$ROOT/\"."
+    return 0
+  fi
+  [ -f "$cfg" ] || cfg="$ROOT/pyproject.toml"
+  [ -d "$ROOT/.venv" ] && ! grep -q '"\{0,1\}venv"\{0,1\}[[:space:]]*[:=]' "$cfg" && missing="venv"
+  ls "$ROOT"/src/*/__init__.py >/dev/null 2>&1 && ! grep -q 'extraPaths' "$cfg" \
+    && missing="${missing:+$missing, }extraPaths [\"src\"]"
+  [ -z "$missing" ] || echo "!! Pyright config in $ROOT lacks $missing, so LSP references stop at the current file. Add \"venvPath\": \".\", \"venv\": \".venv\", \"extraPaths\": [\"src\"] to pyrightconfig.json."
+}
+
+# ro-mysql writes this on MySQL auth failure (monthly password rotation) and clears it on success.
+db_auth_check() {
+  local u t at
+  [ -r "$STATE/db-auth-failed" ] && read -r u t at < "$STATE/db-auth-failed" || return 0
+  echo "!! DB password for $u stopped working ($t, $at). Ask the user to run \`ro-mysql --rotate\` in a terminal."
+}
+
+invariants() {
+  local doc="$LOCAL/${REPO_NAME}-invariants.md" body mirrored changed
+  [ -r "$doc" ] || return 0
+  mirrored=$(sed -n 's/^Last mirrored: \([0-9-]*\).*/\1/p' "$doc" | head -1)
+  changed=$(git -C "$REPO_ROOT" log -1 --format=%cs origin/HEAD -- .claude/rules 2>/dev/null)
+  if [ -n "$changed" ] && [ -n "$mirrored" ] && [[ "$changed" > "$mirrored" ]]; then
+    echo "!! The repo's .claude/rules changed on $changed, after the mirror ($mirrored). Re-mirror into $doc before relying on it."
+  fi
+  # Per-line comment match: a `/^<!--/,/-->/d` range starting on a one-line comment deletes
+  # through EOF, because sed looks for the end address from the NEXT line.
+  body=$(sed -n '/^## TL;DR/,/^---[[:space:]]*$/p' "$doc" \
+    | sed -e '/^## TL;DR/d' -e '/^---[[:space:]]*$/d' \
+          -e '/^[[:space:]]*<!--.*-->[[:space:]]*$/d' -e '/^[[:space:]]*<!--/,/-->/d' \
+          -e '/^[[:space:]]*$/d')
+  if [ -z "$body" ]; then
+    echo "!! No TL;DR could be extracted from $doc. Read it in full before editing code here."
+  else
+    echo "CODE INVARIANTS (a violation is a review reject; full text in ${REPO_NAME}-invariants.md):"
+    printf '%s\n' "$body"
+  fi
+}
+
+emit() {
+  [ -n "$REPO_NAME" ] || return 0
+  local docs="" s
+  for s in invariants rules testing; do
+    [ -f "$LOCAL/$REPO_NAME-$s.md" ] && docs="$docs $REPO_NAME-$s.md"
+  done
+  if [ -n "$docs" ]; then
+    echo "MY DOCS for $REPO_NAME in $LOCAL (authoritative, read on demand):$docs."
+    echo "Invariants before writing code; testing before running or debugging tests; rules for repo conventions, PR labels and ROLLOUT."
+  fi
+  if grep -qx "$REPO_NAME" "$LOCAL/no-project-settings" 2>/dev/null; then
+    echo "This repo's CLAUDE.md, AGENTS.md and .claude/{rules,skills,commands} are NOT loaded; its rules are mirrored in the invariants doc. Never edit them. Nested src/**/CLAUDE.md maps stay readable."
+  fi
+
+  pyright_check
+
+  if [ -n "${TEST_GATE_FILE:-}" ] && [ -n "${TEST_RUNNER:-}" ] && [ -f "$REPO_ROOT/$TEST_GATE_FILE" ]; then
+    local blocked
+    blocked=$(tr_refused_md 2>/dev/null)
+    blocked=${blocked:+$blocked and bare \`pytest\` are}
+    echo
+    echo "TESTS: \`$TEST_RUNNER a.py b.py -k \"x or y\" > <scratchpad>/t.log 2>&1\`, one invocation per turn, then Read the log.${TEST_NOTE:+ $TEST_NOTE} ${blocked:-Bare \`pytest\` is} blocked. Never build or start anything to run a test; on a setup failure read the testing doc."
+  fi
+
+  if grep -qx "$REPO_NAME" "$LOCAL/prod-data-repos" 2>/dev/null; then
+    echo
+    echo "PROD DATA (read-only): \`ro-mysql\` and \`bqro\` only. \`ro-mysql --tunnels\` lists every database, its tunnel and whether it is STAGING. Load the debug skill before any RCA."
+    gcloud_check
+    db_auth_check
+  fi
+
+  if [ -f "$LOCAL/${REPO_NAME}-invariants.md" ]; then
+    echo
+    invariants
+  fi
+
+  if [ -f "$ROOT/CONTEXT-MAP.md" ]; then
+    echo
+    echo "DOMAIN DOCS: CONTEXT-MAP.md -> src/lib*/CONTEXT-MAP.md -> context/<subject>.md; load only the subjects you touch. Use \`## Language\` terms verbatim, re-check \`## Notes\` against code, surface (don't relitigate) a docs/adr/ conflict. Unknown term: check the lib's CONTEXT-MAP, then ask."
+  fi
+}
+
+# The session's project (bin/agent-task, under the work root): a bound session gets the project
+# slice, and on /clear an unbound one inherits its terminal tab's binding. An unbound session gets
+# the path its per-session folder will have; nothing is created until something is written there.
+# agent-task names the per-session folder's repo itself (handoff.handoff_folder, from
+# CLAUDE_PROJECT_DIR), the one derivation the context-watch nudge and pre-compact also use.
+task_dir() {
+  local sid src branch
+  command -v hook_read >/dev/null && hook_read sid='.session_id // empty' src='.source // empty'
+  [ -n "$sid" ] || return 0
+  branch=$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  "${0%/*}/../bin/agent-task" session-start --session "$sid" --source "$src" --branch "$branch" \
+    --cap $((BUDGET - ${#out} - 300)) 2>/dev/null
+}
+
+# MCP servers have one source, ~/.agents/mcp/servers.json, which `agent-kit render` resolves into
+# ~/.claude/mcp.json. The zsh launcher syncs only the account it
+# starts; this syncs every account in the background, so an IDE, desktop-app or `command claude`
+# launch converges them too. Servers bind at session start, so a change reaches the next session.
+[ -x "$HOME/.claude/bin/claude-account" ] \
+  && ( "$HOME/.claude/bin/claude-account" sync-mcp ) </dev/null >/dev/null 2>&1 &
+
+out=$(emit)
+o=$(task_dir)
+[ -n "$o" ] && out="${out:+$out
+}$o"
+n=$(grep -vc -e '^#' -e '^[[:space:]]*$' "$STATE/prunable-worktrees.txt" 2>/dev/null)
+if [ "${n:-0}" -gt 0 ]; then
+  out="$out
+$n worktrees look prunable (list: ~/.claude/state/prunable-worktrees.txt). \`~/.claude/bin/claude-gc --prune-worktrees\` removes them; ask the user first."
+fi
+# The published kit is synced monthly, not per edit; the sync writes this stamp.
+if [ -r "$STATE/kit-last-sync" ] && [ -z "$(find "$STATE/kit-last-sync" -mtime -30 2>/dev/null)" ]; then
+  out="$out
+claude-kit was last synced $(head -1 "$STATE/kit-last-sync") (over 30 days ago). Mention it once; the monthly sync steps are in ~/.claude/local/claude-kit-rules.md."
+fi
+size=$(printf '%s' "$out" | wc -c | tr -d ' ')
+if [ "$size" -gt "$BUDGET" ]; then
+  echo "!! session-context emitted ${size}B (budget ${BUDGET}B); the harness may truncate it. Shrink the invariants TL;DR or this hook."
+fi
+printf '%s\n' "$out"

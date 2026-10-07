@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Read-streak: point the MAIN session at the `researcher` agent after 8 code-discovery calls in a
+# row with no edit, and refuse discovery reads 12 calls after that.
+#
+#   PostToolUse (Read|Grep|Glob|LSP|Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task|SendMessage)
+#       A discovery read adds 1: Read, Grep, Glob, LSP, or a Bash command whose pipeline heads read
+#       files (cat, sed, grep, rg, find, ls, git log/show/diff/blame, gh pr view/diff, gh api, ...).
+#       An edit, a Bash file write (redirect, rm/mv/cp/mkdir/tee, sed -i, a mutating git or gh
+#       subcommand), or an Agent/Task/SendMessage call resets the streak. Everything else is neutral:
+#       ro-mysql/bqro (prod-data reads belong in the main session, per the debug skill), MCP tools,
+#       Skill, ToolSearch, web tools, tests, scripts, polling loops (sleep). The 8th read injects one
+#       additionalContext.
+#   PreToolUse (Read|Grep|Glob|LSP|Bash)
+#       Once the streak holds NUDGE_AT+DENY_AFTER (20) reads, the next discovery read is denied, and
+#       every one after it until the streak resets. `# solo` on any Bash command lifts the deny for
+#       the rest of the streak, Read/Grep included (a marker file); Read and Grep carry no free text,
+#       so that Bash comment is the one override. Neutral calls are never denied.
+#   UserPromptSubmit
+#       a new prompt starts a new streak.
+#   Main session only: a payload with agent_id is a subagent's and is skipped, so a researcher or an
+#   engineer reads freely.
+#
+# WHY. Inline exploration in the main session is paid for on every later call (the session re-reads
+# its whole context each time); a researcher run on Sonnet returns a 300-word answer instead. The nudge
+# goes through additionalContext because a systemMessage never reaches the model (claude-kit-rules).
+# The deny exists because the nudge alone was ignored: over one week, 22 work sessions made one
+# researcher spawn between them, and one session took 6 nudges over 160 direct calls. The old count
+# also missed most streaks: any `2>&1` (lib/cmd-tokens reported it as a command `1`), any gh call
+# and any unrecognised command reset it.
+# DENY_AFTER=12: a "read a few files, then edit" flow stays far below 20 reads (set from a replay of a week of real sessions).
+#
+# COST. Runs on every read/edit/Bash call of every session. PreToolUse reads one small file and
+# exits below the deny threshold; jq/awk/sed run only for a Bash command in PostToolUse or at the
+# threshold. Never exits non-zero.
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+
+NUDGE_AT=8
+DENY_AFTER=12
+DENY_AT=$((NUDGE_AT + DENY_AFTER))
+S="${CLAUDE_STATE_DIR:-$HOME/.claude/state}/read-streak"
+
+hook_input
+p=$HOOK_INPUT
+re='"agent_id"[[:space:]]*:[[:space:]]*"[^"]'
+[[ $p =~ $re ]] && exit 0
+# A top-level key is unescaped; the same text inside a string value is \"-escaped and cannot match.
+field() {
+  local re="\"$2\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
+  printf -v "$1" '%s' ''
+  [[ $p =~ $re ]] && printf -v "$1" '%s' "${BASH_REMATCH[1]}"
+  return 0
+}
+field event hook_event_name
+field sid session_id
+[ -n "$sid" ] || exit 0
+case $sid in *[!A-Za-z0-9._-]*) exit 0 ;; esac
+f="$S/$sid"
+
+# count: N, the reads in the current streak (the .reads file's length).
+count() {
+  local s=
+  N=0
+  [ -e "$f.reads" ] || return 0
+  IFS= read -r s <"$f.reads" 2>/dev/null
+  N=${#s}
+}
+
+# Leading git/gh options before the subcommand: -C <dir>, -c <k=v>, -R <repo>, --no-pager.
+_OPTS='([[:space:]]+(-[CcR])[[:space:]]+[^[:space:]]+|[[:space:]]+--no-pager)*[[:space:]]+'
+GIT_WRITE="(^|[^[:alnum:]_-])git${_OPTS}(add|commit|push|pull|checkout|switch|merge|rebase|reset|stash|apply|am|cherry-pick|revert|rm|mv|restore|clean|init|clone|bisect|gc|update-ref)([[:space:]]|$)"
+GIT_READ="(^|[^[:alnum:]_-])git${_OPTS}(log|show|diff|blame|grep|ls-files|ls-tree|cat-file|status|shortlog|rev-list|rev-parse|merge-base|describe|reflog|whatchanged|name-rev|for-each-ref|range-diff)([[:space:]]|$)"
+GH_WRITE="(^|[^[:alnum:]_-])gh${_OPTS}(pr[[:space:]]+(create|edit|merge|comment|review|close|reopen|ready)|issue[[:space:]]+(create|edit|comment|close|reopen)|run[[:space:]]+(rerun|cancel)|workflow[[:space:]]+run|release[[:space:]]+create)([[:space:]]|$)"
+GH_API_WRITE='gh[^;&|]*[[:space:]]api[[:space:]][^;&|]*(-X|--method)[[:space:]=]*(POST|PATCH|PUT|DELETE)'
+GH_READ="(^|[^[:alnum:]_-])gh${_OPTS}(pr[[:space:]]+(view|diff|list|checks|status)|issue[[:space:]]+(view|list)|run[[:space:]]+(view|list)|api|search|repo[[:space:]]+view|release[[:space:]]+(view|list)|workflow[[:space:]]+(view|list))([[:space:]]|$)"
+
+# bash_kind: KIND = read | write | data | other for the Bash command in HOOK_INPUT; SOLO=1 when it
+# carries the `# solo` comment outside a quoted span.
+bash_kind() {
+  local cmd t clean heads
+  KIND=other SOLO=
+  hook_lib open cmd-view || return 0
+  hook_read cmd='.tool_input.command // ""'
+  [ -n "$cmd" ] || return 0
+  # A heredoc body is data, not commands: keep the text up to the line that opens it.
+  case $cmd in *'<<'[!\<]*) cmd=$(awk '{ print } /<<[^<]/ { exit }' <<<"$cmd") ;; esac
+  cmd_view "$cmd"
+  cmd_flag solo && SOLO=1
+  # fd duplication and /dev/null are not file writes: drop them before the `>` test below.
+  clean=$CMD_BARE
+  clean=${clean//[0-9]>&[0-9]/ }; clean=${clean//>&[0-9]/ }; clean=${clean//&>\/dev\/null/ }
+  clean=${clean//[0-9]>\/dev\/null/ }; clean=${clean//>\/dev\/null/ }
+  CMD_BARE=$clean
+  cmd_tokens || return 0
+  cmd_invokes 'ro-mysql|bqro' && { KIND=data; return 0; }
+  case $clean in *'>'* | *'sed -i'* | *'sed --in-place'* | *'-delete'*) KIND=write; return 0 ;; esac
+  cmd_invokes 'rm|mv|cp|mkdir|touch|ln|chmod|tee|truncate|patch|install|rsync' && { KIND=write; return 0; }
+  [[ $clean =~ $GIT_WRITE || $clean =~ $GH_WRITE || $clean =~ $GH_API_WRITE ]] && { KIND=write; return 0; }
+  # Waiting on a background job is not discovery.
+  cmd_invokes 'sleep' && return 0
+  # Pipeline heads: a filter after `|` (head, grep, jq) reads its input, not files.
+  heads=$(sed -E -e 's/\|\|/;/g' -e 's/&&/;/g' -e 's/\|[^;]*//g' <<<"$clean")
+  CMD_BARE=$heads
+  cmd_tokens || return 0
+  while IFS= read -r t; do
+    case $t in
+      ls|cat|head|tail|grep|egrep|fgrep|rg|ag|ack|find|fd|sed|awk|wc|tree|diff|cmp|nl|less|more|bat|tac|xxd|od|hexdump|strings|stat|file|jq|yq|sort|uniq|cut|column|ast-grep|sg)
+        KIND=read; return 0 ;;
+      git) [[ $heads =~ $GIT_READ ]] && { KIND=read; return 0; } ;;
+      gh) [[ $heads =~ $GH_READ ]] && { KIND=read; return 0; } ;;
+    esac
+  done <<<"$CMD_TOKENS"
+  return 0
+}
+
+case $event in
+  UserPromptSubmit) rm -f "$f.reads" "$f.fired" "$f.solo" "$f" 2>/dev/null; exit 0 ;;
+  PreToolUse)
+    count
+    [ "$N" -ge "$DENY_AT" ] || exit 0
+    [ -e "$f.solo" ] && exit 0
+    field tool tool_name
+    case $tool in
+      Read|Grep|Glob|LSP) hook_lib open || exit 0 ;;
+      Bash)
+        bash_kind
+        if [ -n "$SOLO" ]; then : >"$f.solo" 2>/dev/null; exit 0; fi
+        [ "$KIND" = read ] || exit 0 ;;
+      *) exit 0 ;;
+    esac
+    deny "\`# solo\` on any Bash command (e.g. \`true # solo\`) lifts this until your next edit: for the file you are about to change.
+Denied: $N code-discovery reads in a row with no edit. Ask $(host_noun delegate) one question with the start paths; prod-data queries are not affected."
+    ;;
+  PostToolUse) ;;
+  *) exit 0 ;;
+esac
+field tool tool_name
+
+kind=
+case $tool in
+  Read|Grep|Glob|LSP) kind=read ;;
+  Bash)
+    bash_kind
+    case $KIND in read) kind=read ;; write) kind=reset ;; *) exit 0 ;; esac ;;
+  Edit|Write|MultiEdit|NotebookEdit|Agent|Task|SendMessage) kind=reset ;;
+  *) exit 0 ;;
+esac
+
+if [ "$kind" = reset ]; then
+  [ -e "$f.reads" ] && rm -f "$f.reads" "$f.fired" "$f.solo" 2>/dev/null
+  exit 0
+fi
+
+# A read. Parallel tool calls run this hook concurrently for one session, so there is no
+# read-modify-write: each read appends one byte (O_APPEND, so none is lost) and the count is the
+# file's length; the nudge goes out from the one call that creates the .fired marker (noclobber
+# opens it O_EXCL). The last of 8 parallel reads always sees 8.
+if [ ! -d "$S" ]; then
+  mkdir -p "$S" 2>/dev/null || exit 0
+  find "$S" -maxdepth 1 -type f -mtime +2 -delete 2>/dev/null
+fi
+printf . >>"$f.reads" 2>/dev/null || exit 0
+count
+[ "$N" -ge "$NUDGE_AT" ] || exit 0
+set -C
+{ : >"$f.fired"; } 2>/dev/null || exit 0
+hook_lib open || exit 0
+add_context PostToolUse "$N code-reading calls in a row with no edit. Hand further searching or reading to $(host_noun delegate) with one question and the start paths. After $DENY_AFTER more, reads here are refused."
+exit 0

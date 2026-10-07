@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Retired: the git pre-push hook gates an agent's pushes now (git-hooks/agent/pre-push, logic in
+# hooks/lib/push-gate), injected into agent shells through the settings env. It sees
+# `git -C <wt> push`, scripts and every other form, which this PreToolUse text match missed, and
+# keys the review on the branch's record. The override is AGENT_PUSH_NOW="<reason>" git push ...
+# Kept as a no-op, not deleted: a session started before an update still has this path in its
+# loaded settings and runs it on every Bash call until it restarts. Not in registry.json.
+exit 0

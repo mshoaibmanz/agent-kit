@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# claude-account: run Claude Code under several accounts with one shared setup.
+#
+# Each extra account gets its own config dir, ~/.claude-<name>: its own login and its own
+# .claude.json (folder trust, per-project state, user-scope MCP servers). Everything else in it is a
+# symlink into ~/.claude, so settings and permissions, hooks, agents, skills, plugins, local docs,
+# transcripts and prompt history have one source; Claude Code writes settings through the link.
+# The default account, "personal", is ~/.claude itself and runs with CLAUDE_CONFIG_DIR unset: set to
+# ~/.claude, it would move the Keychain login entry and the global config file.
+#
+# MCP servers have one source, $AGENT_KIT_DIR/mcp/servers.json (the kit root), with secrets as Keychain references.
+# `agent-kit render --host claude` resolves it into ~/.claude/mcp.json (not in git: it holds
+# tokens), and `sync-mcp` makes every account's user scope match that file through `claude mcp
+# add-json/remove -s user`. It compares mcp.json with the account's .claude.json on every run, so
+# drift on either side is repaired, and calls the CLI only for servers that differ. The launcher
+# runs it before each launch, so an IDE or a plain `command claude` session gets the same servers.
+# Change servers in servers.json only: a user-scope server added by hand is removed at the next
+# sync, and a project-scope one (`claude mcp add`, scope local) reaches one account only, which
+# `check` and every launch report.
+#
+# Routing: ~/.claude/local/accounts, lines "<account> <path-prefix>", first match wins. A directory
+# no line matches is tried again as its git repo root (the main checkout's, so a linked worktree
+# anywhere routes like its repo); still no match means personal. CLAUDE_ACCOUNT=<name> overrides
+# per launch. The zsh launcher (local/claude-launcher.zsh) makes one call: `claude-account launch`.
+set -uo pipefail
+
+BASE="$HOME/.claude"
+# The kit this script belongs to (its bin/ parent), when the caller's environment does not name one.
+KIT_DIR=${AGENT_KIT_DIR:-$(cd -P "$(dirname "$0")/.." 2>/dev/null && pwd)}
+ROUTES="$BASE/local/accounts"
+MCP="$BASE/mcp.json"
+MARK=".claude-account"
+# Linked into every account. Not listed, so per account: .claude.json, sessions, session-env,
+# shell-snapshots, ide, daemon*, jobs, telemetry, caches, and the org's policy-limits.json and
+# remote-settings.json.
+SHARED="CLAUDE.md settings.json settings.local.json keybindings.json statusline-command.sh kit.env.example hooks
+agents commands skills skills-archive local bin plugins projects history.jsonl plans
+state tmp worktrees file-history paste-cache"
+
+usage() {
+  cat <<'EOF'
+usage: claude-account <command>
+  setup <name>     create ~/.claude-<name> and link the shared entries, then print the login command
+  check [name]     verify an account's links (every account when no name), and name project-scope
+                   MCP servers one account has and another lacks
+  which [dir]      the account for a directory (default: the current one)
+  launch [dir]     the launcher's call: print the config dir to run with (nothing for personal),
+                   sync MCP servers, report broken links and project-scope MCP gaps on stderr;
+                   fails when not set up
+  sync-mcp [name]  make user-scope MCP servers match ~/.claude/mcp.json (every account when no name)
+  list             accounts and their login state
+  dirs             every account's config dir, personal first
+EOF
+}
+
+die() { echo "claude-account: $*" >&2; exit 2; }
+
+# acct_dir <name>: set DIR (config dir) and JSON (its global config file). A variable, not output:
+# inside `$(…)` die would exit only the subshell and the caller would go on with an empty dir.
+# Letters are spelled out: in a UTF-8 locale bash's [a-z] also matches A-Y, so `Work` passed, and
+# on a case-insensitive disk ~/.claude-Work is ~/.claude-work under a second account name.
+acct_dir() {
+  case "$1" in
+    personal) DIR=$BASE; JSON="$HOME/.claude.json" ;;
+    *[!abcdefghijklmnopqrstuvwxyz0123456789-]*|'')
+      die "account names are lowercase letters, digits and '-', not '$1'" ;;
+    *) DIR="$HOME/.claude-$1"; JSON="$DIR/.claude.json" ;;
+  esac
+}
+
+# as_account <name> <cmd>...: run a command as that account.
+as_account() {
+  local name=$1
+  shift
+  if [ "$name" = personal ]; then
+    env -u CLAUDE_CONFIG_DIR "$@"
+  else
+    CLAUDE_CONFIG_DIR="$HOME/.claude-$name" "$@"
+  fi
+}
+
+accounts() {
+  local d
+  echo personal
+  for d in "$HOME"/.claude-*; do
+    [ -f "$d/$MARK" ] && printf '%s\n' "${d#"$HOME"/.claude-}"
+  done
+}
+
+setup() {
+  local name=${1:-} e
+  [ -n "$name" ] || die "usage: claude-account setup <name>"
+  [ "$name" != personal ] || die "personal is ~/.claude itself"
+  acct_dir "$name"
+  { mkdir -p "$DIR" && : > "$DIR/$MARK"; } || die "cannot create $DIR"
+  for e in $SHARED; do
+    [ -e "$BASE/$e" ] || continue
+    [ -L "$DIR/$e" ] && continue
+    if [ -e "$DIR/$e" ]; then
+      echo "kept $DIR/$e: it exists and is not a link; merge it by hand" >&2
+      continue
+    fi
+    ln -s "$BASE/$e" "$DIR/$e" && echo "linked $e"
+  done
+  echo "log in with:  CLAUDE_CONFIG_DIR=$DIR claude auth login"
+}
+
+# check_links <name>: one line per shared entry that is not a link into ~/.claude.
+check_links() {
+  local name=$1 e rc=0
+  [ "$name" = personal ] && return 0
+  acct_dir "$name"
+  [ -f "$DIR/$MARK" ] || { echo "$name: not set up (claude-account setup $name)"; return 1; }
+  for e in $SHARED; do
+    [ -e "$BASE/$e" ] || continue
+    [ -L "$DIR/$e" ] && continue
+    if [ -e "$DIR/$e" ]; then
+      echo "$name: $e is a separate copy, not a link to ~/.claude/$e (something rewrote it): diff, merge into ~/.claude, remove it, then re-run claude-account setup $name"
+    else
+      echo "$name: $e is not linked (added to ~/.claude after setup): re-run claude-account setup $name"
+    fi
+    rc=1
+  done
+  return $rc
+}
+
+# check_project_mcp: project-scope MCP servers live in one account's .claude.json, so the same
+# directory run as another account has none of them. One line per owning account, directory and
+# server list, naming every account that lacks them.
+check_project_mcp() {
+  local name rows='' names
+  names=$(accounts)
+  for name in $names; do
+    acct_dir "$name"
+    [ -r "$JSON" ] || continue
+    rows="$rows$(jq -r --arg a "$name" '(.projects // {}) | to_entries[] | .key as $d
+      | (.value.mcpServers // {}) | keys[] | "\($a)\t\($d)\t\(.)"' "$JSON" 2>/dev/null)
+"
+  done
+  printf '%s' "$rows" | awk -F'\t' -v accts="$(printf '%s ' $names)" -v kit="$KIT_DIR" '
+    NF == 3 { has[$1 FS $2 FS $3] = 1; row[++n] = $0 }
+    END {
+      na = split(accts, A, " ")
+      for (i = 1; i <= n; i++) {
+        split(row[i], f, FS)
+        for (j = 1; j <= na; j++) {
+          if (A[j] == f[1] || has[A[j] FS f[2] FS f[3]]) continue
+          k = f[1] FS f[2] FS A[j]
+          if (!(k in miss)) order[++m] = k
+          miss[k] = (k in miss) ? miss[k] ", " f[3] : f[3]
+        }
+      }
+      for (i = 1; i <= m; i++) {
+        split(order[i], g, FS)
+        k = g[1] FS g[2] FS miss[order[i]]
+        if (!(k in who)) line[++l] = k
+        who[k] = (k in who) ? who[k] ", " g[3] : g[3]
+      }
+      for (i = 1; i <= l; i++) {
+        split(line[i], g, FS)
+        printf "%s: project-scope MCP servers in %s that %s %s: %s.", g[1], g[2], who[line[i]],
+          (index(who[line[i]], ",") ? "lack" : "lacks"), g[3]
+        printf " Move them to %s/mcp/servers.json and run `agent-kit render --host claude`", kit
+        printf " (every account), or remove them: `claude mcp"
+        printf " remove -s local <name>` in that dir, as %s\n", g[1]
+      }
+      exit (m > 0)
+    }'
+}
+
+check() {
+  local rc=0 name
+  if [ -n "${1:-}" ]; then acct_dir "$1"; fi
+  for name in ${1:-$(accounts)}; do
+    check_links "$name" || rc=1
+  done
+  check_project_mcp || rc=1
+  return $rc
+}
+
+# which_account [dir]: the directory's account (see Routing above).
+which_account() {
+  local dir=${1:-$PWD} acct common
+  acct=$(route "$dir") && { printf '%s\n' "$acct"; return; }
+  if common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    acct=$(route "${common%/*}") && { printf '%s\n' "$acct"; return; }
+  fi
+  echo personal
+}
+
+# route <dir>: the first routing line whose prefix holds <dir>; fails when none does.
+route() {
+  local acct prefix
+  [ -r "$ROUTES" ] || return 1
+  while read -r acct prefix _; do
+    case "$acct" in ''|\#*) continue ;; esac
+    prefix=${prefix/#\~/$HOME}
+    prefix=${prefix%/}
+    case "$1/" in "$prefix"/*) printf '%s\n' "$acct"; return 0 ;; esac
+  done < "$ROUTES"
+  return 1
+}
+
+# mcp_ops <account .claude.json>: one line per server whose user-scope entry differs from mcp.json.
+# "-name": in the user scope only. "+name": in mcp.json only. "~name": in both, configured
+# differently. add-json stores a stdio server without "args" with "args": [], so that is compared as
+# equal. jq reads both files itself, so the comparison puts no token on a command line; sync_mcp's
+# add-json does: the CLI takes the config only as an argument, so a resolved secret in mcp.json
+# reaches argv for that call. Keep secrets out of it as "${VAR}" (expanded when the server starts).
+mcp_ops() {
+  jq -rn --slurpfile w "$MCP" --slurpfile h "$1" '
+    def norm: if type == "object" and has("command") then {args: []} + . else . end;
+    (($w[0] // {}).mcpServers // {}) as $s | (($h[0] // {}).mcpServers // {}) as $u
+    | ($u | keys[] | select($s[.] == null) | "-" + .),
+      ($s | keys[] | select($u[.] == null) | "+" + .),
+      ($s | keys[] | select($u[.] != null and ($s[.] | norm) != ($u[.] | norm)) | "~" + .)'
+}
+
+# sync_mcp <name>: make the account's user-scope MCP servers match mcp.json. The diff is taken from
+# the account's .claude.json on every run, so a server removed by hand or a reset file is repaired
+# too; the CLI runs only when there is a difference, and a failed call is retried next run.
+sync_mcp() {
+  local name=$1 have ops op n cfg rc=0 changed='' left
+  acct_dir "$name"
+  [ -r "$MCP" ] || return 0
+  command -v jq >/dev/null 2>&1 || { echo "claude-account: jq is needed to sync MCP servers" >&2; return 1; }
+  have=$JSON
+  [ -r "$have" ] || have=/dev/null
+  ops=$(mcp_ops "$have") || {
+    echo "claude-account: $MCP or $JSON is not valid JSON; $name MCP servers not synced" >&2
+    return 1
+  }
+  [ -n "$ops" ] || return 0
+  while IFS= read -r op; do
+    n=${op#?}
+    [ -n "$n" ] || continue
+    case $op in
+      -*) as_account "$name" claude mcp remove -s user "$n" >/dev/null 2>&1 || rc=1 ;;
+      *)
+        # A changed server is replaced: add-json refuses a name that exists.
+        if [ "${op%"$n"}" = '~' ]; then
+          as_account "$name" claude mcp remove -s user "$n" >/dev/null 2>&1
+        fi
+        cfg=$(jq -c --arg n "$n" '.mcpServers[$n]' "$MCP") \
+          && as_account "$name" claude mcp add-json -s user "$n" "$cfg" >/dev/null 2>&1 || rc=1 ;;
+    esac
+    changed="$changed $op"
+  done <<<"$ops"
+  echo "claude-account: $name MCP servers synced from mcp.json:$changed" >&2
+  if [ "$rc" != 0 ]; then
+    echo "claude-account: a claude mcp call failed for $name; the next sync retries" >&2
+    return 1
+  fi
+  # A server the CLI stores in another form than mcp.json's would be re-added on every launch.
+  left=$(mcp_ops "$JSON" 2>/dev/null) && [ -n "$left" ] \
+    && echo "claude-account: $name still differs from mcp.json after the sync:" $left \
+      "- write those servers in $KIT_DIR/mcp/servers.json as \`claude mcp get <name>\` prints them" >&2
+  return 0
+}
+
+sync_all() {
+  local rc=0 name
+  if [ -n "${1:-}" ]; then acct_dir "$1"; fi
+  for name in ${1:-$(accounts)}; do
+    if [ "$name" != personal ]; then
+      acct_dir "$name"
+      if [ ! -f "$DIR/$MARK" ]; then
+        echo "claude-account: $name is not set up (claude-account setup $name)" >&2
+        rc=1
+        continue
+      fi
+    fi
+    sync_mcp "$name" || rc=1
+  done
+  return $rc
+}
+
+# launch [dir]: the one call the launcher makes.
+launch() {
+  local name
+  name=${CLAUDE_ACCOUNT:-$(which_account "${1:-$PWD}")}
+  acct_dir "$name"
+  if [ "$name" != personal ]; then
+    [ -f "$DIR/$MARK" ] \
+      || die "account '$name' is not set up: claude-account setup $name (or CLAUDE_ACCOUNT=personal claude)"
+    check_links "$name" >&2
+  fi
+  sync_mcp "$name"
+  # Subshell: check_project_mcp walks every account through acct_dir, which resets DIR/JSON.
+  ( check_project_mcp ) >&2
+  [ "$name" = personal ] && return 0
+  echo "claude: account $name ($DIR)" >&2
+  printf '%s\n' "$DIR"
+}
+
+list() {
+  local name state
+  for name in $(accounts); do
+    acct_dir "$name"
+    state=$(as_account "$name" claude auth status 2>/dev/null | jq -r '
+      if .loggedIn then "logged in" + (if .email then " as " + .email else "" end)
+      else "not logged in" end' 2>/dev/null)
+    printf '%-10s %-28s %s\n' "$name" "$DIR" "${state:-unknown}"
+  done
+}
+
+dirs() {
+  local name
+  for name in $(accounts); do
+    acct_dir "$name"
+    printf '%s\n' "$DIR"
+  done
+}
+
+case "${1:-}" in
+  setup) shift; setup "$@" ;;
+  check) shift; check "$@" ;;
+  which) shift; which_account "$@" ;;
+  launch) shift; launch "$@" ;;
+  sync-mcp) shift; sync_all "$@" ;;
+  list) list ;;
+  dirs) dirs ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

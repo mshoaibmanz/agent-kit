@@ -1,0 +1,52 @@
+Shared hook libs. Hooks source them as "${0%/*}/lib/<name>", so a hooks copy under test uses its own.
+hook-io      hook_lib <open|closed> [lib...] (jq + libs; closed denies on PreToolUse and tells the user elsewhere, open tells the user; both exit 0)
+             hook_input, hook_read VAR='jq expr'... (one jq), decide <deny|ask> <reason> [context],
+             deny, ask, add_context <event> <text>, stop_block <sid> <reason>; HOOK_LIB, STOP_BLOCK_DIR
+             kit_env: load the per-user overlay once (below); KIT_KEYS, the declared keys
+kit_env.py   kit_env() -> dict: the same overlay for Python (comment-guard, agent_task, bqro);
+             kit_root(script) -> the kit an entry point in bin/ or hooks/ runs from ($AGENT_KIT_DIR,
+             else its folder's parent, following links only until an agent-setup install, which a dev
+             install links into); kit_dir() -> the kit for library code ($AGENT_KIT_DIR, else its own)
+kit-root.sh  kit_root <script>: the same for the shell tools in bin/ (agent-run, claude-gc)
+cmd-view     cmd_view <cmd> (CMD_MASKED, CMD_BARE), cmd_mask <text>, cmd_flag <word>,
+             cmd_tokens (CMD_TOKENS), cmd_invokes <ere> [tokens]
+state        path_key <path>; branch -> PR pointer: pr_open, pr_number, pr_ptr_set, pr_ptr_clear <branch>
+test-run     tr_invoked, tr_scope <raw cmd>, tr_state <sid> <agent_id> <root> (TR_STATE, TR_LASTRUN),
+             tr_covered <scope>, tr_record <scope>, tr_mark <run|edit> <sid> <root>, tr_ran <sid> <root>,
+             tr_refused_each <fn>, tr_refused_md, tr_ere <var> <text> (a literal ERE),
+             tr_runner_re <var> (TEST_RUNNER_RE, else TEST_RUNNER literally)
+notify       notify <title> <body> [sound] (macOS banner)
+review-state review sizing and rounds (rv_*), shared by review-trigger, push-gate, review-*-mark
+cmd-tokens   awk: the words of a command in command position, one per line; defines WRAPPERS, the one wrapper list (bash-guards reads it)
+strip-heredocs  awk: a command with heredoc bodies removed, unless the body is fed to a shell
+
+Overlay: $KIT_ENV, else ${CLAUDE_CONFIG_DIR:-~/.claude}/local/kit.env (KIT_ENV=/dev/null = none).
+An agent-setup install's local/setup-paths.env is read over its layers, later ones winning: the
+team preset's preset.env beside it, then the user's kit.env, then setup-paths.env itself.
+KEY=value lines (a trailing CR dropped), value literal, optionally quoted; parsed, never sourced.
+Only the keys below are read, and the file's value wins: a key it lacks is empty, never taken from
+the environment, and turns its check off, so a hook without an overlay is inert; the prod-data
+guards need no key. Documented with placeholder values in ~/.claude/kit.env.example.
+  GIT_AUTHOR         commit author the docs name (CLAUDE.md); git config when unset
+  RELEASE_BRANCH_RE  extra local bases for bash-guards' two-dot diff check (ERE)
+  REVIEW_BASE  the branch review-state diffs against first, before origin/HEAD, main and master; the
+                     one key an exported value still sets when the overlay lacks it (review-state)
+  TEST_GATE_FILE     file at a repo root that turns on test-exec-gate and the SessionStart TESTS line
+  TEST_RUNNER        the one test wrapper allowed there; ci-watch allowlists it for its repair agent
+  TEST_RUNNER_RE     runner names that count as a test run (ERE; default TEST_RUNNER): test-run
+  TEST_REFUSED_CMDS  '|'-separated command prefixes test-exec-gate refuses in a gated repo
+  TEST_NOTE          sentence appended to the gate's refusal and the TESTS line
+  PROTOTYPE_DIRS     extra sandbox dir names (ERE): review-mark-changes, comment-guard
+  CODE_DIRS          dirs holding the repos claude-gc sweeps; unset skips its repo-based steps
+  CODE_DIRS_JSON     JSON array of repo parent directories; takes precedence and preserves spaces
+  BQRO_PROJECT       bqro's jobs project when a query passes no --project_id
+  AGENT_WORK_ROOT    the work root (projects/, tasks/, retro/); default ~/agent-work, else ~/claude-scratch: kit_env.work_root() for agent_task.py and comment-guard; tests-ran-mark
+  CODEX_SANDBOX_GCLOUD  1 adds gcloud's config dir (it holds credentials) to Codex's sandbox writable roots, for bq; agent-setup --codex-gcloud
+  CONTEXT_HANDOFF_AT  context tokens at which context-watch nudges a handoff (default: handoff.py's handoff_default, 30000 before the compaction autoCompactWindow sets, else 600000; 0 = no nudge, the idle-resume notice stays); the status line turns red there
+  CODE_SEARCH_ZOEKT_URL  code-search skill: the Zoekt server behind browser SSO (unset turns that backend off)
+  CODE_SEARCH_SSO_COOKIE  code-search: the SSO session cookie's name, read from the local Chrome profile
+  CODE_SEARCH_GH_OWNER  code-search: default GitHub org or user for gh searches and short repo names
+  CODE_SEARCH_CHROME_PROFILE  code-search: the Chrome profile dir that holds the cookie (default Default)
+  SUBAGENT_RESUME_MAX  context tokens past which a subagent is replaced, not resumed (default 300000): setup and agent-kit render it into rules/hosts/claude.md and agent bodies ({{SUBAGENT_RESUME_MAX_K}})
+  TICKET_PREFIXES    Jira project keys (comma-separated, 2-6 characters); when set, the only prefixes that name a ticket in a branch, worktree name or prompt (agent-task binding); optional
+  TMP_SWEEP_DAYS     days a done item's tmp/ (closed, merged or harvested) waits before claude-gc's sweep report lists it (default 14)

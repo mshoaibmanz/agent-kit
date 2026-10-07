@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Launch @sentry/mcp-server for one Sentry instance (mcp/sentry-instances.json, bin/lib/sentry.py).
+
+  sentry-mcp [--instance NAME] [server args...]   no --instance: the catalog's `sentry` instance
+  sentry-mcp [--instance NAME] --check            resolve the instance and its token, then exit
+
+The token comes from the macOS Keychain, else libsecret's secret-tool, else the instance's
+environment variable, and enters only the server's environment: never argv, rendered config or a
+log. Without an instances file it reads the item agent-kit/mcp/sentry and sets no host, as before."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+KIT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(KIT / "bin" / "lib"))
+
+from sentry import (  # noqa: E402
+    HOST_OPTIONS,
+    TOKEN_ENV,
+    KeychainDenied,
+    KeychainMissing,
+    default_instance,
+    load_instances,
+    read_token,
+)
+
+PACKAGE = "@sentry/mcp-server@0.37.0"
+
+
+def die(message: str) -> NoReturn:
+    sys.stderr.write(f"Sentry MCP off: {message}\n")
+    sys.exit(1)
+
+
+def npx_hint() -> str:
+    try:
+        hint = subprocess.run(
+            ["sh", str(KIT / "hooks/lib/install-hint"), "npx"], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        hint = ""
+    return hint or "install Node.js"
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    name = None
+    if "--instance" in args:
+        at = args.index("--instance")
+        if at + 1 >= len(args):
+            die("--instance needs a name")
+        name = args[at + 1]
+        del args[at : at + 2]
+    check = "--check" in args
+    if check:
+        args.remove("--check")
+    try:
+        instances = load_instances(KIT)
+    except ValueError as e:
+        die(str(e))
+    if name is not None and name not in instances:
+        die(f"unknown instance {name}; configured: {', '.join(instances) or 'none'} (mcp/sentry-instances.json)")
+    inst = instances[name] if name is not None else default_instance(instances)
+    host_arg = any(a in HOST_OPTIONS or a.split("=", 1)[0] in HOST_OPTIONS for a in args)
+    if name is not None and host_arg:
+        die(f"--instance {name} sets the host; drop --host/--url")
+    try:
+        token = read_token(inst, instances.values())
+    except KeychainMissing:
+        die(f"{inst.missing()} for instance {inst.name}. Fix: {inst.enable_command()} (in your own terminal)")
+    except KeychainDenied:
+        die(
+            f"could not read the Keychain item {inst.keychain} for instance {inst.name} (denied or locked). "
+            "Check access in your trusted terminal before importing or rotating a credential."
+        )
+    env = {k: v for k, v in os.environ.items() if not k.startswith(TOKEN_ENV)}
+    if inst.host and not host_arg:
+        if name is not None:
+            env["SENTRY_HOST"] = inst.host
+        else:
+            env.setdefault("SENTRY_HOST", inst.host)
+    if check:
+        print(f"sentry-mcp: instance {inst.name} ok (host {env.get('SENTRY_HOST', 'from args')}, item {inst.keychain})")
+        return
+    if shutil.which("npx") is None:
+        die(f"npx is missing. Fix: {npx_hint()}")
+    env[TOKEN_ENV] = token
+    os.execvpe("npx", ["npx", "-y", PACKAGE, *args], env)
+
+
+if __name__ == "__main__":
+    main()

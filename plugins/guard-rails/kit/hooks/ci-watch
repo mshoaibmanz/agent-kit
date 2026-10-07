@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# ci-watch — self-healing CI watcher for the current PR.
+#
+# Watches the `tests` workflow run for the PR's HEAD. On failure it hands the failed-job
+# logs + the PR diff to a headless Claude repair agent that diagnoses and acts:
+#   • confidently-transient infra flake  -> `gh run rerun --failed` (no code change)
+#   • code/test flake OR real regression -> patch the repo, commit, push (this branch only)
+# Then it re-resolves the new run and loops until CI is green (bounded by CI_WATCH_MAX_CYCLES).
+#
+# The repair agent runs with a scoped permission allowlist (ci-watch-perms.json) so it can
+# edit/commit/push without a prompt, but cannot run arbitrary destructive commands.
+#
+# Usage (standalone):   ~/.claude/hooks/ci-watch [repo_dir]
+# Env:
+#   CI_WATCH_NO_ACT=1      classify/notify only — never invoke the agent, rerun, or push (safe for tests)
+#   CI_WATCH_MAX_CYCLES=N  safety cap on fix/rerun cycles before giving up (default 3)
+#   CI_WATCH_DEADLINE=N    wall-clock budget in seconds before giving up (default 7200)
+#   CI_WATCH_MAX_GLOBAL=N  max concurrent watchers machine-wide (default 2)
+#   CI_WATCH_MODEL=name    model for the repair agent (default: your configured default)
+#   CI_WATCH_WORKFLOW=name workflow to watch (default: tests)
+#   CI_WATCH_PERMS=path    allowlist settings file (default: ~/.claude/hooks/ci-watch-perms.json)
+set -uo pipefail
+
+HOOK_LIB="$(cd "$(dirname "$0")" && pwd)/lib"
+{ . "$HOOK_LIB/notify" && . "$HOOK_LIB/state" && . "$HOOK_LIB/hook-io"; } 2>/dev/null \
+  || { echo "ci-watch: $HOOK_LIB is missing a lib; restore it: git -C ${0%/*}/.. checkout -- hooks/lib"; exit 0; }
+kit_env
+
+REPO_DIR="${1:-$PWD}"
+cd "$REPO_DIR" 2>/dev/null || { echo "ci-watch: bad repo dir '$REPO_DIR'"; exit 0; }
+command -v gh     >/dev/null 2>&1 || { echo "ci-watch: gh not found"; exit 0; }
+command -v claude >/dev/null 2>&1 || { echo "ci-watch: claude not found"; exit 0; }
+
+# Mark this watcher active so the repair agent's own `git push` does not re-spawn a watcher
+# (ci-watch-on-push checks this).
+export CI_WATCH_ACTIVE=1
+
+# Per-repo overrides (workflow name, CI-gating label) live out-of-repo keyed by repo name —
+# same pattern as ~/.claude/local/<repo>-testing.md. Lets non-"tests" repos work.
+REPO_NAME=$(basename "$(dirname "$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" 2>/dev/null)" 2>/dev/null)
+CI_ENV="$HOME/.claude/local/${REPO_NAME}-ci.env"
+[ -f "$CI_ENV" ] && . "$CI_ENV"
+
+# Free-text repo CI knowledge injected verbatim into the repair prompt: verdict semantics,
+# known flakes, which rerun form is safe. Prose that does not fit the .env file goes here, so
+# the agent never has to re-derive it from logs under a 3-cycle cap.
+CI_NOTES="${CI_WATCH_NOTES:-$HOME/.claude/local/${REPO_NAME}-ci-notes.md}"
+notes_block() {
+  [ -f "$CI_NOTES" ] || return 0
+  printf '\n=== Repo CI knowledge (AUTHORITATIVE - read before classifying) ===\n'
+  cat "$CI_NOTES"
+  printf '=== end repo CI knowledge ===\n'
+}
+
+WORKFLOW="${CI_WATCH_WORKFLOW:-tests}"
+MAX_CYCLES="${CI_WATCH_MAX_CYCLES:-3}"
+PERMS="${CI_WATCH_PERMS:-$HOME/.claude/hooks/ci-watch-perms.json}"
+LABEL="${CI_WATCH_LABEL:-}"
+START=$(date +%s)
+DEADLINE="${CI_WATCH_DEADLINE:-7200}"
+
+alert() { # alert <title> <body>: a banner, and the same line in the watcher's log
+  notify "$1" "$2"
+  echo "[$1] $2"
+}
+
+# repair_perms: print the path of this run's allowlist, PERMS plus the overlay's TEST_RUNNER and
+# TMPDIR (with its /private twin). Fails when jq cannot build it.
+repair_perms() {
+  local out="${TMPDIR:-/tmp}/ci-watch-${tag}.perms.json" t=${TMPDIR:-}
+  jq --arg r "${TEST_RUNNER:-}" --arg t "${t%/}" '
+    .permissions.allow += (if $r == "" then [] else ["Bash(\($r):*)", "Bash(env -u VIRTUAL_ENV \($r):*)"] end)
+    | .permissions.additionalDirectories += (if $t == "" then []
+        elif ($t | startswith("/private/")) then [$t] else [$t, "/private" + $t] end)' \
+    "$PERMS" > "$out" 2>/dev/null || return 1
+  printf '%s\n' "$out"
+}
+
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
+
+# Need an open PR. CI runs on `labeled`/`synchronize`, so the run may not exist yet —
+# resolve_run waits for it to appear.
+# `gh pr view` also returns a merged or closed PR for the branch. Only an OPEN one counts, and it
+# alone keeps the branch -> PR pointer (lib/state).
+prinfo=$(gh pr view --json number,state -q '"\(.number) \(.state)"' 2>/dev/null) || prinfo=''
+prnum=${prinfo%% *}
+if [ -z "$prinfo" ] || [ "${prinfo##* }" != OPEN ]; then
+  pr_ptr_clear "$branch"
+  echo "ci-watch: no PR open for branch '$branch'"; exit 0
+fi
+tag="$prnum"
+report="${TMPDIR:-/tmp}/ci-watch-${tag}.md"
+agentlog="${TMPDIR:-/tmp}/ci-watch-${tag}.agent.log"
+lock="${TMPDIR:-/tmp}/ci-watch-${tag}.lock"
+statusfile="$HOME/.claude/tmp/ci-watch-${tag}.status"
+mkdir -p "$HOME/.claude/tmp" 2>/dev/null || true
+pr_ptr_set "$branch" "$prnum"
+# Every exit after this point writes a TERMINAL status: one starting green|RED|idle|no, or
+# containing "gave up". unfinished-work's background waiter loops until it sees one, so an exit
+# that leaves a pending status behind strands that waiter.
+set_status(){ printf '%s\n' "$1" > "$statusfile" 2>/dev/null || true; }
+pr_has_label(){ gh pr view "$prnum" --json labels -q '.labels[].name' 2>/dev/null | grep -qx "$1"; }
+
+# One watcher per PR. The lock is a directory holding the owner's pid, because mkdir is atomic: a
+# check-then-write file let two starts both pass, and the first to exit deleted the other's lock.
+# A dead owner's lock is broken under a second lock, re-read first, as lib/review-state does, so
+# two starts cannot each break it and both run. lock_pid also reads the file an older copy wrote.
+lock_pid() { cat "$lock/pid" 2>/dev/null || cat "$lock" 2>/dev/null; }
+take_lock() {
+  local pid now rc
+  mkdir "$lock" 2>/dev/null && return 0
+  pid=$(lock_pid)
+  { [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; } && return 1
+  # A break lock held past a minute was left by a killed start; clear it rather than wedge the PR.
+  [ -z "$(find "$lock.break" -maxdepth 0 -mmin +1 2>/dev/null)" ] || rmdir "$lock.break" 2>/dev/null
+  mkdir "$lock.break" 2>/dev/null || return 1
+  now=$(lock_pid)
+  # A pid-less lock is being taken right now, unless it is older than the break lock.
+  if [ "$now" = "$pid" ] && { [ -n "$now" ] || [ "$lock" -ot "$lock.break" ]; }; then
+    rm -rf "$lock"
+  fi
+  mkdir "$lock" 2>/dev/null
+  rc=$?
+  rmdir "$lock.break" 2>/dev/null
+  return $rc
+}
+if ! take_lock; then
+  echo "ci-watch: already watching PR #$tag"; exit 0
+fi
+echo $$ > "$lock/pid"
+trap 'rm -rf "$lock"' EXIT
+
+# Machine-wide cap: at most N live watchers (each may spawn a claude -p repair agent that
+# burns API rate limits). Our own lock is already written, so it is counted below.
+MAXW="${CI_WATCH_MAX_GLOBAL:-2}"
+live=0
+for l in "${TMPDIR:-/tmp}"/ci-watch-*.lock; do
+  p=$(cat "$l/pid" 2>/dev/null || cat "$l" 2>/dev/null)
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && live=$((live+1))
+done
+if [ "$live" -gt "$MAXW" ]; then
+  set_status "idle — not watched, $MAXW watchers already live"
+  alert "🟠 ci-watch skipped" "PR #$prnum: $MAXW watchers already live — re-push later or run ~/.claude/hooks/ci-watch manually."
+  exit 0
+fi
+
+# Resolve the $WORKFLOW run for a sha — pinned to the workflow that matters so a green sibling
+# workflow (infosec, cloud-build) can never mask a red tests run. Waits for the run to appear.
+resolve_run() { # $1 sha -> echoes run_id, or returns 1
+  local sha="$1" rid="" waited=0 max="${CI_WATCH_RESOLVE_WAIT:-600}"
+  while [ "$waited" -lt "$max" ]; do
+    rid=$(gh run list --branch "$branch" --workflow "$WORKFLOW" --limit 20 \
+            --json databaseId,headSha \
+            -q ".[] | select(.headSha==\"$sha\") | .databaseId" 2>/dev/null | head -1)
+    [ -n "$rid" ] && { echo "$rid"; return 0; }
+    if [ -n "$LABEL" ] && ! pr_has_label "$LABEL"; then
+      set_status "waiting for label '$LABEL' to start CI (${waited}s elapsed)"
+    else
+      set_status "waiting for '$WORKFLOW' run on ${sha:0:8} (${waited}s elapsed)"
+    fi
+    sleep 20; waited=$((waited+20))
+  done
+  return 1
+}
+
+# Combined logs of the failed jobs, written to a file (handed to the agent by PATH — may be large).
+gather_logs() { # $1 run_id -> echoes log file path
+  local rid="$1" out jid
+  out=$(mktemp "${TMPDIR:-/tmp}/ci-watch-${tag}-faillog.XXXXXX")
+  gh run view "$rid" --json jobs -q '.jobs[] | select(.conclusion=="failure") | .databaseId' 2>/dev/null \
+    | while IFS= read -r jid; do
+        [ -n "$jid" ] && gh run view --job "$jid" --log 2>/dev/null
+      done > "$out"
+  echo "$out"
+}
+
+repair_prompt() { # $1 run_id  $2 logfile
+  local rid="$1" logfile="$2"
+  cat <<EOF
+You are an autonomous CI-repair agent running unattended from a git hook. No human is
+watching — take action, do not ask questions.
+
+Context
+- Repository (your cwd): $REPO_DIR
+- Branch: $branch   Open PR: #$prnum   Failed run: $rid (workflow "$WORKFLOW")
+- Combined logs of the FAILED jobs are at: $logfile  (read / grep it; it may be large)
+- See the change under review with:  gh pr diff $prnum
+- Project rules are AUTHORITATIVE — read ./CLAUDE.md and any testing guide it points to,
+  and obey them (no mock/patch, fixtures only, match existing patterns, one logical change).
+
+Goal: get this PR's CI green. Diagnose the failure, then take EXACTLY ONE corrective action:
+
+1) TRANSIENT, OR NOT REACHABLE FROM THIS DIFF — pod OOM / exit 137 / lost MySQL or redis
+   connection / image-pull / k3s or curl download timeout (e.g. update.k3s.io) / control-plane
+   TLS timeout; OR a flaky test in code this diff provably cannot reach. Do NOT change code.
+
+   Choose the rerun form deliberately — this is where these cycles get wasted:
+       gh run rerun $rid --failed   # ONLY if every failed job is self-contained
+       gh run rerun $rid            # full rerun — REQUIRED when a failed job consumes
+                                    # artifacts built by jobs that --failed would not re-run
+   Re-running a reporting/aggregation job alone re-reads the SAME inputs and re-derives the
+   SAME verdict, so it cannot go green. Artifacts are commonly scoped per run ATTEMPT, so the
+   aggregator then sees none at all and fails a second way. When unsure, do the full rerun.
+   "cannot be rerun; This workflow is already running" means a rerun is in flight — not an
+   error, and not a reason to act again. Say which form you chose and why.
+
+2) CODE / TEST flake OR a REAL REGRESSION — leaked state across the pytest-split/xdist shard
+   boundary, a non-draining producer, persistent /tmp sentinels, an unscoped shared seed, OR a
+   genuine assertion failure in code the diff touched. FIX it in the repo:
+   - Make the minimal correct change, following ./CLAUDE.md.
+   - Validate locally if the test harness is reachable (per the testing guide); if the infra is
+     down, skip gracefully rather than hang.
+   - Commit on THIS branch with a clear imperative subject naming the failure.
+   - Push:  git push     (force-push is blocked by policy; never touch any other branch.)
+
+Hard constraints: exactly one action; never merge/close the PR; never edit files outside
+$REPO_DIR. If you truly cannot determine the cause, print a short diagnosis in your final
+message (your output is logged; do not write files outside the repo) and rerun once (option 1).
+
+Finish by printing ONE line: "ACTION=RERUN — <why>" or "ACTION=FIXED_AND_PUSHED — <why>".
+EOF
+  notes_block
+}
+
+echo "ci-watch: watching PR #$prnum ($branch), workflow '$WORKFLOW', cap ${MAX_CYCLES} cycles"
+set_status "watching PR #$prnum ($branch), workflow '$WORKFLOW'"
+
+cycle=0
+while :; do
+  [ $(( $(date +%s) - START )) -gt "$DEADLINE" ] && { set_status "gave up after ${DEADLINE}s (deadline)"; alert "🟠 ci-watch timed out" "PR #$prnum: exceeded ${DEADLINE}s — check CI manually."; exit 0; }
+  sha=$(git rev-parse HEAD 2>/dev/null) || exit 0
+  if ! run_id=$(resolve_run "$sha"); then
+    if [ -n "$LABEL" ] && ! pr_has_label "$LABEL"; then
+      set_status "idle — '$LABEL' label not set"
+      alert "🟠 ci-watch idle" "PR #$prnum: no run — add the '$LABEL' label to start CI (it re-arms on that label)."
+    else
+      avail=$(gh run list --branch "$branch" --limit 10 --json workflowName -q '[.[].workflowName]|unique|join(", ")' 2>/dev/null)
+      set_status "no '$WORKFLOW' run; workflows seen: ${avail:-none}"
+      alert "🟠 ci-watch: no '$WORKFLOW' run" "PR #$prnum on '$branch'. Workflows seen: ${avail:-none}. Fix CI_WATCH_WORKFLOW in ~/.claude/local/${REPO_NAME}-ci.env if wrong."
+    fi
+    exit 0
+  fi
+
+  # Poll until this run completes. "running" is a pending status to unfinished-work.
+  set_status "running ${run_id} on ${sha:0:8}"
+  while :; do
+    [ $(( $(date +%s) - START )) -gt "$DEADLINE" ] && { set_status "gave up after ${DEADLINE}s (deadline)"; alert "🟠 ci-watch timed out" "PR #$prnum: exceeded ${DEADLINE}s while polling run $run_id — check CI manually."; exit 0; }
+    status=$(gh run view "$run_id" --json status -q .status 2>/dev/null)
+    [ "$status" = "completed" ] && break
+    sleep 60
+  done
+
+  conclusion=$(gh run view "$run_id" --json conclusion -q .conclusion 2>/dev/null)
+  if [ "$conclusion" = "success" ]; then
+    set_status "green$([ "$cycle" -gt 0 ] && echo " after $cycle repair cycle(s)")"
+    alert "🟢 CI passed" "PR #$prnum ($branch)$([ "$cycle" -gt 0 ] && echo " — green after $cycle repair cycle(s)")"
+    exit 0
+  fi
+
+  # A cancelled run is a superseded one -- pushing and then adding the CI-gating label creates two
+  # runs for the same sha, and the first is cancelled. Re-resolve (the outer loop picks the newest)
+  # instead of burning a repair cycle diagnosing a run whose jobs all read "skipping".
+  if [ "$conclusion" = "cancelled" ]; then
+    set_status "run $run_id cancelled (superseded) — re-resolving"
+    echo "ci-watch: run $run_id cancelled; re-resolving newest '$WORKFLOW' run for ${sha:0:8}"
+    sleep 20
+    continue
+  fi
+
+  # Without the CI-gating label the jobs are skipped by design, so a non-green run is not a
+  # failure to repair. Treating it as one spawned 12 repair agents on a PR (#11299) that only
+  # lacked the label.
+  if [ -n "$LABEL" ] && ! pr_has_label "$LABEL"; then
+    set_status "idle — '$LABEL' label not set (run $run_id: ${conclusion:-unknown})"
+    alert "🟠 ci-watch idle" "PR #$prnum: run $run_id ended '${conclusion:-unknown}' without the '$LABEL' label. Not repairing; add the label to start CI (it re-arms on that label)."
+    exit 0
+  fi
+  # Labelled, but this run skipped: the label was added after the push's run had finished, and
+  # the run it triggered is the newer one. Re-resolve once; still the newest means nothing ran.
+  if [ "$conclusion" = "skipped" ]; then
+    if [ "$run_id" = "${skipped_run:-}" ]; then
+      set_status "idle — run $run_id skipped, no newer '$WORKFLOW' run for ${sha:0:8}"
+      alert "🟠 ci-watch idle" "PR #$prnum: run $run_id was skipped and no newer run appeared. Check CI manually."
+      exit 0
+    fi
+    skipped_run=$run_id
+    set_status "run $run_id skipped — re-resolving"
+    sleep 20
+    continue
+  fi
+
+  cycle=$((cycle + 1))
+  if [ "$cycle" -gt "$MAX_CYCLES" ]; then
+    set_status "RED — $MAX_CYCLES cycles exhausted, needs a human (agent log: $agentlog)"
+    alert "🔴 CI still red — cap reached" "PR #$prnum: $MAX_CYCLES repair cycles exhausted. Needs a human. Agent log: $agentlog"
+    exit 0
+  fi
+
+  logfile=$(gather_logs "$run_id")
+  echo "ci-watch: run $run_id failed (cycle $cycle/$MAX_CYCLES); logs at $logfile"
+
+  if [ -n "${CI_WATCH_NO_ACT:-}" ]; then
+    set_status "RED — run $run_id failed (no-act mode, agent not invoked)"
+    alert "🟠 CI failed (no-act)" "PR #$prnum: run $run_id red — classify-only mode, agent not invoked. Logs: $logfile"
+    exit 0
+  fi
+
+  if [ ! -f "$PERMS" ]; then
+    set_status "RED — run $run_id failed; repair allowlist $PERMS missing, needs a human"
+    alert "⚠️ ci-watch misconfigured" "PR #$prnum: allowlist $PERMS missing — refusing to run agent unscoped. See $logfile"
+    exit 0
+  fi
+
+  # Hand off to the headless repair agent: it reruns, or patches+commits+pushes.
+  # --permission-mode default + --settings <allowlist>: allowlisted tools run without a prompt;
+  # anything else is auto-denied in headless mode (no hang, bounded blast radius).
+  # The committed allowlist is generic: the overlay's TEST_RUNNER and this machine's TMPDIR are
+  # added per run. Without jq the generic file is used as is.
+  perms_run=$(repair_perms) || perms_run=$PERMS
+  set_status "repairing run $run_id (cycle $cycle/$MAX_CYCLES)"
+  # ${run_id} must stay braced: a bare $run_id directly followed by the multibyte "…" makes bash
+  # read the first ellipsis byte as part of the name, and `set -u` then kills the repair cycle
+  # with `run_id?: unbound variable` -- after the failure is already logged, so it looked like
+  # the watcher simply never repaired anything.
+  alert "🛠 CI failed — repairing" "PR #$prnum: cycle $cycle/$MAX_CYCLES. Claude is diagnosing run ${run_id}…"
+  echo "===== ci-watch repair cycle $cycle — run $run_id =====" >> "$agentlog" 2>&1
+  # --setting-sources user,local mirrors what ~/.claude/local/claude-launcher.zsh does for an
+  # interactive `claude`. That launcher is a ZSH function and this is a bash script, so it can
+  # never apply here -- without this flag the repair agent is the one context on this machine
+  # still loading the repo's CLAUDE.md / AGENTS.md / .claude/rules/, i.e. still being told to
+  # run tests the retired way (TEST_REFUSED_CMDS). Repo code invariants reach it via
+  # ~/.claude/local/<repo>-invariants.md, same as everywhere else.
+  # `--settings "$perms_run"` is unaffected: it adds a file, it does not select scopes.
+  # --strict-mcp-config with no --mcp-config loads no MCP server: the user scope holds every server
+  # in ~/.claude/mcp.json (claude-account sync-mcp), and a repair cycle needs none of them started.
+  repair_prompt "$run_id" "$logfile" \
+    | claude -p --setting-sources user,local --strict-mcp-config --permission-mode default --settings "$perms_run" ${CI_WATCH_MODEL:+--model "$CI_WATCH_MODEL"} \
+        >> "$agentlog" 2>&1 \
+    || alert "⚠️ repair agent errored" "PR #$prnum: claude -p exited non-zero (cycle $cycle). See $agentlog"
+
+  rm -f "$logfile"
+  # Give the rerun / pushed commit a moment to register a fresh run, then loop.
+  sleep 30
+done

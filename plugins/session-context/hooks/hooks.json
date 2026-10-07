@@ -1,0 +1,176 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/project-bind\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|LSP|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/read-streak\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/project-bind\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/worktree-hint\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/project-bind\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/context-watch\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|LSP|Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task|SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/read-streak\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/project-bind\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/context-watch\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/read-streak\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/context-watch\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/subagent-context\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/pre-compact\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/session-context\""
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/session-context\""
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/session-context\""
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/session-context\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/retro-extract\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

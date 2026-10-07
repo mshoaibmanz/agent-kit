@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""SubagentStart: give every subagent its parent's work folder, the item's HANDOFF.md path and the
+project slice (at most 2KB). Before this, 12% of 753 Agent prompts named the work folder and a
+subagent saw none of the project's knowledge or scripts. The payload's session_id is the parent's.
+Unbound parent: no output. Never blocks: every path exits 0.
+"""
+
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+
+
+def text_for(sid: str) -> str:
+    import agent_task as at
+
+    b = at.bound(sid)
+    if not b:
+        return ""
+    hf = b.folder / "HANDOFF.md"
+    head = f"WORK FOLDER (your parent session's binding): {b.folder}." + (f" Item HANDOFF: {hf}." if hf.is_file() else "")
+    head += " Durable files go there (evidence in out/, disposable files in tmp/, reusable scripts in the project's scripts/ with a `use:` line in INDEX.md)."
+    return head + "\n" + at.slice_text(b, cap=at.SLICE_CAP - len(head) - 1, handoff=False)
+
+
+def main() -> None:
+    if os.environ.get("CI_WATCH_ACTIVE"):
+        return
+    try:
+        p = json.load(sys.stdin)
+    except ValueError:
+        return
+    if p.get("hook_event_name") != "SubagentStart":
+        return
+    text = text_for(p.get("session_id", ""))
+    if text:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # an advisory hook never fails the spawn
+        print(json.dumps({"systemMessage": f"subagent-context error: {type(e).__name__}: {e}"}))
+    sys.exit(0)

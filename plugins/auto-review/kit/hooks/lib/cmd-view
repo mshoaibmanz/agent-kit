@@ -1,0 +1,52 @@
+# Views of a Bash command for the hooks that gate or record it. Sourced after hook-io; defines
+# functions only. Sourcing fails when lib/cmd-tokens is unreadable, so hook_lib applies its policy.
+#
+# Match what a command INVOKES against CMD_BARE: a runner, a commit or a push named inside a
+# message, a PR body or a comment is not run. Quoted spans become the placeholder Q rather than
+# being deleted, so argument positions survive: deleting turned `git -C "$WT" commit` into
+# `git -C  commit` (the trailer and cohesion gates then missed the mandated worktree form) and
+# `> "$LOG"` into a bare `>`. $'…' is masked first, escaped quotes included, since its `\'` would
+# mis-pair the plain rule and leak the string's tail. Comments are stripped after quotes, so a '#'
+# inside a string is kept.
+_CV_SED=(-E -e "s/[\$]'([^'\\\\]|\\\\.)*'/Q/g" -e "s/'[^']*'/Q/g" -e 's/"[^"]*"/Q/g')
+
+# cmd_view <cmd>: set CMD_MASKED (quoted spans masked) and CMD_BARE (CMD_MASKED minus trailing
+# # comments). One sed; comments are stripped in-shell, only when a '#' is present.
+cmd_view() {
+  local line out=''
+  CMD_MASKED=$(sed "${_CV_SED[@]}" <<<"$1")
+  CMD_BARE=$CMD_MASKED
+  case $CMD_MASKED in *'#'*) ;; *) return 0 ;; esac
+  while IFS= read -r line; do
+    out="$out${line%%[[:space:]]#*}
+"
+  done <<<"$CMD_MASKED"
+  CMD_BARE=${out%?}
+}
+
+# cmd_mask <text>: print <text> with quoted spans masked, for a caller slicing one command into
+# segments without overwriting CMD_*.
+cmd_mask() { sed "${_CV_SED[@]}" <<<"$1"; }
+
+# cmd_flag <word>: the command carries the escape comment `# <word>` outside any quoted span, so a
+# commit message or PR body quoting the escape does not trigger it.
+cmd_flag() {
+  local re="#[[:space:]]*$1"
+  [[ $CMD_MASKED =~ $re ]]
+}
+
+# cmd_tokens: set CMD_TOKENS, the words of CMD_BARE in command position (lib/cmd-tokens), one per
+# line. Returns awk's status, so a guard can refuse rather than read "no tokens" as allow.
+cmd_tokens() { CMD_TOKENS=$(awk -f "$HOOK_LIB/cmd-tokens" <<<"$CMD_BARE"); }
+
+# cmd_invokes <ere> [tokens]: a command-position word matches <ere> in full. Pure shell: guards
+# call this several times per Bash call.
+cmd_invokes() {
+  local t re="^($1)\$"
+  while IFS= read -r t; do
+    [[ $t =~ $re ]] && return 0
+  done <<<"${2-$CMD_TOKENS}"
+  return 1
+}
+
+[ -r "$HOOK_LIB/cmd-tokens" ]

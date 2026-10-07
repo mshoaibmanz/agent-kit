@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# PostToolUse hook for Edit|Write|MultiEdit: marks that source code changed so review-trigger
+# (Stop) and the git pre-push gate (lib/push-gate) size a review. lib/review-state rv_mark_edit sets the worktree's edit
+# marker and, on this session's first code edit there, its base: round 1 reviews from that HEAD,
+# so committed work still gets reviewed in every worktree the session touches. The marker is
+# cleared when a review completes, never here.
+#
+# Only marks for source files: doc/config/markdown edits don't trigger a review.
+set -uo pipefail
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+hook_lib open
+hook_read files='(.tool_input.file_paths // [(.tool_input.file_path // "")]) | join("\n")' session_id='.session_id // "unknown"'
+
+kit_env
+hook_lib open review-state
+seen=''
+while IFS= read -r file; do
+  case "$file" in */sandbox/*|*/prototypes/*|*.proto.ts|*.proto.tsx|/tmp/*|/private/tmp/*|/var/folders/*) continue ;; esac
+  [ -n "${PROTOTYPE_DIRS:-}" ] && [[ $file =~ /($PROTOTYPE_DIRS)/ ]] && continue
+  rv_is_code "$file" || continue
+  parent=${file%/*}
+  case "$seen" in *"$parent"$'\n'*) continue ;; esac
+  seen="$seen$parent"$'\n'
+  root=$(git -C "$parent" rev-parse --show-toplevel 2>/dev/null) || continue
+  rv_mark_edit "$session_id" "$root"
+done <<<"$files"
+exit 0

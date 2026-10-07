@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# tab-signal <state> — own the terminal tab title for this session.
+#
+# Title = "<project> · <item>" once the session binds (bin/agent-task writes the label
+# file and its .model marker); an unbound session shows the repo name. `tab-signal name
+# <sid> "<words>"` still sets a label by hand. This hook only seeds the label and swaps
+# the leading glyph for the busy, idle and attention states, so the title never churns. Claude Code's own OSC title writes are
+# disabled via CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 in settings.json, otherwise they
+# fight this.
+#
+# Hooks have no controlling tty, so walk the process tree to the `claude` ancestor's
+# pty and write the OSC title (+ BEL) there directly.
+#   states: start (seed) | busy ● | idle ✓ +bell | attn ⚠ +bell | name (model-set)
+state="${1:-start}"
+
+label_dir="$HOME/.claude/state/tab-label"
+mkdir -p "$label_dir" 2>/dev/null
+
+# clip <text> <n> — collapse whitespace, then trim to a word boundary rather than
+# mid-word, marking the truncation.
+clip() {
+  printf '%s' "$1" | tr '\n' ' ' \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]\{2,\}/ /g; s/[[:space:]]*$//' \
+    | awk -v n="$2" '{
+        if (length($0) > n) {
+          s = substr($0, 1, n); sub(/[[:space:]][^[:space:]]*$/, "", s); print s "…"
+        } else print
+      }'
+}
+
+if [ "$state" = "name" ]; then
+  # Invoked by the model from a Bash call, not by a hook: there is no JSON on stdin,
+  # and reading it would hang the tool call.
+  sid="$2"
+  if [ $# -ge 2 ]; then shift 2; else shift $#; fi
+  desc=$(clip "$*" 30)
+  if [ -z "$sid" ] || [ -z "$desc" ]; then
+    echo 'usage: tab-signal name <session-id> "<2-3 word task description>"' >&2
+    exit 2
+  fi
+else
+  input=$(cat 2>/dev/null)   # drain hook stdin (JSON payload)
+  field() { printf '%s' "$input" | jq -r "$1 // empty" 2>/dev/null; }
+  sid=$(field '.session_id')
+  cwd=$(field '.cwd')
+fi
+[ -z "$cwd" ] && cwd="$PWD"
+
+label_file="$label_dir/${sid:-nosession}"
+
+branch=$(GIT_OPTIONAL_LOCKS=0 git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)
+[ -z "$branch" ] && branch=$(basename "$cwd")
+tag=$(printf '%s' "$branch" \
+      | sed -n 's/^\([A-Za-z][A-Za-z0-9]*-[0-9][0-9]*\).*/\1/p' | tr '[:lower:]' '[:upper:]')
+[ -z "$tag" ] && tag=$(printf '%s' "$branch" | cut -c1-12)
+
+compose() {  # <description> -> "<description> · <TAG>"
+  if [ -n "$tag" ]; then printf '%s · %s' "$1" "$tag"; else printf '%s' "$1"; fi
+}
+
+case "$state" in
+  name)
+    compose "$desc" > "$label_file"
+    : > "$label_file.model"   # the model has spoken; the stub must never win again
+    ;;
+  start)
+    # Only seed when absent: SessionStart also fires on resume/clear/compact, and
+    # those must not wipe a label that already carries the task description.
+    if [ ! -s "$label_file" ]; then
+      repo=$(GIT_OPTIONAL_LOCKS=0 git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+      repo=$([ -n "$repo" ] && basename "$(dirname "$repo")" || basename "$cwd")
+      printf '%s' "${repo:-$tag}" > "$label_file"
+    fi
+    find "$label_dir" -type f -mtime +7 -delete 2>/dev/null
+    ;;
+esac
+
+label=$(cat "$label_file" 2>/dev/null)
+[ -z "$label" ] && label="$tag"
+
+bell=0
+case "$state" in
+  attn)      glyph="⚠ "; bell=1 ;;
+  idle)      glyph="✓ "; bell=1 ;;
+  busy|name) glyph="● " ;;
+  *)         glyph="○ " ;;
+esac
+
+# resolve controlling pty via ancestry
+pid=$$
+dev=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  { [ -z "$pid" ] || [ "$pid" = 0 ]; } && break
+  tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$tty" in
+    tty[s0-9]*) [ -w "/dev/$tty" ] && { dev="/dev/$tty"; break; } ;;
+  esac
+  pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+done
+[ -z "$dev" ] && exit 0
+
+# Inside tmux, OSC-0 sets only the *pane* title, and .tmux.conf pins allow-rename off
+# — so the window name (= the iTerm2 -CC tab) would never change. Rename the owning
+# window explicitly so the glyph reaches the tab.
+tmux_bin=$(command -v tmux 2>/dev/null || echo /opt/homebrew/bin/tmux)
+if [ -x "$tmux_bin" ] && "$tmux_bin" list-panes -a >/dev/null 2>&1; then
+  win=$("$tmux_bin" list-panes -a -F '#{pane_tty} #{window_id}' 2>/dev/null \
+        | awk -v d="$dev" '$1 == d { print $2; exit }')
+  [ -n "$win" ] && "$tmux_bin" rename-window -t "$win" "$glyph$label" 2>/dev/null
+fi
+
+printf '\033]0;%s%s\007' "$glyph" "$label" > "$dev" 2>/dev/null
+# The BEL is what tmux monitor-bell sees; it badges the background tab.
+[ "$bell" = 1 ] && printf '\007' > "$dev" 2>/dev/null
+exit 0

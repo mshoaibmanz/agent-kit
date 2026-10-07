@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# UserPromptSubmit: when a prompt reads as a prod-data or RCA question, add one context line
+# telling the model to load the `debug` skill (which owns the answer format) before querying.
+# Silent on every other prompt, and always exits 0: it is a nudge, not a gate.
+#
+# Why: RCA sessions queried prod without loading `debug`, then stated a guessed mechanism as
+# fact and, asked for the evidence, admitted it was inferred. systemMessage never reaches the
+# model, so this uses hookSpecificOutput.additionalContext.
+#
+# Triggers: "in/on/from prod", "prod data/db/issue", RCA, binlog, "why did", "root cause"; or an
+# investigate-style verb together with an id-shaped token (2-4 letters then 8+ digits, like
+# AB12345678901C, or a bare 9+ digit id). A bare "prod" is not enough: config talk ("stg/prod
+# DBs") mentions it constantly. bash 3.2: nocasematch and [[ =~ ]] only.
+set -u
+
+command -v jq >/dev/null 2>&1 || exit 0
+prompt=$(jq -r '.prompt // empty' 2>/dev/null) || exit 0
+[ -n "$prompt" ] || exit 0
+
+shopt -s nocasematch
+case $prompt in
+  /debug*|'<'*|'Another Claude session'*|'Stop hook feedback'*) exit 0 ;;
+esac
+
+lb='(^|[^[:alnum:]_])'
+rb='([^[:alnum:]_]|$)'
+direct="${lb}(in|on|from) (prod|production)${rb}|${lb}(prod|production) (data|db|issue|incident|bug|order|shipment)|${lb}(rca|binlogs?)${rb}|why did|root cause"
+verb='investigat|look into|dig into|check|why|what happened|status'
+ids="${lb}[a-z]{2,4}[0-9]{8,}[a-z]?${rb}|${lb}[0-9]{9,}${rb}"
+
+if [[ $prompt =~ $direct ]] || { [[ $prompt =~ $verb ]] && [[ $prompt =~ $ids ]]; }; then
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"Prod-data or RCA prompt. If the answer needs production data, load the `debug` skill (Skill tool) before the first ro-mysql or bqro query; it sets the answer format."}}'
+fi
+exit 0

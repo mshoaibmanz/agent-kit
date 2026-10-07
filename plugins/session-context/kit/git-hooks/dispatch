@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Git hook dispatcher for the agent git layer. Setup gives it to agent shells only, as a
+# command-scope core.hooksPath in the host's environment (GIT_CONFIG_COUNT/KEY_n/VALUE_n: Claude's
+# settings.json env, Codex's shell_environment_policy.set, Cursor's sessionStart env), after any
+# GIT_CONFIG_* entries of the user's. A human's shell never sees it, and setup never writes a
+# global core.hooksPath. Command scope beats a repo-local core.hooksPath (husky's .husky/_), so the
+# layer reaches every repo an agent touches. Every hook name git supports is a link to this file,
+# except reference-transaction and post-index-change: they fire on every ref update and index
+# write, and this forks git for each; link one if a repo needs it. For hook <name> it runs:
+#   1. agent/<name>, when the shell is an agent's (AI_AGENT, CLAUDECODE or AGENT_HOST set) and
+#      AGENT_GIT_HOOKS is not off;
+#   2. the repo's own hook: <the core.hooksPath git would use without the layer>/<name>, else
+#      $(git rev-parse --git-common-dir)/hooks/<name>. The layer replaces that directory, so
+#      without this step husky hooks and a repo's own pre-push scan would stop running.
+# The first non-zero exit wins. With one of the two present it is exec'd with git's own stdin
+# (proc-receive speaks a two-way protocol on it, so it can never be buffered); with both, a hook
+# that reads stdin (pre-push's ref list, post-rewrite, the receive hooks) gets the same bytes in
+# each step. With neither, stdin is drained and the hook passes, except push-to-checkout: its mere
+# presence replaces receive.denyCurrentBranch=updateInstead, so git's default update runs here.
+# Rollback: setup --no-blocking-hooks takes the layer's entry out of the host environment.
+name=${0##*/}
+here=$(cd -P "${0%/*}" 2>/dev/null && pwd) || here=${0%/*}
+
+agent=''
+if [ -n "${AI_AGENT:-}${CLAUDECODE:-}${AGENT_HOST:-}" ] && [ "${AGENT_GIT_HOOKS:-}" != off ] \
+   && [ -x "$here/agent/$name" ]; then
+  agent="$here/agent/$name"
+fi
+
+# The hooksPath the repo would use without the layer: the last value, from any scope (system,
+# global, includeIf, local, worktree, a user's own command-scope entry), that does not name this
+# directory. None: the default directory.
+dir=''
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  case $d in "~"/*) d="$HOME/${d#\~/}" ;; esac
+  case $d in /*) ;; *) d="$PWD/$d" ;; esac
+  [ "$(cd -P "$d" 2>/dev/null && pwd)" = "$here" ] || dir=$d
+done <<EOF
+$(git config --get-all core.hooksPath 2>/dev/null)
+EOF
+[ -n "$dir" ] || dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/hooks
+own=''
+if [ -x "$dir/$name" ] && [ "$(cd -P "$dir" 2>/dev/null && pwd)" != "$here" ]; then
+  own="$dir/$name"
+fi
+
+ptc_default() { # git's default for push-to-checkout: refuse a dirty worktree, else update it
+  local head=HEAD
+  git update-index -q --ignore-submodules --refresh || { echo "Up-to-date check failed" >&2; return 1; }
+  git diff-files --quiet --ignore-submodules -- || { echo "Working directory has unstaged changes" >&2; return 1; }
+  git cat-file -e HEAD 2>/dev/null || head=$(git hash-object -t tree --stdin </dev/null)
+  git diff-index --quiet --cached --ignore-submodules "$head" -- || { echo "Working directory has staged changes" >&2; return 1; }
+  git read-tree -u -m "$1" || { echo "Could not update working tree to new HEAD" >&2; return 1; }
+}
+[ -n "$own" ] || [ "$name" != push-to-checkout ] || own=ptc_default
+
+reads_stdin() { case $name in pre-push|post-rewrite|pre-receive|post-receive) return 0 ;; esac; return 1; }
+
+if [ -z "$agent" ] || [ -z "$own" ]; then
+  if [ -z "$agent$own" ]; then
+    ! reads_stdin || cat >/dev/null
+    exit 0
+  fi
+  [ "$own" != ptc_default ] || { ptc_default "$@"; exit; }
+  exec "$agent$own" "$@"
+fi
+
+tmp=''
+if reads_stdin; then
+  tmp=$(mktemp "${TMPDIR:-/tmp}/agent-git-hook.XXXXXX") || exit 1
+  trap 'rm -f "$tmp"' EXIT
+  cat > "$tmp"
+fi
+feed() { if [ -n "$tmp" ]; then "$@" < "$tmp"; else "$@"; fi; }
+feed "$agent" "$@" || exit $?
+feed "$own" "$@"

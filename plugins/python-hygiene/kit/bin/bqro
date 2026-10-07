@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Read-only BigQuery for agents: dry-runs first and refuses any statementType other than
+SELECT (Google's parser is the authority, not local regex), then executes with a hard
+--maximum_bytes_billed cap.
+
+usage: bqro 'SELECT ...' [--project_id=X] [--parameter=...] [--max_rows=N]
+env:   BQ_MAX_BYTES_BILLED (cap in bytes, default 200 GiB)
+
+bq itself returns only the first 100 rows unless told otherwise, with no sign that it cut the
+result, so bqro passes --max_rows=1000000 unless the caller sets it.
+
+Without --project_id the jobs project is the overlay's BQRO_PROJECT, read by
+~/.claude/hooks/lib/kit_env.py (the hooks' parser: $KIT_ENV, else <config dir>/local/kit.env; an
+environment variable BQRO_PROJECT is ignored).
+"""
+import json
+import os
+import shutil
+import sys
+import subprocess
+from pathlib import Path
+
+KIT_LIB = str(Path(__file__).resolve().parent.parent / "hooks/lib")
+DEFAULT_CAP_BYTES = 200 * 1024**3
+DEFAULT_MAX_ROWS = 1_000_000
+ON_DEMAND_USD_PER_TIB = 6.25
+BLOCKED_FLAGS = (
+    "--destination_table",
+    "--append_table",
+    "--replace",
+    "--use_legacy_sql",
+    "--nouse_legacy_sql",
+    "--maximum_bytes_billed",
+    "--dry_run",
+    "--flagfile",
+    "--bigqueryrc",
+)
+# An expired gcloud login: the refresh cannot prompt from a non-interactive shell, and agents
+# retried it instead of handing it to the user.
+REAUTH_MARKERS = ("Reauthentication failed", "invalid_grant", "RefreshError")
+REAUTH_HINT = "bqro: gcloud login expired: the user runs `gcloud auth login` in their own terminal, then retry once"
+
+
+def die(msg: str) -> None:
+    print(f"bqro: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def overlay_project() -> str:
+    """The overlay's BQRO_PROJECT; dies when the hooks' overlay parser cannot be loaded."""
+    sys.path.insert(0, KIT_LIB)
+    sys.dont_write_bytecode = True
+    try:
+        from kit_env import kit_env, kit_root
+    except ImportError as e:
+        die(f"cannot load {KIT_LIB}/kit_env.py ({e}); restore it: git -C {Path(__file__).resolve().parents[1]} checkout -- hooks/lib")
+    os.environ["AGENT_KIT_DIR"] = str(kit_root(__file__))
+    return kit_env()["BQRO_PROJECT"]
+
+
+def main() -> None:
+    sql: str | None = None
+    passthru: list[str] = []
+    for a in sys.argv[1:]:
+        if a.startswith("-"):
+            if any(a == f or a.startswith(f + "=") for f in BLOCKED_FLAGS):
+                die(f"flag not allowed: {a}")
+            passthru.append(a)
+        elif sql is None:
+            sql = a
+        else:
+            die("exactly one SQL positional arg")
+    if not sql or not sql.strip():
+        die("usage: bqro 'SELECT ...' [--project_id=X]")
+    if sql.lstrip().split(None, 1)[0].lower() not in ("select", "with"):
+        die("SELECT/WITH queries only")
+    if not any(a.startswith("--project_id") for a in passthru):
+        project = overlay_project()
+        if not project:
+            die(
+                "no jobs project: pass --project_id=<project>, or set BQRO_PROJECT in "
+                "~/.claude/local/kit.env (see kit.env.example)"
+            )
+        passthru.append(f"--project_id={project}")
+    if not any(a.startswith("--max_rows") or a.startswith("-n") for a in passthru):
+        passthru.append(f"--max_rows={DEFAULT_MAX_ROWS}")
+
+    bq = shutil.which("bq") or die("bq not found on PATH") or ""
+    base = [bq, "-q", "--format=json", "query", "--nouse_legacy_sql", *passthru]
+    dry = subprocess.run([*base, "--dry_run", sql], capture_output=True, text=True)
+    if dry.returncode != 0:
+        sys.stderr.write(dry.stderr or dry.stdout)
+        if any(marker in dry.stderr + dry.stdout for marker in REAUTH_MARKERS):
+            print(REAUTH_HINT, file=sys.stderr)
+        sys.exit(dry.returncode or 1)
+    try:
+        stats = json.loads(dry.stdout)["statistics"]["query"]
+        stype = stats["statementType"]
+        scanned = int(stats.get("totalBytesProcessed", 0))
+    except (json.JSONDecodeError, KeyError, TypeError):
+        die(f"could not verify statementType from dry run; refusing to execute. Output was:\n{dry.stdout[:800]}")
+        return
+    if stype != "SELECT":
+        die(f"statementType={stype} rejected; SELECT only")
+
+    cap = int(os.environ.get("BQ_MAX_BYTES_BILLED", DEFAULT_CAP_BYTES))
+    gib = scanned / 1024**3
+    est = scanned / 1024**4 * ON_DEMAND_USD_PER_TIB
+    print(f"bqro: will scan {gib:.2f} GiB (~${est:.2f} on-demand); cap {cap / 1024**3:.0f} GiB", file=sys.stderr)
+    if scanned > cap:
+        die(f"scan exceeds cap ({gib:.1f} GiB > {cap / 1024**3:.0f} GiB); narrow the query "
+            f"(partition filter / column pruning) or raise BQ_MAX_BYTES_BILLED explicitly")
+    os.execv(bq, [*base, f"--maximum_bytes_billed={cap}", sql])
+
+
+main()

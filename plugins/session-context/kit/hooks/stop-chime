@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Stop(chime) — ring the "done" bell ONLY when the turn is actually ending.
+#
+# WHY. Every hook in the Stop array runs regardless of what another hook decided, so an
+# unconditional chime and ✓ tab glyph fire while review-trigger or unfinished-work is blocking
+# and the session is about to take another turn. Transcript audit 2026-09-10: 123 false "done"
+# chimes across 33 sessions (106 review-trigger, 12 prototype-mode, 5 red-CI), one session
+# chiming 11 times while still working.
+#
+# CONTRACT. Every Stop hook that emits decision:"block" does it through stop_block (lib/hook-io),
+# which first touches $STOP_BLOCK_DIR/<session_id>. This hook consumes that marker:
+# present and fresh -> stay silent, the session is still working; absent -> ✓ + bell + chime.
+#
+# The check is DEFERRED ~2s in a background subshell because hooks within one array have no
+# guaranteed execution order — reading the marker inline would race the blocker that writes
+# it, and the race resolves toward a false chime. Two seconds is imperceptible on a completion
+# chime.
+#
+# The marker is CONSUMED (deleted) rather than merely aged out: a review pass that finishes
+# in under the freshness window would otherwise leave its own marker to silence the genuine
+# completion that follows it. The age check remains as the backstop for a marker orphaned by
+# a crash, and stale files are swept after a day.
+set -uo pipefail
+
+# ci-watch exports this to its headless repair agent: no one is watching that session.
+[ -n "${CI_WATCH_ACTIVE:-}" ] && exit 0
+
+. "${0%/*}/lib/hook-io" 2>/dev/null || exit 0
+hook_lib open
+hook_read sid='.session_id // "unknown"'
+[ -n "$sid" ] || sid=unknown
+
+mkdir -p "$STOP_BLOCK_DIR" 2>/dev/null || true
+find "$STOP_BLOCK_DIR" -type f -mtime +1 -delete 2>/dev/null || true
+marker="$STOP_BLOCK_DIR/$sid"
+
+(
+  sleep 2
+  if [ -f "$marker" ]; then
+    now=$(date +%s)
+    mt=$(stat -f %m "$marker" 2>/dev/null || echo 0)
+    rm -f "$marker" 2>/dev/null
+    [ "$((now - mt))" -lt 60 ] && exit 0
+  fi
+  # tab-signal reads cwd from the payload, so hand it the same stdin this hook received.
+  printf '%s' "$HOOK_INPUT" | "${0%/*}/tab-signal" idle
+  afplay /System/Library/Sounds/Hero.aiff
+) >/dev/null 2>&1 &
+
+exit 0

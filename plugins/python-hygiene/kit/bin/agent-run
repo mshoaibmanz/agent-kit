@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# agent-run: one read-only review by a role on its own provider, recorded as a review round. The
+# provider adapter for roles a host cannot spawn natively (roles.toml; cross-reviewer on Claude).
+#
+#   agent-run <role> <worktree> [--base origin/<b>] [--since <tree-or-sha>] [--out <file>]
+#             [--effort <e>] [--model <m>] [--objective "<one line>"] [--timeout <seconds>] [--dry-run]
+#
+# The role's provider, model, effort, timeout, finding-id prefix and fallback come from roles.toml as
+# `agent-kit render` wrote them (lib/review-state rv_role); a model of `inherit` is main's. The
+# flags override model, effort and timeout. The provider's CLI:
+#   openai     codex exec -C <root> -m <model> -c model_reasoning_effort=<effort> -s read-only
+#              --ephemeral --output-schema <schema>          (CODEX_BIN names another codex)
+#   anthropic  claude -p --model <model> --effort <effort> --json-schema <schema>
+#              --output-format json --tools Read,Grep,Glob,Bash --no-session-persistence
+#                                                             (CLAUDE_BIN names another claude)
+# The prompt is the role's agent body (`agent-kit agent-body`: agents/<role>.md without its
+# frontmatter, placeholders filled for the host roles.toml gives the provider: the same text the
+# host's own agent of that role reads), then the correctness rubric
+# (skills/review-rubric/references/correctness.md), then the scope: the whole PR as `git diff --stat`
+# plus its file list, and the delta since --since when given. No diff text: the reviewer inspects it
+# with the git commands the scope names. The answer follows skills/review-rubric/
+# review-output.schema.json, and every finding gets the id <prefix>-<n> (CX-<n> for cross-reviewer).
+# --dry-run writes the prompt, prints the provider command line, runs and records nothing.
+#
+# Writes <out> (JSON), <out>.md (the findings verbatim, for whoever fixes), <out>.log and
+# <out>.stdout (the CLI's stderr and stdout, apart: claude -p's JSON answer is its stdout, and a
+# warning on stderr in the same file made it unparseable) and <out>.prompt.md. Default <out>:
+# $(git rev-parse --git-common-dir)/agent-review-runs/<role>-<branch>-<UTC time>.json.
+#
+# On success the round goes into the branch review record (lib/review-state), the record the git
+# pre-push gate reads, so a round counts from any host:
+#   - a round this session's push refusal issued at the worktree (CLAUDE_CODE_SESSION_ID, or
+#     AGENT_SESSION_ID) for the tree reviewed takes the return through rv_complete, as an agent's
+#     return does: the round completes when its last correctness reviewer has returned, and
+#     findings owe the fixer's TALLY, verbatim with their ids;
+#   - otherwise (rv_rec_fresh first) a round pending for this tree completes once no other
+#     correctness reviewer is listed, one pending for another tree is left alone, and with none
+#     pending a tree not yet reviewed gains a round;
+#   - on failure, the role's fallback takes its place in the session's pending round (rv_round_swap);
+#   - either way `.reviews` gains {agent: <role>, tree, head, findings, verdict, out, seconds, at}.
+# On failure (no CLI, auth, quota, timeout, output off the schema) it exits non-zero, says why, and
+# records nothing.
+# Exit: 0 reviewed (or dry run); 2 usage; 3 CLI missing; 4 the CLI failed or timed out; 5 output invalid.
+set -uo pipefail
+
+die() { printf 'agent-run: %s\n' "$1" >&2; exit "${2:-1}"; }
+usage() { sed -n '5,6p' "$0" | sed 's/^# *//' >&2; exit 2; }
+
+src=${BASH_SOURCE[0]}
+. "$(dirname "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")")/../hooks/lib/kit-root.sh" ||
+  die "cannot load hooks/lib/kit-root.sh beside $src" 1
+KIT=$(kit_root "$src") || die "cannot resolve the kit directory" 1
+export AGENT_KIT_DIR=$KIT
+
+role='' wt='' base='' since='' out='' effort='' model='' objective='' timeout='' dry=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --base) base=${2:-}; shift 2 || usage ;;
+    --since) since=${2:-}; shift 2 || usage ;;
+    --out) out=${2:-}; shift 2 || usage ;;
+    --effort) effort=${2:-}; shift 2 || usage ;;
+    --model) model=${2:-}; shift 2 || usage ;;
+    --objective) objective=${2:-}; shift 2 || usage ;;
+    --timeout) timeout=${2:-}; shift 2 || usage ;;
+    --dry-run) dry=1; shift ;;
+    -h|--help) usage ;;
+    -*) die "unknown option $1" 2 ;;
+    *)
+      if [ -z "$role" ]; then role=$1
+      elif [ -z "$wt" ]; then wt=$1
+      else die "one role and one worktree only (got $role, $wt and $1)" 2
+      fi
+      shift ;;
+  esac
+done
+[ -n "$role" ] && [ -n "$wt" ] || usage
+
+. "$KIT/hooks/lib/review-state" || die "cannot load $KIT/hooks/lib/review-state" 1
+rv_roles
+role=$(rv_role_name "$role")
+rv_role "$role" || die "no role $role in roles.toml (agent-kit roles lists them)" 2
+provider=$RV_R_PROVIDER prefix=$RV_R_PREFIX fallback=$RV_R_FALLBACK
+[ -n "$prefix" ] || die "role $role has no prefix in roles.toml: its findings need ids" 2
+model=${model:-$RV_R_MODEL} effort=${effort:-$RV_R_EFFORT} timeout=${timeout:-$RV_R_TIMEOUT}
+if [ "$model" = inherit ]; then rv_role main && model=$RV_R_MODEL; fi
+case $timeout in ''|*[!0-9]*) die "--timeout takes seconds (got $timeout)" 2 ;; esac
+case $provider:$effort in
+  openai:minimal|openai:low|openai:medium|openai:high|openai:xhigh) ;;
+  anthropic:low|anthropic:medium|anthropic:high|anthropic:xhigh|anthropic:max) ;;
+  *) die "effort $effort is not on the $provider scale" 2 ;;
+esac
+label=$(_rv_label "$provider")
+# fallback_hint: what the session runs in this role's place.
+hint=
+
+root=$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null) || die "$wt is not a git worktree" 2
+br=$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null) || br=HEAD
+sid=$(agent_session_id) || die "Cannot resolve the session identity" 2
+# fail <message> <code>: the role's fallback takes its place in this session's pending round
+# (rv_round_swap), so the round can complete without it, then die.
+fail() {
+  if [ -n "$fallback" ] && rv_available "$fallback"; then
+    fallback=$RV_AVAILABLE
+    [ -z "$sid" ] || rv_round_swap "$sid" "$root" "$role" "$fallback"
+    if rv_role "$fallback" && [ "$RV_R_INVOKE" = agent ]; then
+      hint=" Spawn the supported native role $fallback for this round."
+    else
+      hint=" Run agent-run $fallback for this round."
+    fi
+  else
+    fallback=''
+    hint=" Restore a runnable provider or use the supported Claude host; no unsupported native fallback was issued."
+  fi
+  die "$1$hint" "$2"
+}
+
+# A CLI present when the round was issued (rv_push_decide checks) can be gone by now: the fallback
+# swap applies here too, or the round waited out the TTL on a reviewer that never ran.
+cli=$(_rv_cli "$provider")
+[ -n "$dry" ] || command -v "$cli" >/dev/null 2>&1 \
+  || fail "the $label CLI ($cli) is not on PATH. Nothing recorded.$hint" 3
+
+schema=$KIT/skills/review-rubric/review-output.schema.json
+body=$KIT/agents/$role.md
+rubric=$KIT/skills/review-rubric/references/correctness.md
+for f in "$schema" "$body" "$rubric"; do [ -f "$f" ] || die "missing $f" 1; done
+
+rv_snapshot "$root" || die "cannot snapshot $root" 1
+tree=$RV_TREE head=$RV_HEAD
+
+# The PR: from where the branch left its base (the nearest base branch's merge base).
+fork=''
+if [ -n "$base" ]; then
+  git -C "$root" rev-parse -q --verify "$base^{commit}" >/dev/null 2>&1 || die "--base $base is not a commit here (git fetch?)" 2
+  fork=$(git -C "$root" merge-base "$base" "${head:-HEAD}" 2>/dev/null) || die "$base shares no history with $br" 2
+else
+  bn=''
+  for r in $(_rv_bases "$root"); do
+    mb=$(git -C "$root" merge-base "${head:-HEAD}" "$r" 2>/dev/null) || continue
+    n=$(git -C "$root" rev-list --count "$mb..${head:-HEAD}" 2>/dev/null) || continue
+    if [ -z "$bn" ] || [ "$n" -lt "$bn" ]; then base=$r; fork=$mb; bn=$n; fi
+  done
+  [ -n "$fork" ] || { fork=$(_rv_fork "$root" "${head:-HEAD}"); base="(no base branch)"; }
+fi
+if [ -n "$since" ]; then
+  st=$(git -C "$root" rev-parse -q --verify "$since^{tree}" 2>/dev/null) || die "--since $since is not a tree or commit here" 2
+  ft=$(git -C "$root" rev-parse -q --verify "$fork^{tree}" 2>/dev/null)
+  [ "$st" != "$ft" ] || since=''   # the delta is the whole PR
+fi
+
+ts=$(date -u +%Y%m%dT%H%M%SZ)
+if [ -z "$out" ]; then
+  gd=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "no git dir for $root" 1
+  out="$gd/agent-review-runs/$role-${br//\//-}-$ts.json"
+fi
+# Absolute: the CLI runs from the worktree root, so a relative path would land there.
+case $out in /*) ;; *) out=$PWD/$out ;; esac
+case $out in *.json) stem=${out%.json} ;; *) stem=$out ;; esac
+# dirname, not ${out%/*}: for a bare `--out review.json` that made a directory named review.json.
+od=$(dirname -- "$out")
+mkdir -p "$od" || die "cannot create $od" 1
+[ ! -d "$out" ] || die "--out $out is a directory" 2
+prompt=$stem.prompt.md log=$stem.log sout=$stem.stdout raw=$stem.raw.json md=$stem.md
+
+# agent-kit refuses an unknown placeholder, which stops the run here rather than handing the model
+# a literal one.
+btext=$(AGENT_KIT_DIR=$KIT "$KIT/bin/agent-kit" agent-body "$role" --provider "$provider") ||
+  die "cannot render agents/$role.md for provider $provider (agent-kit agent-body)" 1
+{
+  printf '%s\n' "$btext"
+  printf '\n<correctness_rubric>\n'
+  cat "$rubric"
+  printf '</correctness_rubric>\n\n<review_scope>\n'
+  printf 'Repository: %s, branch %s.\n' "$root" "$br"
+  printf 'Objective: %s\n' "${objective:-not given; infer it from the change, and say so in the summary}"
+  printf 'The change is the working tree as snapshotted into tree %s (built on commit %s; uncommitted and untracked code included). Line numbers refer to the working tree.\n' "$tree" "${head:-none}"
+  printf '\nWhole PR (base %s, fork point %s): inspect it with `git diff %s %s`.\n' "$base" "$fork" "$fork" "$tree"
+  git -C "$root" diff --stat=200 "$fork" "$tree" 2>/dev/null | tail -n 400
+  printf '\nFiles:\n'
+  git -C "$root" diff --name-status "$fork" "$tree" 2>/dev/null | head -n 400
+  if [ -n "$since" ]; then
+    printf '\nDelta since the last review round: `git diff %s %s`. Review THIS: the rest of the PR was already reviewed; read it only as context for the delta.\n' "$since" "$tree"
+    git -C "$root" diff --stat=200 "$since" "$tree" 2>/dev/null | tail -n 400
+  fi
+  printf '</review_scope>\n'
+} > "$prompt" || die "cannot write $prompt" 1
+
+case $provider in
+  openai)
+    args=("$cli" exec -C "$root" -m "$model" -c "model_reasoning_effort=$effort" -s read-only --ephemeral --color never
+      --output-schema "$schema" -o "$raw") ;;
+  anthropic)
+    # Without its "$schema" key: claude -p rejects the draft-2020-12 meta-schema id it carries
+    # ("no schema with key or ref"), which the first real run of this path hit (2026-10-03).
+    # No --agent: the prompt already starts with the role's body, and --agent narrows the tools to
+    # its frontmatter list, which drops the structured-output tool, so .structured_output was null.
+    js=$(jq -c 'del(.["$schema"])' "$schema") || die "cannot read $schema" 1
+    args=("$cli" -p --model "$model" --effort "$effort" --output-format json
+      --json-schema "$js" --tools Read,Grep,Glob,Bash --no-session-persistence) ;;
+esac
+if [ -n "$dry" ]; then
+  printf 'agent-run: dry run, %s (%s:%s, effort %s); nothing run or recorded.\ncommand: cd %q &&' "$role" "$provider" "$model" "$effort" "$root"
+  printf ' %q' "${args[@]}"
+  printf ' < %q\n' "$prompt"
+  exit 0
+fi
+rm -f "$raw"
+
+# The CLI runs in its own process group so a timeout or an interrupt stops all of it.
+set -m
+start=$(date +%s)
+( cd "$root" && exec "$KIT/bin/provider-exec" "$provider" "${args[@]}" ) < "$prompt" > "$sout" 2> "$log" &
+pid=$!
+set +m
+stop_cli() { kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL -- "-$pid" 2>/dev/null; }
+trap 'stop_cli; fail "interrupted; nothing recorded" 4' INT TERM HUP
+timed_out=0
+while kill -0 "$pid" 2>/dev/null; do
+  if [ $(( $(date +%s) - start )) -ge "$timeout" ]; then timed_out=1; stop_cli; break; fi
+  sleep 2
+done
+wait "$pid" 2>/dev/null; rc=$?
+trap - INT TERM HUP
+secs=$(( $(date +%s) - start ))
+
+if [ "$timed_out" = 1 ]; then
+  fail "$label did not finish within ${timeout}s; nothing recorded. Log: $log.$hint Or retry with --timeout." 4
+fi
+if [ "$rc" != 0 ]; then
+  # Only the tail: the log starts with the prompt, which names auth and limits itself.
+  why='see the log' last=$({ tail -n 20 "$sout"; tail -n 20 "$log"; } 2>/dev/null)
+  if printf '%s' "$last" | command grep -Eqi 'not logged in|codex login|/login|unauthori[sz]ed|401|expired token|re-?authenticate'; then why="authentication: log in to the $label CLI"
+  elif printf '%s' "$last" | command grep -Eqi 'rate.?limit|quota|usage limit|429|insufficient'; then why='quota or rate limit'
+  fi
+  printf 'agent-run: %s exited %s after %ss (%s); nothing recorded. Last lines of %s:\n' "$label" "$rc" "$secs" "$why" "$log" >&2
+  { tail -n 3 "$sout"; tail -n 5 "$log"; } 2>/dev/null | cut -c1-300 >&2
+  fail "$label failed." 4
+fi
+# claude -p --output-format json wraps the answer: the schema's object is the result's
+# .structured_output. With verbose on (a settings key) stdout is every message as an array instead.
+[ "$provider" != anthropic ] \
+  || jq -e '(if type == "array" then (map(select(.type == "result")) | last) else . end) | .structured_output // empty' \
+       "$sout" > "$raw" 2>/dev/null || true
+
+valid='type == "object"
+  and (.verdict | IN("approve", "needs-attention"))
+  and (.summary | type == "string" and length > 0)
+  and (.next_steps | type == "array")
+  and (.findings | type == "array")
+  and all(.findings[]; (.title | type == "string") and (.body | type == "string")
+    and (.file | type == "string") and (.line_start | type == "number") and (.line_end | type == "number")
+    and (.severity | IN("critical", "high", "medium", "low"))
+    and (.confidence | type == "number") and (.recommendation | type == "string"))'
+jq -e "$valid" "$raw" >/dev/null 2>&1 || fail "$label's answer in $raw does not match $schema; nothing recorded. Log: $log.$hint" 5
+jq --arg p "$prefix" '.findings |= [to_entries[] | {id: "\($p)-\(.key + 1)"} + (.value | del(.id))]' "$raw" > "$out.$$" \
+  && mv -f "$out.$$" "$out" && rm -f "$raw" || die "cannot write $out" 1
+
+n=$(jq -e '.findings | length' "$out" 2>/dev/null) || die "cannot read $out; nothing recorded" 1
+verdict=$(jq -r .verdict "$out")
+{
+  printf '# agent-run %s: %s at %s\n\nVerdict: %s. %s\n\n' "$role" "$br" "${tree:0:12}" "$verdict" "$(jq -r .summary "$out")"
+  jq -r '.findings[] | "\(.id) [\(.severity), confidence \(.confidence)] \(.title)\n\(.file):\(.line_start)-\(.line_end)\n\(.body)\nRecommendation: \(.recommendation)\n"' "$out"
+} > "$md" || die "cannot write $md; nothing recorded" 1
+
+# The record.
+recorded="not recorded: detached HEAD"
+if [ "$br" != HEAD ]; then
+  # Standalone (no round of this session took the result): a round pending for THIS tree loses
+  # this role from its agents and completes once no correctness reviewer is left (the once-per-PR
+  # roles do not count); a round pending for another tree is not touched (this run reviewed an
+  # older snapshot); with none pending, a tree not yet reviewed gains a round. A stale record is
+  # reset first (rv_rec_fresh). Records from before a roles rename hold an old name (rv_role_drop).
+  drop=$(rv_role_drop "$role")
+  once=''
+  for w in $RV_ONCE; do once="${once:+$once,}\"$w\""; done
+  once="[$once]"
+  done_='.rounds = ((.rounds // 0) + 1) | .reviewed_tree = $t | .reviewed_head = $h | del(.pending_tree, .pending_head, .pending_since, .agents, .anchor)'
+  filter="if (.pending_tree // \"\") != \"\" then (if .pending_tree == \$t then (.agents = ((.agents // []) - $drop) | if ((.agents - $once) | length) == 0 then $done_ else . end) else . end) elif (.reviewed_tree // \"\") == \$t then . else $done_ end"
+  if [ -n "$sid" ]; then
+    # The session's round, bound to the tree reviewed. Its findings owe the same TALLY as any
+    # reviewer's ("<n> findings": zero owes none), and the round completes when its last
+    # correctness reviewer returns.
+    rv_complete "$sid" "$root" "$role" "agent-run $role reported $n findings" "" "$tree"
+    [ -z "$RV_CONSUMED" ] || filter='.'
+  fi
+  [ "$filter" = . ] || rv_rec_fresh "$root" "$br"
+  if rv_rec_update "$root" "$br" "$filter | .reviews = ((.reviews // []) + [{agent: \$r, tree: \$t, head: \$h, findings: (\$n | tonumber), verdict: \$v, out: \$o, seconds: (\$s | tonumber), at: (now | todate)}])" \
+       --arg r "$role" --arg t "$tree" --arg h "$head" --arg n "$n" --arg v "$verdict" --arg o "$out" --arg s "$secs"; then
+    rv_rec_read "$root" "$br"
+    recorded="recorded on $br, round $RV_REC_ROUNDS ($RV_REC_FILE)"
+  else
+    recorded="NOT recorded: the branch record could not be written"
+  fi
+fi
+
+printf 'agent-run %s: %s, %s finding(s) on %s in %ss (%s:%s, effort %s); %s.\n' \
+  "$role" "$verdict" "$n" "$br" "$secs" "$provider" "$model" "$effort" "$recorded"
+jq -r '.summary' "$out"
+jq -r '.findings[] | "  \(.id) [\(.severity) \(.confidence)] \(.title) (\(.file):\(.line_start))"' "$out"
+[ "$n" = 0 ] || printf 'Findings, verbatim for whoever fixes (keep the %s- ids): %s\n' "$prefix" "$md"
+printf 'JSON: %s\n' "$out"
