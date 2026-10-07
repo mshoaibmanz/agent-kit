@@ -26,7 +26,7 @@ from kit_env import kit_root  # noqa: E402
 KIT = kit_root(__file__)
 
 from sentry import (  # noqa: E402
-    HOST_OPTIONS,
+    LEGACY,
     TOKEN_ENV,
     KeychainDenied,
     KeychainMissing,
@@ -55,6 +55,14 @@ def npx_hint() -> str:
     return hint or "install Node.js"
 
 
+def effective_host(args: list[str], env: dict[str, str]) -> str:
+    """The host the server reaches, as @sentry/mcp-server 0.37.0 resolves it: --url, SENTRY_URL,
+    --host, then SENTRY_HOST."""
+    url, host = host_values(args, ("--url",)), host_values(args, ("--host",))
+    found = [*url[-1:], env.get("SENTRY_URL", ""), *host[-1:], env.get("SENTRY_HOST", "")]
+    return next((value for value in found if value), "the server's default")
+
+
 def main() -> None:
     args = sys.argv[1:]
     name = None
@@ -74,9 +82,21 @@ def main() -> None:
     if name is not None and name not in instances:
         die(f"unknown instance {name}; configured: {', '.join(instances) or 'none'} (mcp/sentry-instances.json)")
     inst = instances[name] if name is not None else default_instance(instances)
-    host_arg = any(a in HOST_OPTIONS or a.split("=", 1)[0] in HOST_OPTIONS for a in args)
-    if name is not None and host_arg:
+    # A token goes to its own instance's host only, checked before any store is read. The server takes
+    # a URL (--url, else SENTRY_URL) over a host (--host, else SENTRY_HOST), so each is a host here.
+    hosts = host_values(args)
+    if name is not None and hosts:
         die(f"--instance {name} sets the host; drop --host/--url")
+    if inst.host:
+        other = next((h for h in (*hosts, os.environ.get("SENTRY_URL", "")) if h and host_key(h) != host_key(inst.host)), None)
+        if other is not None:
+            die(f"instance {inst.name} is configured for {inst.host}; drop --host/--url or SENTRY_URL {other}")
+    configured = {host_key(i.host) for i in instances.values()}
+    if inst is LEGACY:
+        inherited = [os.environ.get(variable, "") for variable in ("SENTRY_URL", "SENTRY_HOST")]
+        taken = next((h for h in (*hosts, *inherited) if h and host_key(h) in configured), None)
+        if taken is not None:
+            die(f"{taken} is a configured instance's host; launch that instance with --instance")
     try:
         token = read_token(inst, instances.values())
     except KeychainMissing:
@@ -87,20 +107,12 @@ def main() -> None:
             "Check access in your trusted terminal before importing or rotating a credential."
         )
     env = {k: v for k, v in os.environ.items() if not k.startswith(TOKEN_ENV)}
-    # A token goes to its own instance's host only: a configured instance (the default included) sets
-    # its host over any inherited one, and the legacy item never reaches a configured instance's host.
-    hosts = host_values(args)
     if inst.host:
-        other = next((host for host in hosts if host_key(host) != host_key(inst.host)), None)
-        if other is not None:
-            die(f"instance {inst.name} is configured for {inst.host}; drop --host/--url {other}")
+        # Its own host over any inherited one; no URL, which the server would prefer.
+        env.pop("SENTRY_URL", None)
         env["SENTRY_HOST"] = inst.host
-    owners = {host_key(i.host): i.name for i in instances.values()}
-    for host in (*hosts, env.get("SENTRY_HOST", "")):
-        if host and inst.name != owners.get(host_key(host), inst.name):
-            die(f"{host} is instance {owners[host_key(host)]}'s host; launch it with --instance {owners[host_key(host)]}")
     if check:
-        print(f"sentry-mcp: instance {inst.name} ok (host {env.get('SENTRY_HOST', 'from args')}, item {inst.keychain})")
+        print(f"sentry-mcp: instance {inst.name} ok (host {effective_host(args, env)}, item {inst.keychain})")
         return
     if shutil.which("npx") is None:
         die(f"npx is missing. Fix: {npx_hint()}")

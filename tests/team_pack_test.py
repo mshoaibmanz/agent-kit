@@ -11,6 +11,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,14 @@ class PackRepos(InstallerUxFixture):
         self.git(folder, 'commit', '-q', '-m', message)
         return self.git(folder, 'rev-parse', 'HEAD')
 
+    def folder_overlay(self) -> None:
+        """An overlay skill replacing the kit's typescript-best-practices, its references/patterns.md
+        file a folder there."""
+        mine = self.root / 'local/skills/typescript-best-practices'
+        (mine / 'references/patterns.md').mkdir(parents=True)
+        (mine / 'SKILL.md').write_text('---\nname: typescript-best-practices\ndescription: Mine.\n---\n\nMine.\n')
+        (mine / 'references/patterns.md/notes.md').write_text('# Notes\n')
+
     def overlay_round_trip(self, install: Callable[..., subprocess.CompletedProcess], *flags: str) -> None:
         """An overlay skill replaces the kit's typescript-best-practices whole, its references/patterns.md
         a folder there, on a first run and a rerun; deleting the overlay brings the kit's skill back."""
@@ -70,10 +79,7 @@ class PackRepos(InstallerUxFixture):
         install(*FLAGS, *flags, '--apply')
         skill = self.root / 'skills/typescript-best-practices'
         kit_patterns = (skill / 'references/patterns.md').read_text()
-        mine = self.root / 'local/skills/typescript-best-practices'
-        (mine / 'references/patterns.md').mkdir(parents=True)
-        (mine / 'SKILL.md').write_text('---\nname: typescript-best-practices\ndescription: Mine.\n---\n\nMine.\n')
-        (mine / 'references/patterns.md/notes.md').write_text('# Notes\n')
+        self.folder_overlay()
         for _ in range(2):
             result = install(*FLAGS, *flags, '--apply')
             self.assertIn('overlay skill typescript-best-practices overrides the kit skill of that name', result.stdout)
@@ -833,6 +839,38 @@ exit 1''')
         self.assertEqual(os.readlink(legacy), '../.agents/local')
         self.assertTrue(any(problem in found for found in self.doctor(code=1)['problems']))
         self.assertTrue(any(problem in found for found in json.loads(self.kit('doctor', '--host', 'claude').stdout)[0]['errors']))
+
+    def test_a_link_of_the_users_over_the_one_setup_made_is_kept(self) -> None:
+        self.host_cli('claude')
+        legacy = self.home / '.claude/local'
+        for relink, problem in (('../.local/share/agent-kit/local', None),
+                                ('../.agents/local', f'{legacy} is a link to ../.agents/local, not the link to {self.root / "local"}')):
+            with self.subTest(relink):
+                self.setup(*FLAGS, '--apply')
+                self.assertEqual(legacy.readlink(), self.root / 'local')
+                legacy.unlink()
+                legacy.symlink_to(relink)
+                result = self.setup(*FLAGS, '--apply')
+                self.assertEqual(os.readlink(legacy), relink)
+                if problem:
+                    self.assertIn(f'agent-setup: left in place: {problem}', result.stderr)
+                    (self.home / '.agents/local').mkdir(parents=True)
+                    self.assertTrue(any(problem in found for found in self.doctor(code=1)['problems']))
+                else:
+                    self.doctor()
+                legacy.unlink()
+
+    def test_a_file_to_folder_overlay_install_rolls_back(self) -> None:
+        self.host_cli('claude')
+        self.setup(*FLAGS, '--apply')
+        patterns = self.root / 'skills/typescript-best-practices/references/patterns.md'
+        kit_patterns = patterns.read_text()
+        self.folder_overlay()
+        journal = re.search(r'\(journal (\S+)\)', self.setup(*FLAGS, '--apply').stdout).group(1)
+        self.assertTrue((patterns / 'notes.md').is_file())
+        self.setup('rollback', journal)
+        self.assertEqual(patterns.read_text(), kit_patterns)
+        self.assertNotIn('Mine.', (patterns.parent.parent / 'SKILL.md').read_text())
 
     def test_an_overlay_skill_replaces_a_kit_skill_across_a_file_to_folder_change_and_back(self) -> None:
         self.overlay_round_trip(self.setup)

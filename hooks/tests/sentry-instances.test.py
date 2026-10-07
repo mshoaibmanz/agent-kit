@@ -227,7 +227,8 @@ class Wrapper(Fixture):
             [python, *command] if python else command,
             capture_output=True,
             text=True,
-            env={**os.environ, **(env or {})},
+            # No inherited SENTRY_* (a real token or host in the caller's shell): each test sets its own.
+            env={**{k: v for k, v in os.environ.items() if not k.startswith("SENTRY_")}, **(env or {})},
             timeout=60,
         )
 
@@ -283,8 +284,52 @@ class Wrapper(Fixture):
             proc = self.run_bin("sentry-mcp", *args, env={**env, "SENTRY_HOST": "sentry.beta.invalid" if not args else ""})
             with self.subTest(legacy=args):
                 self.assertEqual(proc.returncode, 1)
-                self.assertIn("sentry.beta.invalid is instance beta's host", proc.stderr)
+                self.assertIn("sentry.beta.invalid is a configured instance's host", proc.stderr)
                 self.assertFalse(log.exists())
+
+    def test_an_inherited_sentry_url_is_a_host_and_is_refused_before_any_token_read(self) -> None:
+        """@sentry/mcp-server prefers SENTRY_URL over SENTRY_HOST: one naming another host is refused
+        for the default, a named and the legacy instance, before any store is read."""
+        script(self.root / "path/npx", FAKE_NPX.replace("; } >", "; printf 'url=%s\\n' \"$SENTRY_URL\"; } >"))
+        log = self.root / "npx.log"
+        env = {"PATH": f"{self.root / 'path'}:/usr/bin:/bin", "NPX_LOG": str(log)}
+        refused = (([], "https://sentry.beta.invalid"), (["--instance", "beta"], "https://sentry.alpha.invalid/"))
+        for args, url in refused:
+            proc = self.run_bin("sentry-mcp", *args, env={**env, "SENTRY_URL": url})
+            with self.subTest(args=args):
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("is configured for", proc.stderr)
+                self.assertNotIn("Keychain", proc.stderr)
+                self.assertFalse(log.exists())
+        self.items.write_text(f"agent-kit-test/sentry-alpha={TOKEN}\n{self.beta_item}=beta-token\n{sentry.LEGACY_SERVICE}=legacy\n")
+        proc = self.run_bin("sentry-mcp", env={**env, "SENTRY_URL": "https://sentry.alpha.invalid"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.read_text().splitlines()[1:], [f"token={TOKEN}", "host=sentry.alpha.invalid", "url="])
+        check = self.run_bin("sentry-mcp", "--check", env={**env, "SENTRY_URL": "https://sentry.alpha.invalid"})
+        self.assertIn("(host sentry.alpha.invalid,", check.stdout)
+        log.unlink()
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {"beta": {"host": "sentry.beta.invalid", "keychain": self.beta_item}})
+        proc = self.run_bin("sentry-mcp", env={**env, "SENTRY_URL": "https://sentry.beta.invalid"})
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sentry.beta.invalid is a configured instance's host", proc.stderr)
+        self.assertFalse(log.exists())
+        check = self.run_bin("sentry-mcp", "--check", "--host", "h.invalid", env={**env, "SENTRY_URL": "https://u.invalid"})
+        self.assertIn("(host https://u.invalid,", check.stdout)
+
+    def test_two_instances_may_share_a_host(self) -> None:
+        shared = {"host": "sentry.shared.invalid"}
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {
+            "alpha": {**shared, "keychain": "agent-kit-test/sentry-alpha", "server": "sentry"},
+            "beta": {**shared, "keychain": self.beta_item}})
+        self.items.write_text(f"agent-kit-test/sentry-alpha={TOKEN}\n{self.beta_item}=beta-token\n")
+        script(self.root / "path/npx", FAKE_NPX)
+        log = self.root / "npx.log"
+        env = {"PATH": f"{self.root / 'path'}:/usr/bin:/bin", "NPX_LOG": str(log)}
+        for args, token in (([], TOKEN), (["--instance", "alpha"], TOKEN), (["--instance", "beta"], "beta-token")):
+            proc = self.run_bin("sentry-mcp", *args, env=env)
+            with self.subTest(args=args):
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(log.read_text().splitlines()[1:], [f"token={token}", "host=sentry.shared.invalid"])
 
     def test_runs_under_the_system_python(self) -> None:
         if not Path("/usr/bin/python3").exists():

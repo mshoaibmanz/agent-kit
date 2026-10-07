@@ -19,7 +19,7 @@ if sys.version_info < (3, 11):
              f'Fix: {_FIX or "install Python 3.11 or newer"}, then rerun with it.')
 
 import argparse
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 import contextlib
 from dataclasses import dataclass, replace
 import hashlib
@@ -514,14 +514,13 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
     if host == 'claude' and 'hooks' in components:
         changes.append(Change('link', target / 'bin', str(root / 'bin')))
     if host == 'claude':
-        # Claude's hooks, commands and skill texts name <config dir>/local, the overlay's older home: it
-        # links to the kit's overlay. The user's own folder, or link elsewhere, is kept and both doctors
-        # report it; the user's own link to the overlay needs nothing.
+        # Claude's hooks, commands and skill texts read <config dir>/local, linked to the kit's overlay. A folder
+        # or another link there is the user's, even over setup's: kept, and both doctors report it.
         local, problem = target / 'local', overlay.claude_link_problem(target, root)
-        if problem and (local.is_dir() or local.is_symlink()) and not prior_record(root, local, 'link'):
+        if kept := bool(problem) and (local.is_dir() or local.is_symlink()):
             print('agent-setup: left in place: ' + problem, file=sys.stderr)
-        elif problem or prior_record(root, local, 'link'):
-            changes.append(Change('link', local, str(root / 'local')))
+        ours = problem or (local.is_symlink() and os.readlink(local) == str(root / 'local'))
+        changes.append(Change('link' if ours and not kept else 'forget', local, str(root / 'local')))
     for change in changes:
         if change.kind not in ('hooks', 'cursor-hooks'):
             continue
@@ -746,12 +745,11 @@ def prior_record(root: Path, target: Path, kind: str | None = None) -> dict:
                                          previous.get('managed', {}).get(str(target), {}))
 
 
-def retired_folder(root: Path, target: Path) -> bool:
-    """Whether target is a kit folder holding only files an earlier install wrote, unchanged: a skill's
-    folder that is a file now (an overlay's layout), whose files the plan retires first."""
-    return root in target.parents and target.is_dir() and not target.is_symlink() and all(
-        file_digest(path) == prior_record(root, path, 'link' if path.is_symlink() else 'file').get('hash')
-        for path in target.rglob('*') if path.is_symlink() or not path.is_dir())
+def layout_folder(target: Path, made: Callable[[Path], bool] = lambda _: False) -> bool:
+    """Whether target is a folder holding only files made says setup wrote: an overlay skill turned a kit
+    file into a folder there (or back), and those files go first, by the plan or by rollback."""
+    return target.is_dir() and not target.is_symlink() and all(
+        made(path) for path in target.rglob('*') if path.is_symlink() or not path.is_dir())
 
 
 class Collision(ValueError):
@@ -765,7 +763,10 @@ class Collision(ValueError):
 
 def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
     target = change.target
-    prior = prior_record(Path(args.root_dir).expanduser().absolute(), target, change.kind)
+    if change.kind == 'forget':  # no longer setup's: its record goes, the path stays as it is
+        return {'kind': 'forget', 'target': str(target), 'noop': True}
+    root = Path(args.root_dir).expanduser().absolute()
+    prior = prior_record(root, target, change.kind)
     record = {'kind': change.kind, 'target': str(target), 'mode': change.mode}
     present = target.exists() or target.is_symlink()
     backup = args.collision == 'backup'
@@ -778,12 +779,11 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
             record.update(hash=None, present=present, before_hash=current, noop=not present)
             return record
         if change.kind == 'file' and target.suffix == '.mdc' and not prior:
-            legacy = prior_record(Path(args.root_dir).expanduser().absolute(), target, 'text')
+            legacy = prior_record(root, target, 'text')
             if legacy and target.is_file() and not target.is_symlink():
                 if target.read_text() in (legacy.get('owned', ''), legacy.get('owned', '') + '\n') or backup:
                     prior = {'hash': digest(target.read_bytes())}
                     record['retired_identity'] = 'text:' + str(target)
-        root = Path(args.root_dir).expanduser().absolute()
         other = 'file' if change.kind == 'link' else 'link'
         if not prior and root in target.parents and (switched := prior_record(root, target, other)):
             # A kit file switching between a copy and a dev link: the earlier install's record, of
@@ -801,8 +801,9 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
         if same:
             record.update(hash=wanted_hash, present=present, before_hash=current_hash, noop=True)
             return record
-        owned = prior and current_hash is not None and current_hash == prior.get('hash')
-        if present and not owned and not backup and not retired_folder(root, target):
+        owned = (prior and current_hash is not None and current_hash == prior.get('hash')) or (root in target.parents and layout_folder(
+            target, lambda path: file_digest(path) == prior_record(root, path, 'link' if path.is_symlink() else 'file').get('hash')))
+        if present and not owned and not backup:
             raise Collision(f'Existing user content is preserved; select --collision backup or skip, or another destination: {target}')
         record.update(hash=wanted_hash, present=present, before_hash=current_hash)
         return record
@@ -958,7 +959,7 @@ def apply_change(change: Change, record: dict, journal: Path, number: int) -> No
         atomic(target, (outside.rstrip() + '\n\n' + record['owned'] + '\n').lstrip().encode(), change.mode)
 
 
-def rollback_preflight(record: dict) -> bool:
+def rollback_preflight(record: dict, installed: Collection[str] = ()) -> bool:
     """Return true for the before-state; otherwise validate without changing any file."""
     target = Path(record['target'])
     kind = record['kind']
@@ -967,7 +968,7 @@ def rollback_preflight(record: dict) -> bool:
     if kind in ('file', 'link', 'remove'):
         current = file_digest(target)
         backup = Path(record['backup']) if record.get('backup') else None
-        if kind == 'remove' and (target.exists() or target.is_symlink()) and current != record.get('before_hash'):
+        if kind == 'remove' and current != record.get('before_hash') and not layout_folder(target, lambda path: str(path) in installed) and (target.exists() or target.is_symlink()):
             raise ValueError(f'Recreated deselected skill is preserved: {target}')
         if current == record.get('before_hash') and not (backup and (backup.exists() or backup.is_symlink())):
             return True
@@ -1016,6 +1017,8 @@ def rollback_record(record: dict) -> None:
     if kind in ('file', 'link', 'remove'):
         current = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
         if current is None:
+            if layout_folder(target):
+                shutil.rmtree(target)
             if target.exists() or target.is_symlink():
                 raise ValueError(f'Recreated user content is preserved: {target}')
             if record.get('backup') and (Path(record['backup']).exists() or Path(record['backup']).is_symlink()):
@@ -1268,7 +1271,7 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
             write_journal()
         managed = dict(previous.get('managed', {}))
         for change, record in planned.records:
-            if record['kind'] == 'remove':
+            if record['kind'] in ('remove', 'forget'):
                 managed.pop('file:' + record['target'], None)
                 managed.pop('link:' + record['target'], None)
             else:
@@ -1325,7 +1328,7 @@ def rollback(args: argparse.Namespace) -> int:
     records = journal['records']
     for number, record in enumerate(records):
         if number not in progress['completed']:
-            rollback_preflight(record)
+            rollback_preflight(record, {other['target'] for other in records})
     for number in reversed(range(len(records))):
         if number in progress['completed']:
             continue

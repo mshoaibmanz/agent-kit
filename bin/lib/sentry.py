@@ -214,12 +214,12 @@ def host_key(host: str) -> str:
     return re.sub(r"^https?://", "", host.strip().lower()).split("/", 1)[0]
 
 
-def host_values(args: list) -> list:
-    """The hosts --host/--url name in server args."""
+def host_values(args: list[str], options: Iterable[str] = HOST_OPTIONS) -> list[str]:
+    """The hosts the options (--host and --url) name in server args, in order."""
     out = []
     for at, arg in enumerate(args):
         option, _, value = arg.partition("=")
-        if option in HOST_OPTIONS:
+        if option in options:
             out.append(value if "=" in arg else (args[at + 1] if at + 1 < len(args) else ""))
     return out
 

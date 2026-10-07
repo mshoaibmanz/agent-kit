@@ -226,14 +226,14 @@ def _pack_preset(files: PackFiles, spec: str, commit: str | None) -> tuple[str, 
     text read of the file does, so its sha256 does not depend on how it was fetched."""
     found = PACK_TOML in files
     text = preset_text(files.pop(PACK_TOML, (b'', 0))[0], PACK_TOML, spec)
-    pack = build_pack(files, spec, commit)
+    pack = build_pack(files, f'preset {spec}', commit)
     if not found and pack is None:
         raise ValueError(f'preset {spec}: holds no {PACK_TOML}, {PACK_SKILLS}/ or rules.md')
     return text, pack
 
 
 def preset_text(data: bytes, name: str, spec: str) -> str:
-    return utf8_text(data, name, spec).replace('\r\n', '\n').replace('\r', '\n')
+    return utf8_text(data, name, f'preset {spec}').replace('\r\n', '\n').replace('\r', '\n')
 
 
 def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
@@ -248,7 +248,7 @@ def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
         root, _, toml = (path or PACK_TOML).rpartition('/')
         commit: str | None = head or gh_head(repo)
         if toml == PACK_TOML:
-            files = pack_files(gh_entries(repo, commit, root, spec), spec)
+            files = pack_files(gh_entries(repo, commit, root, spec), f'preset {spec}')
             if path and PACK_TOML not in files:
                 raise ValueError(f'preset {spec}: no {path} in the repository')
             text, pack = _pack_preset(files, spec, commit)
@@ -263,7 +263,7 @@ def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
         if local.is_dir() or file.name == PACK_TOML:
             folder = local if local.is_dir() else file.parent
             commit = git_head(folder)
-            text, pack = _pack_preset(pack_files(folder_entries(folder), spec), spec, commit)
+            text, pack = _pack_preset(pack_files(folder_entries(folder), f'preset {spec}'), spec, commit)
         else:
             text, pack, commit = preset_text(file.read_bytes(), file.name, spec), None, None
     try:

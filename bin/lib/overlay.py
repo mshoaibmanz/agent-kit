@@ -26,11 +26,11 @@ def read_overlay(local: Path) -> Pack | None:
 
     entries = (entry for entry in folder_entries(local) if entry.path in (PACK_RULES, PACK_SKILLS) or (
         entry.path.startswith(PACK_SKILLS + '/') and not (entry.kind == 'file' and entry.path.count('/') == 1)))
-    spec = f'overlay {local}'
+    label = f'overlay {local}'
     try:
-        return build_pack(pack_files(entries, spec, allow_links=False), spec, None, words=OVERLAY_RULES_WORDS)
+        return build_pack(pack_files(entries, label, allow_links=False), label, None, words=OVERLAY_RULES_WORDS)
     except ValueError as error:
-        raise ValueError(f'{str(error).removeprefix("preset ")}; fix it, then run agent-kit sync') from None
+        raise ValueError(f'{error}; fix it, then run agent-kit sync') from None
 
 
 def overrides(names: Iterable[str], kit: Iterable[str], pack: Iterable[str]) -> dict[str, str]:
