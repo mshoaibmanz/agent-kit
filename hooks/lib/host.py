@@ -34,8 +34,10 @@ def git_layer_env(
     to that one. Its entry (its value, or a GIT_CONFIG_KEY_n named in owned, an earlier render's;
     the last such) keeps its index while no core.hooksPath follows it, else it becomes a no-op entry
     and the layer's goes after all the others. Removing or moving an entry would renumber the user's
-    keys, so a dropped one stays as a no-op instead. ValueError: a GIT_CONFIG_COUNT that git itself
-    would reject.
+    keys, so a dropped one stays as a no-op instead. Each earlier owned entry below the count is
+    returned again as that no-op: a caller that drops the owned keys it no longer gets back would
+    otherwise leave a hole below GIT_CONFIG_COUNT, which git rejects. ValueError: a GIT_CONFIG_COUNT
+    that git itself would reject.
     """
     raw = str(env.get("GIT_CONFIG_COUNT", "") or "0")
     if not raw.isdigit():
@@ -45,32 +47,40 @@ def git_layer_env(
     def hooks_path(i: int) -> bool:
         return env.get(f"GIT_CONFIG_KEY_{i}", "").lower() == "core.hookspath"
 
+    def no_op(*indexes: int) -> dict[str, str]:
+        out = {}
+        for i in indexes:
+            out |= {f"GIT_CONFIG_KEY_{i}": "agent-kit.gitHooks", f"GIT_CONFIG_VALUE_{i}": "off"}
+        return out
+
     mine = [
         i
         for i in range(count)
         if f"GIT_CONFIG_KEY_{i}" in owned or (hooks_path(i) and env.get(f"GIT_CONFIG_VALUE_{i}") == hooks_dir)
     ]
     index = mine[-1] if mine else count
+    retired = no_op(*(i for i in mine[:-1] if f"GIT_CONFIG_KEY_{i}" in owned))
     key, value = f"GIT_CONFIG_KEY_{index}", f"GIT_CONFIG_VALUE_{index}"
     if enabled:
         if any(hooks_path(i) for i in range(index + 1, count)):
             return {
                 "GIT_CONFIG_COUNT": str(count + 1),
-                key: "agent-kit.gitHooks",
-                value: "off",
+                **retired,
+                **no_op(index),
                 f"GIT_CONFIG_KEY_{count}": "core.hooksPath",
                 f"GIT_CONFIG_VALUE_{count}": hooks_dir,
             }
         return {
             "GIT_CONFIG_COUNT": str(max(count, index + 1)),
+            **retired,
             key: "core.hooksPath",
             value: hooks_dir,
         }
     if index == count:
         return {}
     if index + 1 < count:
-        return {"GIT_CONFIG_COUNT": str(count), key: "agent-kit.gitHooks", value: "off"}
-    return {"GIT_CONFIG_COUNT": str(index)} if index else {}
+        return {"GIT_CONFIG_COUNT": str(count), **retired, **no_op(index)}
+    return {"GIT_CONFIG_COUNT": str(index), **retired} if index else {}
 
 
 

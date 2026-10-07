@@ -107,10 +107,11 @@ def cmd_dashboard(api: ModuleType, args: argparse.Namespace) -> int:
     from kit_env import work_root
 
     out = Path(args.out).expanduser() if args.out else Path(work_root()) / "dashboard/index.html"
-    out.parent.mkdir(parents=True, exist_ok=True)
 
-    def write() -> str:
-        text, masked = build(api, args.check_updates)
+    def write(retrying: bool = False) -> str:
+        # A retry after a failed rebuild makes no --check-updates network calls.
+        text, masked = build(api, args.check_updates and not retrying)
+        out.parent.mkdir(parents=True, exist_ok=True)
         api.atomic_write(out, text, 0o600)
         print(
             f"dashboard: wrote {out}" + (f" ({masked} token-shaped value(s) masked)" if masked else ""),
@@ -132,4 +133,4 @@ def watch_paths(api: ModuleType) -> list[Path]:
     from kit_env import layers
 
     setup = Setup(api, False)
-    return watched(setup.kit, layers(), {h: setup.roots[h] for h in setup.configured})
+    return watched(setup.kit, layers(), {h: setup.roots[h] for h in setup.configured}, api.drift_sources())

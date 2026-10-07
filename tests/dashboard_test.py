@@ -630,28 +630,64 @@ class DashboardScenarioTests(Fixture):
             user_layer.parent.mkdir(parents=True, exist_ok=True)
             user_layer.write_text('REVIEW_BASE=trunk\n')
             self.assertEqual(self.next_version(url, '2'), '3', 'the effective user layer was not watched')
-            # The page's folder gone: the rebuild fails, and the last page stays served.
+            # The settings base the drift check reads.
+            base = self.root / 'hosts/claude/settings.base.json'
+            base.write_text(base.read_text().rstrip() + '\n\n')
+            self.assertEqual(self.next_version(url, '3'), '4', 'the settings base was not watched')
+            # The page's folder gone: the rebuild makes it again.
             shutil.rmtree(self.home / 'out')
             (self.root / 'local/kit.env').write_text('REVIEW_BASE=main\n')
+            self.assertEqual(self.next_version(url, '4'), '5', 'the rebuild did not make the page folder again')
+            self.assertTrue((self.home / 'out/index.html').is_file())
+            # The page's path a folder: the rebuild fails, and the last page stays served.
+            (self.home / 'out/index.html').unlink()
+            (self.home / 'out/index.html/blocker').mkdir(parents=True)
+            (self.root / 'local/kit.env').write_text('REVIEW_BASE=trunk\n')
             time.sleep(5)
             self.assertIsNone(proc.poll(), 'the watch died with its rebuild')
-            self.assertEqual(FETCH(url + 'version', timeout=10).read().decode(), '3')
-            # The folder back and nothing else edited: the next poll retries the rebuild.
-            (self.home / 'out').mkdir()
-            self.assertEqual(self.next_version(url, '3'), '4', 'a failed rebuild was not retried')
+            self.assertEqual(FETCH(url + 'version', timeout=10).read().decode(), '5')
+            # The path free again and nothing else edited: a later poll retries the rebuild.
+            shutil.rmtree(self.home / 'out/index.html')
+            self.assertEqual(self.next_version(url, '5'), '6', 'a failed rebuild was not retried')
             self.assertTrue((self.home / 'out/index.html').is_file())
         finally:
             rest, err = self.stop_watch(proc)
         self.assertIn('dashboard: regenerating failed', err)
 
+    def test_a_failing_rebuild_backs_off_and_its_retries_skip_network_checks(self) -> None:
+        from dashboard_watch import POLL_SECONDS, watch
+
+        marker = self.home / 'watched.txt'
+        page = '<html><head><meta http-equiv="Content-Security-Policy" content="script-src x"></head><body></body></html>'
+        calls: list[tuple[float, bool]] = []
+
+        def rebuild(retrying: bool) -> str:
+            calls.append((time.monotonic(), retrying))
+            if len(calls) == 1:
+                marker.write_text('changed\n')
+                return page
+            if len(calls) < 4:
+                raise OSError('the disk is full')
+            raise KeyboardInterrupt  # ends the watch as Ctrl-C does
+
+        self.assertEqual(watch(rebuild, lambda: [marker], 0, None), 0)
+        self.assertEqual([retrying for _, retrying in calls], [False, False, True, True])
+        first, second = calls[2][0] - calls[1][0], calls[3][0] - calls[2][0]
+        self.assertGreaterEqual(first, 2 * POLL_SECONDS - 0.1, 'the first retry waits twice the poll')
+        self.assertGreaterEqual(second, 4 * POLL_SECONDS - 0.1, 'the wait doubles')
+
     def test_watch_covers_each_hosts_rendered_files(self) -> None:
         from dashboard_watch import watched
 
         kit, roots = self.home / 'kit', {'claude': self.home / '.claude', 'cursor': self.home / '.cursor'}
-        paths = set(watched(kit, [self.home / 'overlay/kit.env'], roots))
+        (kit / 'agents').mkdir(parents=True)
+        (kit / 'agents/reviewer.md').write_text('# reviewer\n')
+        sources = [kit / 'hosts/claude/settings.base.json', kit / 'hosts/claude/host.json', kit / 'agents']
+        paths = set(watched(kit, [self.home / 'overlay/kit.env'], roots, sources))
         for wanted in ('.claude/settings.json', '.claude/settings.local.json', '.claude/CLAUDE.md',
                        '.cursor/rules/agent-kit.mdc', '.cursor/mcp.json', '.cursor/hooks.json',
-                       'overlay/kit.env', 'overlay'):
+                       'overlay/kit.env', 'overlay', 'kit/hosts/claude/settings.base.json',
+                       'kit/hosts/claude/host.json', 'kit/agents', 'kit/agents/reviewer.md'):
             self.assertIn(self.home / wanted, paths)
         self.assertNotIn(self.home / '.cursor/settings.local.json', paths, 'a Claude-only file')
         self.assertIn(kit / 'local', paths, 'the folder itself, so a new file in it counts')

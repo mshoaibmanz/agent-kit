@@ -1292,6 +1292,12 @@ def setup_drift() -> list[str]:
     return list(module.managed_drift(state.get("managed", {}).values()))
 
 
+def drift_sources() -> list[Path]:
+    """The kit files claude_findings reads besides the live config, which the dashboard's --watch
+    fingerprints; agents/ and state/rendered/ as folders."""
+    return [BASE, HOST_DIR / "host.json", ROLES, REGISTRY, SERVERS, KIT / "rules/hosts/claude.md", AGENT_SRC, STATE]
+
+
 def claude_findings(mcp: Literal["values", "names"] = "values", host: dict[str, Any] | None = None) -> list[Finding]:
     """Each way the live Claude config differs from the kit's sources. mcp="values" compares each
     rendered server with its Keychain references resolved, which reads their values; mcp="names"

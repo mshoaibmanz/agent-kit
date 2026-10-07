@@ -49,6 +49,9 @@ ENTRY_FIELDS = {'environment': 'env', 'servers': 'mcpServers', 'plugins': 'enabl
 # Top-level settings keys another kind owns entry by entry: the settings layer's values for them merge
 # into that kind's entries instead.
 LAYER_ELSEWHERE = {'env': 'environment', 'enabledPlugins': 'plugins', 'extraKnownMarketplaces': 'marketplaces'}
+# The numbered GIT_CONFIG_* entries and their count, which the kit's core.hooksPath entry shares with the user's.
+GIT_CONFIG_ENTRY = re.compile(r'GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)')
+MISSING = object()
 DOC_FIELDS = {**ENTRY_FIELDS, 'hooks': 'hooks', 'cursor-hooks': 'hooks'}
 SECRET_NAMES = {'auth.json', 'credentials.json', 'kit.env', 'settings.local.json', '.env'}
 TEXT_BEGIN = '<!-- BEGIN agent-kit setup -->'
@@ -1393,30 +1396,39 @@ def settings_layer_problem(args: argparse.Namespace, root: Path, state: dict[str
         return [prefix + key for key in sorted(set(want) | set(have))
                 if key not in want or key not in have or want[key] != have[key]]
 
-    # As host_changes builds them: the kit's own env keys and its core.hooksPath entry (with the count)
-    # are not the layer's, while a GIT_CONFIG_* entry of the user's is; a preset's plugins and
-    # marketplaces win over the layer's.
-    live = load_json(target / 'settings.json', {}) or {}
-    live_env = live.get('env', {}) if isinstance(live.get('env'), dict) else {}
-    try:
-        hooks_entry = git_layer_env(live_env, str(root / 'git-hooks'), owned('environment'), enabled=args.blocking_hooks)
-    except ValueError as error:
-        return f'the settings env cannot be checked: {error}'
-    kit_keys = {*kit_shell(args, root, target), *hooks_entry, 'GIT_CONFIG_COUNT'}
+    # As host_changes builds them: the kit's own env keys are not the layer's, nor is any numbered
+    # GIT_CONFIG_* entry or its count (git_layer_env lays the kit's hooks entry and its no-ops among the
+    # user's, so the two cannot be told apart by name); a GIT_CONFIG_* key of the user's otherwise is
+    # compared. A preset's plugins and marketplaces win over the layer's.
+    kit_keys = set(kit_shell(args, root, target))
 
     def layer_env(env: dict[str, Any]) -> dict[str, Any]:
-        return {key: value for key, value in env.items() if key not in kit_keys}
+        return {key: value for key, value in env.items() if key not in kit_keys and not GIT_CONFIG_ENTRY.fullmatch(key)}
 
     enabled, markets = plugin_settings(state.get('configuration', {}).get('preset_values', {}).get('plugins', {}))
-    stale = differ('', {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}, owned('settings'))
-    stale += differ('env.', layer_env(layer.get('env', {})), layer_env(owned('environment')))
-    stale += differ('enabledPlugins.', {**layer.get('enabledPlugins', {}), **enabled}, owned('plugins'))
-    stale += differ('extraKnownMarketplaces.', {**layer.get('extraKnownMarketplaces', {}), **markets},
-                    owned('marketplaces'))
+    kinds = (('', 'settings', {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}),
+             ('env.', 'environment', layer_env(layer.get('env', {}))),
+             ('enabledPlugins.', 'plugins', {**layer.get('enabledPlugins', {}), **enabled}),
+             ('extraKnownMarketplaces.', 'marketplaces', {**layer.get('extraKnownMarketplaces', {}), **markets}))
+    live = load_json(target / 'settings.json', {}) or {}
+    stale, blocked = [], []
+    for prefix, kind, want in kinds:
+        have = layer_env(owned(kind)) if kind == 'environment' else owned(kind)
+        current = doc_field(live, ENTRY_FIELDS[kind]) if isinstance(live, dict) else {}
+        current = current if isinstance(current, dict) else {}
+        for key in differ('', want, have):
+            stale.append(prefix + key)
+            # As prepare_change decides: the user's own value there, neither applied nor wanted, is a
+            # collision that --apply refuses and --collision skip leaves in place.
+            if key in current and current[key] != have.get(key, MISSING) and current[key] != want.get(key, MISSING):
+                blocked.append(prefix + key)
     if not stale:
         return None
-    return (f'the settings layer differs from what setup applied to {target / "settings.json"} '
-            f'({", ".join(stale)}): rerun agent-setup --apply')
+    message = f'the settings layer differs from what setup applied to {target / "settings.json"} ({", ".join(stale)})'
+    if blocked:
+        return (f'{message}: your own value of {", ".join(blocked)} there blocks it; rerun agent-setup --apply '
+                '--collision backup to replace it (the install journal keeps yours), or drop the key from the layer')
+    return f'{message}: rerun agent-setup --apply'
 
 
 def sync_pending(root: Path, state: dict[str, Any]) -> str | None:

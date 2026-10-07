@@ -10,13 +10,15 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from hosts import RENDERED_FILES
 
 POLL_SECONDS = 2
+# The longest wait before a failed rebuild is retried with no watched file changed.
+MAX_BACKOFF = 60
 # Kit files the page reads; a host root's own config files by name (its other files change on every
 # prompt, history and caches among them).
 KIT_FILES = (
@@ -41,14 +43,17 @@ POLICY = re.compile(r'(http-equiv="Content-Security-Policy" content=")([^"]*)(")
 Fingerprint = dict[str, tuple[int, int]]
 
 
-def watched(kit: Path, layers: Iterable[Path], host_roots: Mapping[str, Path]) -> list[Path]:
-    """The config files the page is generated from: the kit's own; the overlay layers kit_env reads
-    (kit_env.layers()), each with its folder and that folder's top-level files, and the kit's local/
-    the same way (a folder's own mtime moves when a file is added or removed); and each configured
-    host's rendered files plus its HOST_EXTRAS."""
-    layers = list(layers)
-    paths = [kit / name for name in KIT_FILES] + layers
-    for folder in sorted({kit / "local", *(layer.parent for layer in layers)}):
+def watched(
+    kit: Path, layers: Sequence[Path], host_roots: Mapping[str, Path], sources: Sequence[Path] = ()
+) -> list[Path]:
+    """The config files the page is generated from: the kit's own; the sources its drift check reads
+    (agent-kit's drift_sources(): settings base, host definition, roles), a folder among them with
+    its top-level files; the overlay layers kit_env reads (kit_env.layers()), each with its folder and
+    that folder's top-level files, and the kit's local/ the same way (a folder's own mtime moves when
+    a file is added or removed); and each configured host's rendered files plus its HOST_EXTRAS."""
+    paths = [kit / name for name in KIT_FILES] + [*sources, *layers]
+    folders = {kit / "local", *(layer.parent for layer in layers), *(path for path in sources if path.is_dir())}
+    for folder in sorted(folders):
         paths.append(folder)
         try:
             paths += sorted(p for p in folder.iterdir() if p.is_file())
@@ -124,42 +129,46 @@ def handler(current: list[tuple[str, str]]) -> type[BaseHTTPRequestHandler]:
 
 
 def watch(
-    rebuild: Callable[[], str],
+    rebuild: Callable[[bool], str],
     paths: Callable[[], list[Path]],
     port: int,
     opener: Callable[[str], object] | None,
 ) -> int:
-    """Serve rebuild()'s page until Ctrl-C, rebuilding it when a file of paths() changes. paths() runs
-    on every poll, so a file created since is watched; a failed rebuild keeps the last page and is retried on the next poll."""
+    """Serve rebuild(retrying)'s page until Ctrl-C, rebuilding it when a file of paths() changes.
+    paths() runs on every poll, so a file created since is watched. A failed rebuild keeps the last
+    page and is retried at once when a watched file changes again, else after a wait that doubles
+    with each failure up to MAX_BACKOFF; retrying is true for each retry, so it can skip network
+    checks."""
     # Each fingerprint is taken before its rebuild, so an edit made during one is caught by the next poll.
     seen = fingerprint(paths())
     version = 1
-    current = [(live_page(rebuild(), str(version)), str(version))]
+    current = [(live_page(rebuild(False), str(version)), str(version))]
     server = ThreadingHTTPServer(("127.0.0.1", port), handler(current))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     print(f"dashboard: serving {url}; regenerating when a config file changes (Ctrl-C stops)", flush=True)
     if opener:
         opener(url)
-    failure = ""
+    failure, delay, retry_at, tried = "", float(POLL_SECONDS), 0.0, seen
     try:
         while True:
             time.sleep(POLL_SECONDS)
             try:
                 now = fingerprint(paths())
-                if now == seen:
+                if now == seen or (failure and now == tried and time.monotonic() < retry_at):
                     continue
-                # seen moves only once the rebuild succeeds, so a failed one is retried on the next poll.
-                current[0] = (live_page(rebuild(), str(version + 1)), str(version + 1))
+                tried = now
+                current[0] = (live_page(rebuild(bool(failure)), str(version + 1)), str(version + 1))
                 changed, seen = first_change(now, seen), now
                 version += 1
             except Exception as error:  # noqa: BLE001  a half-written file must not end the watch
                 if f"{error!r}" != failure:
                     print(f"dashboard: regenerating failed, still serving the last page: {type(error).__name__}: "
                           f"{error}", file=sys.stderr, flush=True)
-                failure = f"{error!r}"
+                failure, delay = f"{error!r}", min(delay * 2, MAX_BACKOFF)
+                retry_at = time.monotonic() + delay
                 continue
-            failure = ""
+            failure, delay = "", float(POLL_SECONDS)
             print(f"dashboard: regenerated ({changed} changed)", flush=True)
     except KeyboardInterrupt:
         pass
