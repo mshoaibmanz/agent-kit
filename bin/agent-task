@@ -5,18 +5,35 @@ Layout: projects/<p>/{PROJECT.md, INDEX.md, knowledge/, scripts/, data/, items/<
 {HANDOFF.md, task.json, briefs/, out/}}. No worktrees under the work root: they live in
 <repo>/.claude/worktrees/. A legacy tasks/<name>/ folder is a project of one until migrated.
 
-  agent-task bind <project>[/<item>] | <TICKET> | <legacy folder> [desc words] [--session id]
-  agent-task resolve "<text>" [--branch b] [--paths f ...] [--repo r] [--cwd d]
+An item is thin: task.json (ticket, branches, repo, worktrees, PR, status, bound sessions) plus
+HANDOFF.md, briefs/, out/ (evidence for its PR) and tmp/ (fixtures, clones, test homes; never
+indexed). Reusable scripts and knowledge live at the project level. <work root>/.index.json is a
+cache derived from every task.json, rebuilt on each agent-task write; never edit it.
+
+Binding rules (agent_task.decide), certain ones first: explicit bind; the session's own binding;
+a worktree the index maps; a ticket branch mapping to one item; a new <TICKET>-* worktree (creates
+the item); a pasted work-root path of one item; a prompt ticket mapping to one existing item; a
+ticket only one project lists (the project alone). Otherwise the session stays unbound and is
+offered this repo's three most recently touched open items.
+
+  agent-task bind <project>[/<item>] | <TICKET> | <legacy folder> [desc words] [--session id] [--cwd d]
+                                (bind <project> picks its sole open item, else lists them)
+  agent-task resolve "<prompt>" [--cwd d] [--branch b] [--repo r]   the rule that would bind (JSON)
   agent-task where --path [--session id]        exit 1 when the session is unbound
-  agent-task ls [--paths]
-  agent-task index <project>
+  agent-task ls [--paths]                       projects, with each item's status and last-touched date
+  agent-task index [<project>]                  INDEX.md of a project; with none, rebuild .index.json
   agent-task brief <project>/<item> [--name task]
   agent-task harvest <project>/<item>
+  agent-task close <project>/<item> [--pr url] [--promote <tmp file> ...] [--no-promote]
+                                offers each script in the item's tmp/ that the project's scripts/
+                                lacks for promotion (prompt, or the flags), prints the harvest prompts
+                                plus proposed knowledge lines, then status closed
+  agent-task prune [--days n] [--apply]         report tmp/, out/ clones and files >5MB in idle items (dry run)
   agent-task retro "<note>" | --stdin [--source model|user|auto] [--tag t] [--session id]
   agent-task retro --pending                    one `<id> <line>` per unprocessed line
   agent-task retro --mark <id> ...              mark those lines (ids from --pending) processed
-  agent-task migrate --plan
-  agent-task slice [--session id]               the injected context of a bound session
+  agent-task migrate --plan | --bindings [--apply]
+  agent-task slice [--session id]               the injected context of a bound session (at most 2KB)
   agent-task session-start --session id --source startup|resume|clear|compact [--repo r] [--branch b] [--cap n]
                                 (the OUT DIR's repo: --repo, else CLAUDE_PROJECT_DIR's, else the cwd's)
   agent-task nudge --session id --ctx n --at n [--cwd d]   the context-watch handoff text
@@ -30,6 +47,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -38,6 +56,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "hooks", "lib"))
 import agent_task as at  # noqa: E402
 from kit_env import kit_root  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+from tmp_sweep import generated  # noqa: E402
 
 os.environ["AGENT_KIT_DIR"] = str(kit_root(__file__))
 
@@ -65,16 +86,28 @@ def cmd_bind(a: argparse.Namespace) -> int:
     m = re.match(r"^([A-Za-z][A-Za-z0-9]*-[0-9]+)-(.+)$", target)
     if m and "/" not in target and not at.find_legacy(target):
         target, desc = m.group(1).upper(), at.slug(f"{m.group(2)} {desc}")
-    b = at.bind(sid, target, desc=desc, branch=a.branch, repo=a.repo)
+    here = at.place(a.cwd or os.getcwd())
+    if a.branch:
+        here.branch = a.branch
+    was = at.bound(sid)
+    b = at.bind(sid, target, desc=desc, here=here, repo=a.repo, rule="explicit", pick_item=True)
     print(f"Bound session {sid[:8]} to {at.where_label(b)} ({b.folder}). Tab: {b.label}.")
-    print(at.slice_text(b))
+    if not b.item and not b.project.legacy:
+        live = [d.name for d in b.project.items() if at._item_status(d) not in at.DONE_STATUSES]
+        if live:
+            print(f"Bound to the project only: it has {len(live)} open items. Bind one with /bind {b.project.name}/<item>: {', '.join(live[:12])}.")
+    print(at.slice_text(b, at.announce(b, "explicit", was)))
     return 0
 
 
 def cmd_resolve(a: argparse.Namespace) -> int:
-    paths = a.paths if a.paths else (at.changed_paths(a.cwd, a.branch) if a.cwd else [])
-    r = at.resolve(" ".join(a.args), branch=a.branch, paths=paths, repo=a.repo)
-    print(json.dumps({"outcome": r.outcome, "ticket": r.ticket, "candidates": [{"project": p.name, "legacy": p.legacy, "score": round(s, 1)} for p, s in r.candidates]}))
+    pl = at.place(a.cwd) if a.cwd else at.Place()
+    if a.branch:
+        pl.branch = a.branch
+    if a.repo:
+        pl.repo = a.repo
+    d = at.decide(" ".join(a.args), pl)
+    print(json.dumps({"rule": d.rule, "target": d.target, "why": d.why, "candidates": d.candidates}))
     return 0
 
 
@@ -93,18 +126,20 @@ def cmd_ls(a: argparse.Namespace) -> int:
         if p.legacy:
             print(f"tasks/{p.name}  (legacy){'  [handoff]' if (p.path / 'HANDOFF.md').is_file() else ''}")
             continue
-        items = p.items()
-        live = sum(1 for d in items if at._item_status(d) not in at.DONE_STATUSES)
-        line = f"{p.name}  status={p.meta.get('status', '?')}  items={len(items)} open={live}"
+        line = f"{p.name}  status={p.meta.get('status', '?')}"
         if a.paths:
-            line += f"  paths={','.join(p.listing('paths')) or '-'}  terms={','.join(p.listing('terms')) or '-'}"
+            line += f"  repos={','.join(p.listing('repos')) or '-'}  paths={','.join(p.listing('paths')) or '-'}  terms={','.join(p.listing('terms')) or '-'}"
         print(line)
+        rows = sorted(((at.touched(d), d) for d in p.items()), key=lambda x: -x[0])
+        for t, d in rows:
+            print(f"  {p.name}/{d.name}  {at._item_status(d)}  {at.dt.date.fromtimestamp(t).isoformat()}")
     return 0
 
 
 def cmd_index(a: argparse.Namespace) -> int:
     if not a.args:
-        die("usage: agent-task index <project>")
+        print(f"{len(at.rebuild_index())} items -> {at.work_root() / at.INDEX_FILE}")
+        return 0
     f = at.index(a.args[0])
     if not f:
         die(f"no project {a.args[0]}")
@@ -170,7 +205,8 @@ def item_files(d: Path) -> list[Path]:
     """The item's own files: checkouts, dependencies and per-session folders are pruned unread."""
     out = []
     for top, dirs, names in os.walk(d):
-        dirs[:] = [x for x in dirs if x not in HARVEST_SKIP]
+        # Also the bulk the tmp sweep calls generated (scratch homes, checkouts), as close's promotion does.
+        dirs[:] = [x for x in dirs if x not in HARVEST_SKIP and not generated(Path(top) / x)]
         out += [Path(top) / n for n in names]
     return sorted(out)
 
@@ -182,7 +218,12 @@ def cmd_harvest(a: argparse.Namespace) -> int:
     b = at.Binding(p, item)
     d = b.folder
     files = item_files(d)
-    scripts = [f for f in files if f.suffix in (".py", ".sh", ".sql")]
+    # A script whose name the project's scripts/ already has needs no move (close's promotion rule).
+    have = {f.name for f in (p.path / "scripts").iterdir()} if not p.legacy and (p.path / "scripts").is_dir() else set()
+    scripts = [f for f in files if f.suffix in (".py", ".sh", ".sql") and f.name not in have]
+    if a.status_to == "closed":
+        # close has already offered (or, under --no-promote, been told to skip) the tmp/ scripts.
+        scripts = [f for f in scripts if d / "tmp" not in f.parents]
     docs = [f for f in files if f.suffix == ".md" and f.name != "HANDOFF.md"]
     print(f"HARVEST {at.where_label(b)} ({d}). Answer three questions, act on each, then append the summary.")
     print("1. Domain docs: which facts are true beyond this ticket, about business meaning, flows or decisions, and verified in code? Add them through the docs-rollup worktree (session-review skill, \"Domain-doc learnings\"), then record each in knowledge/ as a one-line `status: in-docs -> <doc link>` entry.")
@@ -195,18 +236,117 @@ def cmd_harvest(a: argparse.Namespace) -> int:
         print("   (no scripts in the item)")
     if docs:
         print("   Item docs to mine for 1 and 2: " + ", ".join(str(f.relative_to(d)) for f in docs[:15]))
+    proposed = at.durable_lines(d / "HANDOFF.md")
+    if proposed:
+        print(f"Proposed for {kroot}/ (lines from HANDOFF.md that read as durable; keep, reword or drop each):")
+        for x in proposed:
+            print(f"   - {x}")
     print(f"Then append to {d / 'HANDOFF.md'} (never overwrite it): `## Summary (harvested {at.today()})` with the PR, what shipped, and where each harvested fact and script went.")
     print("Last, record at most 3 learnings: agent-task retro \"<mistake|fact|doc|tooling>: <text>\".")
     if not p.legacy and item:
-        tj = d / "task.json"
-        try:
-            data = json.loads(tj.read_text())
-        except (OSError, ValueError):
-            data = {"item": item}
-        data.update(status="harvested", harvested=at.today())
-        at._atomic_write(tj, json.dumps(data, indent=2) + "\n")
+        at.update_item(p, item, status=a.status_to or "harvested", harvested=at.today(), **({"pr": a.pr} if a.pr else {}), **({"closed": at.today()} if a.status_to == "closed" else {}))
         at.index(p.name)
     return 0
+
+
+def cmd_prune(a: argparse.Namespace) -> int:
+    days = a.days if a.days is not None else 14
+    report = at.prune_report(days)
+    total = 0
+    print(f"# prune {'(APPLY)' if a.apply else '(dry run: nothing is deleted; --apply removes tmp/ contents and clones)'}: items idle {days}+ days under {at.work_root()}")
+    for r in report:
+        print(f"{r['item']}  idle {r['idle_days']}d")
+        for kind, path, size in r["found"]:
+            total += size
+            note = "  (reported only; judge by hand)" if kind == "big" else ""
+            print(f"  {kind:5} {size / 1048576:8.1f}M  {path}{note}")
+    print(f"total {total / 1048576:.1f}M in {len(report)} items")
+    if a.apply:
+        for line in at.prune_apply(report):
+            print(line)
+    return 0
+
+
+PROMOTE_SUFFIXES = {".py": "python3", ".sh": "bash", ".sql": "run"}
+
+
+def tmp_scripts(p: at.Project, d: Path) -> list[Path]:
+    """Scripts under the item's tmp/ whose name the project's scripts/ lacks; generated bulk (checkouts,
+    scratch homes, virtualenvs, caches) is not read."""
+    tmp = d / "tmp"
+    if not tmp.is_dir() or tmp.is_symlink():
+        return []
+    have = {f.name for f in (p.path / "scripts").iterdir()} if (p.path / "scripts").is_dir() else set()
+    out = []
+    for top, dirs, names in os.walk(tmp):
+        dirs[:] = sorted(x for x in dirs if not os.path.islink(os.path.join(top, x)) and not generated(Path(top) / x))
+        for n in sorted(names):
+            f = Path(top) / n
+            if f.suffix in PROMOTE_SUFFIXES and n not in have and not f.is_symlink():
+                out.append(f)
+    return out
+
+
+def add_use_line(p: at.Project, rel: str, text: str) -> None:
+    """A `  - use:` line under the INDEX.md entry of rel (index keeps hand lines by path)."""
+    idx = at.index(p.name, p.path.parent.parent)
+    if idx is None:
+        return
+    lines = idx.read_text().split("\n")
+    for n, line in enumerate(lines):
+        if line.startswith(f"- `{rel}`"):
+            if not (n + 1 < len(lines) and lines[n + 1].startswith("  - use:")):
+                lines.insert(n + 1, f"  - use: {text}")
+                at._atomic_write(idx, "\n".join(lines))
+            return
+
+
+def promote(p: at.Project, d: Path, f: Path) -> str:
+    dest = p.path / "scripts" / f.name
+    if dest.exists():
+        return f"kept {f.relative_to(d)}: scripts/{f.name} exists"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(f, dest)
+    desc = at._desc(f) or f"promoted from items/{d.name}/{f.relative_to(d)}; say when to reach for it"
+    add_use_line(p, f"scripts/{f.name}", f"`{PROMOTE_SUFFIXES[f.suffix]} scripts/{f.name}`: {desc}")
+    return f"promoted {f.relative_to(d)} -> scripts/{f.name} (INDEX.md has its use line)"
+
+
+def cmd_close(a: argparse.Namespace) -> int:
+    """Close an item: offer its tmp/ scripts for promotion, print the harvest prompts (with HANDOFF lines
+    proposed for knowledge/), then status closed. Never blocks: the item stays as a closed ledger entry,
+    and claude-gc's tmp sweep later salvages what stays in its tmp/."""
+    if not a.args or (a.promote and a.no_promote):
+        die("usage: agent-task close <project>/<item> [--pr url] [--promote <tmp file> ...] [--no-promote]")
+    p, item = split_target(a.args[0])
+    if p.legacy or not item:
+        die("agent-task close takes <project>/<item>")
+    d = at.Binding(p, item).folder
+    candidates = tmp_scripts(p, d)
+    chosen: list[Path] = []
+    if a.promote:
+        for name in a.promote:
+            match = [f for f in candidates if name in (str(f), str(f.relative_to(d)), str(f.relative_to(d / "tmp")), f.name)]
+            if not match:
+                die(f"--promote {name}: not a script in {d / 'tmp'} that scripts/ lacks")
+            chosen += [f for f in match if f not in chosen]
+    elif candidates and not a.no_promote and sys.stdin.isatty():
+        for f in candidates:
+            answer = input(f"Promote {f.relative_to(d)} to {p.path / 'scripts'}/? [y/N] ").strip().lower()
+            if answer in ("y", "yes"):
+                chosen.append(f)
+    for f in chosen:
+        print(promote(p, d, f))
+    left = [f for f in candidates if f not in chosen]
+    if left and not a.no_promote:
+        print("Scripts still in tmp/ that scripts/ lacks (claude-gc salvages them to out/salvage/ after the grace period):")
+        for f in left:
+            print(f"   - {f.relative_to(d)}: {at._desc(f) or '(no docstring)'}")
+        print(f"   Promote one with: agent-task close {p.name}/{item} --promote <file>")
+    a.status_to = "closed"
+    rc = cmd_harvest(a)
+    print(f"Closed {p.name}/{item} (status closed; task.json keeps its branch, worktree, PR and sessions).")
+    return rc
 
 
 def cmd_retro(a: argparse.Namespace) -> int:
@@ -233,8 +373,13 @@ def cmd_retro(a: argparse.Namespace) -> int:
 
 
 def cmd_migrate(a: argparse.Namespace) -> int:
+    if a.bindings:
+        lines = at.migrate_bindings(apply=a.apply)
+        print(f"# binding files in {at.bind_dir()} not in `project:p/i` form ({'rewritten' if a.apply else 'dry run; --apply rewrites'}):")
+        print("\n".join(lines) or "(none)")
+        return 0
     if not a.plan:
-        die("only `migrate --plan` exists: moving folders is the user's call")
+        die("only `migrate --plan` and `migrate --bindings` exist: moving folders is the user's call")
     legacy = [p for p in at.projects() if p.legacy]
     toks: dict[str, set[str]] = {}
     generic = {"ticket", "doc", "docs", "repo", "api", "team", "express", "kickoff", "handoff", "index", "plan", "review"}
@@ -285,22 +430,40 @@ def cmd_session_start(a: argparse.Namespace) -> int:
     startup and resume point the tab's binding at this session's (an unbound one blanks it)."""
     sid = need_sid(a.session)
     b = at.bound(sid)
-    cap = min(at.SLICE_CAP, max(a.cap, 1500)) if a.cap else at.SLICE_CAP
+    cwd = a.cwd or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     if a.source == "compact":
-        print(at.compact_text(sid, a.cwd or os.getcwd(), a.repo, a.branch, cap))
+        cap = min(at.CONTEXT_CAP, max(a.cap, 1500)) if a.cap else at.CONTEXT_CAP
+        print(at.compact_text(sid, cwd, a.repo, a.branch, cap))
         return 0
+    cap = min(at.SLICE_CAP, max(a.cap, 1000)) if a.cap else at.SLICE_CAP
     how = ""
     if a.source in ("startup", "resume"):
         at.set_tab(sid, b)
+    if b:
+        how = at.announce(b, "session")
     if not b and a.source == "clear":
         b = at.tab_binding()
         if b:
-            at.write_binding(sid, b, inherited=True)
-            how = f"Kept this tab's binding to {at.where_label(b)} across /clear; a prompt naming another ticket rebinds."
+            at.write_binding(sid, b, inherited=True, rule="tab")
+            how = at.announce(b, "tab") + f" Kept this tab's binding across /clear; a prompt naming another ticket rebinds."
+    pl = at.place(cwd)
+    if a.branch:
+        pl.branch = a.branch
+    if a.repo:
+        pl.repo = a.repo
+    if not b:
+        d = at.decide("", pl, cheap_only=True)
+        if d:
+            b = at.bind(sid, d.target, here=pl, rule=d.rule)
+            how = at.announce(b, d.rule)
     if b:
+        at.set_binding_wt(sid, pl.top)
         print(at.slice_text(b, how, cap=cap))
         return 0
-    print(at.unbound_text(at.handoff_folder(sid, a.cwd or os.getcwd(), a.repo)[1], a.branch))
+    print(at.unbound_text(at.handoff_folder(sid, cwd, a.repo)[1], a.branch))
+    offer = at.offer_text(at.Decision(candidates=at.recent_items(pl.repo)), sid)
+    if offer:
+        print(offer.replace("unbound: no rule was certain.", "Recent open items for " + pl.repo + "."))
     return 0
 
 
@@ -330,11 +493,18 @@ def main() -> int:
     ap.add_argument("--mark", action="store_true")
     ap.add_argument("--stdin", action="store_true")
     ap.add_argument("--plan", action="store_true")
+    ap.add_argument("--bindings", action="store_true")
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--days", type=int, default=None)
+    ap.add_argument("--pr", default="")
+    ap.add_argument("--promote", action="append", default=[])
+    ap.add_argument("--no-promote", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_intermixed_args()
     if a.sub == "ls" and a.paths is not None:
         a.paths = True
-    cmds ={"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge}
+    a.status_to = ""
+    cmds = {"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "close": cmd_close, "prune": cmd_prune, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge}
     if a.help or a.sub not in cmds:
         print(__doc__)
         return 0 if a.help or not a.sub else 2

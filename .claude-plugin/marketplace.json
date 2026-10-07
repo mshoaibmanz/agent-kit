@@ -10,57 +10,112 @@
   "plugins": [
     {
       "name": "guard-rails",
-      "source": "./plugins/guard-rails",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/guard-rails",
+        "ref": "dist"
+      },
       "description": "Safety rails on Bash. DENIES: uncapped file dumps into context (points at Read/Grep), a re-dump of a file already in context, git commits missing the Claude trailers, --amend on pushed history, a second unpushed commit on a branch. ASKS before: force-push, reset --hard, git clean -f, branch delete, stash drop, worktree remove, two-dot diffs against a base. Nudges on comment-heavy edits. Silent on everything else."
     },
     {
       "name": "prod-data",
-      "source": "./plugins/prod-data",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/prod-data",
+        "ref": "dist"
+      },
       "description": "Read-only production data. DENIES raw MySQL clients by any spelling, MySQL drivers from scripts, a swapped ro-mysql client and Keychain secret reads. Ships ro-mysql (one read-only statement per call over the ~/.ssh/config db-tunnel-* forwards, Keychain credentials, staging/prod labels) and bqro (dry-run, SELECT-only, byte cap) on PATH, the debug skill (RCA method and data-reading traps), and a nudge to load it on prod-data prompts. Company schemas and hosts come from ~/.claude/local/."
     },
     {
       "name": "ci-babysitter",
-      "source": "./plugins/ci-babysitter",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/ci-babysitter",
+        "ref": "dist"
+      },
       "description": "Owns the push-to-green loop. After git push it starts a background CI watcher on the PR (needs gh auth); DENIES a push carrying unreviewed code and ASKS when no test ran this session; BLOCKS ending the session while the branch's CI is red or pending. With TEST_GATE_FILE/TEST_RUNNER in ~/.claude/local/kit.env it also routes a repo's tests through one runner. Per-repo tuning via ~/.claude/local/<repo>-ci.env."
     },
     {
       "name": "auto-review",
-      "source": "./plugins/auto-review",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/auto-review",
+        "ref": "dist"
+      },
       "description": "Review at git push with reproduce-first fixes, role-selected providers and a bounded review budget. Explicit installation enables blocking review hooks."
     },
     {
       "name": "session-context",
-      "source": "./plugins/session-context",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/session-context",
+        "ref": "dist"
+      },
       "description": "Project and item context, handoffs, a retro inbox and safe housekeeping. Per-user repository docs remain in your overlay."
     },
     {
       "name": "python-hygiene",
-      "source": "./plugins/python-hygiene",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/python-hygiene",
+        "ref": "dist"
+      },
       "description": "Runs ruff on every edited .py file, only in repos that already carry a ruff config (never reformats a repo that has not adopted it). Ships the conventions house-style skill for Python and SQL. No effect on non-Python edits."
     },
     {
       "name": "terminal-signals",
-      "source": "./plugins/terminal-signals",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/terminal-signals",
+        "ref": "dist"
+      },
       "description": "Cosmetic only: names your VS Code/iTerm terminal tab after the task and flags it busy/idle/needs-attention per session, with macOS completion sounds and banners. The completion chime fires only when the turn is really over, not when another Stop hook blocked. Changes no tool behavior."
     },
     {
       "name": "skills-core",
-      "source": "./plugins/skills-core",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/skills-core",
+        "ref": "dist"
+      },
       "description": "10 passive skills: session-review, grilling, grill-with-docs, domain-modeling, pr-study, prototype, handoff, sentry-fix-issues, unslop, typescript-best-practices. Inert until invoked: installs no hooks."
     },
     {
       "name": "workflow",
-      "source": "./plugins/workflow",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/workflow",
+        "ref": "dist"
+      },
       "description": "Ticket-to-merge-ready commands: /kickoff (Jira ticket, worktree, one commit, PR, CI and review comments to green; takeover and sync modes), /jira (find/create/transition, driven by per-user prefs in ~/.claude/local/jira-prefs.md) and /address-review. Needs the Atlassian MCP and gh."
     },
     {
       "name": "docs",
-      "source": "./plugins/docs",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/docs",
+        "ref": "dist"
+      },
       "description": "The process-doc skill: a self-contained standalone HTML process guide (industrial design system, numbered floor steps, gate chips, config flow, screenshots from a reusable catalog). The screenshot catalog and company config notes live in ~/.claude/local/process-doc/."
     },
     {
       "name": "qa-e2e",
-      "source": "./plugins/qa-e2e",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mshoaibmanz/agent-kit.git",
+        "path": "plugins/qa-e2e",
+        "ref": "dist"
+      },
       "description": "The qa-e2e skill: an end-to-end QA pass on a feature (backend up and seeded, the app driven on an Android emulator or the web, screenshots, findings by verification level, an ops SOP). Repo paths and seeds come from ~/.claude/local/qa-e2e/."
     }
   ]

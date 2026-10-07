@@ -1,31 +1,98 @@
-#!/bin/bash
-# Credentials enter only the server's environment, never rendered config or argv.
-set +x
-set -eu
-# The macOS Keychain, else libsecret's secret-tool (Linux; ro-mysql's SECRET_TOOL_PATHS, never one
-# from PATH), else SENTRY_ACCESS_TOKEN already in the environment, which is also the fallback when a
-# store has no item.
-store_token= store_fix=
-if [ -x /usr/bin/security ]; then
-  store_token=$(/usr/bin/security find-generic-password -s agent-kit/mcp/sentry -a sentry -w 2>/dev/null) ||
-    store_fix='could not access the Keychain item agent-kit/mcp/sentry (missing or denied). Fix: security add-generic-password -s agent-kit/mcp/sentry -a sentry -w (in your own terminal)'
-else
-  for secret_tool in /usr/bin/secret-tool /usr/local/bin/secret-tool; do
-    [ -x "$secret_tool" ] || continue
-    store_token=$("$secret_tool" lookup service agent-kit/mcp/sentry account sentry 2>/dev/null) ||
-      store_fix='no secret-tool item service=agent-kit/mcp/sentry account=sentry. Fix: secret-tool store --label=sentry service agent-kit/mcp/sentry account sentry'
-    break
-  done
-fi
-SENTRY_ACCESS_TOKEN=${store_token:-${SENTRY_ACCESS_TOKEN:-}}
-if [ -z "$SENTRY_ACCESS_TOKEN" ]; then
-  echo "Sentry MCP off: ${store_fix:-no Keychain or secret-tool here, and SENTRY_ACCESS_TOKEN is unset. Fix: export it in your shell profile}" >&2
-  exit 1
-fi
-[ -n "$SENTRY_ACCESS_TOKEN" ] || exit 1
-command -v npx >/dev/null 2>&1 || {
-  echo "Sentry MCP off: npx is missing. Fix: $(sh "${0%/*}/../hooks/lib/install-hint" npx 2>/dev/null || echo 'install Node.js')" >&2
-  exit 1
-}
-export SENTRY_ACCESS_TOKEN
-exec npx -y @sentry/mcp-server@0.37.0 "$@"
+#!/usr/bin/env python3
+"""Launch @sentry/mcp-server for one Sentry instance (mcp/sentry-instances.json, bin/lib/sentry.py).
+
+  sentry-mcp [--instance NAME] [server args...]   no --instance: the catalog's `sentry` instance
+  sentry-mcp [--instance NAME] --check            resolve the instance and its token, then exit
+
+The token comes from the macOS Keychain, else libsecret's secret-tool, else the instance's
+environment variable, and enters only the server's environment: never argv, rendered config or a
+log. Without an instances file it reads the item agent-kit/mcp/sentry and sets no host, as before."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+KIT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(KIT / "bin" / "lib"))
+
+from sentry import (  # noqa: E402
+    HOST_OPTIONS,
+    TOKEN_ENV,
+    KeychainDenied,
+    KeychainMissing,
+    default_instance,
+    load_instances,
+    read_token,
+)
+
+PACKAGE = "@sentry/mcp-server@0.37.0"
+
+
+def die(message: str) -> NoReturn:
+    sys.stderr.write(f"Sentry MCP off: {message}\n")
+    sys.exit(1)
+
+
+def npx_hint() -> str:
+    try:
+        hint = subprocess.run(
+            ["sh", str(KIT / "hooks/lib/install-hint"), "npx"], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        hint = ""
+    return hint or "install Node.js"
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    name = None
+    if "--instance" in args:
+        at = args.index("--instance")
+        if at + 1 >= len(args):
+            die("--instance needs a name")
+        name = args[at + 1]
+        del args[at : at + 2]
+    check = "--check" in args
+    if check:
+        args.remove("--check")
+    try:
+        instances = load_instances(KIT)
+    except ValueError as e:
+        die(str(e))
+    if name is not None and name not in instances:
+        die(f"unknown instance {name}; configured: {', '.join(instances) or 'none'} (mcp/sentry-instances.json)")
+    inst = instances[name] if name is not None else default_instance(instances)
+    host_arg = any(a in HOST_OPTIONS or a.split("=", 1)[0] in HOST_OPTIONS for a in args)
+    if name is not None and host_arg:
+        die(f"--instance {name} sets the host; drop --host/--url")
+    try:
+        token = read_token(inst)
+    except KeychainMissing:
+        die(f"{inst.missing()} for instance {inst.name}. Fix: {inst.enable_command()} (in your own terminal)")
+    except KeychainDenied:
+        die(
+            f"could not read the Keychain item {inst.keychain} for instance {inst.name} (denied or locked). "
+            "Check access in your trusted terminal before importing or rotating a credential."
+        )
+    env = {k: v for k, v in os.environ.items() if not k.startswith(TOKEN_ENV)}
+    if inst.host and not host_arg:
+        if name is not None:
+            env["SENTRY_HOST"] = inst.host
+        else:
+            env.setdefault("SENTRY_HOST", inst.host)
+    if check:
+        print(f"sentry-mcp: instance {inst.name} ok (host {env.get('SENTRY_HOST', 'from args')}, item {inst.keychain})")
+        return
+    if shutil.which("npx") is None:
+        die(f"npx is missing. Fix: {npx_hint()}")
+    env[TOKEN_ENV] = token
+    os.execvpe("npx", ["npx", "-y", PACKAGE, *args], env)
+
+
+if __name__ == "__main__":
+    main()

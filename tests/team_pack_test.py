@@ -479,6 +479,88 @@ exit 1''')
         self.assertFalse((installed / 'alias.md').is_symlink())
         self.assertFalse((self.root / 'skills/team-howto/.git').exists())
 
+    def test_a_preset_sets_the_engine_keys_enables_plugins_and_runs_a_server_from_a_clone(self) -> None:
+        self.host_cli('claude')
+        code = self.home / 'Code'
+        server = code / 'tools-mcp/.venv/bin/tools-mcp'
+        server.parent.mkdir(parents=True)
+        server.write_text('#!/bin/sh\n')
+        server.chmod(0o755)
+        pack = self.pack()
+        (pack / 'agent-kit-preset.toml').write_text(
+            f'[kit]\nCODE_DIRS_JSON = ["{code}"]\nTICKET_PREFIXES = "ABC,OPS"\nGH_ORG = "example-org"\n'
+            'GH_REPOS = "api,example-org/web"\nMODEL_LIBS = "src/*/models/tables.py"\nPUBLISH_HOST = "pages.example.com"\n'
+            '[plugins.codex]\nmarketplace = "openai-codex"\nsource = "github:openai/codex-plugin-cc"\n'
+            '[plugins.thermos]\nmarketplace = "team-plugins"\n'
+            '[mcp.servers.tools]\ncommand = "{{CODE_DIR}}/tools-mcp/.venv/bin/tools-mcp"\n'
+            '[mcp.servers.absent]\ncommand = "{{CODE_DIR}}/absent-mcp/.venv/bin/absent-mcp"\n')
+        flags = ('--hosts', 'claude', '--components', 'rules', 'mcp')
+        self.setup('--preset', str(pack), *flags, '--apply')
+        preset_env = (self.root / 'local/preset.env').read_text()
+        for line in ('TICKET_PREFIXES=ABC,OPS', 'GH_ORG=example-org', 'GH_REPOS=api,example-org/web',
+                     'MODEL_LIBS=src/*/models/tables.py', 'PUBLISH_HOST=pages.example.com'):
+            self.assertIn(line, preset_env)
+        settings = json.loads((self.home / '.claude/settings.json').read_text())
+        self.assertEqual(settings['enabledPlugins'], {'codex@openai-codex': True, 'thermos@team-plugins': True})
+        self.assertEqual(settings['extraKnownMarketplaces'],
+                         {'openai-codex': {'source': {'source': 'github', 'repo': 'openai/codex-plugin-cc'}}})
+        servers = json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers']
+        self.assertEqual(servers['tools']['command'], str(server))
+        self.assertNotIn('absent', servers, 'a server whose clone lacks the command was installed')
+
+        # The user's own plugin stays; a plugin the preset drops is taken out again.
+        settings['enabledPlugins']['personal@own'] = True
+        (self.home / '.claude/settings.json').write_text(json.dumps(settings))
+        (pack / 'agent-kit-preset.toml').write_text(
+            '[plugins.thermos]\nmarketplace = "team-plugins"\n')
+        self.setup('--preset', str(pack), *flags, '--apply')
+        settings = json.loads((self.home / '.claude/settings.json').read_text())
+        self.assertEqual(settings['enabledPlugins'], {'thermos@team-plugins': True, 'personal@own': True})
+        self.assertNotIn('openai-codex', settings.get('extraKnownMarketplaces', {}))
+
+    def test_a_preset_lists_the_sentry_instances_the_installed_kit_reads(self) -> None:
+        self.host_cli('claude')
+        pack = self.pack()
+        (pack / 'agent-kit-preset.toml').write_text(
+            '[mcp.servers.sentry]\ncommand = "{{KIT_DIR}}/bin/sentry-mcp"\nargs = ["--disable-skills=seer"]\n'
+            '[sentry.instances.main]\nhost = "sentry.example.com"\nkeychain = "agent-kit/mcp/sentry"\nserver = "sentry"\n'
+            'orgs = { example = "prod" }\n')
+        flags = ('--hosts', 'claude', '--components', 'rules', 'mcp')
+        self.setup('--preset', str(pack), *flags, '--apply')
+        instances = json.loads((self.root / 'mcp/sentry-instances.json').read_text())['instances']
+        self.assertEqual(instances, {'main': {'host': 'sentry.example.com', 'keychain': 'agent-kit/mcp/sentry',
+                                              'server': 'sentry', 'orgs': {'example': 'prod'}}})
+        servers = json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers']
+        self.assertEqual(list(servers), ['sentry'])
+        self.assertEqual(servers['sentry']['command'], str(self.root / 'bin/sentry-mcp'))
+
+    def test_a_preset_with_a_malformed_engine_key_plugin_or_clone_command_is_refused(self) -> None:
+        cases = {
+            'lowercase ticket keys': ('[kit]\nTICKET_PREFIXES = "abc"\n', 'TICKET_PREFIXES takes Jira project keys'),
+            'a URL as the publish host': ('[kit]\nPUBLISH_HOST = "https://pages.example.com"\n', 'PUBLISH_HOST takes a host name'),
+            'a token as a repo': (f'[kit]\nGH_REPOS = "{TOKEN}"\n', 'GH_REPOS looks like an inline secret'),
+            'a plugin marketplace URL': ('[plugins.codex]\nmarketplace = "m"\nsource = "https://example.com/m.git"\n',
+                                         '[plugins] takes [plugins.<name>] tables'),
+            'a plugin without a marketplace': ('[plugins.codex]\nsource = "github:o/r"\n', '[plugins] takes'),
+            'a clone command that climbs out': ('[mcp.servers.x]\ncommand = "{{CODE_DIR}}/repo/../../bin/sh"\n',
+                                                'a local clone command is {{CODE_DIR}}/<repo>/<path'),
+            'a bare clone root': ('[mcp.servers.x]\ncommand = "{{CODE_DIR}}/server"\n', 'a local clone command is'),
+            'an unknown placeholder': ('[mcp.servers.x]\ncommand = "{{HOME}}/bin/server"\n',
+                                       'unknown command placeholder HOME'),
+            'a Sentry instance without a keychain service': ('[sentry.instances.main]\nhost = "sentry.example.com"\n',
+                                                             '[sentry] takes [sentry.instances.<name>]'),
+            'a Sentry keychain service a shell would split': (
+                '[sentry.instances.main]\nhost = "sentry.example.com"\nkeychain = "k; curl x"\n', '[sentry] takes'),
+            'a token in a Sentry instance': (
+                f'[sentry.instances.main]\nhost = "sentry.example.com"\nkeychain = "k"\nnote = "{TOKEN}"\n',
+                '[sentry] looks like it holds an inline secret'),
+        }
+        for name, (text, expected) in cases.items():
+            with self.subTest(name):
+                preset = self.home / f'{name}.toml'
+                preset.write_text(text)
+                self.refused(str(preset), expected)
+
     def test_placeholders_and_certificates_are_not_secrets(self) -> None:
         pack = self.pack()
         (pack / 'skills/team-howto/references/auth.md').write_text(

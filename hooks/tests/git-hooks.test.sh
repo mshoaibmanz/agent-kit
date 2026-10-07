@@ -5,16 +5,16 @@
 #
 #   bash ~/.agents/hooks/tests/git-hooks.test.sh   (GIT_HOOKS=<dir> tests another copy)
 #
-# The layer is forced through GIT_CONFIG_COUNT (command scope, the way agent shells get it), so the
-# test does not depend on the global core.hooksPath. Fixtures live under $HOME: review-mark-changes
-# skips scratch paths by design. Removed on exit.
+# The layer is injected through GIT_CONFIG_COUNT/KEY/VALUE, exactly as the host env gives it to agent
+# shells (command scope, so it beats a repo-local core.hooksPath). Fixtures live under $HOME:
+# review-mark-changes skips scratch paths by design. Removed on exit.
 set -u
 . "${BASH_SOURCE[0]%/*}/lib.sh"
 G="${GIT_HOOKS:-$HOME/.agents/git-hooks}"
 FX=$(mktemp -d "$HOME/.git-hooks-test-XXXXXX") || exit 1
 export TMPDIR="$FX/tmp"; mkdir -p "$TMPDIR"
 SID="gh-$$"
-TESTS="$HOME/.claude/tmp/claude-tests/$SID"
+TESTS="$HOME/.claude/tmp/claude-tests/$SID"; mkdir -p "${TESTS%/*}"
 cleanup() { rm -rf "$FX"; rm -f "$TESTS"; }
 trap cleanup EXIT
 
@@ -119,6 +119,57 @@ out=$(git -C "$HK" -c commit.gpgsign=false commit -qm "no trailer" 2>&1; echo "r
 check "husky repo (local core.hooksPath), agent: trailer enforced" "$out" 'lacks the trailer'
 git -C "$HK" -c commit.gpgsign=false commit -qm "with$TRAILER" >/dev/null 2>&1
 check "...and the husky hook still runs" "$(cat "$FX/husky.log" 2>/dev/null)" 'husky-ran'
+# A global core.hooksPath is chained too: the layer replaces it, as it replaces a local one.
+GHD="$FX/global-hooks"; mkdir -p "$GHD"
+mkhook "$GHD/pre-commit" '#!/bin/sh\necho global-pre-commit >> "%s/global.log"\n' "$FX"
+printf '[core]\n\thooksPath = %s\n' "$GHD" > "$FX/gitconfig-global"
+GR="$FX/gr"; git init -q -b main "$GR"; printf 'x\n' > "$GR/a.txt"; git -C "$GR" add a.txt
+GIT_CONFIG_GLOBAL="$FX/gitconfig-global" git -C "$GR" -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -qm "g$TRAILER" >/dev/null 2>&1
+check "global core.hooksPath: its pre-commit still runs under the layer" "$(cat "$FX/global.log" 2>/dev/null)" 'global-pre-commit'
+# A user's own GIT_CONFIG_* hooksPath entry, merged before the layer's (git_layer_env), is chained.
+UHD="$FX/user-hooks"; mkdir -p "$UHD"
+mkhook "$UHD/pre-commit" '#!/bin/sh\necho user-pre-commit >> "%s/user.log"\n' "$FX"
+printf 'y\n' >> "$GR/a.txt"; git -C "$GR" add a.txt
+out=$(env GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$UHD" GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1="$G" \
+  git -C "$GR" -c commit.gpgsign=false commit -qm "no trailer" 2>&1; echo "rc=$?")
+check "user's own env hooksPath entry before the layer's: the agent layer runs" "$out" 'lacks the trailer'
+env GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$UHD" GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1="$G" \
+  git -C "$GR" -c commit.gpgsign=false commit -qm "u$TRAILER" >/dev/null 2>&1
+check "...then the user's own pre-commit" "$(cat "$FX/user.log" 2>/dev/null)" 'user-pre-commit'
+mkhook "$HK/.husky/_/pre-push" '#!/bin/sh\nread l; echo "husky-pre-push $l" >> "%s/husky.log"\n' "$FX"
+HKR="$FX/husky-remote.git"; git init -q --bare "$HKR"; git -C "$HK" remote add local "$HKR"
+printf 'x = 1\n' > "$HK/m.py"; git -C "$HK" add m.py; git -C "$HK" -c commit.gpgsign=false commit -qm "code$TRAILER" >/dev/null 2>&1
+out=$(AGENT_PUSH_NOW="chain test" push git -C "$HK" push -q local main)
+check "env-injected layer, agent push: the agent gate runs" "$out" 'agent pre-push: AGENT_PUSH_NOW'
+check "...then the husky pre-push, with the ref list" "$(cat "$FX/husky.log" 2>/dev/null)" 'husky-pre-push refs/heads/main [0-9a-f]{40}'
+
+echo "--- dispatcher: every hook name ---"
+for n in applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg \
+  commit-msg post-commit pre-rebase post-checkout post-merge pre-push pre-receive update proc-receive \
+  post-receive post-update push-to-checkout pre-auto-gc post-rewrite \
+  sendemail-validate fsmonitor-watchman p4-changelist p4-prepare-changelist p4-post-changelist \
+  p4-pre-submit; do
+  [ "$(readlink "$G/$n")" = dispatch ] || miss="${miss:-} $n"
+done
+empty "a dispatcher link for every githooks(5) name" "${miss:-}"
+# No link for the two hooks that fire on every ref update and index write (a fork per event).
+for n in reference-transaction post-index-change; do [ -e "$G/$n" ] && extra="${extra:-} $n"; done
+empty "no reference-transaction or post-index-change link" "${extra:-}"
+PT="$FX/ptc"; git init -q -b main "$PT"; printf 'x\n' > "$PT/a.txt"
+git -C "$PT" add a.txt; git -C "$PT" -c commit.gpgsign=false commit -qm "p$TRAILER"
+git -C "$PT" config receive.denyCurrentBranch updateInstead
+PC="$FX/ptc-clone"; git clone -q "$PT" "$PC" 2>/dev/null
+printf 'y\n' >> "$PC/a.txt"; git -C "$PC" -c commit.gpgsign=false commit -qam "p2$TRAILER"
+out=$(push git -C "$PC" push -q origin main)
+check "push into an updateInstead checkout with no own hook: accepted" "$out" 'rc=0'
+check "...and its worktree updated (the default push-to-checkout)" "$(cat "$PT/a.txt")" '^y$'
+printf 'dirty\n' >> "$PT/a.txt"; printf 'z\n' >> "$PC/a.txt"; git -C "$PC" -c commit.gpgsign=false commit -qam "p3$TRAILER"
+out=$(push git -C "$PC" push -q origin main)
+check "...a dirty target worktree is refused, as git's default does" "$out" 'unstaged changes'
+git -C "$PT" checkout -q -- a.txt
+mkhook "$PT/.git/hooks/push-to-checkout" '#!/bin/sh\necho "own-ptc $1" >> "%s/ptc.log"\ngit read-tree -u -m "$1"\n' "$FX"
+out=$(push git -C "$PC" push -q origin main)
+check "the repo's own push-to-checkout replaces the default" "$(cat "$FX/ptc.log" 2>/dev/null)" 'own-ptc [0-9a-f]{40}'
 
 echo "--- commit-msg ---"
 printf 'y\n' >> "$HK/a.txt"; git -C "$HK" add a.txt

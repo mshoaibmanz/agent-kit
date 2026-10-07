@@ -52,6 +52,17 @@ function emit(w) {
         else if (t ~ /`/) { sub(/^[^`]*`/, "", t);  cmdpos = 1; skip_arg = 0 }
         if (t == "") continue
 
+        # 1b. A redirection holding `&` is no separator: fd duplication or closing (2>&1, >&2,
+        #     0<&3, 2>&-) and both streams to a file (&>log, &>>log). Read by rule 2, `cmd 2>&1`
+        #     reported a command `1`, which reset read-streak's count on every such call. The
+        #     redirect goes, glued or not (`x>&2`); what is glued around it (`2>&1;rm x`,
+        #     `true&>/dev/null&&mysql`) is still parsed. A `&>` target is a file name, not a command.
+        if (t ~ /[<>]&|&>/) {
+            gsub(/[0-9]*[<>]&[0-9]*-?/, "", t)
+            gsub(/&>>?[^;&|]*/, "", t)
+            if (t == "") continue
+        }
+
         # 2. A separator glued between words restarts the command, wherever we are.
         if (t ~ /[;&|]/) {
             sub(/^[^;&|]*[;&|]+/, "", t); cmdpos = 1; skip_arg = 0

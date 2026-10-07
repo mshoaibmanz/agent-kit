@@ -17,15 +17,63 @@ from credentials import holds_secret, show_args, show_url, valid_declarations
 from hosts import HOSTS, normalize_transport
 from pack import (PACK_SKILLS, PACK_TOML, Pack, PackFiles, PresetUnavailable, StalePack, build_pack, folder_entries,
                   gh_entries, gh_file, gh_head, git_head, pack_files, pack_summary, utf8_text)
+from sentry import check_instance
 
 # Preset [kit] keys: overlay keys (hooks/lib/README) a team shares. The first three also answer
 # setup's own questions, so its summary and checks see them.
 PRESET_ANSWERS = {'CODE_SEARCH_GH_OWNER': 'github_owner', 'CODE_DIRS_JSON': 'repo_roots',
                   'CODE_SEARCH_ZOEKT_URL': 'zoekt_url'}
+_NAME = r'[A-Za-z0-9][A-Za-z0-9_.-]*'
+# Keys with a fixed shape; a value that does not fit is refused by name. Lists are comma-separated.
+KEY_FORMS = {
+    'TICKET_PREFIXES': (r'[A-Z][A-Z0-9]+(,[A-Z][A-Z0-9]+)*', 'Jira project keys, e.g. ABC,OPS'),
+    'GH_ORG': (_NAME, 'a GitHub org or user'),
+    'GH_REPOS': (rf'({_NAME}/)?{_NAME}(,({_NAME}/)?{_NAME})*', 'repos, name or owner/name, e.g. api,web'),
+    'MODEL_LIBS': (r'[^\s,]+(,[^\s,]+)*', 'git pathspecs of ORM model files, e.g. src/*/models/tables.py'),
+    'PUBLISH_HOST': (r'[A-Za-z0-9.-]+(:[0-9]{1,5})?', 'a host name, no scheme or path'),
+}
 PRESET_KIT_KEYS = (*PRESET_ANSWERS, 'REVIEW_BASE', 'RELEASE_BRANCH_RE', 'BQRO_PROJECT', 'GIT_AUTHOR',
-                   'SUBAGENT_RESUME_MAX')
+                   'SUBAGENT_RESUME_MAX', *KEY_FORMS)
+# MCP command placeholders: the kit, and a local clone under the first repository root.
+COMMAND_PLACEHOLDERS = {'KIT_DIR', 'AGENT_KIT_DIR', 'CODE_DIR'}
+CODE_DIR_COMMAND = re.compile(r'\{\{CODE_DIR\}\}(/[A-Za-z0-9_.-]+){2,}')
+# [plugins.<name>]: a Claude Code plugin setup enables, from a marketplace that is a GitHub repo.
+PLUGIN_NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
+PLUGIN_SOURCE = re.compile(rf'github:{_NAME}/{_NAME}')
+
+
 def inline_secret(text: str) -> bool:
     return holds_secret(text)
+
+
+def check_command(name: str, command: Any) -> None:
+    """Refuse an MCP command placeholder other than COMMAND_PLACEHOLDERS, and a {{CODE_DIR}} command
+    that is not {{CODE_DIR}}/<repo>/<path> or climbs out of it with `..`."""
+    if not isinstance(command, str):
+        return
+    names = set(re.findall(r'\{\{([^{}]*)\}\}', command))
+    if names - COMMAND_PLACEHOLDERS:
+        raise ValueError(f'MCP {name}: unknown command placeholder {", ".join(sorted(names - COMMAND_PLACEHOLDERS))}; '
+                         f'known: {", ".join(sorted(COMMAND_PLACEHOLDERS))}')
+    if 'CODE_DIR' in names and (not CODE_DIR_COMMAND.fullmatch(command) or '..' in command.split('/')):
+        raise ValueError(f'MCP {name}: a local clone command is {{{{CODE_DIR}}}}/<repo>/<path to the server>, '
+                         f'without .. ({command})')
+
+
+def plugin_table(table: dict[str, Any]) -> bool:
+    return all(PLUGIN_NAME.fullmatch(name) and isinstance(spec, dict) and set(spec) <= {'marketplace', 'source'}
+               and isinstance(spec.get('marketplace'), str) and PLUGIN_NAME.fullmatch(spec['marketplace'])
+               and ('source' not in spec or isinstance(spec['source'], str) and PLUGIN_SOURCE.fullmatch(spec['source']))
+               for name, spec in table.items())
+
+
+def plugin_settings(plugins: dict[str, Any]) -> tuple[dict[str, bool], dict[str, Any]]:
+    """(enabledPlugins, extraKnownMarketplaces) entries for a preset's [plugins]: each plugin on as
+    <name>@<marketplace>, and each marketplace with a source added as a GitHub one."""
+    enabled = {f'{name}@{spec["marketplace"]}': True for name, spec in plugins.items()}
+    markets = {spec['marketplace']: {'source': {'source': 'github', 'repo': spec['source'].removeprefix('github:')}}
+               for spec in plugins.values() if 'source' in spec}
+    return enabled, markets
 
 
 def validate_catalog(catalog: Any) -> dict[str, Any]:
@@ -53,6 +101,7 @@ def validate_catalog(catalog: Any) -> dict[str, Any]:
         if 'args' in normalized and ('command' not in normalized or not isinstance(normalized['args'], list)
                                     or not all(isinstance(value, str) for value in normalized['args'])):
             raise ValueError('MCP args must be strings on a command transport')
+        check_command(name, normalized.get('command'))
         servers[name] = normalized
     return {'mcpServers': servers}
 
@@ -67,12 +116,36 @@ def _kit(table: dict[str, Any]) -> bool:
         for key, value in table.items()) and table.get('SUBAGENT_RESUME_MAX', '1').isdigit()
 
 
+def sentry_table(table: dict[str, Any]) -> bool:
+    """[sentry.instances.<name>]: each instance as mcp/sentry-instances.json holds it."""
+    instances = table.get('instances', {})
+    if set(table) - {'instances'} or not isinstance(instances, dict):
+        return False
+    try:
+        for name, spec in instances.items():
+            check_instance(name, spec if isinstance(spec, dict) else {})
+    except ValueError:
+        return False
+    return len({str(spec.get('server') or f'sentry-{name}').lower() for name, spec in instances.items()}) == len(instances)
+
+
+def check_forms(table: dict[str, Any], spec: str) -> None:
+    for key, (form, example) in KEY_FORMS.items():
+        value = table.get(key)
+        if isinstance(value, str) and value and not re.fullmatch(form, value):
+            raise ValueError(f'preset {spec}: [kit] {key} takes {example}, not {value!r}')
+
+
 # Each table: (what it takes, for the refusal; its check).
 PRESET_SCHEMA: dict[str, tuple[str, Callable[[dict[str, Any]], bool]]] = {
     'kit': (f'one-line strings for {", ".join(PRESET_KIT_KEYS)} (CODE_DIRS_JSON a list of them, '
             'SUBAGENT_RESUME_MAX digits)', _kit),
+    'plugins': ('[plugins.<name>] tables of marketplace (a name) and optional source (github:owner/repo)',
+                plugin_table),
     'mcp': ('[mcp.servers.<name>] tables only', lambda table: set(table) <= {'servers'}
             and isinstance(table.get('servers', {}), dict)),
+    'sentry': ('[sentry.instances.<name>] tables of host, keychain (a Keychain service name), and optional '
+               'server, orgs (slug = "prod" or "staging") and note', sentry_table),
     'hosts': (f'recommended, a list from {", ".join(HOSTS)}', lambda table: set(table) <= {'recommended'}
               and _strings(table.get('recommended', [])) and set(table.get('recommended', [])) <= set(HOSTS)),
     'roles': ('[roles.<name>] tables of model and effort strings', lambda table: all(
@@ -95,6 +168,10 @@ def validate_preset(preset: dict[str, Any], spec: str) -> None:
     for key, value in preset.get('kit', {}).items():
         if any(inline_secret(item) for item in (value if isinstance(value, list) else [value])):
             raise ValueError(f'preset {spec}: [kit] {key} looks like an inline secret; presets hold non-secret defaults only')
+    check_forms(preset.get('kit', {}), spec)
+    for table in ('plugins', 'sentry'):
+        if inline_secret(json.dumps(preset.get(table, {}))):
+            raise ValueError(f'preset {spec}: [{table}] looks like it holds an inline secret; presets hold non-secret defaults only')
     try:
         validate_catalog({'mcpServers': preset.get('mcp', {}).get('servers', {})})
     except ValueError as error:
@@ -221,11 +298,14 @@ class Preset:
     pack: Pack | None = None
     pack_skills: list[str] = field(default_factory=list)
     table: dict[str, Any] | None = None
+    plugins: dict[str, Any] = field(default_factory=dict)
+    sentry: dict[str, Any] = field(default_factory=dict)
 
     def saved(self) -> dict[str, Any]:
         """What current.json keeps, so a later run without --preset applies the same values."""
         values = {'kit': self.kit, 'servers': self.servers, 'answers': self.answers,
-                  'recommended_hosts': self.recommended_hosts, 'pack_skills': self.pack_skills}
+                  'recommended_hosts': self.recommended_hosts, 'pack_skills': self.pack_skills,
+                  'plugins': self.plugins, 'sentry': self.sentry}
         return values if self.table is None else {**values, 'table': self.table}
 
     def env_text(self) -> str:
@@ -262,7 +342,8 @@ def _loaded_preset(spec: str, loaded: LoadedPreset, kept: Pack | None, kit_names
         record['commit'] = loaded.commit
     return Preset(kit=kit, servers=preset.get('mcp', {}).get('servers', {}), record=record, answers=answers,
                   recommended_hosts=preset.get('hosts', {}).get('recommended', []), notes=_notes(record, pack, kept),
-                  pack=pack, pack_skills=[name for name in pack_names if name not in exclude], table=preset)
+                  pack=pack, pack_skills=[name for name in pack_names if name not in exclude], table=preset,
+                  plugins=preset.get('plugins', {}), sentry=preset.get('sentry', {}).get('instances', {}))
 
 
 def _earlier(saved: dict[str, Any], kept: Pack | None, kit_names: list[str]) -> Preset:
@@ -276,7 +357,8 @@ def _earlier(saved: dict[str, Any], kept: Pack | None, kit_names: list[str]) -> 
         return _loaded_preset(record['source'], loaded, kept, kit_names)
     return Preset(kit=dict(values.get('kit', {})), servers=dict(values.get('servers', {})), record=record,
                   answers=dict(values.get('answers', {})), recommended_hosts=list(values.get('recommended_hosts', [])),
-                  pack=kept, pack_skills=list(values.get('pack_skills', kept.skills if kept is not None else [])))
+                  pack=kept, pack_skills=list(values.get('pack_skills', kept.skills if kept is not None else [])),
+                  plugins=dict(values.get('plugins', {})), sentry=dict(values.get('sentry', {})))
 
 
 def apply_preset(spec: str | None, saved: dict[str, Any], source: Path, interactive: bool,

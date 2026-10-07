@@ -19,6 +19,17 @@ RELEASE_BRANCH_RE = "^release/"                   # branches the push gate treat
 BQRO_PROJECT = "example-project"                  # bqro's jobs project
 # GIT_AUTHOR = "Example Bot <bot@example.com>"    # only when the team commits under one author
 # SUBAGENT_RESUME_MAX = "300000"                  # context tokens past which a subagent is not resumed
+# TICKET_PREFIXES = "ABC,OPS"                     # optional: Jira project keys of the team's tickets
+GH_ORG = "example-org"                            # the org the review audits read PRs from
+GH_REPOS = "api,web"                              # its repos those audits cover
+# MODEL_LIBS = "src/*/models/tables.py"           # ORM model files the debug skill's schema check reads
+# PUBLISH_HOST = "pages.example.com"              # internal page host the doc skills link to
+
+# Claude Code plugins setup enables (settings.json enabledPlugins). source, when given, adds the
+# marketplace as a GitHub repository; leave it out for a marketplace each user adds themselves.
+[plugins.codex]
+marketplace = "openai-codex"
+source = "github:openai/codex-plugin-cc"
 
 # MCP servers: a command (often a credential wrapper the kit ships, such as sentry-mcp, which reads
 # the Keychain or secret-tool at start) or a URL with native OAuth. No env, headers or inline keys.
@@ -27,9 +38,27 @@ BQRO_PROJECT = "example-project"                  # bqro's jobs project
 [mcp.servers.docs]
 url = "https://mcp.example.com/mcp"
 
+# A server run from each user's local clone: {{CODE_DIR}} is their first repository root
+# (CODE_DIRS_JSON); setup leaves the server out until that clone has the command.
+# [mcp.servers.tools]
+# command = "{{CODE_DIR}}/tools-mcp/.venv/bin/tools-mcp"
+
 # [mcp.servers.sentry]
 # command = "{{KIT_DIR}}/bin/sentry-mcp"
 # args = ["--host=sentry.example.com", "--disable-skills=seer"]
+
+# Sentry instances (mcp/sentry-instances.json): each has a host and the Keychain or secret-tool
+# service its token lives in (never the token). The one whose server is "sentry" is the entry above;
+# each other renders as its own server (default sentry-<name>) once that user has its token.
+# bin/sentry-map finds which instance, org and project a service reports to.
+# [sentry.instances.main]
+# host = "sentry.example.com"
+# keychain = "agent-kit/mcp/sentry"
+# server = "sentry"
+# orgs = { example = "prod", example-alt = "staging" }   # only for slugs that say neither prd nor stg
+# [sentry.instances.saas]
+# host = "sentry.io"
+# keychain = "agent-kit/mcp/sentry-saas"
 
 [hosts]
 recommended = ["claude", "codex"]                 # shown when none is detected; detection wins

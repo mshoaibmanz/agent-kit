@@ -498,7 +498,11 @@ module.main()
                     chunks.append(chunk)
                 if process.poll() is not None and not ready:
                     break
-            self.assertIsNotNone(process.poll(), "interactive setup did not finish")
+            # The terminal reports EOF as the child exits, which can be before it is reaped.
+            try:
+                process.wait(timeout=max(deadline - time.monotonic(), 0))
+            except subprocess.TimeoutExpired:
+                self.fail("interactive setup did not finish")
             self.assertEqual(
                 process.returncode, 0, b"".join(chunks).decode(errors="replace")[-1000:]
             )

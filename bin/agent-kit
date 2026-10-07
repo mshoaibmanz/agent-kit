@@ -7,6 +7,9 @@
       its {"$keychain": {service, account}} references resolved. --take writes the source over the
       named leaves (dotted paths), --all over every drifted leaf.
   adopt <key.path> [--delete]   copy a live settings value into settings.base.json
+  A user's own settings go in local/settings.json (gitignored), merged over settings.base.json
+  (objects key by key, anything else replaced); the same refusals apply to the merged result.
+  agent-setup applies the same layer on a Claude install with the hooks component.
   doctor               drift per key, MCP drift, broken links, `claude-account check`
   sync [--dry-run]     an agent-setup install: its source checkout's `agent-setup sync`, which
                        reapplies every saved choice and lists what changed
@@ -100,6 +103,8 @@ KIT = kit_root(__file__)
 LIB = Path(__file__).resolve().parent / "lib"
 HOST_DIR = KIT / "hosts/claude"
 BASE = HOST_DIR / "settings.base.json"
+# The user's own settings layer (permissions, env, statusLine and the like), merged over BASE.
+USER_SETTINGS = KIT / "local/settings.json"
 REGISTRY = KIT / "hooks/registry.json"
 SERVERS = KIT / "mcp/servers.json"
 STATE = KIT / "state/rendered"
@@ -204,6 +209,8 @@ class Role:
     prefix: str = ""
     fallback: str = ""
     timeout: int = 900
+    replaces: tuple[str, ...] = ()
+    brief: bool = False
 
 
 @dataclass
@@ -240,7 +247,7 @@ def _role(name: str, spec: Any, bad: list[str]) -> Role | None:
     if not isinstance(spec, dict):
         bad.append(f"{where} is not a table")
         return None
-    unknown = sorted(set(spec) - {"model", "effort", "prefix", "fallback", "timeout"})
+    unknown = sorted(set(spec) - {"model", "effort", "prefix", "fallback", "timeout", "replaces", "brief"})
     if unknown:
         bad.append(f"{where}: unknown keys {unknown}")
     model = spec.get("model")
@@ -257,7 +264,15 @@ def _role(name: str, spec: Any, bad: list[str]) -> Role | None:
     timeout = spec.get("timeout", 900)
     if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
         bad.append(f"{where}: timeout is a positive number of seconds (got {timeout!r})")
-    return Role(name, provider, mid, str(effort), prefix or "", spec.get("fallback", "") or "", timeout)
+    replaces = spec.get("replaces", [])
+    if not isinstance(replaces, list) or not all(isinstance(n, str) and ROLE_NAME.fullmatch(n) for n in replaces):
+        bad.append(f"{where}: replaces is a list of retired role names (got {replaces!r})")
+        replaces = []
+    brief = spec.get("brief", False)
+    if not isinstance(brief, bool):
+        bad.append(f"{where}: brief is true or false (got {brief!r})")
+        brief = False
+    return Role(name, provider, mid, str(effort), prefix or "", spec.get("fallback", "") or "", timeout, tuple(replaces), brief)
 
 
 def load_roles(path: Path | None = None) -> Roles | None:
@@ -308,6 +323,13 @@ def load_roles(path: Path | None = None) -> Roles | None:
     for key in ("round1", "later"):
         if key in review and not set(review[key]) - set(review.get("once", [])):
             bad.append(f"[review] {key} names no correctness reviewer (a role not in once): its round could never complete")
+    retired: dict[str, str] = {}
+    for role in roles.values():
+        for old in role.replaces:
+            if old in roles:
+                bad.append(f"[roles.{role.name}] replaces {old!r}, which is a current role")
+            elif retired.setdefault(old, role.name) != role.name:
+                bad.append(f"{old!r} is replaced by both {retired[old]} and {role.name}")
     seen: dict[str, str] = {}
     for role in roles.values():
         if role.prefix and seen.setdefault(role.prefix, role.name) != role.name:
@@ -345,6 +367,9 @@ def roles_sh(roles: Roles, host: str) -> str:
         *(f"RV_{key.upper()}={shlex.quote(' '.join(roles.review.get(key, [])))}" for key in REVIEW_LISTS),
         "# role provider model effort invoke prefix fallback timeout",
         f"RV_ROLE_TABLE={shlex.quote(chr(10).join(rows))}",
+        "# retired role names as old=new, and the roles whose spawn prompt names a briefs/*.md (agent-type-guard)",
+        f"RV_RETIRED={shlex.quote(' '.join(f'{old}={r.name}' for r in roles.roles.values() for old in r.replaces))}",
+        f"RV_BRIEF_ROLES={shlex.quote(' '.join(r.name for r in roles.roles.values() if r.brief))}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -540,21 +565,39 @@ def render_hooks(entries: list[dict[str, Any]], host: str) -> dict[str, Any]:
     return hooks
 
 
+def merged(base: Any, over: Any) -> Any:
+    """over laid on base: objects merge key by key, anything else in over replaces base's."""
+    if isinstance(base, dict) and isinstance(over, dict):
+        return {**base, **{key: merged(base.get(key), value) for key, value in over.items()}}
+    return copy.deepcopy(over)
+
+
+def base_settings() -> tuple[dict[str, Any], str]:
+    """settings.base.json with the user's own local/settings.json merged over it, and the files read."""
+    base = json.loads(BASE.read_text())
+    if not USER_SETTINGS.is_file():
+        return base, str(BASE)
+    user = json.loads(USER_SETTINGS.read_text())
+    if not isinstance(user, dict):
+        raise SystemExit(f"agent-kit: {USER_SETTINGS} must hold a JSON object")
+    return merged(base, user), f"{BASE} or {USER_SETTINGS}"
+
+
 def source_settings(host: dict[str, Any], components: set[str] | None = None) -> dict[str, Any]:
     selected = components or {"hooks", "roles"}
-    base = json.loads(BASE.read_text()) if "hooks" in selected else {}
+    base, files = base_settings() if "hooks" in selected else ({}, str(BASE))
     clash = sorted(set(base) & set(host["uiOwned"]))
     if clash:
         raise SystemExit(
-            f"agent-kit: {BASE} sets UI-owned keys {clash}; remove them or drop them from uiOwned"
+            f"agent-kit: {files} sets UI-owned keys {clash}; remove them or drop them from uiOwned"
         )
     if "hooks" in base:
-        raise SystemExit(f"agent-kit: {BASE} has a hooks key; hooks come from {REGISTRY}")
+        raise SystemExit(f"agent-kit: {files} has a hooks key; hooks come from {REGISTRY}")
     roles = load_roles() if "roles" in selected else None
     if roles is not None:
         clash = sorted(set(base) & set(ROLE_SETTINGS))
         if clash:
-            raise SystemExit(f"agent-kit: {BASE} sets {clash}; they come from {ROLES} [roles.main]")
+            raise SystemExit(f"agent-kit: {files} sets {clash}; they come from {ROLES} [roles.main]")
         for key, value in role_settings(roles, "claude").items():
             if key not in host["uiOwned"]:
                 base[key] = value
@@ -822,7 +865,18 @@ def mcp_catalog() -> dict[str, Any]:
         sys.path.insert(0, str(LIB))
         from hosts import fill_servers
 
-        catalog["mcpServers"] = fill_servers(servers, str(KIT))
+        catalog["mcpServers"] = servers = fill_servers(servers, str(KIT))
+    # One server per Sentry instance (bin/lib/sentry.py), each beyond the catalog's own only once
+    # it has a token.
+    if isinstance(servers, dict) and (LIB / "sentry.py").is_file():
+        if str(LIB) not in sys.path:
+            sys.path.insert(0, str(LIB))
+        from sentry import expand_servers
+
+        try:
+            catalog["mcpServers"] = expand_servers(KIT, servers)
+        except ValueError as e:
+            raise SystemExit(f"agent-kit: {e}; nothing written") from e
     return catalog
 
 

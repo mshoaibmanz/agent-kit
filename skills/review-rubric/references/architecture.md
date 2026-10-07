@@ -22,4 +22,4 @@ Each finding: `file:line`, check name, evidence. All are structural options unle
 
 ## Deepening a candidate
 
-Classify each dependency. In-process: merge, test through the new interface. Local-substitutable (DB, filesystem): test against the real local instance. Remote or third-party: a port at the seam, tested as `~/.claude/local/<repo>-testing.md` prescribes, never with a mock adapter in a backend suite. The deepened module replaces the shallow ones; if they survive underneath, it added a layer.
+Classify each dependency. In-process: merge, test through the new interface. Local-substitutable (DB, filesystem): test against the real local instance. Remote or third-party: a port at the seam, tested as the overlay's `<repo>-testing.md` prescribes (`~/.claude/local/` on Claude, the kit's `local/` elsewhere), never with a mock adapter in a backend suite. The deepened module replaces the shallow ones; if they survive underneath, it added a layer.

@@ -94,50 +94,150 @@ for label, variables, explicit, expected in (
     result = task("where", "--path", env=dict(ENV, **variables), *(["--session", explicit] if explicit else []))
     check(label + " resolves the binding", result.returncode == 0 and result.stdout.strip() == str(ROOT / "projects/invoices"), result.stdout + result.stderr)
 
-print("--- resolver ---")
-r = resolve("pick up DEMO-1500 today")
-check("resolver: a ticket key in PROJECT.md is an exact match", r["outcome"] == "exact" and r["candidates"][0]["project"] == "invoices", str(r))
-r = resolve("the invoicing line item screen", "--paths", "src/libinvoice/fees.py", "src/libinvoice/x.py", "--repo", "sample-app")
-check("resolver: terms plus paths are one strong match", r["outcome"] == "strong" and r["candidates"][0]["project"] == "invoices", str(r))
-r = resolve("tracking is wrong for this browser search")
-check("resolver: two close projects are ambiguous", r["outcome"] == "ambiguous" and {c["project"] for c in r["candidates"]} >= {"web-tracking", "web-search"}, str(r))
+def ctx_of(out: subprocess.CompletedProcess) -> str:
+    return json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
+
+
+def prompt(sid: str, text: str, cwd: Path = T, env: dict | None = None) -> subprocess.CompletedProcess:
+    return hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": sid, "cwd": str(cwd), "prompt": text}, env=env)
+
+
+def git(*a: str) -> None:
+    subprocess.run(["git", *a], check=True, capture_output=True)
+
+
+HELPER = "00000000-hhhh-4000-8000-000000000000"  # creates items by explicit bind, as /bind does
+
+print("--- resolver: certain rules only, nothing created from a prompt ---")
+r = resolve("pick up CORE-2048 today")
+check("ticket-project: a ticket only one project lists binds that project alone", r["rule"] == "ticket-project" and r["target"] == "invoices", str(r))
 r = resolve("QQ-77 something unrelated")
-check("resolver: no match is none, with the ticket kept", r["outcome"] == "none" and r["ticket"] == "QQ-77", str(r))
-r = resolve("work on DEMO-42")
-check("resolver: a legacy task folder matches its ticket exactly", r["outcome"] == "exact" and r["candidates"][0]["legacy"], str(r))
+check("a ticket nothing maps is no rule", r["rule"] == "" and r["target"] == "", str(r))
+r = resolve("smoke test CORE-119-REL-TEST and CORE-119-REL")
+check("release-branch spellings name no ticket (tickets_in)", r["rule"] == "" and "CORE-119" not in json.dumps(r), str(r))
+task("bind", "invoices/DEMO-1500", "--session", HELPER)
+r = resolve("pick up DEMO-1500 today")
+check("ticket: a prompt ticket mapping to one existing item", r["rule"] == "ticket" and r["target"] == "invoices/DEMO-1500", str(r))
+r = resolve(f"Continue from {ROOT}/projects/invoices/items/DEMO-1500/HANDOFF.md please")
+check("path: a pasted item HANDOFF.md path", r["rule"] == "path" and r["target"] == "invoices/DEMO-1500", str(r))
+(ROOT / "tasks").mkdir(exist_ok=True)
+(ROOT / "tasks" / "DEMO-1500-invoices").symlink_to(ROOT / "projects/invoices/items/DEMO-1500")
+r = resolve(f"Takeover {ROOT}/tasks/DEMO-1500-invoices/HANDOFF.md")
+check("path: a legacy tasks/ link counts as its item", r["rule"] == "path" and r["target"] == "invoices/DEMO-1500", str(r))
+task("bind", "web-tracking/DEMO-310", "--session", HELPER)
+for text, want in (("start on DEMO-310 like DEMO-1500", "web-tracking/DEMO-310"), ("implement the DEMO-1500 approach here", "invoices/DEMO-1500")):
+    r = resolve(text)
+    check(f"ticket: the asked-for or only ticket wins ({text!r})", r["rule"] == "ticket" and r["target"] == want, str(r))
+r = resolve("how did DEMO-1500 and DEMO-310 differ?")
+check("two tickets mapping to two items: no rule, both offered", r["rule"] == "" and set(r["candidates"][:2]) == {"invoices/DEMO-1500", "web-tracking/DEMO-310"}, str(r))
+
+print("--- resolver: worktree, branch and a new <TICKET>-* worktree ---")
+REPO = T / "repo"
+git("init", "-q", "-b", "DEMO-1500-invoices-x", str(REPO))
+git("-C", str(REPO), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+r = resolve("", "--cwd", str(REPO))
+check("branch: a ticket branch mapping to one item", r["rule"] == "branch" and r["target"] == "invoices/DEMO-1500", str(r))
+WT555 = REPO / ".claude/worktrees/DEMO-555-foo"
+git("-C", str(REPO), "worktree", "add", "-q", "-b", "DEMO-555-foo", str(WT555))
+r = resolve("", "--cwd", str(WT555))
+check("worktree-new: a DEMO-555-* worktree with no item creates a project of one", r["rule"] == "worktree-new" and r["target"] == "DEMO-555", str(r))
+project("wtproj", "scope: worktree tests\ntickets: DEMO-556")
+WT556 = REPO / ".claude/worktrees/DEMO-556-bar"
+git("-C", str(REPO), "worktree", "add", "-q", "-b", "DEMO-556-bar", str(WT556))
+r = resolve("", "--cwd", str(WT556))
+check("worktree-new: ...under the one project that lists the ticket", r["rule"] == "worktree-new" and r["target"] == "wtproj/DEMO-556", str(r))
+WTH = REPO / ".claude/worktrees/hosts"
+git("-C", str(REPO), "worktree", "add", "-q", "-b", "hosts", str(WTH))
+r = resolve("", "--cwd", str(WTH))
+check("a worktree named after no ticket, unmapped: no rule", r["rule"] == "", str(r))
+task("bind", "web-tracking/DEMO-310", "--session", HELPER, "--cwd", str(WTH))
+tj = json.loads((ROOT / "projects/web-tracking/items/DEMO-310/task.json").read_text())
+check("binding from inside a worktree records it in task.json", os.path.realpath(WTH) in [os.path.realpath(w) for w in tj.get("worktrees", [])], str(tj))
+idx = json.loads((ROOT / ".index.json").read_text())
+rec = next((x for x in idx["items"] if x["item"] == "DEMO-310"), {})
+check("...and the derived .index.json carries it", rec.get("project") == "web-tracking" and rec.get("worktrees") == tj.get("worktrees") and HELPER[:8] in rec.get("sessions", []), str(rec))
+r = resolve("", "--cwd", str(WTH))
+check("worktree: a worktree the index maps", r["rule"] == "worktree" and r["target"] == "web-tracking/DEMO-310", str(r))
+REL = T / "relrepo"
+git("init", "-q", "-b", "CORE-119-REL", str(REL))
+git("-C", str(REL), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+r = resolve("give me the DML", "--cwd", str(REL))
+check("a release branch binds nothing and offers nothing without this repo's items", r["rule"] == "" and r["candidates"] == [], str(r))
 
 print("--- project-bind: UserPromptSubmit ---")
 S1 = "11111111-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S1, "cwd": str(T), "prompt": "Fix DEMO-1500 rounding please"})
-ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("a ticket key in the prompt binds to its project and item", binding(S1) == "project:invoices/DEMO-1500", binding(S1) + out.stderr)
-check("the bind injects the slice", "PROJECT: invoices · item DEMO-1500" in ctx and "exact match" in ctx, ctx)
-check("the item folder gets task.json", (ROOT / "projects/invoices/items/DEMO-1500/task.json").is_file())
+out = prompt(S1, "Fix DEMO-1500 rounding please")
+ctx = ctx_of(out)
+check("a prompt ticket of one existing item binds it", binding(S1) == "project:invoices/DEMO-1500", binding(S1) + out.stderr)
+check("the bind announces its rule, then the slice", ctx.startswith("bound: invoices/DEMO-1500 (rule: ticket)") and "PROJECT: invoices · item DEMO-1500" in ctx, ctx)
+check("the item folder has task.json and tmp/", (ROOT / "projects/invoices/items/DEMO-1500/task.json").is_file() and (ROOT / "projects/invoices/items/DEMO-1500/tmp").is_dir())
 check("the tab label is <project> · <item>", (T / "labels" / S1).read_text() == "invoices · DEMO-1500")
 S2 = "22222222-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S2, "cwd": str(T), "prompt": "what does the cache layer do? also convert to UTF-8"})
+out = prompt(S2, "what does the cache layer do? also convert to UTF-8")
 check("a Q&A prompt never binds (UTF-8 is no ticket)", out.stdout.strip() == "" and binding(S2) == "", out.stdout + out.stderr)
 S3 = "33333333-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S3, "cwd": str(T), "prompt": "start ABC-12 please"})
-check("no match creates a project of one named after the ticket", binding(S3) == "project:ABC-12/ABC-12" and (ROOT / "projects/ABC-12/PROJECT.md").is_file(), binding(S3))
-inbox = "".join(f.read_text() for f in (ROOT / "retro").glob("*.md")) if (ROOT / "retro").is_dir() else ""
-check("...and records it in the retro inbox", "[auto]" in inbox and "project created project of one ABC-12" in inbox, inbox)
+out = prompt(S3, "start ABC-12 please")
+check("a ticket nothing maps creates nothing and binds nothing", binding(S3) == "" and not (ROOT / "projects/ABC-12").exists(), binding(S3) + out.stdout)
+S3B = "3333333b-aaaa-4000-8000-000000000000"
+out = prompt(S3B, "CORE-2048 follow-up: tweak the copy")
+check("ticket-project: binds the project only (no item made)", binding(S3B) == "project:invoices" and not (ROOT / "projects/invoices/items/CORE-2048").exists() and "rule: ticket-project" in ctx_of(out), binding(S3B) + out.stdout)
+S3C = "3333333c-aaaa-4000-8000-000000000000"
+out = prompt(S3C, "smoke: deploy CORE-119-REL-TEST to staging")
+check("a release-branch name in a prompt never makes a project", binding(S3C) == "" and not (ROOT / "projects/CORE-119").exists(), out.stdout)
+task("bind", "web-tracking/DEMO-900", "--session", HELPER)
+task("bind", "web-search/DEMO-900", "--session", HELPER)
 S4 = "44444444-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S4, "cwd": str(T), "prompt": "the tracking for this browser search is off, see WEB-1"})
-ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("ambiguous: one line with the candidates and the bind command, no bind", binding(S4) == "" and "web-search" in ctx and "agent-task bind" in ctx and ctx.count("\n") == 0, ctx)
+out = prompt(S4, "look at DEMO-900 again")
+ctx = ctx_of(out)
+check("ambiguous: one line per candidate with its /bind argument, no bind", binding(S4) == "" and "/bind web-search/DEMO-900" in ctx and "/bind web-tracking/DEMO-900" in ctx and ctx.startswith("unbound:"), ctx)
+out = prompt(S4, "and DEMO-900 once more")
+check("...offered once per distinct offer", out.stdout.strip() == "", out.stdout)
+out = prompt(S4, "/bind web-search/DEMO-900")
+check("a /bind prompt is left to the command", out.stdout.strip() == "" and binding(S4) == "", out.stdout)
 S5 = "55555555-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S5, "cwd": str(T), "prompt": "DEMO-42 next step"})
-ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("a legacy folder binds as a project of one with its handoff", binding(S5) == "DEMO-42-widget-fix" and "TASK DIR:" in ctx and "Handoff DEMO-42" in ctx, ctx)
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S1, "cwd": str(T), "prompt": "now ABC-99 too"})
+out = prompt(S5, "DEMO-42 next step")
+check("a real legacy folder never binds from a prompt", binding(S5) == "", out.stdout)
+out = task("bind", "DEMO-42", "--session", S5)
+check("an explicit bind of a legacy folder still works, with its handoff", binding(S5) == "DEMO-42-widget-fix" and "TASK DIR:" in out.stdout and "Handoff DEMO-42" in out.stdout, out.stdout)
+out = prompt(S1, "now ABC-99 too")
 check("a bound session is not rebound by a later ticket", binding(S1) == "project:invoices/DEMO-1500" and out.stdout.strip() == "")
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S2, "cwd": str(T), "prompt": "DEMO-1500"}, env=dict(ENV, CI_WATCH_ACTIVE="1"))
+out = prompt(S2, "DEMO-1500", env=dict(ENV, CI_WATCH_ACTIVE="1"))
 check("CI_WATCH_ACTIVE: never binds", binding(S2) == "")
+
+print("--- binding: worktrees, entering one mid-session, session start ---")
+S30 = "30303030-aaaa-4000-8000-000000000000"
+out = prompt(S30, "go", cwd=WT555)
+ctx = ctx_of(out)
+check("a prompt in a new DEMO-555-* worktree creates and binds its item", binding(S30) == "project:DEMO-555/DEMO-555" and ctx.startswith("bound: DEMO-555/DEMO-555 (rule: worktree-new)"), binding(S30) + ctx)
+tj = json.loads((ROOT / "projects/DEMO-555/items/DEMO-555/task.json").read_text())
+check("...recording the worktree and branch", [os.path.realpath(w) for w in tj.get("worktrees", [])] == [os.path.realpath(WT555)] and tj.get("branches") == ["DEMO-555-foo"], str(tj))
+inbox = "".join(f.read_text() for f in (ROOT / "retro").glob("*.md")) if (ROOT / "retro").is_dir() else ""
+check("...and the project of one is in the retro inbox", "project created project of one DEMO-555" in inbox, inbox[-300:])
+S31 = "31313131-aaaa-4000-8000-000000000000"
+prompt(S31, "Fix DEMO-1500 rounding please", cwd=REPO)
+check("bound in the main checkout by its branch", binding(S31) == "project:invoices/DEMO-1500", binding(S31))
+out = prompt(S31, "next", cwd=REPO)
+check("...the same checkout on the next prompt: silent, sticky", out.stdout.strip() == "" and binding(S31) == "project:invoices/DEMO-1500", out.stdout)
+out = prompt(S31, "next", cwd=WT555)
+ctx = ctx_of(out)
+check("entering a mapped worktree mid-session rebinds, announcing the change", binding(S31) == "project:DEMO-555/DEMO-555" and ctx.startswith("bound: DEMO-555/DEMO-555 (rule: worktree; was invoices/DEMO-1500)"), binding(S31) + ctx)
+out = hook("project-bind", {"hook_event_name": "PostToolUse", "tool_name": "EnterWorktree", "session_id": S31, "cwd": str(REPO), "tool_input": {"name": "DEMO-556-bar"}, "tool_response": {"worktreePath": str(WT556), "message": "ok"}})
+ctx = ctx_of(out)
+check("PostToolUse(EnterWorktree) binds the new worktree's item at once", binding(S31) == "project:wtproj/DEMO-556" and "rule: worktree-new; was DEMO-555/DEMO-555" in ctx, binding(S31) + ctx + out.stderr)
+S32 = "32323232-aaaa-4000-8000-000000000000"
+o = task("session-start", "--session", S32, "--source", "startup", env=dict(ENV, CLAUDE_PROJECT_DIR=str(WT555))).stdout
+check("session start inside a mapped worktree binds before the first prompt", binding(S32) == "project:DEMO-555/DEMO-555" and o.startswith("bound: DEMO-555/DEMO-555 (rule: worktree)"), o)
+o = task("session-start", "--session", S32, "--source", "resume", env=dict(ENV, CLAUDE_PROJECT_DIR=str(REL))).stdout
+check("resume keeps the session's own binding (rule: session)", binding(S32) == "project:DEMO-555/DEMO-555" and o.startswith("bound: DEMO-555/DEMO-555 (rule: session)"), o)
+task("bind", "web-search/DEMO-777", "--session", HELPER, "--repo", "relrepo")
+S33 = "33333330-aaaa-4000-8000-000000000000"
+o = task("session-start", "--session", S33, "--source", "startup", env=dict(ENV, CLAUDE_PROJECT_DIR=str(REL))).stdout
+check("unbound on a release branch: OUT DIR plus this repo's recent open items, still unbound", o.startswith("OUT DIR:") and "Recent open items for relrepo" in o and "/bind web-search/DEMO-777" in o and binding(S33) == "", o)
 
 print("--- session-start: lazy OUT DIR, /clear inheritance ---")
 TAB = T / "state" / "task-bindings" / "tab-iterm-session-id-w0t0p0-tab-one"
-check("a prompt bind points the tab at that session", TAB.is_file() and TAB.read_text().startswith("DEMO-42-widget-fix\t" + S5), TAB.read_text() if TAB.is_file() else "no tab file")
+task("bind", "DEMO-42", "--session", S5)
+check("a bind points the tab at that session", TAB.is_file() and TAB.read_text().startswith("DEMO-42-widget-fix\t" + S5), TAB.read_text() if TAB.is_file() else "no tab file")
 S6 = "66666666-aaaa-4000-8000-000000000000"
 out = task("session-start", "--session", S6, "--source", "startup", "--repo", "gate-repo")
 check("unbound startup: OUT DIR path text, folder not created", out.stdout.startswith(f"OUT DIR: {ROOT}/gate-repo/") and not (ROOT / "gate-repo").exists(), out.stdout + out.stderr)
@@ -151,7 +251,7 @@ task("bind", "DEMO-42", "--session", S6B)
 S6C = "6666666c-aaaa-4000-8000-000000000000"
 out = task("session-start", "--session", S6C, "--source", "clear", "--repo", "gate-repo")
 check("clear inherits the binding of the session that was in the tab", binding(S6C) == "DEMO-42-widget-fix" and "across /clear" in out.stdout and "TASK DIR:" in out.stdout, out.stdout + binding(S6C))
-check("...marked inherited", (T / "state" / "task-bindings" / S6C[:8]).read_text() == "DEMO-42-widget-fix\ninherited\n")
+check("...marked inherited", (T / "state" / "task-bindings" / S6C[:8]).read_text() == "DEMO-42-widget-fix\ninherited\nrule:tab\n", (T / "state" / "task-bindings" / S6C[:8]).read_text())
 task("session-start", "--session", S1, "--source", "resume", "--repo", "gate-repo")
 S6D = "6666666d-aaaa-4000-8000-000000000000"
 task("session-start", "--session", S6D, "--source", "clear", "--repo", "gate-repo")
@@ -161,46 +261,28 @@ print("--- project-bind: a binding inherited across /clear ---")
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6D, "cwd": str(T), "prompt": "what next?"})
 check("a prompt with no ticket keeps the inherited binding and its mark", out.stdout.strip() == "" and binding(S6D) == "project:invoices/DEMO-1500" and "inherited" in (T / "state/task-bindings" / S6D[:8]).read_text(), out.stdout)
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6D, "cwd": str(T), "prompt": "carry on with DEMO-1500"})
-check("naming the inherited item keeps it, silently, and makes it sticky", out.stdout.strip() == "" and (T / "state/task-bindings" / S6D[:8]).read_text() == "project:invoices/DEMO-1500\n", out.stdout)
+check("naming the inherited item keeps it, silently, and makes it sticky", out.stdout.strip() == "" and binding(S6D) == "project:invoices/DEMO-1500" and "inherited" not in (T / "state/task-bindings" / S6D[:8]).read_text(), out.stdout)
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6D, "cwd": str(T), "prompt": "now DEMO-42"})
 check("...after which another ticket does not rebind", binding(S6D) == "project:invoices/DEMO-1500" and out.stdout.strip() == "")
 out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6C, "cwd": str(T), "prompt": "pick up DEMO-1500 now"})
 ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("an inherited binding re-resolves on a ticket with an exact project hit, saying so", binding(S6C) == "project:invoices/DEMO-1500" and ctx.startswith("Bound to invoices (exact match on DEMO-1500) (was DEMO-42-widget-fix, kept from before /clear)") and "PROJECT: invoices" in ctx, ctx)
+check("an inherited binding moves on a certain rule, announcing it", binding(S6C) == "project:invoices/DEMO-1500" and ctx.startswith("bound: invoices/DEMO-1500 (rule: ticket; was DEMO-42-widget-fix)") and "kept from before /clear" in ctx and "PROJECT: invoices" in ctx, ctx)
 task("bind", "DEMO-78", "--session", S6B)
 S6E = "6666666e-aaaa-4000-8000-000000000000"
 task("session-start", "--session", S6E, "--source", "clear", "--repo", "gate-repo")
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S6E, "cwd": str(T), "prompt": "start on DEMO-300"})
-ctx = json.loads(out.stdout)["hookSpecificOutput"]["additionalContext"] if out.stdout.strip() else ""
-check("an inherited binding re-resolves on a different ticket (no project: a project of one)", binding(S6E) == "project:DEMO-300/DEMO-300" and "(was DEMO-78/DEMO-78, kept from before /clear)" in ctx, binding(S6E) + ctx)
+out = prompt(S6E, "start on DEMO-300")
+check("an inherited binding stays on a ticket no rule maps (nothing created)", binding(S6E) == "project:DEMO-78/DEMO-78" and out.stdout.strip() == "" and not (ROOT / "projects/DEMO-300").exists(), binding(S6E) + out.stdout)
 
-print("--- project-bind: the branch's ticket against a prompt's mention ---")
-REPO = T / "repo"
-REPO.mkdir()
-subprocess.run(["git", "init", "-q", "-b", "DEMO-200-widget", str(REPO)], check=True)
-subprocess.run(["git", "-C", str(REPO), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+print("--- project-bind: a ticket branch with no item, a mention on it ---")
+BR = T / "brrepo"
+git("init", "-q", "-b", "DEMO-200-widget", str(BR))
+git("-C", str(BR), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
 S12 = "12121212-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S12, "cwd": str(REPO), "prompt": "implement this like DEMO-100 did"})
-check("a prompt's ticket with no project loses to the branch's ticket", binding(S12) == "project:DEMO-200/DEMO-200" and not (ROOT / "projects/DEMO-100").exists(), binding(S12) + out.stdout)
+out = prompt(S12, "implement this like DEMO-100 did", cwd=BR)
+check("a main-checkout ticket branch with no item creates nothing (only a worktree or /bind does)", binding(S12) == "" and not (ROOT / "projects/DEMO-100").exists() and not (ROOT / "projects/DEMO-200").exists(), binding(S12) + out.stdout)
 S13 = "13131313-aaaa-4000-8000-000000000000"
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S13, "cwd": str(REPO), "prompt": "port the fix from DEMO-1500 here"})
-check("a prompt's ticket with an exact project hit beats the branch's", binding(S13) == "project:invoices/DEMO-1500", binding(S13) + out.stdout)
-r = resolve("like DEMO-100 did", "--branch", "DEMO-201-widget")
-check("resolver: no exact hit keeps the branch's ticket", r["outcome"] == "none" and r["ticket"] == "DEMO-201", str(r))
-for text in ("start on DEMO-310 now", "pick up ticket DEMO-310", "switch to DEMO-310", "DEMO-310", "let's move on to DEMO-310 like DEMO-1500", "fix DEMO-310", "ok. please implement DEMO-310"):
-    r = resolve(text, "--branch", "DEMO-201-widget")
-    check(f"resolver: a request for another ticket beats the branch ({text!r})", r["outcome"] == "none" and r["ticket"] == "DEMO-310", str(r))
-for text in ("implement the DEMO-100 approach here", "this started in DEMO-100", "see DEMO-100 for context, then continue", "reuse the fix DEMO-100 shipped", "how did we handle DEMO-100?", "what do DEMO-100 and DEMO-101 share", "the work DEMO-100 did"):
-    r = resolve(text, "--branch", "DEMO-201-widget")
-    check(f"resolver: a mention still loses to the branch ({text!r})", r["ticket"] == "DEMO-201", str(r))
-S20 = "25252525-bbbb-4000-8000-000000000000"
-hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S20, "cwd": str(REPO), "prompt": "start on DEMO-311 now"})
-check("unbound on a ticket branch: an explicit request binds the new ticket, not the branch's", binding(S20) == "project:DEMO-311/DEMO-311", binding(S20))
-for sid, prompt, want in (("26262626-bbbb-4000-8000-000000000000", "start on DEMO-301", "project:DEMO-301/DEMO-301"), ("27272727-bbbb-4000-8000-000000000000", "do it like DEMO-101 did", "project:DEMO-200/DEMO-200")):
-    task("bind", "DEMO-200", "--session", S6B)
-    task("session-start", "--session", sid, "--source", "clear", "--repo", "gate-repo")
-    hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": sid, "cwd": str(REPO), "prompt": prompt})
-    check(f"inherited DEMO-200 on its branch: {prompt!r} binds {want}", binding(sid) == want and not (ROOT / "projects/DEMO-101").exists(), binding(sid))
+out = prompt(S13, "port the fix from DEMO-1500 here", cwd=BR)
+check("...a prompt ticket of one existing item still binds it there", binding(S13) == "project:invoices/DEMO-1500", binding(S13) + out.stdout)
 
 print("--- ticket keys: look-alikes and known Jira prefixes ---")
 S14 = "14141414-aaaa-4000-8000-000000000000"
@@ -213,17 +295,19 @@ OV.mkdir()
 (OV / "kit.env").write_text("BQRO_PROJECT=x\n")
 (OV / "jira-prefs.md").write_text("site: x\nproject_key: DEMO\n\n## CORE notes\n")
 KENV = dict(ENV, KIT_ENV=str(OV / "kit.env"))
-out = hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": S14, "cwd": str(T), "prompt": "start ABC-500 please"}, env=KENV)
+for key in ("ABC-500", "CORE-9", "DEMO-501"):
+    task("bind", f"invoices/{key}", "--session", HELPER)
+out = prompt(S14, "start ABC-500 please", env=KENV)
 check("with jira-prefs.md beside kit.env, an unknown prefix never binds", out.stdout.strip() == "" and binding(S14) == "", out.stdout)
 for n, (key, why) in enumerate((("CORE-9", "a `## <KEY> notes` heading"), ("DEMO-501", "project_key"))):
     sid = f"1515151{n}-aaaa-4000-8000-000000000000"
-    hook("project-bind", {"hook_event_name": "UserPromptSubmit", "session_id": sid, "cwd": str(T), "prompt": f"start {key}"}, env=KENV)
-    check(f"...{why} is a known prefix", binding(sid) == f"project:{key}/{key}", binding(sid))
+    prompt(sid, f"start {key}", env=KENV)
+    check(f"...{why} is a known prefix", binding(sid) == f"project:invoices/{key}", binding(sid))
 r = task("resolve", "x", "--branch", "ABC-9-thing", env=KENV)
-check("...and an unknown branch prefix names no ticket", json.loads(r.stdout)["ticket"] == "", r.stdout)
+check("...and an unknown branch prefix names no ticket", json.loads(r.stdout)["rule"] == "", r.stdout)
 
 out = task("session-start", "--session", S1, "--source", "compact")
-check("a bound session gets the slice on compact", out.stdout.startswith("PROJECT: invoices · item DEMO-1500"), out.stdout)
+check("a bound session gets the announce line and the slice on compact", out.stdout.startswith("bound: invoices/DEMO-1500 (rule: ticket)") and "PROJECT: invoices · item DEMO-1500" in out.stdout, out.stdout)
 
 print("--- context budget: compact re-injection, the nudge text ---")
 item = ROOT / "projects/invoices/items/DEMO-1500"
@@ -231,7 +315,7 @@ item = ROOT / "projects/invoices/items/DEMO-1500"
 (item / "HANDOFF.auto.md").write_text("# HANDOFF.auto\n- branch: DEMO-1500-x\n")
 out = task("session-start", "--session", S1, "--source", "compact", "--cap", "6000")
 o = out.stdout
-check("compact: the slice, then HANDOFF.md and HANDOFF.auto.md", o.startswith("PROJECT: invoices · item DEMO-1500") and f"HANDOFF.md ({item}/HANDOFF.md):" in o and f"HANDOFF.auto.md ({item}/HANDOFF.auto.md):" in o, o)
+check("compact: the slice, then HANDOFF.md and HANDOFF.auto.md", o.startswith("bound: invoices/DEMO-1500") and "PROJECT: invoices · item DEMO-1500" in o and f"HANDOFF.md ({item}/HANDOFF.md):" in o and f"HANDOFF.auto.md ({item}/HANDOFF.auto.md):" in o, o)
 check("...HANDOFF.md cut to its share of the cap, naming the file to Read", "... (cut at 2100 characters; Read" in o and "- step 59:" not in o, o[-800:])
 check("...the slice's 8-line HANDOFF opening is not repeated", "Read it before starting" not in o, o)
 check("...within the cap", len(o.rstrip("\n")) <= 6000, str(len(o)))
@@ -239,7 +323,7 @@ check("...within the cap", len(o.rstrip("\n")) <= 6000, str(len(o)))
 o = task("session-start", "--session", S1, "--source", "compact").stdout
 check("compact: no HANDOFF.auto.md, no section for it", "HANDOFF.auto.md" not in o and "HANDOFF.md (" in o, o[-400:])
 o = task("session-start", "--session", S5, "--source", "compact").stdout
-check("compact: a legacy folder gets its TASK DIR and HANDOFF.md", o.startswith("TASK DIR:") and "HANDOFF.md (" in o and "Handoff DEMO-42" in o, o)
+check("compact: a legacy folder gets its TASK DIR and HANDOFF.md", "TASK DIR:" in o and "HANDOFF.md (" in o and "Handoff DEMO-42" in o, o)
 o = task("nudge", "--session", S1, "--ctx", "612345", "--at", "600000").stdout
 check("nudge: a bound item names its HANDOFF.md, the project INDEX and agent-task retro", o.startswith("CONTEXT 612K: past the 600K handoff point") and f"update {item}/HANDOFF.md" in o and "projects/invoices/INDEX.md (it regenerates" in o and f"agent-task retro" in o and f"--session {S1}" in o, o)
 o = task("nudge", "--session", S5, "--ctx", "700000", "--at", "600000").stdout
@@ -311,7 +395,7 @@ autos = sorted(ROOT.glob(f"*/*-{S16[:8]}/HANDOFF.auto.md"))
 check("pre-compact: HANDOFF.auto.md goes to that same folder", [a.parent.parent.name for a in autos] == ["proj-a"], pc.stdout + str(autos))
 o = task("session-start", "--session", S16, "--source", "compact", "--branch", "DEMO-123-foo", env=PENV).stdout
 check("compact: re-injects it from that folder", f"HANDOFF.auto.md ({ROOT}/proj-a/" in o, o)
-check("compact, unbound: keeps the startup line's branch hint and keep-it-there rule", "the branch names DEMO-123, so the first prompt binds it." in o and "Keep what is worth keeping there, throwaway logs in the scratchpad." in o and "Compacted. Read these before continuing:" in o, o)
+check("compact, unbound: keeps the startup line's branch hint and keep-it-there rule", "the branch names DEMO-123, which maps to no single item; /bind <project>/DEMO-123 creates it." in o and "Keep what is worth keeping there, throwaway logs in the scratchpad." in o and "Compacted. Read these before continuing:" in o, o)
 o = task("nudge", "--session", S2, "--ctx", "600000", "--at", "600000", "--cwd", str(T)).stdout
 check("nudge: unbound names agent-task bind and the OUT DIR", "No project is bound" in o and f"bind <project>[/<item>] --session {S2}" in o and f"in {ROOT}/" in o, o)
 
@@ -319,11 +403,30 @@ print("--- injection cap ---")
 big = project("big", "scope: many scripts\nterms: bulk")
 for i in range(400):
     (big / "scripts" / f"s{i:03}.py").write_text(f'"""Script {i}: ' + "word " * 30 + '"""\n')
+(big / "data").mkdir()
+(big / "data" / "rows.csv").write_text("a,b\n")
 task("index", "big")
+text = (big / "INDEX.md").read_text()
+for i in range(0, 30, 2):
+    entry = next(line for line in text.split("\n") if line.startswith(f"- `scripts/s{i:03}.py`"))
+    text = text.replace(entry, entry + f"\n  - use: replay case {i} " + "x" * 40 + f"\n  - proved: case {i} holds")
+(big / "INDEX.md").write_text(text)
+task("index", "big")
+(big / "knowledge" / "findings.md").write_text("# Findings\n\n- Fees round per line, not per order (source: fees.py:10; verified 2026-10-01; status: project-only)\n")
+(big / "knowledge" / "prd-bulk.md").write_text("# Bulk PRD\n")
 S7 = "77777777-aaaa-4000-8000-000000000000"
 out = task("bind", "big/BIG-1", "--session", S7)
-sl = task("slice", "--session", S7).stdout
-check("the slice stays under 9000 characters (about 2.5K tokens)", 0 < len(sl) <= 9000 and "more lines" in sl, str(len(sl)))
+(big / "items/BIG-1/HANDOFF.md").write_text("# Handoff BIG-1\n" + "".join(f"- state line {i} " + "y" * 200 + "\n" for i in range(20)))
+sl = task("slice", "--session", S7).stdout.rstrip("\n")
+check("the slice stays under 2KB", 0 < len(sl) <= 2000, str(len(sl)))
+check("...lists knowledge entry titles, not counts", "findings: Fees round per line, not per order" in sl and "prd-bulk.md: Bulk PRD" in sl, sl)
+shown = re.findall(r"^- scripts/s(\d+)\.py", sl, re.M)
+check("...at most 10 scripts, only ones with a use:/proved: line", 0 < len(shown) <= 10 and all(int(n) % 2 == 0 for n in shown) and "  - use: replay case" in sl, sl)
+check("...no data/ and no unproven script", "rows.csv" not in sl and "s001.py" not in sl, sl)
+check("...says where a reusable script goes", f"{big}/scripts/ with a `  - use:` line" in sl, sl)
+check("...ends with the item's HANDOFF opening", "HANDOFF: " in sl and "Handoff BIG-1" in sl, sl[-400:])
+bf = Path(task("brief", "big/BIG-1", "--name", "cap").stdout.strip())
+check("brief embeds the slice, not the INDEX", bf.is_file() and "Proven scripts:" in bf.read_text() and "s001.py" not in bf.read_text(), bf.read_text()[-600:] if bf.is_file() else "")
 
 print("--- auto-index keeps hand lines ---")
 rp = ROOT / "projects" / "invoices"
@@ -338,6 +441,12 @@ check("PostToolUse(Write) re-indexes the project", "`scripts/b.py` (python): Sec
 check("...keeping the use/proved lines under their entry", "- `scripts/a.py` (python): Fee replay for one order.\n  - use: replay one order's fees\n  - proved: rounding is per line" in idx, idx)
 check("...and the ## Notes section", "## Notes\nHand note kept." in idx)
 check("...and lists the items with status", "- `items/DEMO-1500/` (open)" in idx, idx)
+for rel in ("items/DEMO-1500/scripts/probe.py", "items/DEMO-1500/tmp/fixture.py", "tmp/scratch.py"):
+    (rp / rel).parent.mkdir(parents=True, exist_ok=True)
+    (rp / rel).write_text('"""Probe one order."""\n')
+task("index", "invoices")
+idx = (rp / "INDEX.md").read_text()
+check("INDEX lists item scripts for on-demand reading, never tmp/", "- `items/DEMO-1500/scripts/probe.py` (python): Probe one order." in idx and "fixture.py" not in idx and "scratch.py" not in idx, idx)
 
 print("--- project-bind: PreToolUse(Write) on the first durable write ---")
 S8 = "88888888-aaaa-4000-8000-000000000000"
@@ -443,6 +552,64 @@ check("ls --paths shows paths and legacy folders", "invoices  status=active" in 
 mg = task("migrate", "--plan")
 check("migrate --plan proposes a grouping and moves nothing", "widget" in mg.stdout and "DEMO-42-widget-fix, DEMO-43-widget-cache" in mg.stdout and (ROOT / "tasks/DEMO-43-widget-cache").is_dir(), mg.stdout)
 check("migrate without --plan refuses", task("migrate").returncode == 2)
+check("ls shows each item's name, status and last-touched date", re.search(r"^  invoices/DEMO-1500  harvested  \d{4}-\d\d-\d\d$", ls, re.M) is not None and re.search(r"^  web-tracking/DEMO-310  open  \d{4}-", ls, re.M) is not None, ls)
+
+print("--- subagent-context: SubagentStart (payload as Claude Code 2.1.291 sends it) ---")
+sa = hook("subagent-context", {"session_id": S1, "transcript_path": "/x.jsonl", "cwd": str(T), "prompt_id": "p", "agent_id": "a961e272483c31737", "agent_type": "researcher", "hook_event_name": "SubagentStart"})
+ctx = ctx_of(sa)
+check("a bound parent's subagent gets the work folder, the HANDOFF path and the slice, within 2KB", sa.returncode == 0 and json.loads(sa.stdout)["hookSpecificOutput"]["hookEventName"] == "SubagentStart" and ctx.startswith(f"WORK FOLDER (your parent session's binding): {rp}/items/DEMO-1500.") and f"Item HANDOFF: {rp}/items/DEMO-1500/HANDOFF.md" in ctx and "PROJECT: invoices · item DEMO-1500" in ctx and len(ctx) <= 2000, ctx)
+sa = hook("subagent-context", {"session_id": "deadbeef-0000", "agent_type": "researcher", "hook_event_name": "SubagentStart"})
+check("...an unbound parent's subagent gets nothing", sa.returncode == 0 and sa.stdout.strip() == "", sa.stdout)
+
+print("--- bind <project>: the sole open item, else the list ---")
+solo = project("solo", "scope: one item")
+task("bind", "solo/only-one", "--session", HELPER)
+S40 = "40404040-aaaa-4000-8000-000000000000"
+out = task("bind", "solo", "--session", S40)
+check("bind <project> with one open item binds that item", binding(S40) == "project:solo/only-one" and "bound: solo/only-one (rule: explicit" in out.stdout, out.stdout)
+out = task("bind", "web-tracking", "--session", S40)
+check("bind <project> with several open items binds the project and lists them", binding(S40) == "project:web-tracking" and "Bound to the project only" in out.stdout and "DEMO-310" in out.stdout and "DEMO-900" in out.stdout, out.stdout)
+
+print("--- binding keys: legacy forms migrate to project:p/i ---")
+BD = T / "state" / "task-bindings"
+S41, S42 = "41414141-aaaa-4000-8000-000000000000", "42424242-aaaa-4000-8000-000000000000"
+(BD / S41[:8]).write_text("DEMO-1500-invoices\n")
+w = task("where", "--path", "--session", S41)
+check("a legacy tasks/ key resolves through its link to the item, and the file migrates on read", w.stdout.strip() == str(rp / "items/DEMO-1500") and binding(S41) == "project:invoices/DEMO-1500", w.stdout + binding(S41))
+(BD / S42[:8]).write_text("invoices/DEMO-1500\n")
+(BD / "tab-tty-ttys099").write_text("DEMO-1500-invoices\t" + S42 + "\n")
+dry = task("migrate", "--bindings").stdout
+check("migrate --bindings is a dry run listing old keys", "42424242: invoices/DEMO-1500 -> project:invoices/DEMO-1500" in dry and "tab-tty-ttys099: DEMO-1500-invoices -> project:invoices/DEMO-1500" in dry and binding(S42) == "invoices/DEMO-1500", dry)
+task("migrate", "--bindings", "--apply")
+check("...--apply rewrites them, the tab file keeping its session", binding(S42) == "project:invoices/DEMO-1500" and (BD / "tab-tty-ttys099").read_text() == "project:invoices/DEMO-1500\t" + S42 + "\n", (BD / "tab-tty-ttys099").read_text())
+
+print("--- close: harvest prompts, proposed knowledge lines, a closed ledger entry ---")
+it501 = rp / "items/DEMO-501"
+(it501 / "HANDOFF.md").write_text("# Handoff DEMO-501\n\n## State\n- PR open\n\n## Decisions\n- Fees round per line because finance reconciles per line\n- Keep the cap at 3\n")
+cl = task("close", "invoices/DEMO-501", "--pr", "https://example.invalid/pr/1")
+tj = json.loads((it501 / "task.json").read_text())
+check("close proposes the HANDOFF's durable lines for knowledge/", "Proposed for" in cl.stdout and "- Fees round per line because" in cl.stdout and "- Keep the cap at 3" in cl.stdout and "- PR open" not in cl.stdout, cl.stdout)
+check("...and leaves a closed ledger entry with its PR (never blocked)", cl.returncode == 0 and tj["status"] == "closed" and tj.get("pr") == "https://example.invalid/pr/1" and tj.get("closed") and tj.get("harvested"), str(tj))
+idx = json.loads((ROOT / ".index.json").read_text())
+check("...which the index reflects", any(x["item"] == "DEMO-501" and x["status"] == "closed" for x in idx["items"]))
+
+print("--- prune: a dry-run report of disposable files in idle items ---")
+old = rp / "items/OLD-1"
+task("bind", "invoices/OLD-1", "--session", HELPER)
+(old / "tmp" / "home").mkdir(parents=True)
+(old / "tmp" / "home" / "f.txt").write_text("x" * 2048)
+(old / "out" / "clone" / ".git").mkdir(parents=True)
+(old / "out" / "clone" / "a.py").write_text("x")
+with open(old / "out" / "big.bin", "wb") as fh:
+    fh.truncate(6 * 1024 * 1024)
+past = time.time() - 30 * 86400
+for f in [old, *old.rglob("*")]:
+    os.utime(f, (past, past))
+pr = task("prune")
+check("prune reports tmp/, clones and files over 5MB in an item idle 14+ days", "invoices/OLD-1  idle 30d" in pr.stdout and f"tmp  " in pr.stdout and str(old / "out/clone") in pr.stdout and str(old / "out/big.bin") in pr.stdout and "dry run" in pr.stdout, pr.stdout)
+check("...lists no active item and deletes nothing", "DEMO-1500" not in pr.stdout and (old / "tmp/home/f.txt").is_file() and (old / "out/clone/.git").is_dir(), pr.stdout)
+pa = task("prune", "--apply")
+check("prune --apply empties tmp/ and removes clones, never the big file", not (old / "tmp/home").exists() and not (old / "out/clone").exists() and (old / "out/big.bin").is_file() and (old / "tmp").is_dir(), pa.stdout)
 ct = HOOKS.parent / "bin" / "claude-task"
 if ct.exists():
     S10 = "aaaaaaaa-aaaa-4000-8000-000000000000"

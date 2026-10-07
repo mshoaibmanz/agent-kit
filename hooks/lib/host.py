@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,48 @@ EVENTS = {
     "subagentStop": "SubagentStop",
     "sessionStart": "SessionStart",
 }
+
+
+def git_layer_env(
+    env: Mapping[str, str], hooks_dir: str, owned: Iterable[str] = (), enabled: bool = True
+) -> dict[str, str]:
+    """The GIT_CONFIG_* keys that put core.hooksPath=hooks_dir into an agent's shell beside the
+    command-scope entries env already holds; with enabled false, the keys that take it out again.
+
+    The layer's entry keeps its index when env already has it (its value, or a GIT_CONFIG_KEY_n
+    named in owned, an earlier render's), else it goes after the others. Git applies the entries in
+    index order, so the layer wins over a core.hooksPath of the user's and the dispatcher chains to
+    that one. Removing an entry that others follow would renumber the user's keys, so it stays as
+    a no-op entry instead. ValueError: a GIT_CONFIG_COUNT that git itself would reject.
+    """
+    raw = str(env.get("GIT_CONFIG_COUNT", "") or "0")
+    if not raw.isdigit():
+        raise ValueError(f"GIT_CONFIG_COUNT is not a count: {raw!r}")
+    count, owned = int(raw), set(owned)
+    index = next(
+        (
+            i
+            for i in range(count)
+            if f"GIT_CONFIG_KEY_{i}" in owned
+            or (
+                env.get(f"GIT_CONFIG_KEY_{i}", "").lower() == "core.hookspath"
+                and env.get(f"GIT_CONFIG_VALUE_{i}") == hooks_dir
+            )
+        ),
+        count,
+    )
+    key, value = f"GIT_CONFIG_KEY_{index}", f"GIT_CONFIG_VALUE_{index}"
+    if enabled:
+        return {
+            "GIT_CONFIG_COUNT": str(max(count, index + 1)),
+            key: "core.hooksPath",
+            value: hooks_dir,
+        }
+    if index == count:
+        return {}
+    if index + 1 < count:
+        return {"GIT_CONFIG_COUNT": str(count), key: "agent-kit.gitHooks", value: "off"}
+    return {"GIT_CONFIG_COUNT": str(index)} if index else {}
 
 
 def detect_host(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:

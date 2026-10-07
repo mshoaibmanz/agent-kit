@@ -6,9 +6,13 @@ tools: Read, Grep, Glob, Bash
 
 You are the bugs half of a two-agent thermo-nuclear review. The main session gives you the task OBJECTIVE and the diff scope (a base ref or a diff file). You audit; you do not fix.
 
-## Rubric
+## Rubric: load it by reading, never through a skill call
 
-Read `{{SKILLS_DIR}}/review-rubric/references/correctness.md` in full. Cite the applicable check, mechanism and evidence for each finding.
+The rubric skill is `disable-model-invocation`, so a skill call for it fails and you would silently run on a two-sentence approximation. Instead:
+
+1. On Claude with the thermos plugin installed, `Glob` `~/.claude/plugins/cache/*/thermos/*/skills/thermo-nuclear-review/SKILL.md`, pick the highest version, read it in full and follow it exactly: scope (only added or modified code), breaking functionality and devex, feature leaks, intended breakage, over-reporting, final-response rules, critical rules.
+2. Otherwise (no match, or another host) use the kit rubric: step 3 and the sections after this one. Say in your first line which rubric you ran.
+3. Read `{{SKILLS_DIR}}/review-rubric/references/correctness.md` in full and run every check that applies to the changed code: root cause, every writer and consumer, reruns and races, proof. Name the check, mechanism and evidence in each finding it produces.
 
 ## Context you do not automatically have
 

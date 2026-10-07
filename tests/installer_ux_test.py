@@ -104,6 +104,42 @@ class InstallerUxTests(InstallerUxFixture):
         self.setup('--components', 'hooks', '--apply', code=2)
         self.assertFalse(self.root.exists())
 
+    def test_setup_applies_the_settings_layer_and_owns_only_its_keys(self) -> None:
+        self.host_cli('claude')
+        self.link('jq')
+        layer = self.root / 'local/settings.json'
+        layer.parent.mkdir(parents=True)
+        layer.write_text(json.dumps({'permissions': {'deny': ['Bash(rm -rf /)']}, 'env': {'TEAM_FLAG': '1'},
+                                     'enabledPlugins': {'mine@own': True}}))
+        flags = ('--hosts', 'claude', '--components', 'hooks', '--apply')
+        self.setup(*flags)
+        live = self.home / '.claude/settings.json'
+        settings = json.loads(live.read_text())
+        self.assertEqual(settings['permissions'], {'deny': ['Bash(rm -rf /)']})
+        self.assertEqual(settings['env']['TEAM_FLAG'], '1')
+        self.assertEqual(settings['env']['AI_AGENT'], 'claude', 'a kit env key beside the layer\'s')
+        self.assertEqual(settings['enabledPlugins'], {'mine@own': True})
+
+        # A key the user adds live stays; a key the layer drops goes; a new layer key arrives.
+        settings['theme'] = 'dark'
+        live.write_text(json.dumps(settings))
+        layer.write_text(json.dumps({'statusLine': {'type': 'command', 'command': 'true'}}))
+        self.setup(*flags)
+        settings = json.loads(live.read_text())
+        self.assertEqual(settings['theme'], 'dark')
+        self.assertNotIn('permissions', settings)
+        self.assertNotIn('TEAM_FLAG', settings['env'])
+        self.assertNotIn('mine@own', settings.get('enabledPlugins', {}))
+        self.assertEqual(settings['statusLine'], {'type': 'command', 'command': 'true'})
+
+        # A layer value that would replace the user's own live key is a collision, not an overwrite.
+        settings['outputStyle'] = 'mine'
+        live.write_text(json.dumps(settings))
+        layer.write_text(json.dumps({'outputStyle': 'kit'}))
+        result = self.setup(*flags, code=2)
+        self.assertIn('settings.json holds your own content (blocks apply)', result.stdout)
+        self.assertEqual(json.loads(live.read_text())['outputStyle'], 'mine')
+
     def test_soft_requirements_skip_their_feature(self) -> None:
         self.link('jq')
         catalog = self.home / 'catalog.json'

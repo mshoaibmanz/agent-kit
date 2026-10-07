@@ -61,6 +61,33 @@
     ]
   },
   {
+    "event": "PreToolUse",
+    "matcher": "SendMessage",
+    "command": "~/.claude/hooks/resume-guard",
+    "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "PreToolUse",
+    "matcher": "Agent",
+    "command": "~/.claude/hooks/agent-type-guard",
+    "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "PreToolUse",
+    "matcher": "Read|Grep|Glob|LSP|Bash",
+    "command": "~/.claude/hooks/read-streak",
+    "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
     "event": "PostToolUse",
     "matcher": "Edit|Write|MultiEdit",
     "command": "~/.claude/hooks/python-format",
@@ -114,6 +141,15 @@
     "matcher": "EnterWorktree",
     "command": "~/.claude/hooks/worktree-hint",
     "timeout": 5,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "PostToolUse",
+    "matcher": "EnterWorktree",
+    "command": "~/.claude/hooks/project-bind",
+    "timeout": 10,
     "hosts": [
       "claude"
     ]
@@ -178,7 +214,7 @@
   },
   {
     "event": "PostToolUse",
-    "matcher": "Read|Grep|Glob|LSP|Bash|Edit|Write|MultiEdit|NotebookEdit|Agent",
+    "matcher": "Read|Grep|Glob|LSP|Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task|SendMessage",
     "command": "~/.claude/hooks/read-streak",
     "timeout": 5,
     "hosts": [
@@ -200,7 +236,9 @@
     "command": "~/.claude/hooks/project-bind",
     "timeout": 10,
     "hosts": [
-      "claude"
+      "claude",
+      "codex",
+      "cursor"
     ]
   },
   {
@@ -276,6 +314,15 @@
     "command": "~/.claude/hooks/stop-chime",
     "timeout": 5,
     "async": true,
+    "hosts": [
+      "claude"
+    ]
+  },
+  {
+    "event": "SubagentStart",
+    "matcher": null,
+    "command": "~/.claude/hooks/subagent-context",
+    "timeout": 10,
     "hosts": [
       "claude"
     ]

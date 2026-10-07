@@ -7,6 +7,11 @@
 #   claude-gc --prune-worktrees  remove exactly the worktrees in that report, nothing else.
 #   --report-file PATH          write or consume this report instead of the shared default.
 #   --report-sha256 HASH        required to consume an explicit reviewed report.
+#   claude-gc --sweep-tmp --report-sha256 HASH
+#                                apply exactly the reviewed work-root tmp/ sweep report the plain run
+#                                writes (bin/lib/tmp_sweep.py: closed items only, bulk deleted, small
+#                                source and data files salvaged to the item's out/salvage/).
+#   --tmp-report-file PATH      write or consume that report instead of state/tmp-sweep.tsv.
 # Repos come from CODE_DIRS_JSON or legacy CODE_DIRS (hooks/lib/hook-io kit_env); without them every
 # repo-based step is skipped, including the dead-worktree transcript prune, which would otherwise
 # read "no live worktree anywhere" and delete every worktree's transcripts.
@@ -18,7 +23,7 @@ case "$PATH" in
   *) PATH="$PATH:/opt/homebrew/bin:/usr/local/bin" ;;
 esac
 log() { printf '%s claude-gc: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
-usage() { echo "usage: claude-gc [--prune-worktrees] [--report-file PATH] [--report-sha256 HASH]" >&2; exit 2; }
+usage() { echo "usage: claude-gc [--prune-worktrees | --sweep-tmp] [--report-file PATH] [--tmp-report-file PATH] [--report-sha256 HASH]" >&2; exit 2; }
 src=${BASH_SOURCE[0]}
 . "$(dirname "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")")/../hooks/lib/kit-root.sh" ||
   { log "cannot load hooks/lib/kit-root.sh beside $src"; exit 1; }
@@ -30,11 +35,16 @@ if ! { . "$KIT/hooks/lib/hook-io" 2>/dev/null && kit_env; }; then
 fi
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 REPORT="$CLAUDE_DIR/state/prunable-worktrees.txt"
-mode=''; report_set=0; report_sha=''
+TMP_REPORT="$CLAUDE_DIR/state/tmp-sweep.tsv"
+mode=''; report_set=0; report_sha=''; tmp_report_set=0
 original_args=("$@")
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --prune-worktrees) [ -z "$mode" ] || usage; mode=prune; shift ;;
+    --sweep-tmp) [ -z "$mode" ] || usage; mode=sweep; shift ;;
+    --tmp-report-file)
+      [ "$tmp_report_set" = 0 ] && [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+      TMP_REPORT=$2; tmp_report_set=1; shift 2 ;;
     --report-file)
       [ "$report_set" = 0 ] && [ "$#" -ge 2 ] && [ -n "$2" ] || usage
       REPORT=$2; report_set=1; shift 2 ;;
@@ -44,7 +54,8 @@ while [ "$#" -gt 0 ]; do
     *) usage ;;
   esac
 done
-[ -z "$report_sha" ] || { [ "$mode" = prune ] && [ "$report_set" = 1 ]; } || usage
+[ -z "$report_sha" ] || { [ "$mode" = prune ] && [ "$report_set" = 1 ]; } || [ "$mode" = sweep ] || usage
+[ "$mode" != sweep ] || { [ -n "$report_sha" ] && [ "$report_set" = 0 ]; } || usage
 [ "$mode:$report_set" != prune:1 ] || [ -n "$report_sha" ] || usage
 [ ! -d "$REPORT" ] || { log "report path is a directory: $REPORT"; exit 1; }
 mkdir -p "$(dirname "$REPORT")" || exit 1
@@ -116,6 +127,11 @@ repos() {
 
 case "$mode" in
   "") ;;
+  sweep)
+    python3 "$KIT/bin/lib/tmp_sweep.py" apply --report "$TMP_REPORT" --sha256 "$report_sha" 2>&1 |
+      while IFS= read -r line; do log "$line"; done
+    exit "${PIPESTATUS[0]}"
+    ;;
   prune)
     [ -f "$REPORT" ] && [ ! -L "$REPORT" ] || { log "no regular report at $REPORT; run claude-gc first"; exit 1; }
     snapshot="$artifacts/snapshot"
@@ -375,4 +391,12 @@ else
   mv "$tmp" "$REPORT" || exit 1
 fi
 log "prunable worktrees: $count (report: $REPORT; remove with $prune_command)"
+
+# Work-root tmp/ sweep REPORT (applying it is the separate --sweep-tmp run).
+sweep_command='claude-gc --sweep-tmp --report-sha256 <sha256>'
+if [ "$tmp_report_set" = 1 ]; then
+  printf -v sweep_command 'claude-gc --sweep-tmp --tmp-report-file %q --report-sha256 <sha256>' "$TMP_REPORT"
+fi
+python3 "$KIT/bin/lib/tmp_sweep.py" scan --report "$TMP_REPORT" --apply-hint "$sweep_command" 2>&1 |
+  while IFS= read -r line; do log "$line"; done
 log "done"

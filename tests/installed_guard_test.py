@@ -603,6 +603,34 @@ class InstalledGuardTests(unittest.TestCase):
             "deny",
         )
 
+    def test_installed_data_wrappers_name_the_next_step(self) -> None:
+        """The installed wrappers, run from the install root, hand a dead end back with its fix."""
+        self.run_setup(
+            "--hosts", "claude", "--components", "hooks", "data-wrappers", "--apply"
+        )
+        bq = self.commands / "bq"
+        bq.write_text(
+            "#!/bin/sh\necho 'ERROR: invalid_grant: Reauthentication failed.' >&2\nexit 1\n"
+        )
+        bq.chmod(0o755)
+
+        def run(*command: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                command, env=self.env, text=True, capture_output=True, timeout=30
+            )
+
+        (self.root / "local/kit.env").write_text("BQRO_PROJECT=jobs-fixture\n")
+        expired = run(str(self.root / "bin/bqro"), "SELECT 1")
+        self.assertEqual(expired.returncode, 1, expired.stderr)
+        self.assertIn("gcloud auth login", expired.stderr)
+        ro_mysql = str(self.root / "bin/ro-mysql")
+        many = run(ro_mysql, "-e", "SELECT 1; SELECT 2")
+        self.assertEqual(many.returncode, 2, many.stderr)
+        self.assertIn("--each=A,B", many.stderr)
+        missing = run(ro_mysql, f"--file={self.home / 'absent.sql'}")
+        self.assertEqual(missing.returncode, 2, missing.stderr)
+        self.assertIn("absent.sql: No such file", missing.stderr)
+
 
 if __name__ == "__main__":
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(InstalledGuardTests)

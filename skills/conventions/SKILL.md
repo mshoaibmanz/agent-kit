@@ -6,10 +6,11 @@ description: House style for writing code — Python (typing, logging, imports, 
 # Conventions
 
 House style only. Footguns live elsewhere: `uv run --with` destroying a project `.venv` in
-`~/.claude/CLAUDE.md`; a repo's type-checker false positives in `~/.claude/local/<repo>-rules.md`;
-analytical-SQL validation in the `debug` skill ("Reading data").
+your host's rules file (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`); a repo's type-checker false
+positives in the overlay's `<repo>-rules.md` (`~/.claude/local/` on Claude, the kit's `local/`
+elsewhere); analytical-SQL validation in the `debug` skill ("Reading data").
 
-**A repo's `~/.claude/local/<repo>-rules.md` overrides this file where they differ**, e.g. a repo
+**A repo's overlay `<repo>-rules.md` overrides this file where they differ**, e.g. a repo
 without a ruff config, where `ruff format` rewrites whole files.
 
 One file, one entry point: add a language by adding a section here, never by creating a

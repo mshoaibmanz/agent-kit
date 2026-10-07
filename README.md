@@ -46,7 +46,7 @@ Your own content is never overwritten silently: an existing file, link, MCP serv
 
 ### Team presets
 
-A preset is a TOML file of non-secret team defaults: `[kit]` overlay keys (`CODE_SEARCH_GH_OWNER`, `CODE_DIRS_JSON`, `CODE_SEARCH_ZOEKT_URL`, `REVIEW_BASE`, `RELEASE_BRANCH_RE`, `BQRO_PROJECT`, `GIT_AUTHOR`, `SUBAGENT_RESUME_MAX`; [`hooks/lib/README`](hooks/lib/README) gives their meanings), `[mcp.servers.<name>]` descriptors that name credential wrappers (`{{KIT_DIR}}/bin/sentry-mcp`, filled with each user's kit root) or native OAuth, `[hosts] recommended`, `[roles.<role>]` model and effort, and `[skills]` include or exclude. `gh:owner/repo[/path]` (default path `agent-kit-preset.toml`) fetches it with your own `gh` login, with its team pack (below) when it has one; a failed fetch prints one line and continues on the plain defaults. A local TOML file or pack folder works too. Setup checks that your login is a member of the preset's GitHub org. It refuses a preset holding a token format (`ghp_`, `sk-`, `xox*-`, `AKIA` and the like) or credentials in a URL. Its `[kit]` values go in `local/preset.env`, under your own `local/kit.env`, and its answers sit under yours (flags and the choices of an earlier install or prompt). A changed preset applies on the next run with `--preset`; `doctor` reports its source and hash. [`presets/example.toml`](presets/example.toml) shows every table with placeholders; keep your team's real preset in a private repository of your organization, never in this public one.
+A preset is a TOML file of non-secret team defaults: `[kit]` overlay keys (`CODE_SEARCH_GH_OWNER`, `CODE_DIRS_JSON`, `CODE_SEARCH_ZOEKT_URL`, `REVIEW_BASE`, `RELEASE_BRANCH_RE`, `BQRO_PROJECT`, `GIT_AUTHOR`, `SUBAGENT_RESUME_MAX`, `TICKET_PREFIXES`, `GH_ORG`, `GH_REPOS`, `MODEL_LIBS`, `PUBLISH_HOST`; [`hooks/lib/README`](hooks/lib/README) gives their meanings), `[mcp.servers.<name>]` descriptors that name credential wrappers (`{{KIT_DIR}}/bin/sentry-mcp`, filled with each user's kit root), a server in a local clone (`{{CODE_DIR}}/<repo>/<path>`, under the first repository root; left out until the clone has it) or native OAuth, `[plugins.<name>]` Claude Code plugins to enable (`marketplace`, and `source = "github:owner/repo"` to add that marketplace), `[sentry.instances.<name>]` Sentry instances (`host` and the `keychain` service of each one's token; every instance beyond the catalog's `sentry` server renders as its own server once you have its token, and `bin/sentry-map find <service>` names the instance, org and project), `[hosts] recommended`, `[roles.<role>]` model and effort, and `[skills]` include or exclude. `gh:owner/repo[/path]` (default path `agent-kit-preset.toml`) fetches it with your own `gh` login, with its team pack (below) when it has one; a failed fetch prints one line and continues on the plain defaults. A local TOML file or pack folder works too. Setup checks that your login is a member of the preset's GitHub org. It refuses a preset holding a token format (`ghp_`, `sk-`, `xox*-`, `AKIA` and the like) or credentials in a URL. Its `[kit]` values go in `local/preset.env`, under your own `local/kit.env`, and its answers sit under yours (flags and the choices of an earlier install or prompt). A changed preset applies on the next run with `--preset`; `doctor` reports its source and hash. [`presets/example.toml`](presets/example.toml) shows every table with placeholders; keep your team's real preset in a private repository of your organization, never in this public one.
 
 ### Team packs
 
@@ -97,6 +97,12 @@ For Codex, `hooks` or `mcp` also names the work root in `[sandbox_workspace_writ
 
 Rules and skills are the default. Hooks start with advisory events. To enable blocking safety and review gates, explicitly choose `--components hooks --blocking-hooks`; later updates keep that choice until `--no-blocking-hooks`. That selection also installs the Git dispatcher environment into the model's shell. Setup never adjusts the host's permission policy.
 
+The Git layer (`git-hooks/`: the agent push gate and commit trailer check) reaches agent shells only. Setup puts a command-scope `core.hooksPath` into the host's environment as `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_n` and `GIT_CONFIG_VALUE_n`: Claude's `settings.json` `env`, Codex's `shell_environment_policy.set`, and the environment Cursor's `sessionStart` hook returns. Your own terminal never sees it, and setup never writes a global `core.hooksPath`. The dispatcher still runs each repository's own hooks: `.git/hooks`, or the `core.hooksPath` the repository would use without the layer (husky's `.husky/_`, a global or a local value).
+
+- Your own `GIT_CONFIG_*` entries in Claude's `env` are kept: the layer's entry goes after them, and `--no-blocking-hooks` or a rollback leaves them as they were. Cursor's hook does the same with the entries its environment carries.
+- Codex: setup never edits your lines, so a `shell_environment_policy.set` with its own `GIT_CONFIG_COUNT` is refused, with the two keys to add and the new count. Once your table carries the layer's entry, setup leaves your `GIT_CONFIG_*` keys alone.
+- A `GIT_CONFIG_COUNT` exported by the shell that launches Claude or Codex is replaced by the host's value. Move such entries into the host configuration.
+
 Codex command hooks require a local runtime exposing `hooks` in `codex features list`. Cloud command hooks are refused. Review the installed hook commands through `/hooks` and trust their current hash yourself. Cursor hook support must be checked in the installed app and confirmed with `--confirm-hook-support cursor`; the guided setup asks this question.
 
 Cursor project rules use `--project-root /path/to/project` and are written to that project's `.cursor/rules/`. Without this flag, setup exports the rule file under the Cursor configuration directory; activate it through **Customize → Rules**. The doctor reports configuration and file drift, not proof that a model loaded the rules.
@@ -138,7 +144,7 @@ python3 bin/agent-setup --hosts codex --components roles \
 
 Keep review prefixes and rounds; existing high effort is valid for both providers. Codex named role activation remains unverified. Roles without a review prefix, such as engineer/researcher/second-opinion, are unavailable through `agent-run` when native invocation is disabled; preview labels those routes. Setup does not enable native role support automatically. Role overrides route review CLIs and supported native agents. The active main-session model for Codex and Cursor stays in that provider's own settings; the `main` catalog entry describes inherited review routing.
 
-Keep user workflow values in `local/kit.env`; generated path choices live in `local/setup-paths.env`, and a team preset's values in `local/preset.env`. The shared parser loads the preset layer first, then the user layer, then the generated path layer, so each later one wins. Setup never reads or copies the user's values into its journal. `kit.env.example` describes optional, non-secret settings. There is no default commit author override; Git's existing identity is used.
+Keep user workflow values in `local/kit.env`; generated path choices live in `local/setup-paths.env`, and a team preset's values in `local/preset.env`. The shared parser loads the preset layer first, then the user layer, then the generated path layer, so each later one wins. Setup never reads or copies the user's values into its journal. `kit.env.example` describes optional, non-secret settings. Your own Claude Code settings (permissions, a status line, env) go in `local/settings.json`, merged over `hosts/claude/settings.base.json`; setup with the hooks component and `agent-kit render` both apply it. Setup owns only the top-level keys the layer gives it: a key you add in the host's `settings.json` stays, a key you drop from the layer goes on the next run, and a layer key that would replace a value of your own is a collision. There is no default commit author override; Git's existing identity is used.
 
 ## Search code
 
@@ -179,9 +185,18 @@ Setup prints the journal ID after apply. If a process stops mid-install, the nex
 
 To see the whole setup at once, run `agent-kit dashboard` from the kit root. It writes one self-contained, light-mode HTML page to `<work root>/dashboard/index.html` (`--out` to choose another path, `--no-open` to skip opening it). It opens on Needs attention: drift per host with the command that fixes it, missing Keychain items with the command to add each, and the sources the kit does not own, each linking to its row. The sidebar switches between the other sections, one at a time (without JavaScript the page is one long scroll): hosts and their doctor drift, MCP servers from the installed catalog, unmanaged sources, overlay keys, the data wrappers, skills per host, roles, hooks, the preset and pack, and the work root. It is read-only and starts only `security find-generic-password` (presence, never the value), `git`, `claude-account dirs` and the page opener. Catalog arguments, URLs and headers are masked by the rule below, overlay values show only for the keys `kit.env.example` documents, every change is a command to copy, and the page loads nothing from the network. `--check-updates` asks a `gh:` preset's source for a newer commit.
 
+The work root keeps one folder per work item, with disposable files in its `tmp/`. `agent-task close <project>/<item>` marks an item closed and offers each script left in its `tmp/` that the project's `scripts/` lacks for promotion, with a `  - use:` line in the project's `INDEX.md` (`--promote <file>` or `--no-promote` without a prompt). `claude-gc` writes a report of what it would sweep from the `tmp/` of items closed or merged at least `TMP_SWEEP_DAYS` (default 14) days ago: checkouts with nothing unpushed, scratch homes, virtualenvs, `node_modules` and caches, and files over 1 MB, to delete; source and data files up to 1 MB (`.py .sh .sql .ipynb .md .csv .json .txt`), to move into the item's `out/salvage/`. `claude-gc --sweep-tmp --report-sha256 <sha256>` applies exactly that reviewed report and nothing outside those `tmp/` folders. A new work root gets `.vscode/settings.json` and `.cursorignore` that keep editors out of `tmp/`, virtualenvs and `worktrees/`, unless you already have your own.
+
 ## Claude plugin compatibility
 
 The original plugin names remain available through the marketplace: `guard-rails`, `prod-data`, `ci-babysitter`, `auto-review`, `session-context`, `python-hygiene`, `terminal-signals`, `skills-core`, `workflow`, `docs` and `qa-e2e`. These packages are generated from the same canonical sources. Review now verifies findings directly and records the fixer's TALLY; there is no separate critic role.
+
+```sh
+claude plugin marketplace add mshoaibmanz/agent-kit
+claude plugin install guard-rails@agent-kit
+```
+
+The packages are not committed to `main`. On every push to `main`, CI runs `scripts/build.sh` and commits the generated `plugins/` tree to the `dist` branch as a new commit (`scripts/publish_dist.sh`); each marketplace entry installs `plugins/<name>` from `dist`. `claude plugin marketplace update agent-kit` picks up a newer build. To try a package from a checkout, run `scripts/build.sh` (it writes the ignored `plugins/` folder) and point `claude --plugin-dir` at `plugins/<name>`.
 
 Use the setup command for host paths, model choices and Git shell activation. Avoid installing the same hook component through both setup and a plugin. Plugin hook packages activate their listed events when installed; review their manifests before choosing them.
 
@@ -207,14 +222,20 @@ A dev install links each kit file (`bin/`, `hooks/`, `skills/`, `agents/`, `rule
 
 Set `TMPDIR` explicitly to an existing fixture directory in your bound task or project, outside this source checkout. The release runner refuses an unset path or a directory inside the checkout. It creates disposable homes and runs the installer, package, installed guard and GC portability suites plus hook checks. Running `hooks/tests/run-all.sh` directly requires an explicit disposable `HOME`.
 
-Edit canonical `bin/`, `hooks/`, `agents/`, `commands/`, `rules/`, `skills/` and `roles.toml`. Generate compatibility packages with `python3 scripts/build_plugins.py`; verify them with `--check`. Generated plugin files are release artifacts.
+`bash tests/run-tests.sh` runs the suites concurrently, one per CPU (`--jobs N` changes that). Each suite, and each file in `hooks/tests`, gets its own `HOME`, `TMPDIR` and `AGENT_WORK_ROOT` under `$TMPDIR/runs/<run>/` and its own log in that run's `logs/`. The run ends with a table of suite, seconds and result, prints the tail of each failed log, and exits non-zero when any suite failed. `tests/verify_release.py` runs first and alone.
+
+- `--serial` runs one suite at a time with its output streamed, and stops at the first failure.
+- `--only <suite>` runs a subset: a path, file name or stem, with globs, repeated or comma-separated (`--only setup_test,'hooks/tests/*'`). `--list` prints the names.
+- The runner, and `tests/run_hooks.py` run on its own, hold one machine-wide lock, `/tmp/agent-kit-suite.lock` (`AGENT_KIT_SUITE_LOCK` moves it), and wait while a run from any checkout holds it. Concurrent agents queue on the lock and need no `pgrep` loop; the kernel releases it when its holder exits.
+
+Edit canonical `bin/`, `hooks/`, `agents/`, `commands/`, `rules/`, `skills/` and `roles.toml`. Generate compatibility packages with `python3 scripts/build_plugins.py` (into the ignored `plugins/`, or `--out <dir>`); `--check` compares a fresh build with that folder. Generated plugin files are release artifacts on the `dist` branch, never on `main`; `tests/verify_release.py` builds them into a scratch folder and validates that build.
 
 ```sh
 # Choose an existing fixture directory in your bound task or project, outside this checkout.
 export TMPDIR="/path/to/your/project/data/fixtures"
 python3 tests/setup_test.py
 bash tests/run-tests.sh
-python3 scripts/build_plugins.py --check
+python3 tests/verify_release.py
 bash scripts/scan.sh
 ```
 

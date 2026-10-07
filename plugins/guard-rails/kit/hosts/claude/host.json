@@ -1,9 +1,0 @@
-{
-  "settings": "~/.claude/settings.json",
-  "mcp": "~/.claude/mcp.json",
-  "agents": "~/.claude/agents",
-  "uiOwned": [
-    "theme",
-    "model"
-  ]
-}

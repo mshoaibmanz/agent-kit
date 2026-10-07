@@ -1,9 +1,0 @@
-{
-  "name": "session-context",
-  "description": "Project and item context, handoffs, a retro inbox and safe housekeeping. Per-user repository docs remain in your overlay.",
-  "version": "2.0.0",
-  "license": "MIT",
-  "author": {
-    "name": "Shoaib Manzoor"
-  }
-}

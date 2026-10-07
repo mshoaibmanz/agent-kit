@@ -1,0 +1,35 @@
+name: dist
+# The Claude plugin packages are generated, never committed to main. Each push to main builds them and
+# commits the plugins/ tree onto the dist branch, which .claude-plugin/marketplace.json installs from.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: dist
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the plugin packages
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: bash scripts/build.sh
+      - name: Commit them onto dist (a new commit; never a force-push)
+        env:
+          TMPDIR: ${{ runner.temp }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: bash scripts/publish_dist.sh "$GITHUB_SHA"

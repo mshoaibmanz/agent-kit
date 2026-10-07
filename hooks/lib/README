@@ -48,3 +48,9 @@ guards need no key. Documented with placeholder values in ~/.claude/kit.env.exam
   CODE_SEARCH_GH_OWNER  code-search: default GitHub org or user for gh searches and short repo names
   CODE_SEARCH_CHROME_PROFILE  code-search: the Chrome profile dir that holds the cookie (default Default)
   SUBAGENT_RESUME_MAX  context tokens past which a subagent is replaced, not resumed (default 300000): setup and agent-kit render it into rules/hosts/claude.md and agent bodies ({{SUBAGENT_RESUME_MAX_K}})
+  TICKET_PREFIXES    Jira project keys (comma-separated) that name tickets in branches and commits; optional
+  GH_ORG             GitHub org the review audits read PRs from
+  GH_REPOS           repos in it (name or owner/name, comma-separated) for those audits
+  MODEL_LIBS         git pathspecs (comma-separated) of the ORM model files the debug skill's schema check compares
+  PUBLISH_HOST       host of the internal page-publishing service the doc skills link to (no scheme)
+  TMP_SWEEP_DAYS     days a closed item's tmp/ waits before claude-gc's sweep report lists it (default 14)

@@ -76,6 +76,14 @@ cwd=$CMD_DIR
 git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
 attempt="$dir/attempt-$sid-$(path_key "$cwd")-$(path_key "$cmd")"
+# The no-remote "committed this turn" marker, per repo and per committer: one marker per session
+# made the parent's commit in one repo deny a subagent's first commit in an unrelated repo, and
+# one sibling subagent's commit deny every other subagent's.
+last_marker() {
+  printf '%s/last-%s-%s-%s\n' "$dir" "$sid" "${1:-main}" \
+    "$(path_key "$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")")"
+}
+fresh() { [ -f "$1" ] && ! [ "$dir/turn-$sid" -nt "$1" ]; }
 if [ "$event" = "PostToolUse" ]; then
   # Only used by the no-remote fallback below. Only a commit that LANDED counts: PostToolUse
   # fires on a non-zero exit too, and marking a commit that does not exist ("nothing added to
@@ -91,7 +99,7 @@ if [ "$event" = "PostToolUse" ]; then
     fi ;;
   esac
   rm -f "$attempt"
-  [ "$landed" = 0 ] || { mkdir -p "$dir"; touch "$dir/last-$sid"; }
+  [ "$landed" = 0 ] || { mkdir -p "$dir"; touch "$(last_marker "${aid:+sub}")"; }
   exit 0
 fi
 
@@ -136,7 +144,8 @@ if [ -n "$(git -C "$cwd" remote 2>/dev/null)" ]; then
   else
     unpushed=0
   fi
-elif [ -f "$dir/last-$sid" ] && ! [ "$dir/turn-$sid" -nt "$dir/last-$sid" ]; then
+# A subagent is held back only by its parent's commit in this repo; the parent by any commit in it.
+elif fresh "$(last_marker main)" || { [ -z "$aid" ] && fresh "$(last_marker sub)"; }; then
   tip=ahead
   # `git -C "$WT" commit`: the repo is a guess (the session cwd), and a no-remote cwd must not
   # wave through a PR worktree's second commit, so the per-turn rule still applies there.

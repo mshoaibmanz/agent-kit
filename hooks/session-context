@@ -33,6 +33,24 @@ gcloud_check() {
   [ "$rc" = 0 ] || echo "!! gcloud auth check failed (checked $at). Check credential access and network from a trusted terminal before reauthenticating."
 }
 
+# Without venv/extraPaths pyright resolves no repo or third-party import, and LSP references and
+# call hierarchy silently stop at the current file (one repo: 6 hits where grep found 97).
+# A local, untracked pyrightconfig.json is also absent from every new worktree.
+pyright_check() {
+  command -v pyright-langserver >/dev/null 2>&1 || return 0
+  [ -f "$ROOT/pyproject.toml" ] || return 0
+  local cfg="$ROOT/pyrightconfig.json" missing=""
+  if [ ! -f "$cfg" ] && [ -f "$REPO_ROOT/pyrightconfig.json" ] && [ "$REPO_ROOT" != "$ROOT" ]; then
+    echo "!! pyrightconfig.json is local to $REPO_ROOT and missing here, so LSP can't resolve imports: cp \"$REPO_ROOT/pyrightconfig.json\" \"$ROOT/\"."
+    return 0
+  fi
+  [ -f "$cfg" ] || cfg="$ROOT/pyproject.toml"
+  [ -d "$ROOT/.venv" ] && ! grep -q '"\{0,1\}venv"\{0,1\}[[:space:]]*[:=]' "$cfg" && missing="venv"
+  ls "$ROOT"/src/*/__init__.py >/dev/null 2>&1 && ! grep -q 'extraPaths' "$cfg" \
+    && missing="${missing:+$missing, }extraPaths [\"src\"]"
+  [ -z "$missing" ] || echo "!! Pyright config in $ROOT lacks $missing, so LSP references stop at the current file. Add \"venvPath\": \".\", \"venv\": \".venv\", \"extraPaths\": [\"src\"] to pyrightconfig.json."
+}
+
 # ro-mysql writes this on MySQL auth failure (monthly password rotation) and clears it on success.
 db_auth_check() {
   local u t at
@@ -75,6 +93,8 @@ emit() {
   if grep -qx "$REPO_NAME" "$LOCAL/no-project-settings" 2>/dev/null; then
     echo "This repo's CLAUDE.md, AGENTS.md and .claude/{rules,skills,commands} are NOT loaded; its rules are mirrored in the invariants doc. Never edit them. Nested src/**/CLAUDE.md maps stay readable."
   fi
+
+  pyright_check
 
   if [ -n "${TEST_GATE_FILE:-}" ] && [ -n "${TEST_RUNNER:-}" ] && [ -f "$REPO_ROOT/$TEST_GATE_FILE" ]; then
     local blocked

@@ -133,7 +133,12 @@ class GCPortabilityTests(unittest.TestCase):
         shutil.move(str(self.kit), plugin / "kit")
         self.kit = plugin / "kit"
         self.env.pop("AGENT_KIT_DIR", None)
-        generated = SOURCE / "plugins/workflow/bin/claude-gc"
+        # main does not track plugins/: build the packages to read the generated entrypoint.
+        subprocess.run(
+            [sys.executable, str(SOURCE / "scripts/build_plugins.py"), "--out", str(self.root / "plugins")],
+            env={**os.environ, "AGENT_KIT_DIR": str(SOURCE)}, capture_output=True, text=True, check=True,
+        )
+        generated = self.root / "plugins/workflow/bin/claude-gc"
         self.assertTrue(generated.is_symlink())
         entry = plugin / "bin/claude-gc"
         entry.symlink_to(generated.readlink())

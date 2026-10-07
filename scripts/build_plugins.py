@@ -54,7 +54,8 @@ def build(destination: Path) -> None:
         plugin = destination / name
         (plugin / '.claude-plugin').mkdir(parents=True)
         copy_licenses(plugin)
-        manifest = {'name': name, 'description': descriptor['description'], 'version': '2.0.0',
+        # No version: a fixed number would pin installs; without one an update follows the dist commit.
+        manifest = {'name': name, 'description': descriptor['description'],
                     'license': 'MIT', 'author': market['owner']}
         (plugin / '.claude-plugin/plugin.json').write_text(json.dumps(manifest, indent=2) + '\n')
         chosen = core_skills if name == 'skills-core' else SKILLS.get(name, [])
@@ -120,20 +121,24 @@ def build(destination: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--check', action='store_true')
+    parser.add_argument('--check', action='store_true', help='compare a fresh build with --out; write nothing')
+    # main does not track plugins/: CI builds it and commits it to the dist branch (scripts/publish_dist.sh).
+    parser.add_argument('--out', type=Path, default=ROOT / 'plugins', help='the packages folder (default: plugins/)')
     args = parser.parse_args()
+    out = args.out.resolve()
     with tempfile.TemporaryDirectory(prefix='public-plugin-build-') as temporary:
         desired = Path(temporary) / 'plugins'
         build(desired)
         if args.check:
-            expected, actual = files(desired), files(ROOT / 'plugins')
+            expected, actual = files(desired), files(out) if out.is_dir() else {}
             drift = sorted(key for key in expected.keys() | actual.keys() if expected.get(key) != actual.get(key))
             sys.stdout.write(json.dumps({'generated_files': len(expected), 'drift': drift}, indent=2) + '\n')
             return bool(drift)
-        for plugin in (ROOT / 'plugins').iterdir():
+        out.mkdir(parents=True, exist_ok=True)
+        for plugin in out.iterdir():
             if plugin.is_dir():
                 shutil.rmtree(plugin)
-        shutil.copytree(desired, ROOT / 'plugins', dirs_exist_ok=True, symlinks=True)
+        shutil.copytree(desired, out, dirs_exist_ok=True, symlinks=True)
     return 0
 
 

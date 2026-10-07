@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Run the release suites: concurrently by default, each in its own HOME, TMPDIR and work root,
+# queued behind any other run on this machine. --serial, --jobs N, --only <suite>, --list; see --help.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "${TMPDIR:-}" ]; then
@@ -13,15 +15,27 @@ case "$TMPDIR/" in
 esac
 mkdir -p "$TMPDIR"
 export TMPDIR
-python3 "$ROOT/tests/verify_release.py"
-python3 "$ROOT/tests/setup_test.py"
-python3 "$ROOT/tests/setup_review_test.py"
-python3 "$ROOT/tests/installer_ux_test.py"
-python3 "$ROOT/tests/team_pack_test.py"
-python3 "$ROOT/tests/dev_install_test.py"
-python3 "$ROOT/tests/dashboard_test.py"
-python3 "$ROOT/tests/plugin_portability_test.py"
-python3 "$ROOT/tests/installed_guard_test.py"
-python3 "$ROOT/tests/gc_portability_test.py"
-python3 "$ROOT/tests/leak_check_test.py"
-python3 "$ROOT/tests/run_hooks.py"
+
+# Run first, one at a time, and stop on a failure: a broken manifest or package build fails fast.
+first=(
+  tests/verify_release.py
+)
+# One suite per line, run concurrently. hooks/tests is one suite per hook-test file in it.
+suites=(
+  tests/setup_test.py
+  tests/setup_review_test.py
+  tests/installer_ux_test.py
+  tests/team_pack_test.py
+  tests/dev_install_test.py
+  tests/dashboard_test.py
+  tests/plugin_portability_test.py
+  tests/installed_guard_test.py
+  tests/gc_portability_test.py
+  tests/leak_check_test.py
+  hooks/tests
+)
+
+args=()
+for suite in "${first[@]}"; do args+=(--first "$suite"); done
+for suite in "${suites[@]}"; do args+=(--suite "$suite"); done
+python3 "$ROOT/tests/run_suites.py" "${args[@]}" "$@"

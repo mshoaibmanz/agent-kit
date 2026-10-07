@@ -29,6 +29,7 @@ jobs:
           echo "${SHA256}  gitleaks.tgz" | shasum -a 256 -c -
           tar -xzf gitleaks.tgz gitleaks
           echo "GITLEAKS=$PWD/gitleaks" >> "$GITHUB_ENV"
+      # Concurrent, one suite per CPU, each in its own HOME and TMPDIR; a failure prints its log tail.
       - name: Hook suites, plugin manifests and copies
         env:
           TMPDIR: ${{ github.workspace }}/../agent-kit-test-fixtures

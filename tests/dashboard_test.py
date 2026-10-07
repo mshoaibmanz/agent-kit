@@ -168,7 +168,8 @@ class Fixture(InstallerUxFixture):
         local.mkdir(exist_ok=True)
         (local / 'kit.env').write_text(f"REVIEW_BASE=main\nAPI_PASSWORD={PLANTED['overlay value']}\n"
                                        f"GIT_AUTHOR='{TOKEN}'\nBQRO_PROJECT=example-project\n")
-        (local / 'preset.env').write_text(f"REVIEW_BASE=develop\nTEAM_SECRET={PLANTED['preset value']}\n")
+        (local / 'preset.env').write_text(f"REVIEW_BASE=develop\nTEAM_SECRET={PLANTED['preset value']}\n"
+                                          "GH_ORG=example-org\nPUBLISH_HOST=pages.example.com\n")
         (self.home / '.ssh').mkdir(exist_ok=True)
         (self.home / '.ssh/config').write_text(SSH_CONFIG)
         state = self.home / '.claude/state'
@@ -372,6 +373,11 @@ class DashboardPageTests(unittest.TestCase):
     def test_overlay_reads_kit_envs_layers_and_names_the_users_layer(self) -> None:
         overlay = page_text(section(self.page, 'overlay'))
         self.assertRegex(overlay, r'REVIEW_BASE\s+main\s+kit\.env\s+preset\.env < kit\.env')
+        # The engine keys a team preset sets show with their values; the unset ones as unset.
+        self.assertRegex(overlay, r'GH_ORG\s+example-org\s+preset\.env')
+        self.assertRegex(overlay, r'PUBLISH_HOST\s+pages\.example\.com\s+preset\.env')
+        for key in ('TICKET_PREFIXES', 'GH_REPOS', 'MODEL_LIBS'):
+            self.assertRegex(overlay, key + r'\s+unset')
         set_key = [c for c in commands(self.page) if 'KEY=value' in c]
         self.assertEqual(set_key, [append_line(self.fx.root / 'local/kit.env')])
 

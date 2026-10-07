@@ -1,11 +1,19 @@
-"""Run all hooks with explicit source paths and a disposable, non-scratch home."""
+"""Run the hook suites with explicit source paths and a disposable, non-scratch home.
+
+No argument runs every suite through hooks/tests/run-all.sh; suite paths run just those.
+"""
 
 from pathlib import Path
 import os
 import subprocess
+import sys
 import tempfile
 
+import suite_lock
+
 source = Path(__file__).resolve().parents[1]
+suites = [Path(argument).resolve() for argument in sys.argv[1:]]
+held = suite_lock.acquire(f'{source} run_hooks.py')
 fixture_root = Path(os.environ.get('TMPDIR', str(source / '.test-fixtures')))
 fixture_root.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='.test-home-', dir=fixture_root) as temporary:
@@ -25,5 +33,8 @@ with tempfile.TemporaryDirectory(prefix='.test-home-', dir=fixture_root) as temp
                BQRO=str(source / 'bin/bqro'), RO_MYSQL=str(source / 'bin/ro-mysql'),
                LAUNCHER=str(source / 'bin/claude-launcher.zsh'), AGENT_KIT_SOURCE=str(source),
                GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null', PYTHONDONTWRITEBYTECODE='1')
-    result = subprocess.run(['bash', str(source / 'hooks/tests/run-all.sh')], env=env, cwd=source)
-    raise SystemExit(result.returncode)
+    code = 0
+    for suite in suites or [source / 'hooks/tests/run-all.sh']:
+        runner = 'python3' if suite.suffix == '.py' else 'bash'
+        code = subprocess.run([runner, str(suite)], env=env, cwd=source).returncode or code
+    raise SystemExit(code)

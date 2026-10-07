@@ -11,11 +11,12 @@ import subprocess
 import sys
 import tomllib
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
-from host import HOSTS  # noqa: E402,F401  (the one host list; hooks/lib needs it standalone)
+from host import HOSTS, git_layer_env  # noqa: E402,F401  (the one host list; hooks/lib needs it standalone)
 from kit_env import kit_env, work_root  # noqa: E402
 
 EVENTS = {
@@ -146,18 +147,21 @@ def host_root_for(kit: Path, host: str) -> Path | None:
     return default_host_root(host) if host in configuration.get("hosts", []) else None
 
 
-def shell_env(kit: Path, host: str) -> dict[str, str]:
+def shell_env(kit: Path, host: str, existing: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The agent shell's variables: the git layer's GIT_CONFIG_* entry goes after any of existing's."""
     if os.environ.get('AGENT_GIT_HOOKS') == 'off':
         return {'AI_AGENT': host, 'AGENT_HOST': host, 'AGENT_GIT_HOOKS': 'off',
                 'AGENT_KIT_DIR': str(kit), 'KIT_ENV': str(kit / 'local/setup-paths.env')}
+    try:
+        layer = git_layer_env(existing or {}, str(kit / "git-hooks"))
+    except ValueError as error:
+        raise SystemExit(f"agent-kit: {error}; nothing written") from None
     return {
         "AI_AGENT": host,
         "AGENT_HOST": host,
         "AGENT_KIT_DIR": str(kit),
         "KIT_ENV": str(kit / "local/setup-paths.env"),
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "core.hooksPath",
-        "GIT_CONFIG_VALUE_0": str(kit / "git-hooks"),
+        **layer,
     }
 
 
@@ -373,11 +377,15 @@ def normalize_transport(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def safe_servers(kit: Path) -> dict[str, Any]:
+    from sentry import expand_servers, safe_sentry, server_names
+
     servers = json.loads((kit / "mcp/servers.json").read_text()).get("mcpServers", {})
     out = {}
     if not isinstance(servers, dict):
         raise ValueError("MCP catalog must map server names to objects")
-    for name, spec in fill_servers(servers, str(kit)).items():
+    sentry_names = server_names(kit)
+    for name, spec in expand_servers(kit, fill_servers(servers, str(kit))).items():
+        is_sentry = name.lower() in sentry_names
         if not isinstance(spec, dict) or set(spec) - {"command", "args", "url", "env", "type", "description"}:
             raise ValueError("Unsupported MCP transport fields; nothing written")
         spec = normalize_transport(spec)
@@ -388,7 +396,7 @@ def safe_servers(kit: Path) -> dict[str, Any]:
         if "url" in spec and (not isinstance(spec["url"], str) or not spec["url"]):
             raise ValueError("MCP URL must be a nonempty string")
         if (
-            name.lower() != "sentry"
+            not is_sentry
             and "args" in spec
             and (
                 "command" not in spec
@@ -398,7 +406,7 @@ def safe_servers(kit: Path) -> dict[str, Any]:
         ):
             raise ValueError("MCP args must be strings on a command transport")
         if (
-            name.lower() != "sentry"
+            not is_sentry
             and "env" in spec
             and (
                 "command" not in spec
@@ -407,9 +415,7 @@ def safe_servers(kit: Path) -> dict[str, Any]:
             )
         ):
             raise ValueError("MCP environment must map names to strings on a command transport")
-        if name.lower() == "sentry":
-            from sentry import safe_sentry
-
+        if is_sentry:
             out[name] = safe_sentry(spec, kit / "bin/sentry-mcp")
         else:
             encoded = json.dumps(spec)
@@ -457,16 +463,18 @@ def fill(
     what: str = "text",
     resume: int | None = None,
     strict: bool = True,
+    extra: dict[str, str] | None = None,
 ) -> str:
     """text with every {{NAME}} filled: AGENT_KIT_DIR and KIT_DIR (the kit), SKILLS_DIR, OVERLAY_DIR
     (<kit>/local), RULES_FILE (the host's instructions file; host text only) and
-    SUBAGENT_RESUME_MAX_K. An unknown one refuses: a literal {{...}} would reach the model as a path
-    it cannot open. Not strict (a team pack's text, where {{...}} is often a CI or template example),
-    an unknown one stays as written."""
+    SUBAGENT_RESUME_MAX_K, plus extra (an MCP command's CODE_DIR). An unknown one refuses: a literal
+    {{...}} would reach the model as a path it cannot open. Not strict (a team pack's text, where
+    {{...}} is often a CI or template example), an unknown one stays as written."""
     names = {match.group(1) for match in PLACEHOLDER.finditer(text)}
     if not names:
         return text
     values = {"AGENT_KIT_DIR": kit, "KIT_DIR": kit, "SKILLS_DIR": f"{kit}/skills", "OVERLAY_DIR": f"{kit}/local"}
+    values.update(extra or {})
     if host:
         values["RULES_FILE"] = rules_file(host, host_root)
     if "SUBAGENT_RESUME_MAX_K" in names:
@@ -483,21 +491,42 @@ def fill(
     return PLACEHOLDER.sub(lambda match: values.get(match.group(1), match.group(0)), text)
 
 
-def fill_servers(servers: dict[str, Any], kit: str) -> dict[str, Any]:
+def code_dir(roots: list[str] | None = None) -> str:
+    """{{CODE_DIR}}: the first repository parent folder (roots, else the overlay's CODE_DIRS_JSON,
+    else its CODE_DIRS), ~ expanded; '' when none is set."""
+    if roots is None:
+        env = kit_env()
+        try:
+            roots = json.loads(env.get("CODE_DIRS_JSON") or "null") or env.get("CODE_DIRS", "").split()
+        except ValueError:
+            roots = []
+    if not isinstance(roots, list):
+        roots = []
+    first = next((root for root in roots or [] if isinstance(root, str) and root.strip()), "")
+    return os.path.expanduser(first.strip()).rstrip("/") if first else ""
+
+
+def fill_servers(servers: dict[str, Any], kit: str, code: str | None = None) -> dict[str, Any]:
     """servers as a host starts them: each command and args filled (fill) for the kit at <kit>, and
     the catalog's `credentials` declaration (read by the dashboard only) dropped. A host starts an
     MCP command as written, without expanding ~ or a variable, so a preset names a wrapper the kit
-    ships as {{KIT_DIR}}/bin/sentry-mcp."""
+    ships as {{KIT_DIR}}/bin/sentry-mcp, and a server run from a local clone as
+    {{CODE_DIR}}/<repo>/<path> (code: that folder, else code_dir() reads the overlay)."""
     out = {}
     for name, spec in servers.items():
         if isinstance(spec, dict):
             what = f"MCP server {name}"
             spec = {key: value for key, value in spec.items() if key != "credentials"}
+            extra: dict[str, str] = {}
+            if "{{CODE_DIR}}" in json.dumps(spec):
+                extra["CODE_DIR"] = code_dir() if code is None else code
+                if not extra["CODE_DIR"]:
+                    raise SystemExit(f"agent-kit: {what}: {{{{CODE_DIR}}}} needs a repository root (CODE_DIRS_JSON)")
             if isinstance(spec.get("command"), str):
-                spec["command"] = fill(spec["command"], kit, what=what)
+                spec["command"] = fill(spec["command"], kit, what=what, extra=extra)
             if isinstance(spec.get("args"), list):
                 spec["args"] = [
-                    fill(arg, kit, what=what) if isinstance(arg, str) else arg for arg in spec["args"]
+                    fill(arg, kit, what=what, extra=extra) if isinstance(arg, str) else arg for arg in spec["args"]
                 ]
         out[name] = spec
     return out
@@ -729,8 +758,21 @@ def render(api: Any, args: Any) -> int:
             )
         new_config = existing
         if "hooks" in components:
-            values = shell_env(api.KIT, host)
             policy = config.get("shell_environment_policy", {})
+            user_set = policy.get("set", {}) if isinstance(policy.get("set"), dict) else {}
+            values = shell_env(api.KIT, host, user_set)
+            if "GIT_CONFIG_COUNT" in user_set and "GIT_CONFIG_COUNT" in values:
+                # The kit's block cannot hold a GIT_CONFIG_COUNT beside the user's own, and setup
+                # never edits the user's lines: the user adds the layer's entry to theirs.
+                if values["GIT_CONFIG_COUNT"] != user_set["GIT_CONFIG_COUNT"]:
+                    index = user_set["GIT_CONFIG_COUNT"]
+                    raise SystemExit(
+                        f"agent-kit: your shell_environment_policy.set has its own GIT_CONFIG_COUNT. Add "
+                        f'GIT_CONFIG_KEY_{index} = "core.hooksPath" and GIT_CONFIG_VALUE_{index} = '
+                        f'"{values[f"GIT_CONFIG_VALUE_{index}"]}" there, set GIT_CONFIG_COUNT = '
+                        f'"{values["GIT_CONFIG_COUNT"]}", and rerun; nothing written'
+                    )
+                values = {key: value for key, value in values.items() if not key.startswith("GIT_CONFIG_")}
             filters = policy.get("filters", {})
             if filters and any(key in policy for key in ("include_only", "exclude")):
                 raise SystemExit(

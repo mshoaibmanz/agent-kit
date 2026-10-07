@@ -1,9 +1,0 @@
-{
-  "name": "terminal-signals",
-  "description": "Cosmetic only: names your VS Code/iTerm terminal tab after the task and flags it busy/idle/needs-attention per session, with macOS completion sounds and banners. The completion chime fires only when the turn is really over, not when another Stop hook blocked. Changes no tool behavior.",
-  "version": "2.0.0",
-  "license": "MIT",
-  "author": {
-    "name": "Shoaib Manzoor"
-  }
-}

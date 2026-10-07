@@ -1,20 +1,22 @@
 ---
 description: Bind this session to a project (and work item) under the work root, so its knowledge, scripts and handoff are injected now and after /clear or compaction. No argument lists the candidates.
-argument-hint: "<project>[/<item>] | <TICKET> | (none: list projects)"
+argument-hint: "<project>[/<item>] | <TICKET> | (none: list projects and items)"
 ---
 
-With no arguments: run `"${AGENT_KIT_DIR}/bin/agent-task" ls --paths`, show the list, and ask which
-project (and item, usually the ticket key) this session belongs to. Then bind.
+With no arguments: run `"${AGENT_KIT_DIR}/bin/agent-task" ls`, show the projects with their items (status,
+last touched), and ask which this session belongs to. Then bind.
 
 Otherwise run, once:
 
 `"${AGENT_KIT_DIR}/bin/agent-task" bind $ARGUMENTS`
 
 The session id comes from `$CLAUDE_CODE_SESSION_ID`; pass `--session <id>` only if it is unset.
-`<project>/<item>` creates the item (and the project) when missing; a bare ticket key binds to the
-project that lists it, else a legacy `tasks/` folder for it, else a new project of one.
+`<project>/<item>` creates the item (and the project) when missing, recording this checkout's
+worktree and branch on it. `<project>` alone binds its sole open item, else the project only and
+lists its open items. A bare ticket key binds the item the index maps it to, else
+`<the project that lists it>/<ticket>`, else a new project of one.
 
-Read what it prints: the project slice (scope, knowledge and scripts index, open items, the
-item's HANDOFF). Read the HANDOFF and the knowledge files it points at before re-deriving
-anything. Keep durable files in the project (`knowledge/`, `scripts/`, `data/`,
-`items/<item>/{briefs,out}`); INDEX.md regenerates on every write there.
+Read what it prints: the `bound:` line, then the slice (scope, open items, knowledge titles, proven
+scripts, the item's HANDOFF opening). Read the HANDOFF and the knowledge it names before
+re-deriving anything. Reusable scripts go to the project's `scripts/` with a `  - use:` line in
+INDEX.md; the item keeps `HANDOFF.md`, `briefs/`, `out/` (evidence) and `tmp/` (disposable).

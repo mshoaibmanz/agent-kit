@@ -36,6 +36,21 @@ def main() -> int:
     ]
     context = "Personal repository guidance: " + ", ".join(docs)
     context += ". Read invariants before edits, rules for conventions, testing before tests. Report conflicts with project instructions."
+    # The session's project item, the same slice Claude's session-context injects (agent-task
+    # binds by worktree or branch here; the prompt-time rules run in project-bind).
+    sid = data.get("session_id") or data.get("conversation_id") or os.environ.get("AGENT_SESSION_ID", "")
+    if sid:
+        kit = kit_root(__file__)
+        source = data.get("source") or "startup"
+        task = subprocess.run(
+            [str(kit / "bin" / "agent-task"), "session-start", "--session", sid, "--source", source if source in ("startup", "resume", "clear", "compact") else "startup", "--cwd", cwd],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        if task.returncode == 0 and task.stdout.strip():
+            context += "\n" + task.stdout.strip()
     sys.stdout.write(
         json.dumps(
             {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}

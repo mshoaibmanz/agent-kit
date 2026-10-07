@@ -127,6 +127,7 @@ sys.exit(1)
 # Records each run: argv, any MYSQL_PWD, and the option file named by its first argument.
 CLIENT_LOG = os.path.join(TMP, "client.log")
 FAKE_2003 = os.path.join(TMP, "fake-2003")
+FAKE_3024 = os.path.join(TMP, "fake-3024")
 FAKE_CLIENT = script(
     os.path.join(TMP, "client", "mysql"),
     f"""\
@@ -142,6 +143,12 @@ with open({CLIENT_LOG!r}, "a") as log:
     log.write(json.dumps(rec) + "\\n")
 if os.path.exists({FAKE_2003!r}):
     sys.exit("ERROR 2003 (HY000): Can't connect to MySQL server on '127.0.0.1:23309'")
+if os.path.exists({FAKE_3024!r}):
+    if sys.argv[-1].startswith("EXPLAIN "):
+        print("id\\tselect_type\\ttable\\ttype\\tpossible_keys\\tkey\\trows\\tExtra")
+        print("1\\tSIMPLE\\tevents\\tALL\\tNULL\\tNULL\\t48211934\\tUsing where")
+        sys.exit(0)
+    sys.exit("ERROR 3024 (HY000) at line 1: Query execution was interrupted, maximum statement execution time exceeded")
 """,
 )
 # Stand-ins for a swapped binary: each only records that it received control.
@@ -159,6 +166,9 @@ os.makedirs(EMPTY_DIR)
 
 m.SECURITY = FAKE_SECURITY
 m.AUTH_FAILED = os.path.join(TMP, "db-auth-failed")
+# Their defaults were bound to the real state file at import; a successful fake run clears through them.
+m.note_auth_failure.__defaults__ = (m.AUTH_FAILED,)
+m.clear_auth_failure.__defaults__ = (m.AUTH_FAILED,)
 m.CLIENT_CANDIDATES = (FAKE_CLIENT,)
 m.open_tunnel = lambda alias: "ssh is disabled in this suite"
 os.environ.update(
@@ -379,6 +389,72 @@ def after_2003(held: dict) -> tuple[bool, int]:
     finally:
         os.remove(FAKE_2003)
     return stopped, len(logged(CLIENT_LOG))
+
+
+def after_3024(argv: list[str]) -> tuple[str, list]:
+    """(stderr, client runs) for a call whose statement hits the max_execution_time cap."""
+    fresh_logs()
+    open(FAKE_3024, "w").close()
+    buf = io.StringIO()
+    try:
+        p = plan(["--tunnel=comm", *argv], keychain={"reader-a@db-tunnel-comm": "x"})
+        with contextlib.redirect_stderr(buf):
+            m.run_plan(p)
+    finally:
+        os.remove(FAKE_3024)
+    return buf.getvalue(), logged(CLIENT_LOG)
+
+
+def timeout_explains_in_the_same_session() -> bool:
+    err, runs = after_3024(["-D", "appdb", "--vertical", "-e", "SELECT * FROM events WHERE j->>'$.a' = 1"])
+    extra = err.split("maximum statement execution time exceeded\n", 1)[-1].splitlines()
+    query, explain = runs[0]["argv"], runs[1]["argv"] if len(runs) > 1 else []
+    init = [a for a in query if a.startswith("--init-command=")]
+    return (
+        len(runs) == 2
+        and explain[-1] == "EXPLAIN FORMAT=TRADITIONAL SELECT * FROM events WHERE j->>'$.a' = 1"
+        and init and init[0] in explain and "read_only = ON" in init[0]
+        and "-D" in explain and "appdb" in explain and "--vertical" not in explain
+        and len(extra) == 2
+        and "events type=ALL key=NULL rows~48211934" in extra[0]
+        and "id BETWEEN a AND b" in extra[1] and "bqro" in extra[1]
+    )
+
+
+def timeout_of_a_show_skips_explain() -> bool:
+    err, runs = after_3024(["-e", "SHOW TABLES"])
+    extra = err.split("maximum statement execution time exceeded\n", 1)[-1].splitlines()
+    return len(runs) == 1 and len(extra) == 1 and "bqro" in extra[0]
+
+
+def file_statement() -> bool:
+    path = os.path.join(TMP, "q.sql")
+    with open(path, "w") as f:
+        f.write("SELECT id\nFROM t\nWHERE a = 1\n")
+    argv = m.with_sql_file(["--tunnel=comm"], path)
+    p = plan(argv, keychain={"reader-a@db-tunnel-comm": "x"})
+    with open(path, "w") as f:
+        f.write("SELECT 1; DELETE FROM t")
+    bad = m.with_sql_file(["--tunnel=comm"], path)
+    return (
+        p.cmd[-1] == "SELECT id\nFROM t\nWHERE a = 1\n"
+        and refused(lambda: plan(bad, keychain={"reader-a@db-tunnel-comm": "x"}))
+        and refused(lambda: m.with_sql_file(["--tunnel=comm", *Q], path))
+    )
+
+
+def each_runs_one_call_per_value() -> bool:
+    fresh_logs()
+    rest, sql_file, values = m.split_extras(["--tunnel=comm", "--each=AE, S'A", "-e", "SELECT {} v FROM t WHERE c = {}"])
+    p = plan(rest, keychain={"reader-a@db-tunnel-comm": "x"})
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = m.run_each(p, values)
+    sqls = [rec["argv"][-1] for rec in logged(CLIENT_LOG)]
+    return (
+        rc == 0 and sql_file is None
+        and sqls == ["SELECT 'AE' v FROM t WHERE c = 'AE'", "SELECT 'S''A' v FROM t WHERE c = 'S''A'"]
+        and refused(lambda: m.run_each(plan(["--tunnel=comm", *Q], keychain={"reader-a@db-tunnel-comm": "x"}), ["x"]))
+    )
 
 
 def keychain_set_round_trip() -> bool:
@@ -681,6 +757,17 @@ checks: dict[str, Callable[[], bool]] = {
     in refusal(lambda: plan(["comm", *Q], logins=fixed_logins())),
     "-D <db> whose name matches a tunnel is still a database": lambda: "is a tunnel"
     not in refusal(lambda: plan(["--tunnel=app", "-D", "comm", *Q], logins=fixed_logins(APP_READER))),
+    "the session cap defaults to 30s": lambda: any(
+        a.endswith("max_execution_time = 30000")
+        for a in plan(["--tunnel=comm", *Q], env={"MYSQL_RO_MAX_MS": None}, keychain={"reader-a@db-tunnel-comm": "x"}).cmd
+    ),
+    "a 3024 EXPLAINs the SELECT in the same read-only session and prints two lines": timeout_explains_in_the_same_session,
+    "...and a 3024 on a non-SELECT prints only the next step": timeout_of_a_show_skips_explain,
+    "a multi-statement refusal names the one-call-per-statement form": lambda: "own `ro-mysql -e" in refusal(
+        lambda: m.validate("SELECT 1; SELECT 2")
+    ),
+    "--file reads the statement and validates it like -e; --file with -e is refused": file_statement,
+    "--each runs one call per value with {} as a quoted literal, and needs a {}": each_runs_one_call_per_value,
 }
 def rejected(sql: str) -> bool:
     try:

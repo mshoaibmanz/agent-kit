@@ -1017,7 +1017,10 @@ rv_push_decide() {
       _rv_set "$sid" "issued.$rk=$RV_REC_PTREE" "ihead.$rk=$RV_REC_PHEAD" "tier.$rk=2" "pending.$rk=1" \
         "proot.$rk=$root" "branch.$rk=$br" "ragents.$rk=$RV_REC_AGENTS"
     fi
-    RV_TEXT="the review round issued for this branch $(( (now - RV_REC_PSINCE) / 60 )) min ago has not returned. Wait for its agents (spawn them now if you never did: ${RV_REC_AGENTS:-bug-reviewer}, in ONE message, in the foreground), reproduce and fix their findings, end with the TALLY line, then push."
+    # Say WHY it waits: the round, the tree and the reviewers whose output never arrived (the record
+    # drops each one as it returns). A round a subagent's push issued, or one whose return went
+    # unrecorded, otherwise reads as a gate stuck for no reason.
+    RV_TEXT="review round $((RV_REC_ROUNDS + 1)) (tree $(rv_short "$RV_REC_PTREE")), issued for this branch $(( (now - RV_REC_PSINCE) / 60 )) min ago, has not returned: no output yet from ${RV_REC_AGENTS:-bug-reviewer} (record: $RV_REC_FILE). Wait for those agents (spawn them now if you never did, in ONE message, in the foreground), reproduce and fix their findings, end with the TALLY line, then push."
     for a in $RV_REC_AGENTS; do
       rv_role "$a" && [ "$RV_R_INVOKE" = run ] || continue
       RV_TEXT="$RV_TEXT $a is not an Agent: run \`$(printf '%q' "${AGENT_KIT_DIR:-${BASH_SOURCE[0]%/*}/../..}/bin/agent-run") $a $(printf '%q' "$root")${RV_REC_TREE:+ --since $RV_REC_TREE}\` $(host_noun bg)."
