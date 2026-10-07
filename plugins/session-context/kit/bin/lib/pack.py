@@ -272,7 +272,7 @@ def git_head(folder: Path) -> str | None:
     """The commit of a git repository folder, None when it has uncommitted changes."""
     if not (folder / '.git').exists() or not shutil.which('git'):
         return None
-    head, status = (git(folder, *arguments, timeout=10)
+    head, status = (git(folder, '--no-optional-locks', *arguments, timeout=10)
                     for arguments in (['rev-parse', 'HEAD'], ['status', '--porcelain', '--untracked-files=all']))
     return head.stdout.strip() if head.returncode == 0 and status.returncode == 0 and not status.stdout else None
 

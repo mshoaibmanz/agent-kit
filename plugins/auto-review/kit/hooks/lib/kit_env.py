@@ -68,29 +68,40 @@ def work_root() -> str:
     return old if not os.path.exists(new) and os.path.isdir(old) else new
 
 
-def kit_env(path: str | None = None) -> dict[str, str]:
-    """Every declared key: its value in path (default kit_env_path()), else empty."""
-    out = dict.fromkeys(KEYS, "")
+def layers(path: str | None = None) -> list[Path]:
+    """The overlay files kit_env reads, lowest first (a later one wins a key): path (default
+    kit_env_path()) alone, or for setup-paths.env the preset's layer and the user's kit.env under it."""
     path = path or kit_env_path()
-    paths = [path]
-    if Path(path).name == "setup-paths.env":
-        user_layer = Path(path).with_name("kit.env")
-        if not user_layer.is_file():
-            config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-            user_layer = Path(config) / "local/kit.env"
-        # A team preset's values sit under the user's own kit.env, which sits under setup's answers.
-        paths = [str(Path(path).with_name("preset.env")), str(user_layer), path]
+    if Path(path).name != "setup-paths.env":
+        return [Path(path)]
+    user_layer = Path(path).with_name("kit.env")
+    if not user_layer.is_file():
+        config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+        user_layer = Path(config) / "local/kit.env"
+    return [Path(path).with_name("preset.env"), user_layer, Path(path)]
+
+
+def parse(text: str) -> dict[str, str]:
+    """KEY=value lines, one surrounding quote pair removed; a later line wins."""
+    out = {}
     # split("\n"), not splitlines(): that also breaks on \x0b, \x85 and others, which bash's read does not.
-    for overlay in paths:
+    for line in text.split("\n"):
+        key, sep, value = line.removesuffix("\r").partition("=")
+        if not sep:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def kit_env(path: str | None = None) -> dict[str, str]:
+    """Every declared key: its value in the overlay layers (layers(path)), else empty."""
+    out = dict.fromkeys(KEYS, "")
+    for layer in layers(path):
         try:
-            text = Path(overlay).read_text()
+            text = layer.read_text()
         except OSError:
             continue
-        for line in text.split("\n"):
-            key, sep, value = line.removesuffix("\r").partition("=")
-            if not sep or key not in out:
-                continue
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-                value = value[1:-1]
-            out[key] = value
+        out.update((key, value) for key, value in parse(text).items() if key in out)
     return out
