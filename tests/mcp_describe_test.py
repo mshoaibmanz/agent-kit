@@ -66,9 +66,11 @@ class FakeHttp(http.server.BaseHTTPRequestHandler):
     """A Streamable HTTP MCP server configured by its server's `cfg`: it wants X-Team `team`
     (default static-1) and its session id, answers initialize as JSON (serverInfo name `name`, or
     the Authorization token and scheme with `echo`) and tools/list as an event stream kept open with
-    heartbeats, the reply first unless `silent`. `redirect` answers every POST with a 307; `drip`
-    sends one byte every 0.5 s inside the status line (`headers`) or the stream's first line
-    (`body`). Each request's headers go to cfg['seen']."""
+    heartbeats, the reply first unless `silent`. `pad` puts the Authorization token 20 characters
+    before the end of each field's limit (serverInfo name, instructions, the tool name). `redirect`
+    answers every POST with a 307; `drip` sends one byte every 0.5 s inside the status line
+    (`headers`), the stream's first line (`body`), or the first chunk-size line of a chunked
+    `Connection: close` stream (`chunked`). Each request's headers go to cfg['seen']."""
 
     protocol_version = 'HTTP/1.1'
 
@@ -104,15 +106,26 @@ class FakeHttp(http.server.BaseHTTPRequestHandler):
         if cfg.get('drip') == 'headers':
             self.wfile.write(b'HTTP/1.1 200 OK\r\nX-Slow: ')
             return self.drip()
+        if cfg.get('drip') == 'chunked':
+            self.wfile.write(b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n'
+                             b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n')
+            return self.drip()
         if self.headers.get('X-Team') != cfg.get('team', 'static-1'):
             return self.send(401)
         method = message.get('method')
         if method == 'notifications/initialized':
             return self.send(202)
+        scheme, _, token = self.headers.get('Authorization', '').partition(' ')
+
+        def padded(limit: int, fill: str) -> str:
+            return fill * (limit - 20) + token
+
         if method == 'initialize':
-            scheme, _, token = self.headers.get('Authorization', '').partition(' ')
             name = f'{token} via {scheme}' if cfg.get('echo') else cfg.get('name', 'web-docs')
             result = {'protocolVersion': '2025-06-18', 'serverInfo': {'name': name, 'version': '3'}}
+            if cfg.get('pad'):
+                result['serverInfo']['name'] = padded(mcp_describe.NAME_MAX, 'n')
+                result['instructions'] = padded(mcp_describe.INSTRUCTIONS_MAX, 'i')
             body = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}).encode()
             return self.send(200, body, {'Content-Type': 'application/json', 'Mcp-Session-Id': 's-1'})
         if self.headers.get('Mcp-Session-Id') != 's-1':
@@ -126,7 +139,8 @@ class FakeHttp(http.server.BaseHTTPRequestHandler):
             return self.drip()
         try:
             if not cfg.get('silent'):
-                reply = {'jsonrpc': '2.0', 'id': message['id'], 'result': {'tools': [{'name': 'lookup', 'description': 'd'}]}}
+                tool = padded(mcp_describe.NAME_MAX, 't') if cfg.get('pad') else 'lookup'
+                reply = {'jsonrpc': '2.0', 'id': message['id'], 'result': {'tools': [{'name': tool, 'description': 'd'}]}}
                 self.wfile.write(f'event: message\ndata: {json.dumps(reply)}\n\n'.encode())
             for _ in range(600):
                 self.wfile.write(b': ping\n\n')
@@ -195,6 +209,28 @@ class McpDescribeTests(Fixture):
         self.assertIn('2 tools', page_text(mcp))
         self.assertIn('needs sign-in', page_text(mcp))
         self.assertIn('mcp describe', page_text(section(page, 'actions')))
+
+    def test_a_credential_across_each_field_limit_leaves_no_prefix_in_the_cache_or_the_ok_line(self) -> None:
+        self.install()
+        url, _ = serve(self, pad=True)
+        secret = 'pad-' + 'Hq7Rw2Lx' * 4 + 'Z'
+        self.assertEqual(len(secret), 37)
+        installed = self.root / 'mcp/servers.json'
+        catalog = json.loads(installed.read_text())
+        catalog['mcpServers']['padded'] = {'url': url, 'headers': {'X-Team': 'static-1', 'Authorization': 'Bearer ' + secret}}
+        installed.write_text(json.dumps(catalog))
+        result = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'mcp', 'describe', '--only', 'padded',
+                                 '--timeout', '30'], capture_output=True, text=True, env=self.env(), timeout=120,
+                                stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cached = json.loads((self.root / 'state/mcp-describe.json').read_text())['servers']['padded']
+        name = 'n' * (mcp_describe.NAME_MAX - 20) + '[redacted]'
+        self.assertEqual(cached['name'], name)
+        self.assertEqual(cached['instructions'], 'i' * (mcp_describe.INSTRUCTIONS_MAX - 20) + '[redacted]')
+        self.assertEqual(cached['tools'], ['t' * (mcp_describe.NAME_MAX - 20) + '[redacted]'])
+        self.assertIn(f'  ok: {name} 3, 1 tools', result.stdout)
+        for text in (result.stdout, result.stderr, json.dumps(cached)):
+            self.assertNotIn(secret[:5], text, 'a prefix of the credential survived the clip')
 
 
 class McpDescribeUnitTests(unittest.TestCase):
@@ -272,6 +308,12 @@ class McpDescribeUnitTests(unittest.TestCase):
                 entry = self.http({'X-Team': 'static-1'}, 2, drip=where)
                 self.assertEqual(entry, Described('error', error='timeout'))
                 self.assertLess(time.monotonic() - started, 3)
+
+    def test_a_closing_chunked_stream_that_drips_its_chunk_size_line_stops_at_the_deadline(self) -> None:
+        started = time.monotonic()
+        entry = self.http({'X-Team': 'static-1'}, 2, drip='chunked')
+        self.assertEqual(entry, Described('error', error='timeout'))
+        self.assertAlmostEqual(time.monotonic() - started, 2, delta=0.5)
 
     def test_the_cache_reader_validates_every_entry(self) -> None:
         good = Described('ok', 'today', '', 'n', '2', 'Hi', ('t',))

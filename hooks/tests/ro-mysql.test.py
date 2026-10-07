@@ -17,6 +17,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -606,7 +607,8 @@ def add_writes_the_block_and_stores_the_password() -> bool:
         argv_log = f.read()
     block = (
         "Host db-tunnel-billing\n  # ro-mysql: user=reader\n  HostName bastion.example.test\n  User ops\n"
-        "  Port 2222\n  LocalForward 15310 billing.db.example.test:3306\n  ExitOnForwardFailure yes\n"
+        "  Port 2222\n  ControlMaster no\n  ControlPath none\n  GatewayPorts no\n"
+        "  LocalForward 15310 billing.db.example.test:3306\n  ExitOnForwardFailure yes\n"
         "  ServerAliveInterval 30\n  ServerAliveCountMax 3\n"
     )
     found = ("db-tunnel-billing", "15310", "reader") in [tuple(t)[:3] for t in m.load_tunnels(config)]
@@ -873,6 +875,107 @@ def add_refuses_while_another_add_holds_the_lock() -> bool:
     return refused and "another ro-mysql add holds" in shown and not prompts and untouched(config, BASE_CONFIG)
 
 
+MULTIPLEXED = {
+    "bastion": "Host jump\n  HostName bastion.example.test\n  User ops\n  ControlMaster auto\n"
+    "  ControlPath {SSH}/cm-%r@%h:%p\n  ControlPersist 10m\n  GatewayPorts yes\n",
+    "Host *": "Host jump\n  HostName bastion.example.test\n  User ops\n\n"
+    "Host *\n  ControlMaster auto\n  ControlPath {SSH}/cm-%n\n  ControlPersist 10m\n  GatewayPorts yes\n",
+}
+MULTIPLEXING = {"controlmaster", "controlpath", "controlpersist", "gatewayports"}
+
+
+def add_never_shares_the_bastions_multiplexing_socket() -> bool:
+    """Set on the bastion or by `Host *`: the block resets them, and the rest still matches."""
+    results = []
+    for text in MULTIPLEXED.values():
+        config = scratch_home(text)
+        refused, shown, _ = run_add(config, ADD_ARGS)
+        with open(config) as f:
+            block = f.read().split("Host db-tunnel-billing\n", 1)[-1].split("\n\n", 1)[0]
+        new, jump = ssh_g(config, "db-tunnel-billing"), ssh_g(config, "jump")
+        rest = {k: v for k, v in comparable(new).items() if k not in MULTIPLEXING}
+        results.append(
+            not refused and "  ControlMaster no\n  ControlPath none\n  GatewayPorts no\n" in block
+            and "ControlPersist" not in block and "cm-" not in block
+            and new["controlmaster"] == ["false"] and "controlpath" not in new and new["gatewayports"] == ["no"]
+            and rest == {k: v for k, v in comparable(jump).items() if k not in MULTIPLEXING}
+        )
+        if not results[-1]:
+            print(shown, block, sep="\n")
+    return all(results)
+
+
+@contextlib.contextmanager
+def editor_appends(path: str, edit: str, on_open: int) -> Iterator[None]:
+    """Append edit to path just before its on_open-th open for reading in this process: another
+    editor's write landing between two of add's reads. An audit hook (never removed) watches."""
+    state = {"opens": 0, "armed": True}
+    EDITORS.append((os.path.realpath(path), edit, on_open, state))
+    try:
+        yield
+    finally:
+        state["armed"] = False
+
+
+EDITORS: list[tuple[str, str, int, dict]] = []
+
+
+def _audit(event: str, args: tuple) -> None:
+    if event != "open" or not EDITORS:
+        return
+    for path, edit, on_open, state in EDITORS:
+        if not state["armed"] or not isinstance(args[0], str) or args[1] != "r":
+            continue
+        if os.path.realpath(args[0]) == path:
+            state["opens"] += 1
+            if state["opens"] == on_open:
+                state["armed"] = False
+                with open(path, "a") as f:
+                    f.write(edit)
+
+
+sys.addaudithook(_audit)
+
+
+def add_keeps_an_edit_made_while_it_reads_the_config() -> bool:
+    """The edit lands after add's first read of the config, before the next: the build input and
+    what the re-check compares against are one snapshot, so the edit is seen and kept."""
+    config = scratch_home()
+    edit = "\nHost db-tunnel-other\n  LocalForward 15399 other.db:3306\n"
+    with editor_appends(config, edit, on_open=2), contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()) as err:
+        m.add(ADD_ARGS, config=config, ask=lambda _prompt: ADD_PASSWORD)
+    with open(config) as f:
+        text = f.read()
+    return text.startswith(BASE_CONFIG + edit) and "Host db-tunnel-billing" in text and (
+        "changed during the prompt" in err.getvalue()
+    )
+
+
+SIGNALLED_ADD = """\
+import importlib.machinery, importlib.util, json, os, sys
+loader = importlib.machinery.SourceFileLoader("rom", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("rom", loader))
+loader.exec_module(m)
+m.add(json.loads(sys.argv[3]), config=sys.argv[2], ask=lambda _prompt: os.kill(os.getpid(), int(sys.argv[4])))
+"""
+
+
+def add_releases_the_lock_on_sigterm_or_sighup_at_the_prompt() -> bool:
+    results = []
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        config = scratch_home()
+        r = subprocess.run(
+            [sys.executable, "-c", SIGNALLED_ADD, PATH, config, json.dumps(ADD_ARGS), str(int(signum))],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+        )
+        results.append(
+            r.returncode == 128 + signum and not os.path.exists(config + ".ro-mysql-lock")
+            and untouched(config, BASE_CONFIG)
+        )
+    return all(results)
+
+
 def cached_state_reads_each_row_kind() -> bool:
     return [m.cached_state(r) for r in (
         {},
@@ -908,6 +1011,12 @@ ADD_CHECKS: dict[str, Callable[[], bool]] = {
     "add reads a quoted Include (port refusal and discovery)": add_reads_a_quoted_include,
     "add keeps an edit made during the prompt and backs up the current file": add_keeps_an_edit_made_during_the_prompt,
     "add refuses while another add holds the lock": add_refuses_while_another_add_holds_the_lock,
+    "add never shares the bastion's ControlMaster/ControlPath/ControlPersist nor its GatewayPorts":
+        add_never_shares_the_bastions_multiplexing_socket,
+    "add keeps an edit landing between its reads of the config (one snapshot)":
+        add_keeps_an_edit_made_while_it_reads_the_config,
+    "add releases the lock on SIGTERM or SIGHUP at the prompt and writes nothing":
+        add_releases_the_lock_on_sigterm_or_sighup_at_the_prompt,
     "cached_state reads a checked, a failed and a missing row": cached_state_reads_each_row_kind,
     "two backups within one second get two names": two_backups_in_one_second_get_two_names,
 }

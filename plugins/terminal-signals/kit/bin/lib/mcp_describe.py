@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 import datetime as dt
 import http.client
+import itertools
 import json
 import os
 import select
@@ -68,14 +69,18 @@ class Redirected(Unanswered):
     status = "redirected"
 
 
+def text(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def clip(value: object, limit: int) -> str:
-    return value[:limit] if isinstance(value, str) else ""
+    return text(value)[:limit]
 
 
 @dataclasses.dataclass(frozen=True)
 class Described:
     """One server's cached entry, the only shape written or read: name, version, instructions and
-    tools are filled for "ok" only."""
+    tools are filled for "ok" only, and within their limits once masked."""
 
     status: Status
     checked: str = ""
@@ -113,12 +118,14 @@ class Described:
         )
 
     def masked(self, credentials: list[str]) -> Described:
+        """Every credential masked out of the whole strings, then each clipped to its limit: a
+        clip first could cut a credential and leave a prefix that no longer matches it."""
         return dataclasses.replace(
             self,
-            name=redact(self.name, credentials),
-            version=redact(self.version, credentials),
-            instructions=redact(self.instructions, credentials),
-            tools=tuple(redact(t, credentials) for t in self.tools),
+            name=clip(redact(self.name, credentials), NAME_MAX),
+            version=clip(redact(self.version, credentials), NAME_MAX),
+            instructions=clip(redact(self.instructions, credentials), INSTRUCTIONS_MAX),
+            tools=tuple(clip(redact(t, credentials), NAME_MAX) for t in self.tools),
         )
 
 
@@ -173,7 +180,8 @@ def reply_in(text: str, request_id: int) -> dict[str, Any] | None:
 
 
 def answer(init: dict[str, Any], tools: dict[str, Any]) -> Described:
-    """The allowlisted entry from the initialize and tools/list replies."""
+    """The allowlisted entry from the initialize and tools/list replies, its strings whole until
+    Described.masked clips them."""
     for reply in (init, tools):
         if "error" in reply:
             raise Unanswered("JSON-RPC error")
@@ -193,14 +201,10 @@ def answer(init: dict[str, Any], tools: dict[str, Any]) -> Described:
         raise ProtocolError("protocol error")
     return Described(
         status="ok",
-        name=clip(info.get("name"), NAME_MAX),
-        version=clip(info.get("version"), NAME_MAX),
-        instructions=clip(instructions, INSTRUCTIONS_MAX),
-        tools=tuple(
-            clip(t.get("name"), NAME_MAX)
-            for t in items[:TOOLS_MAX]
-            if isinstance(t, dict)
-        ),
+        name=text(info.get("name")),
+        version=text(info.get("version")),
+        instructions=instructions,
+        tools=tuple(text(t.get("name")) for t in items[:TOOLS_MAX] if isinstance(t, dict)),
     )
 
 
@@ -272,30 +276,30 @@ def describe_stdio(spec: dict[str, Any], deadline: float) -> Described:
         start_new_session=True,
     )
     assert proc.stdin is not None and proc.stdout is not None
-    buffer = b""
 
     def send(message: dict[str, Any]) -> None:
         assert proc.stdin is not None
         proc.stdin.write(json.dumps(message).encode() + b"\n")
         proc.stdin.flush()
 
-    def receive(request_id: int) -> dict[str, Any]:
-        nonlocal buffer
+    def reads() -> Iterator[bytes]:
+        """stdout as it arrives, until it closes; the deadline checked at least once a second."""
         assert proc.stdout is not None
         while True:
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                reply = reply_in(line.decode("utf-8", "replace"), request_id)
-                if reply is not None:
-                    return reply
-            ready, _, _ = select.select(
-                [proc.stdout], [], [], min(remaining(deadline), 1)
-            )
+            ready, _, _ = select.select([proc.stdout], [], [], min(remaining(deadline), 1))
             if ready:
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
-                    raise Unanswered(f"exited ({proc.poll()}) before answering")
-                buffer += chunk
+                    return
+                yield chunk
+
+    output = lines(reads())
+
+    def receive(request_id: int) -> dict[str, Any]:
+        reply = next((r for line in output if (r := reply_in(line, request_id)) is not None), None)
+        if reply is None:
+            raise Unanswered(f"exited ({proc.poll()}) before answering")
+        return reply
 
     try:
         send(initialize(1))
@@ -310,14 +314,13 @@ def describe_stdio(spec: dict[str, Any], deadline: float) -> Described:
 
 
 @contextlib.contextmanager
-def watchdog(conn: http.client.HTTPConnection, deadline: float) -> Iterator[None]:
-    """Shut the connection's socket down at the deadline, so a read that keeps getting a byte at a
-    time (headers included) cannot outlast it."""
+def watchdog(sock: socket.socket, deadline: float) -> Iterator[None]:
+    """Shut sock down at the deadline, so a read that keeps getting a byte at a time (headers, a
+    chunk-size line or a trailer included) cannot outlast it."""
 
     def cut() -> None:
-        if conn.sock is not None:
-            with contextlib.suppress(OSError):
-                conn.sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
 
     timer = threading.Timer(max(deadline - time.monotonic(), 0), cut)
     timer.daemon = True
@@ -328,24 +331,20 @@ def watchdog(conn: http.client.HTTPConnection, deadline: float) -> Iterator[None
         timer.cancel()
 
 
-def chunks(
-    conn: http.client.HTTPConnection,
-    response: http.client.HTTPResponse,
-    deadline: float,
-) -> Iterator[bytes]:
-    """The body in reads of at most READ_CHUNK bytes, the deadline checked before each and the socket
-    timeout set to what is left of it."""
+def chunks(response: http.client.HTTPResponse, deadline: float) -> Iterator[bytes]:
+    """The body in reads of at most READ_CHUNK bytes, the deadline checked before each; the watchdog
+    ends a read that is still running at the deadline."""
     total = 0
     while True:
-        left = remaining(deadline)
-        if conn.sock is not None:
-            with contextlib.suppress(OSError):
-                conn.sock.settimeout(left)
-        chunk = response.read1(READ_CHUNK)
+        remaining(deadline)
+        # A read the watchdog cut ends or fails: past the deadline, either is the timeout.
+        try:
+            chunk = response.read1(READ_CHUNK)
+        except (http.client.HTTPException, OSError):
+            remaining(deadline)
+            raise
         if not chunk:
-            remaining(
-                deadline
-            )  # a cut by the watchdog reads as the end: it is the timeout
+            remaining(deadline)
             return
         total += len(chunk)
         if total > BODY_MAX:
@@ -354,6 +353,7 @@ def chunks(
 
 
 def lines(blocks: Iterator[bytes]) -> Iterator[str]:
+    """The text lines of a byte stream, stdio's or an HTTP body's; a last unended line too."""
     buffer = b""
     for block in blocks:
         buffer += block
@@ -368,7 +368,8 @@ def event_reply(blocks: Iterator[bytes], request_id: int) -> dict[str, Any]:
     """The matching JSON-RPC reply from an event stream, read event by event: it returns as soon as
     the reply arrives, however long the server keeps the stream open."""
     data: list[str] = []
-    for line in _with_end(lines(blocks)):
+    # a closing blank line: a stream that ends mid-event still dispatches it
+    for line in itertools.chain(lines(blocks), [""]):
         if line.startswith("data:"):
             data.append(line[5:].lstrip())
             continue
@@ -379,12 +380,6 @@ def event_reply(blocks: Iterator[bytes], request_id: int) -> dict[str, Any]:
         if reply is not None:
             return reply
     raise ProtocolError("protocol error")
-
-
-def _with_end(source: Iterator[str]) -> Iterator[str]:
-    """source, then a blank line: a stream that ends mid-event still dispatches it."""
-    yield from source
-    yield ""
 
 
 def connection(url: str, deadline: float) -> tuple[http.client.HTTPConnection, str]:
@@ -419,7 +414,10 @@ def post(
         **headers,
     }
     try:
-        with watchdog(conn, deadline):
+        conn.connect()
+        # getresponse() clears conn.sock on `Connection: close`, while the response reads on.
+        sock = conn.sock
+        with watchdog(sock, deadline):
             conn.request("POST", path, body=body, headers=sent)
             try:
                 response = conn.getresponse()
@@ -435,7 +433,7 @@ def post(
             session = response.getheader("Mcp-Session-Id", "") or ""
             if "id" not in message:
                 return {}, session
-            blocks = chunks(conn, response, deadline)
+            blocks = chunks(response, deadline)
             if "text/event-stream" in (response.getheader("Content-Type") or ""):
                 return event_reply(blocks, message["id"]), session
             reply = reply_in(b"".join(blocks).decode("utf-8", "replace"), message["id"])
@@ -458,7 +456,7 @@ def describe_http(spec: dict[str, Any], deadline: float) -> Described:
         )
         post(url, headers, INITIALIZED, deadline)
         tools, _ = post(url, headers, TOOLS, deadline)
-    except (TimeoutError, socket.timeout):
+    except TimeoutError:
         raise Unanswered("timeout") from None
     except (http.client.HTTPException, OSError) as error:
         raise Unanswered(f"not reached: {type(error).__name__}") from None

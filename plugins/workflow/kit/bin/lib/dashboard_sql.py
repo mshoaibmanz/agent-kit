@@ -50,17 +50,16 @@ def form_patterns(module: ModuleType) -> tuple[tuple[str, str], ...]:
     )
 
 
-def tunnel_state(state: tuple[str, str, list[str] | None, str], rejected: bool) -> Cell:
-    """The tunnel's state as ro-mysql last recorded it (its cached_state), never probed: a rejected
+def tunnel_state(state: Any, rejected: bool) -> Cell:
+    """The tunnel's state as ro-mysql last recorded it (its CachedState), never probed: a rejected
     login (db-auth-failed), the last --refresh's error or login path, or not checked."""
-    checked, via, databases, reason = state
     if rejected:
         return (Badge("login rejected", "bad"), Muted("run ro-mysql --rotate in your own terminal"))
-    if not checked:
+    if not state.checked:
         return Badge("not checked")
-    if databases is None:
-        return (Badge("failed", "bad"), Muted(f"{checked}: {reason}"))
-    return (Badge("ok", "ok"), Muted(f"{checked} {via}".strip()))
+    if state.databases is None:
+        return (Badge("failed", "bad"), Muted(f"{state.checked}: {state.reason}"))
+    return (Badge("ok", "ok"), Muted(f"{state.checked} {state.via}".strip()))
 
 
 def target(t: Any) -> str:
@@ -92,7 +91,6 @@ def sql_section(setup: Setup, sec: Section) -> None:
             else:
                 cred = Muted("No Keychain item (no annotated user, or a shared alias)")
             staging += t.kind == "STAGING"
-            databases = state[2]
             rows.append(
                 Row(
                     (
@@ -101,7 +99,7 @@ def sql_section(setup: Setup, sec: Section) -> None:
                         Badge(t.kind, "warn" if t.kind == "PROD" else "ok"),
                         t.user or "?",
                         cred,
-                        ", ".join(databases) if databases is not None else "-",
+                        ", ".join(state.databases) if state.databases is not None else "-",
                         tunnel_state(state, bool(t.user) and failed == (t.user, t.alias)),
                     ),
                     row,

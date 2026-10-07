@@ -25,15 +25,22 @@ login path of that user is used. --login-path forces one only if its user is the
 `-h`/`-P` are not accepted.
 
 `add` refuses an alias or local port the config or an Included file already has. The block copies
-every connection key the bastion's config sets (HostName, User, Port, ProxyJump, ProxyCommand,
-IdentityFile, IdentitiesOnly, CertificateFile: what `ssh -G <bastion>` shows beyond the defaults)
-and goes before the first wildcard Host or Match of ~/.ssh/config, so a `Host *` default cannot
-override it. add writes the new config to a temporary file and checks that `ssh -G` resolves the
-new alias to the bastion's connection and the one new forward; on any difference it names the keys
-and writes nothing. Only then does it prompt for the password, back the config up beside it
-(config.bak-<time>), replace it in one rename and store the password as --rotate does; the password
-never reaches argv or the screen. --dry-run prints the checked block and writes nothing. Its first
-word `add` is the subcommand, so a database named add is passed with -D.
+the bastion's full `ssh -G` output (its HostName, and every key whose value differs from what a
+host no block names gets) except the keys a tunnel sets itself or must not share: Host, the
+forwards (Local/Remote/DynamicForward, ClearAllForwardings), ExitOnForwardFailure, the
+ServerAlive keys, ControlMaster, ControlPath, ControlPersist and GatewayPorts. It always writes
+`ControlMaster no`, `ControlPath none` and `GatewayPorts no`, and resets a key a wildcard block
+would add but the bastion lacks (`ProxyJump none`, `ProxyCommand none`, `IdentityAgent
+SSH_AUTH_SOCK`). The block goes before the first wildcard Host or Match of ~/.ssh/config, so its
+first values win. add writes the new config to a temporary file and checks that `ssh -G` resolves
+the new alias exactly like the bastion (those keys aside) with the one new forward; a key a
+wildcard block still shadows gets one more line, up to three rounds, and any difference left is
+named and nothing is written. Only then does it prompt for the password. Under a lock beside the
+config (released on SIGTERM or SIGHUP too) it re-reads the config and its Includes and builds again
+if they changed during the prompt, backs the current file up beside it (config.bak-<time>),
+replaces it in one rename and stores the password as --rotate does; the password never reaches
+argv or the screen. --dry-run prints the block and every warning, writes nothing and exits 0. Its
+first word `add` is the subcommand, so a database named add is passed with -D.
 
 On ERROR 2003 the target's tunnel is re-opened and the same validated command re-run once. On
 ERROR 1045 the user and tunnel are recorded in ~/.claude/state/db-auth-failed until that pair next
@@ -802,20 +809,29 @@ def _exit_on_signal(signum: int, _frame: object) -> NoReturn:
 
 
 @contextlib.contextmanager
+def exit_on_signals() -> Iterator[None]:
+    """SIGTERM and SIGHUP raise SystemExit inside the block, so its finally clauses still run."""
+    previous = {s: signal.signal(s, _exit_on_signal) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+
+
+@contextlib.contextmanager
 def password_file(password: str) -> Iterator[str]:
     """A 0600 [client] option file holding the password, removed when the block exits."""
     fd, path = tempfile.mkstemp(prefix="ro-mysql-", suffix=".cnf")
     # SIGTERM/SIGHUP would otherwise skip the finally and leave the password on disk.
-    previous = {s: signal.signal(s, _exit_on_signal) for s in (signal.SIGTERM, signal.SIGHUP)}
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(f"[client]\npassword={cnf_quote(password)}\n")
-        yield path
-    finally:
-        with contextlib.suppress(OSError):
-            os.remove(path)
-        for s, handler in previous.items():
-            signal.signal(s, handler)
+    with exit_on_signals():
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(f"[client]\npassword={cnf_quote(password)}\n")
+            yield path
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(path)
 
 
 def run_client(
@@ -964,15 +980,23 @@ def read_cache(path: str = CACHE) -> dict[tuple[str, str], dict[str, str]]:
     return {(r["alias"], r["port"]): r for r in rows if "port" in r}
 
 
-def cached_state(row: dict[str, str]) -> tuple[str, str, list[str] | None, str]:
-    """(checked, via, databases, reason) of one --refresh cache row: databases is None when the
-    check failed (reason says why) or never ran (reason "not checked")."""
+class CachedState(NamedTuple):
+    """One --refresh cache row: databases is None when the check failed (reason says why) or never
+    ran (reason "not checked")."""
+
+    checked: str
+    via: str
+    databases: list[str] | None
+    reason: str
+
+
+def cached_state(row: dict[str, str]) -> CachedState:
     if not row:
-        return "", "", None, "not checked"
-    databases = row.get("databases", "")
+        return CachedState("", "", None, "not checked")
+    checked, via, databases = row.get("checked", ""), row.get("via", ""), row.get("databases", "")
     if databases.startswith("?"):
-        return row.get("checked", ""), row.get("via", ""), None, databases[1:].strip()
-    return row.get("checked", ""), row.get("via", ""), [d for d in databases.split(",") if d], ""
+        return CachedState(checked, via, None, databases[1:].strip())
+    return CachedState(checked, via, [d for d in databases.split(",") if d], "")
 
 
 def refresh(tunnels: list[Tunnel], path: str = CACHE) -> None:
@@ -1015,8 +1039,8 @@ def show_tunnels(tunnels: list[Tunnel], do_refresh: bool) -> None:
         state = "up" if h == t.alias else "down" if h is None else f"down ({h} holds the port)"
         if h == LSOF_FAILED:
             state = "? (lsof failed)"
-        _, _, databases, reason = cached_state(cache.get((t.alias, t.port), {}))
-        dbs = ",".join(databases) if databases is not None else f"? {reason}"
+        cached = cached_state(cache.get((t.alias, t.port), {}))
+        dbs = ",".join(cached.databases) if cached.databases is not None else f"? {cached.reason}"
         rows.append((t.name, t.port, t.kind, tunnel_user(t, logins) or "?", state, dbs))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
     for r in rows:
@@ -1196,10 +1220,14 @@ def parse_add(argv: list[str]) -> tuple[NewTunnel, bool]:
 
 UNMATCHED_HOST = "ro-mysql-unmatched-host.invalid"  # no block names it: ssh -G shows the defaults
 # ssh -G keys the new block sets itself, or that only name the host asked about: never copied or compared.
+# A tunnel never shares the bastion's multiplexing socket, nor listens beyond loopback.
 SELF_KEYS = {
     "host", "localforward", "remoteforward", "dynamicforward", "clearallforwardings",
     "exitonforwardfailure", "serveraliveinterval", "serveralivecountmax",
+    "controlmaster", "controlpath", "controlpersist", "gatewayports",
 }
+# Written into every block, which sits above the wildcards, so these win over a `Host *` value.
+OWN_LINES = ("ControlMaster no", "ControlPath none", "GatewayPorts no")
 # Keys ssh adds to on every matching block instead of keeping the first value.
 ACCUMULATING = {"identityfile", "certificatefile", "sendenv", "setenv"}
 # The value that sets a key back to "not set", for a key the bastion lacks but a wildcard block
@@ -1267,6 +1295,7 @@ def config_value(key: str, value: str) -> str:
 def tunnel_block(t: NewTunnel, settings: dict[str, list[str]]) -> str:
     lines = [f"Host {t.alias}", f"  # ro-mysql: user={t.user}"]
     lines += [f"  {KEYWORDS.get(k, k)} {config_value(k, v)}" for k, values in settings.items() for v in values]
+    lines += [f"  {line}" for line in OWN_LINES]
     lines += [
         f"  LocalForward {t.local_port} {t.remote}",
         "  ExitOnForwardFailure yes",
@@ -1334,16 +1363,19 @@ def fixable(
 def backup_config(target: str, old: str, now: datetime.datetime | None = None) -> str:
     """A 0600 copy of the config beside it, named config.bak-<time>, -<n> added on a collision."""
     stamp = (now or datetime.datetime.now()).strftime("%Y%m%d-%H%M%S")
-    for n in itertools.count():
-        backup = f"{target}.bak-{stamp}" + (f"-{n}" if n else "")
-        try:
-            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            continue
-        with os.fdopen(fd, "w") as f:
-            f.write(old)
-        return backup
-    raise AssertionError("unreachable")
+    names = (f"{target}.bak-{stamp}" + (f"-{n}" if n else "") for n in itertools.count())
+    backup, fd = next((name, fd) for name in names if (fd := created(name)) is not None)
+    with os.fdopen(fd, "w") as f:
+        f.write(old)
+    return backup
+
+
+def created(path: str) -> int | None:
+    """A descriptor of path, created 0600 for writing; None when path exists."""
+    try:
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return None
 
 
 @contextlib.contextmanager
@@ -1370,18 +1402,20 @@ def candidate(target: str, text: str) -> Iterator[str]:
 
 @contextlib.contextmanager
 def config_lock(target: str) -> Iterator[None]:
-    """A directory beside the config, so two `add` runs never write it at once."""
+    """A directory beside the config, so two `add` runs never write it at once; SIGTERM and SIGHUP
+    release it too."""
     lock = f"{target}.ro-mysql-lock"
     os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-    try:
-        os.mkdir(lock, 0o700)
-    except FileExistsError:
-        die(f"add: another ro-mysql add holds {lock}; if none is running, remove that directory")
-    try:
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            os.rmdir(lock)
+    with exit_on_signals():
+        try:
+            os.mkdir(lock, 0o700)
+        except FileExistsError:
+            die(f"add: another ro-mysql add holds {lock}; if none is running, remove that directory")
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(lock)
 
 
 def read_text(path: str) -> str:
@@ -1406,12 +1440,16 @@ class Prepared(NamedTuple):
         return f"add: {t.alias} not added; nothing changed:\n  " + "\n  ".join(self.taken + self.differ) + hint
 
 
+MAX_FIX_ROUNDS = 3
+
+
 def prepare(t: NewTunnel, config: str, target: str) -> Prepared:
     """Build the block from the bastion's full ssh -G output and check the new config resolves the
-    alias like the bastion, adding a line per key a wildcard block shadows (three tries at most)."""
-    old = read_text(target)
+    alias like the bastion, adding a line per key a wildcard block shadows (MAX_FIX_ROUNDS tries)."""
+    old = read_text(target)  # one snapshot: the build input, and what a later change is judged by
     blocks = config_blocks(config)
-    seen = {path: read_text(path) for path in {target, *(b.path for b in blocks)}}
+    seen = {path: read_text(path) for path in {os.path.realpath(b.path) for b in blocks} - {target}}
+    seen[target] = old
     taken = []
     if t.alias.lower() in {a.lower() for b in blocks for a in b.aliases()}:
         taken.append(f"{t.alias} is already in {config} or a file it Includes")
@@ -1426,7 +1464,7 @@ def prepare(t: NewTunnel, config: str, target: str) -> Prepared:
             "--via names the bastion's alias there")
     settings = bastion_settings(bastion, resolved(UNMATCHED_HOST, config))
     at = insert_at(blocks, config)
-    for _ in range(3):
+    for _ in range(MAX_FIX_ROUNDS):
         block = tunnel_block(t, settings)
         text = with_block(old, block, at)
         with candidate(target, text) as tmp:
@@ -1440,6 +1478,14 @@ def prepare(t: NewTunnel, config: str, target: str) -> Prepared:
 
 def unchanged(p: Prepared) -> bool:
     return all(read_text(path) == text for path, text in p.seen.items())
+
+
+def checked(t: NewTunnel, config: str, target: str) -> Prepared:
+    """prepare, then refuse (nothing written) a taken alias or port or a difference."""
+    p = prepare(t, config, target)
+    if p.taken or p.differ:
+        die(p.refusal(t, config))
+    return p
 
 
 def add(
@@ -1460,18 +1506,14 @@ def add(
             print(f"ro-mysql: warning: {problem}", file=sys.stderr)
         return
     with config_lock(target):
-        p = prepare(t, config, target)
-        if p.taken or p.differ:
-            die(p.refusal(t, config))
+        p = checked(t, config, target)
         try:
             password = ask(f"{t.alias} ({t.user}) password, blank skips storing: ")
         except (EOFError, KeyboardInterrupt):
             die("add: cancelled; nothing changed")
         if not unchanged(p):
             print(f"ro-mysql: {config} changed during the prompt; building and checking again", file=sys.stderr)
-            p = prepare(t, config, target)
-            if p.taken or p.differ:
-                die(p.refusal(t, config))
+            p = checked(t, config, target)
         backup = backup_config(target, p.old) if p.old else None
         with candidate(target, p.text) as tmp:
             os.replace(tmp, target)
