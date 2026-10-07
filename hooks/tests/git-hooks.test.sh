@@ -84,6 +84,21 @@ check "force-push: AGENT_PUSH_NOW does not override" "$out" 'rc=1'
 out=$(human git -C "$WT" push -q -f 2>&1; echo "rc=$?")
 check "human force-push: the agent layer stays out" "$out" 'rc=0'
 
+echo "--- pre-push: every pushed branch is type-checked ---"
+if command -v basedpyright >/dev/null 2>&1 || command -v pyright >/dev/null 2>&1; then
+  python3 -m venv --without-pip "$WT/.venv"; printf '.venv\n' > "$WT/.gitignore"; commit "ignore venv" >/dev/null
+  human git -C "$WT" push -q 2>/dev/null
+  g checkout -q -b ok-branch; printf 'k = 1\n' > "$WT/ok.py"; commit "ok" >/dev/null
+  g checkout -q -b bad-branch feat; printf 'n: int = "s"\n' > "$WT/bad.py"; commit "bad" >/dev/null
+  g checkout -q feat
+  out=$(push git -C "$WT" push -q origin ok-branch bad-branch)
+  check "a clean branch then one with a type error: refused" "$out" 'rc=1'
+  check "...on the second branch's error" "$out" 'bad\.py:1'
+  g branch -q -D ok-branch bad-branch
+else
+  echo "SKIP pre-push type gate: no basedpyright or pyright"
+fi
+
 echo "--- pre-push: human push, scratch scope ---"
 work e 80; commit "e" >/dev/null
 out=$(human git -C "$WT" push -q 2>&1; echo "rc=$?")

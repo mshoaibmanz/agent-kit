@@ -170,6 +170,25 @@ Everything personal lives in the kit root's `local/` folder. Setup writes only i
 - **Drift**: setup records the overlay's skills and rules with the install. `agent-setup doctor` reports a change since, until `agent-kit sync` (or a rerun) installs it, and an edit to an installed copy like any other installed path.
 - **Claude's `local`**: Claude's hooks, commands and skill texts read `<config dir>/local` (`~/.claude/local`), so setup links it to `<kit root>/local` and both doctors check the link. A link of your own that resolves to `<kit root>/local` is left as it is. A real folder there, or a link to anywhere else, is kept, with a warning and a doctor problem. To switch it, move its files into `<kit root>/local`, then remove it (for a link, `rm ~/.claude/local` removes only the link) and rerun setup.
 
+## Verification
+
+The model hears only errors from correctness rules, and only those its change made. A check whose tool is missing is skipped silently.
+- **Per edit** (`hooks/verify-edit`): the edited file is checked before and after the edit (the edit tool's `originalFile`, else the committed copy). Only errors the old text did not have reach the model, at most 10 lines, and the edit is never blocked.
+  - Python: ruff. A repo with a ruff config is also fixed and formatted with it, and its rule selection applies; one without is checked with `--select F,E9,B` and never reformatted. Either way only F, E9, B and syntax errors are reported, without F401, F841 and B008.
+  - TypeScript and JavaScript: the repo's eslint, errors only, when the repo has an eslint config.
+- **Stop and push** (`review-trigger` and the agent pre-push gate): the files the branch changed since it left its base branch are type-checked, errors only, and an error counts only on a line the branch added or changed (`git diff -U0` against the fork point). Errors the change causes on unchanged lines, such as a caller of a changed signature, are left to CI and tests. Unresolved imports are ignored.
+  - Python: basedpyright, else pyright, with the environment that `pyrightconfig.json` names, else `.venv` or `venv`. With no environment, the check is skipped and every push says so.
+  - TypeScript: `tsc --noEmit -p` on the project that lists the file: the nearest `tsconfig.json`, else the project it references that does (a solution-style config).
+  - Both check tracked files only. Stop checks the working tree; the push checks every commit being pushed, each with its own `pyrightconfig.json`.
+  - Stop shows a tree's errors once, together with the self-check review. The push refuses them until they are fixed or `AGENT_PUSH_NOW="<reason>"` is given; a push of the tree a Stop checked reuses that result. A check that runs past its deadline (40 s at Stop, 90 s at push) passes with a note, and nothing is recorded as passed.
+  - Known limit: a line separator (U+2028, U+2029) or a lone carriage return counts as a line break for the checker but not for git, so an error after one on the same line can be matched to the wrong line.
+
+A new worktree (EnterWorktree, or `git worktree add` in an agent shell) gets the main checkout's untracked `pyrightconfig.json`, with `venvPath`/`venv` pointing at the main checkout's environment.
+
+Everything is on by default. The overlay key `VERIFY_OFF` turns parts off: space-separated `<repo-glob>:<what>` entries, where `<what>` is `python.edit`, `python.types`, `typescript.edit`, `typescript.types` or `worktree`, e.g. `VERIFY_OFF='legacy-*:python.types my-api:worktree'`.
+
+The kit cannot quiet the pyright editor plugin's hint diagnostics. Claude Code takes the language server's settings only from the plugin's own entry, and `pyright.disableTaggedHints` is not a `pyrightconfig.json` key.
+
 ## Search code
 
 The bundled code-search skill refreshes eligible local clones under the configured repository roots before searching them. It only pulls clean, attached branches with an upstream and zero unpushed commits, using `pull --ff-only --no-rebase --no-autostash`. Dirty, ahead, detached, diverged or failed clones are skipped and reported as coverage gaps. It checks incoming paths against existing ignored files and symlink parents before pulling the exact fetched tip. A collision skips that refresh and reports the gap; unrelated ignored caches remain compatible. It never stashes or resets user work.
