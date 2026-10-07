@@ -63,9 +63,9 @@ from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, defaul
                    strip_legacy_sandbox)
 from kit_env import code_dir, kit_env  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
-                       detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary,
-                       server_runtime)
-from pack import PACK_DIR, PACK_MCP, PACK_SKILLS, extension_lists, installed_pack, render_extensions  # noqa: E402
+                       detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary)
+from pack import (PACK_DIR, PACK_SKILLS, McpPlan, extension_lists, installed_pack, mcp_plan,  # noqa: E402
+                  sync_pack_mcp)
 from preset import Preset, apply_preset, kit_skills, plugin_settings, source_status, validate_catalog  # noqa: E402
 from sentry import INSTANCES_FILE, expand_servers, merge_instances, read_instances  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
@@ -299,12 +299,14 @@ def validate_toml_boundary(text: str) -> None:
         raise ValueError('TOML scalar keys after the managed END retain its table context; move them before the block or add an explicit table header')
 
 
-def overlay_text(args: argparse.Namespace, from_preset: set[str]) -> str:
+def overlay_text(args: argparse.Namespace, from_preset: set[str], answered: set[str]) -> str:
     """local/setup-paths.env: setup's own answers, the top overlay layer. An answer the preset
-    supplied stays in the preset's layer (local/preset.env, under the user's kit.env), not here."""
+    supplied stays in the preset's layer (local/preset.env, under the user's kit.env), not here, and
+    so do repository roots nobody gave: an empty CODE_DIRS_JSON would hide the user's CODE_DIRS."""
     if any('\n' in value or '\r' in value for value in [*args.repo_roots, args.work_root]):
         raise ValueError('Repository and work roots must fit on one line')
-    overlay = '' if 'repo_roots' in from_preset else 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
+    unset = 'repo_roots' in from_preset or (not args.repo_roots and 'repo_roots' not in answered)
+    overlay = '' if unset else 'CODE_DIRS_JSON=' + json.dumps(args.repo_roots) + '\n'
     if args.work_root:
         overlay += 'AGENT_WORK_ROOT=' + args.work_root + '\n'
     if args.github_owner and 'github_owner' not in from_preset:
@@ -357,7 +359,7 @@ def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view:
 
 
 def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, overlays: dict[str, str],
-                 resume: int, preset: Preset) -> list[Change]:
+                 resume: int, preset: Preset, mcp: McpPlan) -> list[Change]:
     root = Path(args.root_dir).expanduser().absolute()
     target = host_target(args, host, home)
     components = set(args.components)
@@ -404,8 +406,7 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                                        owned, enabled=args.blocking_hooks))
             changes.append(Change('environment', settings, shell, 0o600))
         if 'mcp' in components:
-            servers = fill_servers(safe_catalog(view / 'mcp/servers.json')['mcpServers'], str(view),
-                                   code_dir(args.repo_roots))
+            servers = fill_servers(mcp.runnable, str(view), code_dir(args.repo_roots))
             # One server per Sentry instance, as `agent-kit render` lists them (bin/lib/sentry.py).
             servers = expand_servers(view, servers, overlay=root / 'local')
             servers = resolve_values(servers, view, root, target, target)
@@ -546,58 +547,14 @@ def catalog_path(args: argparse.Namespace) -> Path:
     return Path(args.mcp_catalog).expanduser() if args.mcp_catalog else Path(args.source).expanduser().resolve() / 'mcp/servers.json'
 
 
-def mcp_selection(args: argparse.Namespace, view: Path, preset: Preset,
-                  servers: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """The catalog servers this install can start, and a line for each one it leaves out and why.
-
-    A server whose runtime is missing is left out, so no host starts a command that cannot run. Its
-    descriptor stays in the catalog or preset: a rerun after installing the runtime adds it. The
-    catalog keeps its kit placeholders: it is installed as is, and a later render fills them from the
-    installed kit. Filled with the view here for the checks only. A server run from a local clone
-    ({{CODE_DIR}}/<repo>/...) is left out the same way until that clone has it, and one run from the
-    team pack's mcp/ project ({{PACK_DIR}}) while uv, which syncs it, is missing. A pack server's bare
-    command is written as its absolute path: a host started from the Dock lacks ~/.local/bin on PATH."""
-    local = code_dir(args.repo_roots)
-    uv = shutil.which('uv')
-    runnable, skipped = {}, []
-    for name, spec in servers.items():
-        text = json.dumps(spec)
-        clone, packed = '{{CODE_DIR}}' in text, '{{PACK_DIR}}' in text
-        if clone and not local:
-            skipped.append(f'MCP server {name}: {{{{CODE_DIR}}}} needs a repository root (CODE_DIRS_JSON)')
-            continue
-        if packed and (preset.pack is None or not preset.pack.has_mcp):
-            skipped.append(f'MCP server {name}: the team pack has no mcp/ project for {{{{PACK_DIR}}}}')
-            continue
-        if packed and not uv:
-            skipped.append(f'MCP server {name}: uv is missing, which syncs the team pack\'s mcp/ project. '
-                           f'Fix: {install_hint("uv")}, then rerun agent-setup')
-            continue
-        filled = fill_servers({name: spec}, str(view), local)[name]
-        command = filled.get('command', '')
-        if packed and command and '/' not in command:
-            if not (found := shutil.which(command)):
-                skipped.append(f'MCP server {name}: {command} is missing. Fix: {install_hint(command)}')
-                continue
-            spec = {**spec, 'command': found}
-        elif server_runtime(filled) and not shutil.which(command):
-            continue
-        elif clone and '{{CODE_DIR}}' in str(spec.get('command')) and not os.access(command, os.X_OK):
-            skipped.append(f'MCP server {name}: {command} is not an executable in your clone yet; '
-                           'rerun agent-setup once it is')
-            continue
-        runnable[name] = spec
-    return runnable, skipped
-
-
 def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
-                      servers: dict[str, Any]) -> tuple[set[Path], list[str]]:
+                      servers: dict[str, Any]) -> tuple[set[Path], McpPlan]:
     """The kit as this install selects it, in view; returns the paths in it that setup derived rather
     than copied from the source (the team pack's included), which a dev install keeps as copies, and
-    a line for each MCP server it leaves out (mcp_selection)."""
+    the MCP plan (pack.mcp_plan) whose servers it installs."""
     source = Path(args.source).expanduser().resolve()
     derived = {Path('hooks/registry.json')}
-    skipped: list[str] = []
+    mcp = McpPlan({}, (), None)
     for name in ('bin', 'hooks', 'git-hooks', 'agents', 'commands', 'rules', 'hosts', 'skills', 'references'):
         path = source / name
         if path.is_dir():
@@ -625,9 +582,10 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
         derived.add(Path('roles.toml'))
     kit_api(view).load_roles()
     if 'mcp' in args.components:
-        runnable, skipped = mcp_selection(args, view, preset, servers)
+        mcp = mcp_plan(servers, view=view, root=Path(args.root_dir).expanduser().absolute(), pack=preset.pack,
+                       local=code_dir(args.repo_roots))
         (view / 'mcp').mkdir()
-        (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': runnable}, indent=2) + '\n')
+        (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': mcp.runnable}, indent=2) + '\n')
         derived.add(Path('mcp/servers.json'))
         # Sentry instances: the source's, then the preset's [sentry.instances] over them field by
         # field; the user's overlay copy applies over both when the wrapper or a render reads them.
@@ -635,13 +593,13 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
         if instances:
             (view / 'mcp' / INSTANCES_FILE).write_text(json.dumps({'instances': instances}, indent=2) + '\n')
             derived.add(Path('mcp') / INSTANCES_FILE)
-    return derived, skipped
+    return derived, mcp
 
 
-def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str],
-         servers: dict[str, Any]) -> tuple[list[Change], list[str]]:
-    """The changes this install makes, and a line for each MCP server it leaves out."""
-    derived, skipped = installation_view(args, view, preset, servers)
+def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str], answered: set[str],
+         servers: dict[str, Any]) -> tuple[list[Change], McpPlan]:
+    """The changes this install makes, and its MCP plan."""
+    derived, mcp = installation_view(args, view, preset, servers)
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
     home = Path.home()
@@ -670,10 +628,8 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.suffix == '.md':
                 filled = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
-                                      strict=relative.parts[1] not in pack_skills)
-                if relative.parts[2:] == ('SKILL.md',):
-                    filled = render_extensions(filled, relative.parts[1], extensions.get(relative.parts[1], []))
-                filled = filled.encode()
+                                      strict=relative.parts[1] not in pack_skills,
+                                      extensions=extensions.get(relative.parts[1], [])).encode()
                 if filled != content:
                     derived.add(relative)
                 content = filled
@@ -682,7 +638,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
                 continue
             changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
     # The preset's layer is written when it has values or an earlier install wrote one.
-    overlays = {'preset.env': preset.env_text(), 'setup-paths.env': overlay_text(args, from_preset)}
+    overlays = {'preset.env': preset.env_text(), 'setup-paths.env': overlay_text(args, from_preset, answered)}
     for name, text in overlays.items():
         if text or name == 'setup-paths.env' or (root / 'local' / name).is_file():
             changes.append(Change('file', root / 'local' / name, text.encode(), 0o600))
@@ -694,7 +650,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         changes.append(Change('file', root / 'state/rendered' / ('roles-' + host + '.sh'), api.roles_sh(roles, host).replace(str(view), str(root)).encode()))
     resume = setup_resume(root, overlays) if args.hosts else 0
     for host in args.hosts:
-        changes.extend(host_changes(args, view, host, home, overlays, resume, preset))
+        changes.extend(host_changes(args, view, host, home, overlays, resume, preset, mcp))
     previous = load_json(root / '.install-state/current.json', {})
     for record in previous.get('managed', {}).values():
         target = Path(record['target'])
@@ -707,7 +663,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         if identity in unique and unique[identity] != change:
             raise ValueError(f'Two selected components conflict: {change.target}')
         unique[identity] = change
-    return list(unique.values()), skipped
+    return list(unique.values()), mcp
 
 
 def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change], preset: Preset) -> list[Change]:
@@ -1127,7 +1083,7 @@ class Plan:
     records: list[tuple[Change, dict]]
     collisions: list[tuple[str, bool]]
     report: dict[str, Any]
-    sync: list[str] | None = None
+    sync: tuple[str, ...] | None = None
 
     @property
     def blocked(self) -> bool:
@@ -1142,7 +1098,8 @@ def show_plan(args: argparse.Namespace, planned: Plan) -> None:
         print_summary(planned.rows, planned.prepared, args, Path(args.root_dir).expanduser().absolute())
 
 
-def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], notes: list[Row]) -> Plan:
+def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], answered: set[str],
+            notes: list[Row]) -> Plan:
     """Plan the install and check it against what is on disk; prints nothing (show_plan does)."""
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
@@ -1164,8 +1121,7 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
     with tempfile.TemporaryDirectory(prefix='agent-kit-install-view-') as folder:
         view = Path(folder) / 'kit source'
         view.mkdir()
-        changes, left_out = plan(args, view, preset, from_preset, servers)
-        installed = json.loads((view / 'mcp/servers.json').read_text())['mcpServers'] if 'mcp' in args.components else {}
+        changes, mcp = plan(args, view, preset, from_preset, answered, servers)
         records, collisions, skipped = [], [], []
         for change in changes:
             try:
@@ -1182,9 +1138,7 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
     prepared = [(change, record) for change, record in records if not record.get('noop')]
     deps = dependencies(args, servers)
     notes = [*notes, *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped),
-             *(Row('Skipped', line) for line in left_out)]
-    packed = [spec for spec in installed.values() if '{{PACK_DIR}}' in json.dumps(spec)]
-    sync = [str(shutil.which('uv')), 'sync', '--frozen', '--no-dev', '--project', str(root / PACK_DIR / PACK_MCP)] if packed else None
+             *(Row('Skipped', line) for line in mcp.skipped)]
     if preset.record and args.github_owner:
         notes.append(org_access(args.github_owner, args.zoekt_url))
     for rows in routes.values():
@@ -1212,9 +1166,9 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
             'auth': 'Reuse each provider login; no auth files are read or copied.',
             'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
             'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'}
-    if sync:
-        report['mcp_sync'] = sync
-    return Plan(summary, prepared, records, collisions, report, sync)
+    if mcp.sync:
+        report['mcp_sync'] = list(mcp.sync)
+    return Plan(summary, prepared, records, collisions, report, mcp.sync)
 
 
 def configured(args: argparse.Namespace, preset: Preset, answered: set[str], preset_owned: set[str]) -> dict[str, Any]:
@@ -1309,22 +1263,6 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
         sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n'
                          + (f'MCP: {synced}\n' if synced else ''))
     return 0
-
-
-def sync_pack_mcp(command: list[str] | None) -> str | None:
-    """Run command, uv sync of the team pack's mcp/ project, and say how it went (None: nothing to
-    sync). The environment uv creates there (.venv) belongs to no record: neither drift nor a
-    collision. A failed sync leaves the install as it is; the server's own `uv run` retries it."""
-    if not command:
-        return None
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return f'team pack mcp/ project not synced ({error}); rerun: {shlex.join(command)}'
-    if result.returncode:
-        reason = (result.stderr.strip().splitlines() or ['uv sync failed'])[-1]
-        return f'team pack mcp/ project not synced ({reason}); rerun: {shlex.join(command)}'
-    return f'team pack mcp/ project synced ({command[-1]})'
 
 
 def rollback(args: argparse.Namespace) -> int:
@@ -1432,8 +1370,8 @@ def sync_pending(root: Path, state: dict[str, Any]) -> str | None:
     are what an edit to a derived file or a new kit file waits for."""
     args = parser().parse_args(['sync', '--root-dir', str(root)])
     try:
-        preset, _, from_preset, notes = resolve(args, root, state, state.get('configuration', {}))
-        planned = preview(args, preset, from_preset, notes)
+        preset, answered, from_preset, notes = resolve(args, root, state, state.get('configuration', {}))
+        planned = preview(args, preset, from_preset, answered, notes)
     except Exception as error:  # noqa: BLE001 (doctor diagnoses: a checkout mid-merge breaks the preview in any way)
         return f'agent-kit sync cannot preview this install: {type(error).__name__}: {" ".join(str(error).split())}'
     if planned.blocked:
@@ -1613,7 +1551,7 @@ def main() -> int:
         return interactive(args, root, preset, answered, from_preset, notes)
     if args.action == 'doctor':
         return doctor(args)
-    planned = preview(args, preset, from_preset, notes)
+    planned = preview(args, preset, from_preset, answered, notes)
     if args.action == 'sync':
         return sync(args, planned, preset, answered, from_preset)
     show_plan(args, planned)
@@ -1699,13 +1637,13 @@ def interactive(args: argparse.Namespace, root: Path, preset: Preset, answered: 
     answers = {key: getattr(args, key) for key in (*SAVED_KEYS, 'collision', 'host_roots')}
     answers['answered'] = sorted(answered)
     args.apply = False
-    planned = preview(args, preset, from_preset - answered, notes)
+    planned = preview(args, preset, from_preset - answered, answered, notes)
     show_plan(args, planned)
     if args.collision == 'refuse' and planned.collisions:
         choice = ask('Some paths hold your own content: [b]ackup and replace, [s]kip them, or [a]bort? [a]: ', args).lower()
         if choice[:1] in ('b', 's'):
             args.collision = answers['collision'] = 'backup' if choice[:1] == 'b' else 'skip'
-            planned = preview(args, preset, from_preset - answered, notes)
+            planned = preview(args, preset, from_preset - answered, answered, notes)
             show_plan(args, planned)
     if planned.blocked:
         # Saved only when the run stops here: the rerun after the fix offers them as defaults.
@@ -1743,6 +1681,10 @@ def sync(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[
         print(f'  {"configuration":12} {", ".join(changed)}')
     if not planned.prepared and not changed:
         print(f'sync: nothing changed; {root} matches {Path(args.source).expanduser().resolve()}')
+        # An earlier sync of the pack's mcp/ project failed or its lock moved on: retried on its own.
+        if planned.sync:
+            print('MCP: ' + ('team pack mcp/ project to sync; rerun without --dry-run' if args.dry_run
+                             else str(sync_pack_mcp(planned.sync))))
         return 0
     if args.dry_run:
         print(f'sync: {len(planned.prepared) or 1} change(s) to apply; rerun without --dry-run to apply them')

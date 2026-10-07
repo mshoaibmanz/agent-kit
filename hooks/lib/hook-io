@@ -95,6 +95,32 @@ kit_env() {
   return 0
 }
 
+# context_points: COMPACT_AT (where the host auto-compacts, 0 when unknown) and HANDOFF_DEFAULT, both
+# from hooks/lib/handoff.py, then HANDOFF_AT (CONTEXT_HANDOFF_AT when set, 0 = no nudge, else the
+# default). The answer is cached per config dir and redone once settings.json is newer, so the hot
+# path forks nothing. DEFAULT_HANDOFF_AT stands in only when Python cannot answer.
+context_points() {
+  kit_env
+  local cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  local cache="${CLAUDE_STATE_DIR:-$HOME/.claude/state}/context-watch/.points" d='' c='' from=''
+  if [ -f "$cache" ] && ! [ "$cfg" -nt "$cache" ]; then
+    read -r d c from < "$cache" 2>/dev/null
+  fi
+  if [ "$from" != "$cfg" ]; then
+    set -f; set -- $(python3 "$HOOK_LIB/handoff.py" points 2>/dev/null); set +f
+    d=${1:-} c=${2:-}
+    case $d$c in '' | *[!0-9]*) d='' ;; *)
+      mkdir -p "${cache%/*}" 2>/dev/null &&
+        printf '%s %s %s\n' "$d" "$c" "$cfg" > "$cache.$$" 2>/dev/null && mv -f "$cache.$$" "$cache" 2>/dev/null ;;
+    esac
+  fi
+  case $d in '' | *[!0-9]*) d=600000 c=0 ;; esac
+  case $c in '' | *[!0-9]*) c=0 ;; esac
+  COMPACT_AT=$c HANDOFF_DEFAULT=$d HANDOFF_AT=${CONTEXT_HANDOFF_AT:-}
+  case $HANDOFF_AT in '' | *[!0-9]*) HANDOFF_AT=$d ;; esac
+  return 0
+}
+
 # kit_work_root: the one work-root resolver for bash; hooks/lib/kit_env.py work_root() is its twin.
 # CLAUDE_OUT_ROOT (tests), else the overlay's AGENT_WORK_ROOT, else ~/agent-work, else
 # ~/claude-scratch (its old name) when only that exists.

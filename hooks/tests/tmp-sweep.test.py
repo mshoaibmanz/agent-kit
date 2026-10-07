@@ -242,13 +242,6 @@ class Sweep(Fixture):
                       "a harvested item is done")
 
         git("commit", "-q", "--allow-empty", "-m", "made after the report", cwd=pushed)
-        # Keep the report's fingerprint (newest mtime) so only the settled recheck can refuse it.
-        fingerprint = next(line.split("\t")[4] for line in self.report().read_text().splitlines()
-                           if line.startswith("delete\t") and line.split("\t")[1].endswith("/tmp/pushed"))
-        for top, dirs, files in os.walk(pushed):
-            for name in dirs + files:
-                os.utime(os.path.join(top, name), ns=(int(fingerprint), int(fingerprint)), follow_symlinks=False)
-        os.utime(pushed, ns=(int(fingerprint), int(fingerprint)))
         proc = self.gc("--sweep-tmp", "--report-sha256", hashlib.sha256(self.report().read_bytes()).hexdigest())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(f"skip (holds a checkout with unpushed work or a stash): {pushed.resolve()}", proc.stdout)
@@ -256,6 +249,21 @@ class Sweep(Fixture):
             self.assertTrue((d / kept).exists(), kept)
         self.assertFalse((d / "tmp/home/big.bin").exists())
         self.assertEqual(subprocess.run(["git", "stash", "list"], cwd=stashed, capture_output=True, text=True).stdout.count("\n"), 1)
+
+    def test_git_bookkeeping_neither_delays_nor_refuses_a_clean_checkout(self) -> None:
+        d = self.item("p", "done", "closed", "2020-01-01")
+        pushed = self.clone(self.origin(), d / "tmp/pushed")
+        age(d)
+        git("status", "--porcelain", cwd=pushed)
+        proc = self.gc()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.lines().get(str(pushed.resolve())), ("delete", "git checkout"), self.report().read_text())
+        git("maintenance", "run", "--auto", cwd=pushed)
+        git("status", "--porcelain", cwd=pushed)
+        proc = self.gc("--sweep-tmp", "--report-sha256", hashlib.sha256(self.report().read_bytes()).hexdigest())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"deleted (git checkout): {pushed.resolve()}", proc.stdout)
+        self.assertFalse(pushed.exists())
 
     def test_grace_comes_from_tmp_sweep_days(self) -> None:
         d = self.item("p", "done", "closed")

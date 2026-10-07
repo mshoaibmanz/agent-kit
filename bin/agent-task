@@ -58,9 +58,6 @@ import handoff  # noqa: E402
 import retro  # noqa: E402
 from kit_env import kit_root  # noqa: E402
 
-# bin/lib: tmp_sweep, which agent_task's harvest imports on use.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
-
 os.environ["AGENT_KIT_DIR"] = str(kit_root(__file__))
 
 
@@ -103,7 +100,7 @@ def cmd_bind(a: argparse.Namespace) -> int:
     except bd.AmbiguousTicket as e:
         die(f"not bound: {e}")
     print(f"Bound session {sid[:8]} to {at.where_label(b)} ({b.folder}). Tab: {b.label}.")
-    live = b.open_items
+    live = [] if b.item or b.project.legacy else b.project.open_items()
     if live:
         print(f"Bound to the project only: it has {len(live)} open items. Bind one with /bind {b.project.name}/<item>: {', '.join(live[:12])}.")
     print(at.slice_text(b, bd.announce(b, "explicit", was)))
@@ -363,7 +360,8 @@ def cmd_session_start(a: argparse.Namespace) -> int:
 
 def cmd_nudge(a: argparse.Namespace) -> int:
     """hooks/context-watch: the text of the handoff nudge at the context threshold."""
-    print(handoff.nudge_text(need_sid(a.session), a.ctx, a.at, a.cwd or os.getcwd()))
+    at = a.at if a.at is not None else handoff.handoff_default()
+    print(handoff.nudge_text(need_sid(a.session), a.ctx, at, a.cwd or os.getcwd()))
     return 0
 
 
@@ -382,7 +380,7 @@ def main() -> int:
     ap.add_argument("--tag", default="")
     ap.add_argument("--cap", type=int, default=0)
     ap.add_argument("--ctx", type=int, default=0)
-    ap.add_argument("--at", type=int, default=600000)
+    ap.add_argument("--at", type=int, default=None)
     ap.add_argument("--pending", action="store_true")
     ap.add_argument("--mark", action="store_true")
     ap.add_argument("--stdin", action="store_true")

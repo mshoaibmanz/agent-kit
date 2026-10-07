@@ -668,6 +668,19 @@ check "...but not the idle-resume notice (90 min at 605K)" "$out" '"systemMessag
 printf 'CONTEXT_HANDOFF_AT=700000\n' > "$CW/high.env"
 out=$(CW_KIT=$CW/high.env cw "$(cwp cw-s6 "$CW/t1.jsonl")")
 check "context-watch: the overlay's threshold is used (605K under 700K)" "$(flat "$out")" '^<rc 0>$'
+mkdir -p "$CW/cfg" "$CW/copy/hooks"
+printf '{"autoCompactWindow": 623000}\n' > "$CW/cfg/settings.json"
+aline 0 0 575000 > "$CW/t575.jsonl"; aline 0 0 565000 > "$CW/t565.jsonl"
+out=$(CW_KIT=/dev/null CLAUDE_CONFIG_DIR=$CW/cfg cw "$(cwp cw-s20 "$CW/t565.jsonl")")
+check "context-watch: autoCompactWindow 623000, no overlay value: 565K is under the derived 570K" "$(flat "$out")" '^<rc 0>$'
+out=$(CW_KIT=/dev/null CLAUDE_CONFIG_DIR=$CW/cfg cw "$(cwp cw-s20 "$CW/t575.jsonl")")
+check "...575K nudges before compaction, which it places near 600K" "$out" 'CONTEXT 575K: past the 570K handoff point; auto-compaction follows near 600K\.'
+cp "$H/context-watch" "$CW/copy/hooks/"; ln -s "$H/lib" "$CW/copy/hooks/lib"
+out=$(printf '%s' "$(cwp cw-s21 "$CW/t575.jsonl")" | KIT_ENV=/dev/null CLAUDE_CONFIG_DIR=$CW/cfg CLAUDE_STATE_DIR=$CW/state CLAUDE_PROJECT_DIR= bash "$CW/copy/hooks/context-watch")
+check "context-watch: the fallback text (no agent-task) takes the same compaction point" "$out" 'past the 570K handoff point; auto-compaction follows near 600K\. At the next'
+out=$(printf '%s' "$(cwp cw-s22 "$CW/t1.jsonl")" | KIT_ENV=/dev/null CLAUDE_STATE_DIR=$CW/state CLAUDE_PROJECT_DIR= bash "$CW/copy/hooks/context-watch")
+check "...and leaves the compaction point out when autoCompactWindow is unset" "$out" 'past the 600K handoff point\. At the next'
+check "...naming no number for it" "$out" 'near' absent
 { aline 0 0 650000; aline 0 0 640000 2026-10-03T10:00:00.000Z claude-opus-5-5 true; aline 0 0 0; } > "$CW/t2.jsonl"
 out=$(cw "$(cwp cw-s7 "$CW/t2.jsonl")")
 check "context-watch: a sidechain line and a zero (synthetic) usage are skipped" "$out" 'CONTEXT 650K'
@@ -867,7 +880,7 @@ sl() {
       context_window:{used_percentage:45,total_input_tokens:450000,context_window_size:1000000,
         current_usage:{input_tokens:2,cache_creation_input_tokens:0,cache_read_input_tokens:449998}}}
      + (if $pc == null then {} else {prompt_cache:$pc} end)) * ($x // {})' \
-    | KIT_ENV=/dev/null STATUSLINE_NOW=$N bash "$SL"
+    | KIT_ENV=/dev/null CLAUDE_STATE_DIR=$T/sl-state STATUSLINE_NOW=$N bash "$SL"
 }
 plain() { printf '%s' "$1" | sed "s/${ESC}\[[0-9;]*m//g"; }
 warm() { printf '{"warm":true,"caching_observed":true,"ttl":"%s","expires_at":%s}' "$1" "$2"; }
@@ -897,6 +910,11 @@ out=$(sl "$(warm 1h $((N - 5)))")
 check "status line: warm with expires_at already past reads cold" "$(plain "$out")" 'cache ○ cold · \$3\.60 to rewarm$'
 out=$(sl '{"warm":false,"caching_observed":false,"ttl":"1h","expires_at":null}')
 check "status line: caching never observed shows no cache segment" "$(plain "$out")" 'cache' absent
+at575='{"context_window":{"current_usage":{"input_tokens":5,"cache_read_input_tokens":574995}}}'
+out=$(sl none "$at575")
+check "status line: 575K is yellow under the default handoff point" "$out" "${ESC}\[33m45%"
+out=$(CLAUDE_CONFIG_DIR=$CW/cfg sl none "$at575")
+check "status line: with autoCompactWindow 623000, 575K is past the derived 570K and red" "$out" "${ESC}\[31m45%"
 
 echo "--- session-context payload size (each repo with a local invariants doc under CODE_DIRS) ---"
 b=$(sed -n 's/^BUDGET=\([0-9]*\).*/\1/p' "$H/session-context" | head -1)

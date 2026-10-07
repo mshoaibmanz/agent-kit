@@ -25,7 +25,6 @@ import suite_lock
 ROOT = Path(__file__).resolve().parents[1]
 # Run first, one at a time, and stop on a failure: a broken manifest or package build fails fast.
 FIRST = ("tests/verify_release.py",)
-# Run concurrently. hooks/tests is one suite per hook-test file in it.
 SUITES = (
     "tests/setup_test.py",
     "tests/setup_review_test.py",
@@ -147,10 +146,10 @@ class Runner:
                 start_new_session=True,
             )
             with self.guard:
+                self.children.add(process)
                 # stop() may have run between the check above and Popen: it never saw this child.
                 if self.stopping:
                     kill_group(process)
-                self.children.add(process)
             if self.stream and process.stdout:
                 for line in process.stdout:
                     output.write(line)

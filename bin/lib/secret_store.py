@@ -32,10 +32,11 @@ def secret_tool() -> str:
 
 
 def lookup(service: str, account: str, reveal: bool, timeout: int = 10) -> Tuple[int, str]:
-    """(exit code, the store's raw output when reveal, else ""); 0 means found. Without reveal the
-    Keychain is asked for the item's attributes only, never the secret. secret-tool exits 1 for a
-    missing item and a refusal alike, so either, or an empty secret, reads as ITEM_NOT_FOUND. A store
-    that cannot run reads as 1; the env store has no items."""
+    """(exit code, the secret when reveal, else ""); 0 means found. The secret comes without the
+    newline the store ends its output with. Without reveal the Keychain is asked for the item's
+    attributes only, never the secret. secret-tool exits 1 for a missing item and a refusal alike, so
+    either, or an empty secret, reads as ITEM_NOT_FOUND. A store that cannot run reads as 1; the env
+    store has no items."""
     where = store()
     if where == "env":
         return ITEM_NOT_FOUND, ""
@@ -49,4 +50,34 @@ def lookup(service: str, account: str, reveal: bool, timeout: int = 10) -> Tuple
         return 1, ""
     if where == "secret-tool" and (proc.returncode != 0 or not proc.stdout.strip()):
         return ITEM_NOT_FOUND, ""
-    return proc.returncode, proc.stdout if reveal and proc.returncode == 0 else ""
+    if not reveal or proc.returncode != 0:
+        return proc.returncode, ""
+    secret = proc.stdout.rstrip("\n") if where == "secret-tool" else proc.stdout
+    return 0, secret[:-1] if secret.endswith("\n") else secret
+
+
+def save(service: str, account: str, secret: str, label: str) -> bool:
+    """Store secret under (service, account), then read it back: True when the store holds it. The
+    secret never enters argv: `security -i` reads it hex-encoded on stdin, secret-tool on stdin. A
+    service or account a `security -i` line would split is refused; the env store saves nothing."""
+    where = store()
+    if where == "env" or any(c.isspace() or c in "\"'\\" for c in service + account):
+        return False
+    if where == "keychain":
+        command = [SECURITY, "-i"]
+        stdin = f"add-generic-password -U -s {service} -a {account} -X {secret.encode().hex()}\n"
+    else:
+        command = [secret_tool(), "store", f"--label={label}", "service", service, "account", account]
+        stdin = secret
+    try:
+        proc = subprocess.run(command, input=stdin, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and lookup(service, account, reveal=True) == (0, secret)
+
+
+def env_suffix(text: str) -> str:
+    """text as a variable name part: ASCII letters and digits kept, every other byte as _XX (hex),
+    so prod-a and prod_a never share a variable."""
+    return "".join(chr(byte) if chr(byte).isascii() and chr(byte).isalnum() else f"_{byte:02X}"
+                   for byte in text.encode())

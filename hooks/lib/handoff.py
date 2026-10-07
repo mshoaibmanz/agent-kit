@@ -3,8 +3,9 @@ pre-compact's staleness check and the text session-start re-injects after a comp
 
 from __future__ import annotations
 
+import json
 import os
-import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -20,25 +21,43 @@ from agent_task import (
     slice_text,
     state_dir,
 )
-from binding import announce
+from binding import announce, place
 
 
-# The context budget: hooks/context-watch nudges at CONTEXT_HANDOFF_AT, hooks/pre-compact snapshots
-# a stale handoff, and session-start re-injects both after the compaction.
-COMPACT_NEAR = "657K"  # autoCompactWindow 680000 in hosts/claude/settings.base.json
+# The context budget: hooks/context-watch nudges at CONTEXT_HANDOFF_AT (else handoff_default()),
+# hooks/pre-compact snapshots a stale handoff, and session-start re-injects both after the compaction.
+DEFAULT_HANDOFF_AT = 600000
+# Claude Code compacts this many tokens below autoCompactWindow (680000 compacted near 657K).
+COMPACT_RESERVE = 23000
+HANDOFF_ROOM = 30000  # what the default nudge leaves for writing the handoff before compaction
 STALE_WITHOUT_NUDGE = 1800  # seconds
+
+
+def compact_at() -> int | None:
+    """The context size at which the host auto-compacts: the rendered settings.json's autoCompactWindow
+    less COMPACT_RESERVE, or None when the key is unset (or not a usable number)."""
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    try:
+        settings = json.loads((config / "settings.json").read_text())
+    except (OSError, ValueError):
+        return None
+    window = settings.get("autoCompactWindow") if isinstance(settings, dict) else None
+    if isinstance(window, bool) or not isinstance(window, int) or window <= COMPACT_RESERVE + HANDOFF_ROOM:
+        return None
+    return window - COMPACT_RESERVE
+
+
+def handoff_default() -> int:
+    """The nudge point when CONTEXT_HANDOFF_AT is unset: HANDOFF_ROOM before compaction, else
+    DEFAULT_HANDOFF_AT."""
+    near = compact_at()
+    return near - HANDOFF_ROOM if near else DEFAULT_HANDOFF_AT
 
 
 def repo_name(cwd: str) -> str:
     """The name session-context gives the repo: the main checkout's folder (worktrees share it),
     else the cwd's own folder."""
-    try:
-        common = subprocess.run(["git", "-C", cwd or ".", "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=3).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        common = ""
-    if common:
-        return os.path.basename(os.path.dirname(common))
-    return os.path.basename(os.path.realpath(cwd or ".")) or "misc"
+    return place(cwd).repo or os.path.basename(os.path.realpath(cwd or ".")) or "misc"
 
 
 def handoff_folder(sid: str, cwd: str = "", repo: str = "") -> tuple[Binding | None, Path]:
@@ -58,7 +77,10 @@ def nudge_marker(sid: str) -> Path:
 
 def nudge_text(sid: str, ctx: int, at: int, cwd: str) -> str:
     b, folder = handoff_folder(sid, cwd)
-    head = f"CONTEXT {ctx // 1000}K: past the {at // 1000}K handoff point; auto-compaction follows near {COMPACT_NEAR}."
+    near = compact_at()
+    head = f"CONTEXT {ctx // 1000}K: past the {at // 1000}K handoff point" + (
+        f"; auto-compaction follows near {near // 1000}K." if near else "."
+    )
     retro = f'record up to 3 learnings with `{agent_task_bin()} retro "<mistake|fact|doc|tooling>: <text>" --session {sid}`'
     if b:
         if b.project.legacy:
@@ -124,3 +146,8 @@ def compact_text(sid: str, cwd: str = "", repo: str = "", branch: str = "", cap:
     else:
         head = unbound_text(folder, branch)[:room]
     return (head + ("\n" + tail if tail else ""))[:cap]
+
+
+if __name__ == "__main__" and sys.argv[1:] == ["points"]:
+    # hook-io's context_points: "<handoff_default> <compact_at, 0 when unknown>".
+    print(handoff_default(), compact_at() or 0)

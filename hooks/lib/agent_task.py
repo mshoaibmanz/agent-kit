@@ -144,6 +144,9 @@ class Project:
         d = self.path / "items"
         return sorted(p for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
 
+    def open_items(self) -> list[str]:
+        return [d.name for d in self.items() if item_status(d) not in DONE_STATUSES]
+
     def listing(self, key: str) -> list[str]:
         return [x.strip() for x in re.split(r"[,\n]", self.meta.get(key, "")) if x.strip()]
 
@@ -199,8 +202,6 @@ def legacy_alias(path: Path, root: Path | None = None) -> tuple[str, str] | None
 class Binding:
     project: Project
     item: str = ""
-    # bind(pick_item=True) on a project with no sole open item: the open items to offer.
-    open_items: list[str] = field(default_factory=list, compare=False)
 
     @property
     def key(self) -> str:
@@ -692,22 +693,36 @@ def index(name: str, root: Path | None = None) -> Path | None:
 
 
 def item_status(d: Path) -> str:
-    try:
-        return json.loads((d / "task.json").read_text()).get("status", "open")
-    except (OSError, ValueError):
-        return "open"
+    return str(read_task(d).get("status", "open"))
 
 
 HARVEST_SKIP = {"worktrees", ".git", "node_modules", "sessions", "__pycache__", ".venv"}
 PROMOTE_SUFFIXES = {".py": "python3", ".sh": "bash", ".sql": "run"}
+BULK_DIRS = frozenset((
+    ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    ".nox", ".cache", ".gradle", ".next", ".turbo", ".parcel-cache", ".eggs",
+))
+# A folder holding one of these is a home a test or a host sandbox made, not work.
+HOME_MARKERS = frozenset((".claude", ".codex", ".cursor", ".config", ".local", "Library"))
+
+
+def generated(folder: Path) -> str | None:
+    """The kind of generated bulk folder is (without asking git whether a checkout is settled), as
+    harvest and the tmp sweep (bin/lib/tmp_sweep.py) judge it."""
+    if folder.name in BULK_DIRS:
+        return folder.name
+    if (folder / ".git").exists() or (folder / ".git").is_symlink():
+        return "git checkout"
+    try:
+        names = {child.name for child in folder.iterdir()}
+    except OSError:
+        return None
+    return "scratch home" if names & HOME_MARKERS else None
 
 
 def _item_files(d: Path) -> list[Path]:
-    """The item's own files: checkouts, dependencies, per-session folders and the bulk the tmp sweep
-    calls generated (scratch homes, checkouts) are pruned unread."""
-    # bin/lib/tmp_sweep imports this module, so it is imported on use (bin/agent-task puts bin/lib on the path).
-    from tmp_sweep import generated
-
+    """The item's own files: checkouts, dependencies, per-session folders and generated bulk (scratch
+    homes, checkouts) are pruned unread."""
     out = []
     for top, dirs, names in os.walk(d):
         dirs[:] = [x for x in dirs if x not in HARVEST_SKIP and not generated(Path(top) / x)]
@@ -853,7 +868,7 @@ def slice_text(b: Binding, how: str = "", cap: int = SLICE_CAP, handoff: bool = 
             lines += ["  " + x for x in hf.read_text(errors="replace").split("\n")[:8] if x.strip()]
         return "\n".join(lines)[:cap]
     p = b.project
-    open_items = [d.name for d in p.items() if item_status(d) not in DONE_STATUSES]
+    open_items = p.open_items()
     head = [
         *([how] if how else []),
         # The root is spelled out once; a long work root would otherwise push the scripts past the cap.

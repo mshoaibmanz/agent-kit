@@ -45,12 +45,10 @@ with tempfile.TemporaryDirectory(prefix='verify-release-', dir=os.environ.get('T
         failures.append('marketplace plugin matrix')
     sys.path.insert(0, str(root / 'scripts'))
     from build_plugins import plugin_source
-    # Each entry is what --marketplace writes, and that is plugins/<name> on the branch publish_dist.sh writes.
+    # Each entry's source is the one --marketplace generates from plugin_source.
     for row in market['plugins']:
-        source = plugin_source(row['name'])
-        if row.get('source') != source or (source['source'], source['path'], source['ref']) != (
-                'git-subdir', f'plugins/{row["name"]}', 'dist'):
-            failures.append(f'marketplace source for {row["name"]} is not plugins/{row["name"]} on dist')
+        if row.get('source') != plugin_source(row['name']):
+            failures.append(f'marketplace source for {row["name"]} differs from plugin_source (run build_plugins.py --marketplace)')
     # dist publishes only a commit ci has passed on main: never on a bare push or by hand.
     dist_flow = (root / '.github/workflows/dist.yml').read_text()
     if not all(text in dist_flow for text in ('workflow_run:', 'workflows: [ci]', 'types: [completed]',

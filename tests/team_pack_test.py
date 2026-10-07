@@ -551,6 +551,8 @@ exit 1''')
             'a pack path that climbs out': ('[mcp.servers.x]\ncommand = "uv"\nargs = ["--project", "{{PACK_DIR}}/../../bin"]\n',
                                             'a team pack path is {{PACK_DIR}}/<path>, without ..'),
             'a bare pack root': ('[mcp.servers.x]\ncommand = "{{PACK_DIR}}"\n', 'a team pack path is'),
+            'a pack command inside .venv': ('[mcp.servers.x]\ncommand = "{{PACK_DIR}}/mcp/.venv/bin/x"\n',
+                                            'a team pack path points into .venv'),
             'a Sentry instance without a keychain service': ('[sentry.instances.main]\nhost = "sentry.example.com"\n',
                                                              '[sentry]: Sentry instance main needs a keychain service'),
             'a Sentry keychain service a shell would split': (
@@ -668,15 +670,24 @@ exit 1''')
         (pack / 'agent-kit-preset.toml').write_text(
             f'[kit]\nCODE_DIRS_JSON = ["{code}"]\n'
             '[mcp.servers.absent]\ncommand = "{{CODE_DIR}}/absent-mcp/.venv/bin/absent-mcp"\n'
+            '[mcp.servers.by-arg]\ncommand = "/bin/sh"\nargs = ["{{CODE_DIR}}/absent-repo/serve.sh"]\n'
+            '[mcp.servers.by-npx]\ncommand = "npx"\nargs = ["-y", "some-mcp"]\n'
             '[mcp.servers.packed]\ncommand = "uv"\nargs = ["run", "--project", "{{PACK_DIR}}/mcp", "packed-mcp"]\n')
         result = self.setup('--preset', str(pack), '--hosts', 'claude', '--components', 'rules', 'mcp')
         skipped = result.stdout.split('Skipped:\n')[1]
         self.assertIn(f'MCP server absent: {code}/absent-mcp/.venv/bin/absent-mcp is not an executable in your clone yet', skipped)
+        self.assertIn(f'MCP server by-arg: {code}/absent-repo/serve.sh is not in your clone yet', skipped)
+        self.assertIn('MCP server by-npx: npx is missing', skipped)
         self.assertIn('MCP server packed: the team pack has no mcp/ project for {{PACK_DIR}}', skipped)
+        (code / 'absent-repo').mkdir()
+        (code / 'absent-repo/serve.sh').write_text('#!/bin/sh\n')
+        result = self.setup('--preset', str(pack), '--hosts', 'claude', '--components', 'rules', 'mcp')
+        self.assertNotIn('MCP server by-arg', result.stdout, 'a server whose clone now holds its path is still left out')
         self.write_mcp_project(pack / 'mcp')
         result = self.setup('--preset', str(pack), '--hosts', 'claude', '--components', 'rules', 'mcp', '--apply')
         self.assertIn("MCP server packed: uv is missing, which syncs the team pack's mcp/ project", result.stdout)
-        self.assertFalse((self.home / '.claude/mcp.json').exists(), 'a server that cannot start was installed')
+        servers = json.loads((self.home / '.claude/mcp.json').read_text())['mcpServers']
+        self.assertEqual(list(servers), ['by-arg'], 'a server that cannot start was installed')
 
     def write_mcp_project(self, folder: Path, lock: bool = False) -> None:
         """A uv project whose console script answers an MCP initialize request on stdin, with the
@@ -740,7 +751,14 @@ exit 1''')
         self.assertEqual(self.doctor()['drift'], [])
         rerun = self.setup(*flags, env=self.uv_env())
         self.assertIn('Installed 0 changes', rerun.stdout)
+        self.assertNotIn('MCP:', rerun.stdout, 'a project synced at its uv.lock is synced again')
         self.assertEqual(self.doctor()['drift'], [])
+        # A sync that failed (no environment) is retried by the next sync, though nothing else changed.
+        shutil.rmtree(project / '.venv')
+        retried = self.setup('sync', env=self.uv_env())
+        self.assertIn('sync: nothing changed', retried.stdout)
+        self.assertIn(f'MCP: team pack mcp/ project synced ({project})', retried.stdout)
+        self.assertTrue((project / '.venv').is_dir())
         self.assertEqual([path.name for path in (self.home / 'tmp').iterdir() if not path.name.startswith('uv-')], [],
                          'setup left files in TMPDIR')
 

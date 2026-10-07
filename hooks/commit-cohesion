@@ -77,9 +77,7 @@ git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
 attempt="$dir/attempt-$sid-$(path_key "$cwd")-$(path_key "$cmd")"
 # The no-remote "committed this turn" marker, per repo and per committer (main, or sub.<agent_id
-# key>): one marker per session made the parent's commit in one repo deny a subagent's first
-# commit in an unrelated repo, and one shared subagent marker let a subagent's own second commit
-# through while a sibling's commit counted against every other subagent.
+# key>): a commit counts only against its own committer's later commits in the same repo.
 committer=main
 [ -z "$aid" ] || committer="sub.$(path_key "$aid")"
 repo_key=$(path_key "$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$cwd")")

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tomllib
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,8 @@ SANDBOX_END = "# END agent-kit sandbox"
 SANDBOX_COMPONENTS = frozenset({"hooks", "mcp"})
 PLACEHOLDER = re.compile(r"\{\{([^{}]*)\}\}")
 PACK_DIR = "pack"  # the installed kit's copy of its team pack: {{PACK_DIR}}
+# The line of a kit SKILL.md that install_text replaces with the installed skills extending it.
+EXTENSIONS_MARKER = "<!-- agent-kit: extensions -->"
 SUBAGENT_RESUME_MAX = 300000
 # Each host's global instructions file under its config root, the one the kit's rules reach.
 RULES_FILES = {"claude": "CLAUDE.md", "codex": "AGENTS.md", "cursor": "rules/agent-kit.mdc"}
@@ -528,13 +530,18 @@ def install_text(
     host_root: str | None = None,
     resume: int | None = None,
     strict: bool = True,
+    extensions: Sequence[str] = (),
 ) -> str:
     """A kit markdown file as installed with its kit at <kit>: its {{...}} placeholders filled (fill,
-    strict or not), each ```sh block first exports AGENT_KIT_DIR (with export), and ${CLAUDE_SKILL_DIR},
-    which only Claude Code expands, names <kit>/skills/<skill> as one shell word. A kit given as a shell
-    expression (${CLAUDE_PLUGIN_ROOT}/kit) is double-quoted so it still expands."""
+    strict or not), its EXTENSIONS_MARKER line replaced by extensions (the installed skills extending
+    it, pack.extension_lists), each ```sh block first exports AGENT_KIT_DIR (with export), and
+    ${CLAUDE_SKILL_DIR}, which only Claude Code expands, names <kit>/skills/<skill> as one shell word.
+    A kit given as a shell expression (${CLAUDE_PLUGIN_ROOT}/kit) is double-quoted so it still expands."""
     word = f'"{kit}"' if "$" in kit else shlex.quote(kit)
     text = fill(text, kit, host, host_root, skill or "kit text", resume, strict)
+    text = text.replace(
+        EXTENSIONS_MARKER, "\n".join(extensions) or f"No installed skill extends {skill or 'this one'}."
+    )
     if export:
         text = text.replace("```sh\n", f"```sh\nexport AGENT_KIT_DIR={word}\n")
     if skill:

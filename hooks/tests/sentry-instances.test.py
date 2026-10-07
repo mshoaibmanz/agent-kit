@@ -6,8 +6,10 @@ lib's constant in a subprocess), so no case reads the real Keychain."""
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -352,6 +354,18 @@ class Origins(Fixture):
         names = {name: inst.env_name for name, inst in sentry.load_instances(self.kit, self.overlay).items()}
         self.assertEqual(names, {"prod-a": "SENTRY_ACCESS_TOKEN_PROD_2DA", "prod_a": "SENTRY_ACCESS_TOKEN_PROD_5FA",
                                  "beta": "SENTRY_ACCESS_TOKEN_BETA"})
+
+    def test_the_variable_name_before_hex_is_read_with_a_warning_to_rename(self) -> None:
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {"prod-a": {"host": "a.invalid", "keychain": "k/a"}})
+        inst = sentry.load_instances(self.kit, self.overlay)["prod-a"]
+        os.environ["SENTRY_ACCESS_TOKEN_PROD_A"] = TOKEN
+        self.addCleanup(os.environ.pop, "SENTRY_ACCESS_TOKEN_PROD_A", None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertTrue(sentry.token_present(inst))
+            self.assertEqual(sentry.read_token(inst), TOKEN)
+        self.assertIn("sentry: rename SENTRY_ACCESS_TOKEN_PROD_A to SENTRY_ACCESS_TOKEN_PROD_2DA", err.getvalue())
+        self.assertNotIn(TOKEN, err.getvalue())
 
 
 class Match(unittest.TestCase):

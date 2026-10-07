@@ -22,7 +22,6 @@ from agent_task import (
     ensure_item,
     find_legacy,
     index,
-    item_status,
     legacy_alias,
     legacy_project,
     load_index,
@@ -324,13 +323,12 @@ def bind(sid: str, target: str, *, desc: str = "", here: Place | None = None, re
         name = slug(name) or "misc"
         pdir = project_dir(name, root)
     p = parse_project(pdir) if pdir else create_project(name, scope=desc, terms=desc, repos=repo, root=root)
-    live: list[str] = []
     if not item and pick_item:
-        live = [d.name for d in p.items() if item_status(d) not in DONE_STATUSES]
+        live = p.open_items()
         item = live[0] if len(live) == 1 else ""
     if item:
         ensure_item(p, item, branch=here.branch, repo=repo, worktree=here.top if here.linked else "")
-    b = Binding(parse_project(p.path), item, open_items=[] if item else live)
+    b = Binding(parse_project(p.path), item)
     write_binding(sid, b, rule=rule, wt=here.top)
     adopt_session_dir(sid, b, root)
     index(p.name, root)

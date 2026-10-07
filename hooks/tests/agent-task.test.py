@@ -360,6 +360,12 @@ o = task("session-start", "--session", S5, "--source", "compact").stdout
 check("compact: a legacy folder gets its TASK DIR and HANDOFF.md", "TASK DIR:" in o and "HANDOFF.md (" in o and "Handoff DEMO-42" in o, o)
 o = task("nudge", "--session", S1, "--ctx", "612345", "--at", "600000").stdout
 check("nudge: a bound item names its HANDOFF.md, the project INDEX and agent-task retro", o.startswith("CONTEXT 612K: past the 600K handoff point") and f"update {item}/HANDOFF.md" in o and "projects/invoices/INDEX.md (it regenerates" in o and f"agent-task retro" in o and f"--session {S1}" in o, o)
+(T / "cfg").mkdir()
+(T / "cfg/settings.json").write_text('{"autoCompactWindow": 623000}\n')
+o = task("nudge", "--session", S1, "--ctx", "575000", env=dict(ENV, CLAUDE_CONFIG_DIR=str(T / "cfg"))).stdout
+check("nudge: with no --at, the point sits 30K before the compaction autoCompactWindow places", o.startswith("CONTEXT 575K: past the 570K handoff point; auto-compaction follows near 600K."), o)
+o = task("nudge", "--session", S1, "--ctx", "612345", "--at", "600000", env=dict(ENV, CLAUDE_CONFIG_DIR=str(T / "nocfg"))).stdout
+check("nudge: no autoCompactWindow names no compaction point", o.startswith("CONTEXT 612K: past the 600K handoff point. ") and "near" not in o, o)
 o = task("nudge", "--session", S5, "--ctx", "700000", "--at", "600000").stdout
 check("nudge: a legacy folder's INDEX.md is kept by hand", "INDEX.md (a line per file you leave)" in o and "DEMO-42-widget-fix/HANDOFF.md" in o, o)
 (item / "HANDOFF.auto.md").write_text("# HANDOFF.auto\n- branch: OLD-branch\n")
@@ -698,6 +704,14 @@ for rel in ("scripts/keep.py", "worktrees/wt/src/deep.py", ".git/hooks/pre.sh", 
     (hv_item / rel).write_text('"""x."""\n')
 hv = task("harvest", "invoices/DEMO-1501").stdout
 check("harvest lists the item's scripts only", "scripts/keep.py" in hv and not any(s in hv for s in ("deep.py", "pre.sh", "build.py", "sessions/s/x.py")), hv)
+alone = run([sys.executable, "-c", "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import agent_task as at; "
+             "p = at.parse_project(Path(sys.argv[2])); print(*(f.name for f in sum(at.item_scripts(p, Path(sys.argv[3])), [])))",
+             str(HOOKS / "lib"), str(ROOT / "projects/invoices"), str(hv_item)])
+check("hooks/lib harvests on its own (no bin/lib on the path)", alone.returncode == 0 and "keep.py" in alone.stdout, alone.stdout + alone.stderr)
+(ROOT / "projects/invoices/items/DEMO-1502").mkdir()
+(ROOT / "projects/invoices/items/DEMO-1502/task.json").write_text("[]\n")
+ls = task("ls")
+check("a task.json that is not an object reads as open", ls.returncode == 0 and re.search(r"^  invoices/DEMO-1502  open  ", ls.stdout, re.M) is not None, ls.stdout + ls.stderr)
 
 print("--- one work-root resolver ---")
 H = T / "home"

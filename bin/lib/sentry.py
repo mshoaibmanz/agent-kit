@@ -8,6 +8,7 @@ import copy
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -47,12 +48,18 @@ class Instance:
     @property
     def env_name(self) -> str:
         """The variable a machine without a store reads: the catalog's own server keeps the
-        historical SENTRY_ACCESS_TOKEN, every other instance has its own: letters and digits kept and
-        every other byte as _XX (hex), as bin/ro-mysql's env_name, so prod-a and prod_a never share one."""
+        historical SENTRY_ACCESS_TOKEN, every other instance has its own, its upper-cased name as
+        secret_store.env_suffix spells it, so prod-a and prod_a never share one."""
         if self.server.lower() == TEMPLATE_SERVER:
             return TOKEN_ENV
-        return TOKEN_ENV + "_" + "".join(
-            c.upper() if c.isascii() and c.isalnum() else f"_{ord(c):02X}" for c in self.name)
+        return TOKEN_ENV + "_" + secret_store.env_suffix(self.name.upper())
+
+    @property
+    def old_env_name(self) -> str:
+        """The name env_name had before it spelled each byte in hex (every other character as _)."""
+        if self.server.lower() == TEMPLATE_SERVER:
+            return TOKEN_ENV
+        return TOKEN_ENV + "_" + re.sub(r"[^A-Z0-9]", "_", self.name.upper())
 
     def enable_command(self, store: Optional[str] = None) -> str:
         store = store or secret_store.store()
@@ -164,25 +171,29 @@ def default_instance(instances: Dict[str, Instance]) -> Instance:
     return next((i for i in instances.values() if i.server.lower() == TEMPLATE_SERVER), LEGACY)
 
 
-def _store_lookup(service: str, reveal: bool) -> "tuple[int, str]":
-    """(exit code, token or ""); 0 means found (secret_store.lookup). A revealing read may wait on
-    a Keychain prompt."""
-    code, raw = secret_store.lookup(service, ACCOUNT, reveal, timeout=120 if reveal else 10)
-    return code, raw.strip()
+def env_token(inst: Instance) -> str:
+    """The instance's token from its variable. The name before the hex spelling is still read, with a
+    one-line warning to rename it."""
+    token = os.environ.get(inst.env_name, "")
+    if not token and inst.old_env_name != inst.env_name and os.environ.get(inst.old_env_name):
+        print(f"sentry: rename {inst.old_env_name} to {inst.env_name}; the old name is read for now", file=sys.stderr)
+        token = os.environ[inst.old_env_name]
+    return token
 
 
 def token_present(inst: Instance) -> bool:
     """Whether the instance has a token: its store item, else its variable."""
-    return _store_lookup(inst.keychain, reveal=False)[0] == 0 or bool(os.environ.get(inst.env_name))
+    return secret_store.lookup(inst.keychain, ACCOUNT, reveal=False)[0] == 0 or bool(env_token(inst))
 
 
 def read_token(inst: Instance) -> str:
     """The instance's token from its store item, else its variable. KeychainMissing when neither
-    has one, KeychainDenied when the item exists but could not be read."""
-    code, token = _store_lookup(inst.keychain, reveal=True)
+    has one, KeychainDenied when the item exists but could not be read. A revealing read may wait on
+    a Keychain prompt."""
+    code, token = secret_store.lookup(inst.keychain, ACCOUNT, reveal=True, timeout=120)
     if code == 0 and token:
         return token
-    fallback = os.environ.get(inst.env_name, "")
+    fallback = env_token(inst)
     if fallback:
         return fallback
     if code == ITEM_NOT_FOUND:

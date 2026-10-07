@@ -66,6 +66,9 @@ def check_command(name: str, command: Any, arguments: Any = ()) -> None:
             if not placed or '..' in re.split(r'[/=]', value):
                 what = 'a local clone command' if placeholder == 'CODE_DIR' else 'a team pack path'
                 raise ValueError(f'MCP {name}: {what} is {shape}, without .. ({value})')
+            if placeholder == 'PACK_DIR' and '.venv' in re.split(r'[/=]', value):
+                raise ValueError(f'MCP {name}: a team pack path points into .venv, which setup syncs and no record '
+                                 f'keeps; run it with uv run --project {{{{PACK_DIR}}}}/mcp ({value})')
 
 
 def plugin_table(table: dict[str, Any]) -> bool:

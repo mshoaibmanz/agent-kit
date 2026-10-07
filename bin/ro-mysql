@@ -79,10 +79,8 @@ CLIENT_CANDIDATES = (
 )
 
 def env_name(account: str) -> str:
-    """RO_MYSQL_PASSWORD_ plus the account with letters and digits kept and every other byte as _XX
-    (hex): one name per account, so prod-a and prod_a tunnels never share a password."""
-    return "RO_MYSQL_PASSWORD_" + "".join(
-        chr(byte) if chr(byte).isascii() and chr(byte).isalnum() else f"_{byte:02X}" for byte in account.encode())
+    """RO_MYSQL_PASSWORD_ plus the account as secret_store.env_suffix spells it: one name per account."""
+    return "RO_MYSQL_PASSWORD_" + secret_store.env_suffix(account)
 LSOF_FAILED = "an unknown process (lsof failed)"
 DEFAULT_MAX_MS = 30000
 # Agents answered a 3024 by widening the scan, so the timeout names the plan and the next step.
@@ -447,38 +445,19 @@ def keychain_get(account: str) -> str | None:
 
 
 def store_get(account: str) -> str | None:
-    """The account's password from the store (secret_store), without the newline the store ends it with."""
-    code, raw = secret_store.lookup(KEYCHAIN_SERVICE, account, reveal=True)
-    if code != 0:
-        return None
-    if secret_store.store() == "secret-tool":
-        return raw.rstrip("\n") or None
-    return raw[:-1] if raw.endswith("\n") else raw
+    """The account's password from the store (secret_store)."""
+    code, secret = secret_store.lookup(KEYCHAIN_SERVICE, account, reveal=True)
+    return secret or None if code == 0 else None
 
 
 def keychain_set(account: str, password: str) -> bool:
-    """Store via `security -i` on stdin, hex-encoded, so the password never enters argv."""
+    """Store the account's password (secret_store.save: never in argv)."""
     if not DB_USER_RE.fullmatch(account):
         return False
-    store = secret_store.store()
-    if store == "env":
+    if secret_store.store() == "env":
         print(f"  no Keychain or secret-tool here: export {env_name(account)} in your shell profile instead", file=sys.stderr)
         return False
-    if store == "secret-tool":
-        try:
-            r = subprocess.run([secret_store.secret_tool(), "store", f"--label=ro-mysql {account}", "service", KEYCHAIN_SERVICE,
-                                "account", account], input=password, capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return r.returncode == 0 and keychain_get(account) == password
-    line = f"add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -X {password.encode().hex()}\n"
-    try:
-        r = subprocess.run(
-            [secret_store.SECURITY, "-i"], input=line, capture_output=True, text=True, timeout=10
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return r.returncode == 0 and keychain_get(account) == password
+    return secret_store.save(KEYCHAIN_SERVICE, account, password, label=f"ro-mysql {account}")
 
 
 def note_auth_failure(user: str, alias: str, path: str = AUTH_FAILED) -> None:

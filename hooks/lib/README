@@ -42,7 +42,7 @@ guards need no key. Documented with placeholder values in ~/.claude/kit.env.exam
   BQRO_PROJECT       bqro's jobs project when a query passes no --project_id
   AGENT_WORK_ROOT    the work root (projects/, tasks/, retro/); default ~/agent-work, else ~/claude-scratch: kit_env.work_root() for agent_task.py and comment-guard; tests-ran-mark
   CODEX_SANDBOX_GCLOUD  1 adds gcloud's config dir (it holds credentials) to Codex's sandbox writable roots, for bq; agent-setup --codex-gcloud
-  CONTEXT_HANDOFF_AT  context tokens at which context-watch nudges a handoff (default 600000, 0 = no nudge; the idle-resume notice stays); the status line turns red there
+  CONTEXT_HANDOFF_AT  context tokens at which context-watch nudges a handoff (default: handoff.py's handoff_default, 30000 before the compaction autoCompactWindow sets, else 600000; 0 = no nudge, the idle-resume notice stays); the status line turns red there
   CODE_SEARCH_ZOEKT_URL  code-search skill: the Zoekt server behind browser SSO (unset turns that backend off)
   CODE_SEARCH_SSO_COOKIE  code-search: the SSO session cookie's name, read from the local Chrome profile
   CODE_SEARCH_GH_OWNER  code-search: default GitHub org or user for gh searches and short repo names

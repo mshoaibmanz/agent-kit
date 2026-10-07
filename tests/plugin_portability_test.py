@@ -69,6 +69,15 @@ class PluginPortabilityTests(unittest.TestCase):
                         self.assertFalse(target.is_symlink(), str(target))
                         self.assertEqual(target.read_bytes(), data)
 
+    def test_no_package_ships_the_raw_extensions_marker(self) -> None:
+        debug = sorted((self.source / 'plugins').glob('*/skills/debug/SKILL.md'))
+        self.assertTrue(debug, 'a plugin ships the debug skill')
+        self.assertIn('No installed skill extends this one.', debug[0].read_text())
+        # The packaged kit/ is a source agent-setup installs from, which fills the marker then.
+        marked = [str(path) for path in (self.source / 'plugins').glob('*/skills/**/*.md')
+                  if '<!-- agent-kit: extensions -->' in path.read_text()]
+        self.assertEqual(marked, [])
+
     def test_packaged_setup_preview_and_roles_resolve_kit(self) -> None:
         for name in ('workflow', 'terminal-signals', 'prod-data'):
             with self.subTest(plugin=name):

@@ -20,19 +20,13 @@ from pathlib import Path
 from typing import Iterator, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
-from agent_task import DONE_STATUSES, read_task  # noqa: E402
+from agent_task import DONE_STATUSES, generated, read_task  # noqa: E402
 from kit_env import kit_env, work_root as overlay_work_root  # noqa: E402
 
 DEFAULT_DAYS = 14
 MAX_SALVAGE = 1024 * 1024
 BIG_FILE = 5 * 1024 * 1024
 SALVAGE_SUFFIXES = frozenset((".py", ".sh", ".sql", ".ipynb", ".md", ".csv", ".json", ".txt"))
-BULK_DIRS = frozenset((
-    ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
-    ".nox", ".cache", ".gradle", ".next", ".turbo", ".parcel-cache", ".eggs",
-))
-# A folder holding one of these is a home a test or a host sandbox made, not work.
-HOME_MARKERS = frozenset((".claude", ".codex", ".cursor", ".config", ".local", "Library"))
 REPORT_HEADER = ("# tmp-sweep v1: action, path, kind, bytes, fingerprint. Only delete and salvage lines are applied; "
                  "report lines are for you to judge.")
 
@@ -58,22 +52,25 @@ def sweep_days() -> int:
     return int(raw) if raw.strip().isdigit() else DEFAULT_DAYS
 
 
-def item_status(item: Path) -> tuple[str, str]:
+def status_and_closed(item: Path) -> tuple[str, str]:
     """(status, the date it was closed or harvested), read as agent-task reads task.json."""
     data = read_task(item)
     return str(data.get("status", "open")), str(data.get("closed") or data.get("harvested") or "")
 
 
 def is_done(item: Path) -> bool:
-    return item_status(item)[0] in DONE_STATUSES
+    return status_and_closed(item)[0] in DONE_STATUSES
 
 
 def newest_mtime(path: Path) -> int:
-    """The newest mtime (ns) of path and everything under it, links not followed."""
+    """The newest mtime (ns) of path and everything under it, links not followed. A checkout's .git is
+    left out: git's own reads rewrite it (`status` refreshes the index, a detached auto-maintenance
+    takes objects/maintenance.lock), and git_settled judges what it holds."""
     newest = path.lstat().st_mtime_ns
     if path.is_dir() and not path.is_symlink():
         for top, dirs, files in os.walk(path):
-            for name in dirs + files:
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for name in dirs + [f for f in files if f != ".git"]:
                 try:
                     newest = max(newest, os.lstat(os.path.join(top, name)).st_mtime_ns)
                 except OSError:
@@ -116,19 +113,6 @@ def unsettled_checkouts(folder: Path) -> list[Path]:
                 found.append(Path(top))
         dirs[:] = [d for d in dirs if d != ".git" and not os.path.islink(os.path.join(top, d))]
     return found
-
-
-def generated(folder: Path) -> str | None:
-    """The kind of generated bulk folder is (without asking git whether a checkout is settled)."""
-    if folder.name in BULK_DIRS:
-        return folder.name
-    if (folder / ".git").exists() or (folder / ".git").is_symlink():
-        return "git checkout"
-    try:
-        names = {child.name for child in folder.iterdir()}
-    except OSError:
-        return None
-    return "scratch home" if names & HOME_MARKERS else None
 
 
 def bulk_kind(folder: Path) -> str | None:
@@ -177,7 +161,7 @@ def item_folders(root: Path) -> Iterator[tuple[Path, Path | None]]:
 
 def ready(item: Path, tmp: Path | None, days: int, now: float) -> str | None:
     """None when the item may be swept, else why not."""
-    status, closed = item_status(item)
+    status, closed = status_and_closed(item)
     if status not in DONE_STATUSES:
         return f"status {status}"
     cutoff = now - days * 86400
@@ -312,6 +296,10 @@ def apply(root: Path, report: Path, expected: str, log=print) -> int:
             log(f"skip (gone or now a link): {path}")
             counts["skipped"] += 1
             continue
+        if action == "delete" and path.is_dir() and unsettled_checkouts(path):
+            log(f"skip (holds a checkout with unpushed work or a stash): {path}")
+            counts["skipped"] += 1
+            continue
         if path.is_dir():
             current = str(newest_mtime(path))
         else:
@@ -319,10 +307,6 @@ def apply(root: Path, report: Path, expected: str, log=print) -> int:
             current = f"{stat.st_size}:{stat.st_mtime_ns}"
         if current != fingerprint or (action == "salvage" and path.is_dir()):
             log(f"skip (changed since the report): {path}")
-            counts["skipped"] += 1
-            continue
-        if action == "delete" and path.is_dir() and unsettled_checkouts(path):
-            log(f"skip (holds a checkout with unpushed work or a stash): {path}")
             counts["skipped"] += 1
             continue
         if action == "delete":
