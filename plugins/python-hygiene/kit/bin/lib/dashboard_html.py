@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
-from typing import Literal, Union
+from typing import Literal, NamedTuple, Union
 from urllib.parse import quote
 
 TEMPLATE = Path(__file__).with_name("dashboard.html")
@@ -225,21 +225,28 @@ def table(value: Table) -> str:
     )
 
 
-AH_FIELDS = (  # (key, label, placeholder, value)
-    ("name", "Name", "orders", ""),
-    ("user", "DB user", "reader", ""),
-    ("via", "Bastion alias", "jump", ""),
-    ("host", "Remote host", "db.example.com", ""),
-    ("port", "Remote port", "3306", "3306"),
-    ("local", "Local port", "15310", ""),
+class FormField(NamedTuple):
+    key: str
+    label: str
+    placeholder: str
+    value: str = ""
+
+
+AH_FIELDS = (
+    FormField("name", "Name", "orders"),
+    FormField("user", "DB user", "reader"),
+    FormField("via", "Bastion alias", "jump"),
+    FormField("host", "Remote host", "db.example.com"),
+    FormField("port", "Remote port", "3306", "3306"),
+    FormField("local", "Local port", "15310"),
 )
 
 
 def add_helper(value: AddHelper) -> str:
     fields = "".join(
-        f'<label>{esc(label)}<input data-f="{key}" type="text" autocomplete="off" spellcheck="false" '
-        f'placeholder="{esc(hint)}"' + (f' value="{esc(default)}"' if default else "") + "></label>"
-        for key, label, hint, default in AH_FIELDS
+        f'<label>{esc(f.label)}<input data-f="{f.key}" type="text" autocomplete="off" spellcheck="false" '
+        f'placeholder="{esc(f.placeholder)}"' + (f' value="{esc(f.value)}"' if f.value else "") + "></label>"
+        for f in AH_FIELDS
     )
     patterns = "".join(f' data-p-{esc(name)}="{esc(pattern)}"' for name, pattern in value.patterns)
     return (

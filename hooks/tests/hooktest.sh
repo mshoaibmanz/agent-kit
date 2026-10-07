@@ -44,7 +44,7 @@ run() {
 }
 
 echo "--- syntax ---"
-# Every file, not a hand-kept list (lib/db-registry went unchecked on one). A shell shebang, or a
+# Every file, not a hand-kept list, so a new one cannot go unchecked. A shell shebang, or a
 # lib's bare comment header (sourced, so no shebang), is bash; awk, JSON and README are skipped.
 nsh=0
 for f in "$H"/* "$H"/lib/*; do

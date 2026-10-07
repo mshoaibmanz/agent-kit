@@ -104,9 +104,9 @@ document.body.classList.add('views');q.addEventListener('input',filter);window.a
 /*ah:begin*/
 var AH_SECRET=/pass|pwd|secret|token/i,AH_LOOKS_SECRET=/:[^\/@]*@|pass|pwd|secret|token/i;
 function ahDec(s){try{return decodeURIComponent(s)}catch(x){return s}}
-function ahRules(get){var re=function(k){return new RegExp('^(?:'+get(k)+')$$')},range=function(k){return get(k).split('-').map(Number)};
-return{name:re('name'),user:re('user'),via:re('via'),host:re('host'),port:/^[0-9]{1,5}$$/,local:/^[0-9]+$$/,
-localPorts:range('local-ports'),remotePorts:range('remote-ports'),staging:new RegExp(get('staging'),'i'),
+function ahRules(get){var re=function(k){return new RegExp('^(?:'+get(k)+')$$',get(k+'-flags'))},range=function(k){return get(k).split('-').map(Number)};
+return{name:re('name'),user:re('user'),via:re('via'),host:re('host'),port:re('port'),local:re('port'),
+localPorts:range('local-ports'),remotePorts:range('remote-ports'),staging:new RegExp(get('staging'),get('staging-flags')),
 prefix:get('prefix'),suffix:get('suffix'),service:get('service')}}
 function ahScrub(text){var s=text.trim(),i=s.indexOf('://'),secret=false;if(i<0)return{text:s,secret:false};
 var head=s.slice(0,i+3),rest=s.slice(i+3),at=-1,u,c;

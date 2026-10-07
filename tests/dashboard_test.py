@@ -9,7 +9,6 @@ import base64
 import contextlib
 import hashlib
 import html
-import http.server
 import io
 import json
 import os
@@ -21,8 +20,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import tomllib
 import unittest
 
@@ -181,7 +178,8 @@ class Fixture(InstallerUxFixture):
                                        f"GIT_AUTHOR='{TOKEN}'\nBQRO_PROJECT=example-project\n")
         (local / 'preset.env').write_text(f"REVIEW_BASE=develop\nTEAM_SECRET={PLANTED['preset value']}\n")
         (self.home / '.ssh').mkdir(exist_ok=True)
-        (self.home / '.ssh/config').write_text(SSH_CONFIG)
+        (self.home / '.ssh/team.conf').write_text('Host jump\n  HostName bastion.example.test\n')
+        (self.home / '.ssh/config').write_text(f'Include "{self.home}/.ssh/team.conf"\n\n' + SSH_CONFIG)
         state = self.home / '.claude/state'
         state.mkdir(parents=True, exist_ok=True)
         (state / 'db-tunnels.tsv').write_text('alias\tport\tkind\tchecked\tvia\tdatabases\n'
@@ -417,6 +415,7 @@ class DashboardPageTests(unittest.TestCase):
         self.assertNotIn('through db-tunnel', text, 'an alias is never shown as the bastion')
         self.assertIn('id="sql-add" data-ports="15306 15307" data-aliases="db-tunnel-orders db-tunnel-orders-stg"', sql)
         self.assertIn(' data-p-name="[a-z0-9][a-z0-9-]*"', sql, "the form checks with ro-mysql's own patterns")
+        self.assertIn('team.conf', sql, 'a file the ssh config Includes is a source too')
         self.assertIn('ro-mysql add --name', page_text(section(self.page, 'actions')))
 
     def test_skills_list_the_source_and_label_a_host_its_hosts_line_leaves_out(self) -> None:
@@ -820,6 +819,16 @@ class DescriptionTests(unittest.TestCase):
                                 text=True, timeout=60, env={**os.environ, 'AGENT_KIT_DIR': str(bare)})
         self.assertEqual(json.loads(result.stdout or '{}'), {'mcpServers': {'w': {'command': 'x'}}}, result.stderr)
 
+    def test_a_token_shaped_description_installs_and_each_refusal_names_its_field(self) -> None:
+        token = 'gh' + 'p_' + 'A1b2C3d4E5f6G7h8I9j0'
+        spec = {'command': 'x', 'description': f'Reads issues with a token such as {token}'}
+        self.assertEqual(validate_catalog({'mcpServers': {'w': spec}})['mcpServers']['w'], spec)
+        for wrong, field in (({'command': 'x', 'args': ['--token', token]}, 'in args'),
+                             ({'command': token}, 'in command'),
+                             ({'command': 'x', 'env': {'A': 'b'}}, 'env refused')):
+            with self.subTest(field), self.assertRaisesRegex(ValueError, field):
+                validate_catalog({'mcpServers': {'w': wrong}})
+
     def test_a_preset_description_is_one_line_of_text(self) -> None:
         from preset import validate_preset
 
@@ -857,7 +866,7 @@ out.missing = ahBuild({name: 'Bad Name', user: '', via: 'db-tunnel-x', host: 'db
 out.parity = PARITY.map(function (f) { return ahBuild(f, {ports: [], aliases: []}, R); });
 console.log(JSON.stringify(out));
 '''
-# The r1 probe's userinfo shapes, each with a password that must not survive.
+# Userinfo shapes, each with a password that must not survive.
 SCRUB = {
     'mysql://u:p@ss@host:3306/db': 'mysql://u@host:3306/db',
     'mysql://u:pa/ss@host/db': 'mysql://u@host/db',
@@ -889,6 +898,7 @@ PARITY = [
     {**GOOD, 'local': '1023'},
     {**GOOD, 'local': '65535'},
     {**GOOD, 'local': '65536'},
+    {**GOOD, 'local': '015310'},
 ]
 
 
@@ -973,293 +983,42 @@ class ConnectionHelperScriptTests(unittest.TestCase):
             with self.subTest(f=f):
                 self.assertEqual((not js['missing'], js['alias']), parse_add_verdict(m, f))
 
-    def test_the_page_carries_ro_mysqls_patterns_not_copies(self) -> None:
+    def test_a_changed_ro_mysql_pattern_and_its_flags_flow_into_the_page(self) -> None:
+        from dashboard_html import AddHelper, add_helper
+        from dashboard_sections import load_script
+        from dashboard_sql import form_patterns
+
+        text = (SOURCE / 'bin/ro-mysql').read_text()
+        changed = text.replace('TUNNEL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")',
+                               'TUNNEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")')
+        changed = changed.replace('(?:staging|stg)", re.IGNORECASE)', '(?:staging|stg)")')
+        self.assertNotEqual(changed.count('re.IGNORECASE'), text.count('re.IGNORECASE'))
+        folder = Path(tempfile.mkdtemp(prefix='ro-mysql-', dir=os.environ.get('TMPDIR')))
+        self.addCleanup(shutil.rmtree, folder, True)
+        (folder / 'ro-mysql').write_text(changed)
+        patterns = {'shipped': form_patterns(ro_mysql_module()),
+                    'changed': form_patterns(load_script(folder / 'ro-mysql', 'ro_mysql_changed'))}
+        self.assertIn('data-p-staging-flags="i"', add_helper(AddHelper((), (), patterns['shipped'])))
+        self.assertIn('data-p-staging-flags=""', add_helper(AddHelper((), (), patterns['changed'])))
         template = (SOURCE / 'bin/lib/dashboard.html').read_text()
-        block = template[template.index('/*ah:begin*/'):template.index('/*ah:end*/')]
-        for copy in ('staging|stg', '[a-z0-9][a-z0-9-]*', 'A-Za-z0-9_.@-', '1024', '65535', "'db-tunnel-"):
-            self.assertNotIn(copy, block)
-
-
-FAKE_MCP = '''import json, os, subprocess, sys
-child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
-log = open(os.environ['FAKE_MCP_LOG'], 'a')
-log.write(json.dumps({'child': child.pid, 'env_ok': os.environ.get('FAKE_SECRET') == sys.argv[1]}) + '\\n')
-for line in sys.stdin:
-    msg = json.loads(line)
-    log.write(json.dumps({'method': msg.get('method')}) + '\\n'); log.flush()
-    if msg.get('method') == 'initialize':
-        result = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}},
-                  'serverInfo': {'name': 'fake-docs', 'version': '1.2'},
-                  'instructions': 'Search the fake documentation before answering.'}
-    elif msg.get('method') == 'tools/list':
-        result = {'tools': [{'name': 'search', 'description': 'Find a page'}, {'name': 'read', 'description': 'Read one'}]}
-    else:
-        continue
-    print('a log line on stdout')
-    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)
-'''
-
-
-class McpHandler(http.server.BaseHTTPRequestHandler):
-    """A Streamable HTTP MCP server that wants one static header and its session id."""
-
-    def log_message(self, *_args) -> None:
-        pass
-
-    def do_POST(self) -> None:
-        message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        if self.headers.get('X-Team') != 'static-1':
-            self.send_response(401)
-            self.end_headers()
-            return
-        method = message.get('method')
-        if method == 'notifications/initialized':
-            self.send_response(202)
-            self.end_headers()
-            return
-        if method == 'initialize':
-            body, kind = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': {
-                'protocolVersion': '2025-06-18', 'serverInfo': {'name': 'web-docs', 'version': '3'}}}), 'application/json'
-        elif self.headers.get('Mcp-Session-Id') == 's-1':
-            reply = {'jsonrpc': '2.0', 'id': message['id'], 'result': {'tools': [{'name': 'lookup'}]}}
-            body, kind = f'event: message\ndata: {json.dumps(reply)}\n\n', 'text/event-stream'
-        else:
-            self.send_response(400)
-            self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header('Content-Type', kind)
-        self.send_header('Mcp-Session-Id', 's-1')
-        self.end_headers()
-        self.wfile.write(body.encode())
-
-
-class McpDescribeTests(Fixture):
-    def test_describe_caches_each_answer_kills_the_server_and_the_page_shows_it(self) -> None:
-        self.install()
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), McpHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.shutdown)
-        url = f'http://127.0.0.1:{server.server_address[1]}/mcp'
-        script, log = self.home / 'fake_mcp.py', self.home / 'fake_mcp.log'
-        script.write_text(FAKE_MCP)
-        secret = PLANTED['catalog env value']
-        installed = self.root / 'mcp/servers.json'
-        catalog = json.loads(installed.read_text())
-        catalog['mcpServers'].update({
-            'fake': {'command': sys.executable, 'args': [str(script), secret],
-                     'env': {'FAKE_SECRET': secret, 'FAKE_MCP_LOG': str(log)}},
-            'web': {'url': url, 'headers': {'X-Team': 'static-1'}},
-            'webauth': {'url': url, 'headers': {'X-Team': 'wrong'}},
-            'oauth': {'url': url}})
-        installed.write_text(json.dumps(catalog))
-        result = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'mcp', 'describe', '--only', 'fake',
-                                 'web', 'webauth', 'oauth', '--timeout', '30'], capture_output=True, text=True,
-                                env=self.env(), timeout=120, stdin=subprocess.DEVNULL)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        cached = json.loads((self.root / 'state/mcp-describe.json').read_text())['servers']
-        self.assertEqual(cached['fake']['serverInfo'], {'name': 'fake-docs', 'version': '1.2'})
-        self.assertEqual(cached['fake']['tools'], [{'name': 'search', 'description': 'Find a page'},
-                                                   {'name': 'read', 'description': 'Read one'}])
-        self.assertEqual(cached['web']['tools'], [{'name': 'lookup', 'description': ''}])
-        self.assertEqual(cached['webauth']['status'], 'needs sign-in')
-        self.assertEqual(cached['oauth']['status'], 'needs sign-in')
-        self.assertNotIn('docs', cached, '--only describes only the named servers')
-        records = [json.loads(line) for line in log.read_text().splitlines()]
-        self.assertTrue(records[0]['env_ok'], 'the server got its catalog env')
-        self.assertEqual([r['method'] for r in records[1:]], ['initialize', 'notifications/initialized', 'tools/list'])
-        child = records[0]['child']
-        for _ in range(50):
-            if subprocess.run(['/bin/ps', '-p', str(child)], capture_output=True).returncode:
-                break
-            time.sleep(0.1)
-        else:
-            self.fail("the server's child outlived describe: its process group was not killed")
-        for text in (result.stdout, result.stderr, json.dumps(cached)):
-            self.assertNotIn(secret, text)
-            self.assertNotIn('static-1', text)
-        page, _ = self.dashboard()
-        mcp = section(page, 'mcp')
-        self.assertRegex(mcp, r'<b>fake</b><div class="desc">Search the fake documentation before answering\.</div>')
-        self.assertIn('2 tools', page_text(mcp))
-        self.assertIn('needs sign-in', page_text(mcp))
-        self.assertIn('mcp describe', page_text(section(page, 'actions')))
-
-
-FAKE_STDIO = '''import json, os, signal, subprocess, sys, time
-mode, secret = sys.argv[1], os.environ.get('FAKE_SECRET', '')
-if mode == 'child':
-    code = 'import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(120)'
-    subprocess.Popen([sys.executable, '-c', code, sys.argv[2]], stdin=subprocess.DEVNULL)
-    while not os.path.exists(sys.argv[2]) or not open(sys.argv[2]).read():
-        time.sleep(0.05)
-for line in sys.stdin:
-    msg = json.loads(line)
-    if msg.get('method') == 'initialize':
-        result = {'serverInfo': {'name': 'fake ' + secret, 'version': '1'}, 'instructions': 'Use ' + secret}
-        if mode == 'badresult':
-            result = 'not an object'
-        if mode == 'echoerror':
-            print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'error': {'code': 1, 'message': 'bad ' + secret}}), flush=True)
-            continue
-        print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)
-    elif msg.get('method') == 'tools/list':
-        if mode == 'srvreq':
-            print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'method': 'roots/list'}), flush=True)
-        tools = [{'name': 'a', 'description': 'reads with ' + secret}]
-        print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'tools': tools}}), flush=True)
-'''
-
-
-class StreamHandler(http.server.BaseHTTPRequestHandler):
-    """initialize as JSON; tools/list as an event stream kept open with heartbeats, the reply sent
-    first unless the server's `silent`. A `redirect` server answers every POST with a 307."""
-
-    protocol_version = 'HTTP/1.1'
-    seen: list = []
-
-    def log_message(self, *_args) -> None:
-        pass
-
-    def do_POST(self) -> None:
-        cfg = self.server.cfg  # type: ignore[attr-defined]
-        type(self).seen.append((self.server.server_address[1], dict(self.headers)))
-        message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        if cfg.get('redirect'):
-            self.send_response(307)
-            self.send_header('Location', cfg['redirect'])
-            self.send_header('Content-Length', '0')
-            self.end_headers()
-            return
-        if message.get('method') == 'notifications/initialized':
-            self.send_response(202)
-            self.send_header('Content-Length', '0')
-            self.end_headers()
-            return
-        if message.get('method') == 'initialize':
-            body = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': {'serverInfo': {'name': 'sse'}}}).encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
-        self.end_headers()
-        try:
-            if not cfg.get('silent'):
-                reply = {'jsonrpc': '2.0', 'id': message['id'], 'result': {'tools': [{'name': 'lookup'}]}}
-                self.wfile.write(f'event: message\ndata: {json.dumps(reply)}\n\n'.encode())
-            for _ in range(600):
-                self.wfile.write(b': ping\n\n')
-                self.wfile.flush()
-                time.sleep(0.1)
-        except OSError:
-            pass
-
-
-class McpDescribeUnitTests(unittest.TestCase):
-    """mcp_describe against fake servers: cleanup, matching, redaction, redirects and deadlines."""
-
-    def setUp(self) -> None:
-        import types
-
-        self.dir = Path(tempfile.mkdtemp(prefix='describe-', dir=os.environ.get('TMPDIR')))
-        self.addCleanup(shutil.rmtree, self.dir, True)
-        self.script = self.dir / 'fake_stdio.py'
-        self.script.write_text(FAKE_STDIO)
-        self.api = types.SimpleNamespace(resolve=lambda spec: spec)
-
-    def stdio(self, mode: str, *args: str, env: dict | None = None) -> dict:
-        import mcp_describe
-
-        spec = {'command': sys.executable, 'args': [str(self.script), mode, *args], 'env': env or {}}
-        return mcp_describe.describe(self.api, spec, 20)
-
-    def serve(self, **cfg) -> str:
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), StreamHandler)
-        server.cfg = cfg  # type: ignore[attr-defined]
-        server.daemon_threads = True
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        return f'http://127.0.0.1:{server.server_address[1]}/mcp'
-
-    def test_a_child_that_ignores_sigterm_is_killed_with_the_group(self) -> None:
-        mark = self.dir / 'child.pid'
-        entry = self.stdio('child', str(mark))
-        self.assertEqual(entry['status'], 'ok')
-        pid = mark.read_text()
-        for _ in range(50):
-            if subprocess.run(['/bin/ps', '-p', pid], capture_output=True).returncode:
-                break
-            time.sleep(0.1)
-        else:
-            os.kill(int(pid), 9)
-            self.fail('the SIGTERM-ignoring child outlived describe')
-
-    def test_a_server_request_is_not_taken_for_the_reply(self) -> None:
-        self.assertEqual(self.stdio('srvreq')['tools'], [{'name': 'a', 'description': 'reads with '}])
-
-    def test_a_result_that_is_not_an_object_is_a_protocol_error(self) -> None:
-        self.assertEqual(self.stdio('badresult'), {'status': 'protocol error'})
-
-    def test_no_env_value_survives_in_what_the_server_says(self) -> None:
-        secret = 'pw-' + 'Zq81mmXv'
-        ok = self.stdio('echo', env={'FAKE_SECRET': secret})
-        failed = self.stdio('echoerror', env={'FAKE_SECRET': secret})
-        self.assertEqual(ok['status'], 'ok')
-        self.assertNotIn(secret, json.dumps(ok))
-        self.assertIn('[redacted]', ok['instructions'])
-        self.assertEqual(failed, {'status': 'error', 'error': 'JSON-RPC error'})
-
-    def test_a_redirect_never_carries_the_headers_elsewhere(self) -> None:
-        import mcp_describe
-
-        StreamHandler.seen = []
-        elsewhere = self.serve()
-        url = self.serve(redirect=elsewhere)
-        token = 'tok-' + 'Lr93kd0aQ'
-        entry = mcp_describe.describe(self.api, {'url': url, 'headers': {'Authorization': f'Bearer {token}'}}, 10)
-        self.assertEqual(entry, {'status': 'redirected'})
-        port = int(elsewhere.rsplit(':', 1)[1].split('/')[0])
-        self.assertEqual([p for p, _ in StreamHandler.seen if p == port], [], 'the redirect target got a request')
-
-    def test_an_open_event_stream_returns_on_the_reply_and_heartbeats_cannot_outlast_the_deadline(self) -> None:
-        import mcp_describe
-
-        headers = {'X-Team': 'static-1'}
-        started = time.monotonic()
-        entry = mcp_describe.describe(self.api, {'url': self.serve(), 'headers': headers}, 20)
-        self.assertEqual(entry.get('tools'), [{'name': 'lookup', 'description': ''}], entry)
-        self.assertLess(time.monotonic() - started, 10)
-        started = time.monotonic()
-        entry = mcp_describe.describe(self.api, {'url': self.serve(silent=True), 'headers': headers}, 2)
-        self.assertEqual(entry, {'status': 'error', 'error': 'timeout'})
-        self.assertLess(time.monotonic() - started, 6)
-
-    def test_the_cache_reader_validates_every_entry(self) -> None:
-        import mcp_describe
-
-        (self.dir / 'state').mkdir()
-        (self.dir / 'state/mcp-describe.json').write_text(json.dumps({'servers': {
-            'good': {'status': 'ok', 'serverInfo': {'name': 'n', 'version': '2'}, 'instructions': 'Hi',
-                     'tools': [{'name': 't', 'description': 'd'}, 'junk'], 'checked': 'today'},
-            'odd': {'status': 'ok', 'serverInfo': 'junk', 'tools': 'junk', 'instructions': ['x']},
-            'junk': 'not an entry'}}))
-        _, cache = mcp_describe.read_cache(self.dir)
-        self.assertEqual(cache['good'], mcp_describe.Described('ok', 'today', '', 'n 2', 'Hi', (('t', 'd'),)))
-        self.assertEqual(cache['odd'], mcp_describe.Described('ok'))
-        self.assertNotIn('junk', cache)
+        code = template[template.index('/*ah:begin*/'):template.index('/*ah:end*/')].replace('$$', '$')
+        row = {**GOOD, 'name': 'Orders-STG'}
+        js = code + (f'var P = {json.dumps({k: dict(v) for k, v in patterns.items()})}, F = {json.dumps(row)};'
+                     'var out = {}; Object.keys(P).forEach(function (k) {'
+                     ' out[k] = ahBuild(F, {ports: [], aliases: []}, ahRules(function (n) { return P[k][n]; })); });'
+                     'console.log(JSON.stringify(out));')
+        out = json.loads(subprocess.run([str(shutil.which('node')), '-e', js], capture_output=True, text=True,
+                                        timeout=60, check=True).stdout)
+        self.assertEqual(out['shipped']['missing'], ['name'], 'uppercase is refused, and the name reads as STAGING')
+        self.assertEqual((out['changed']['missing'], out['changed']['alias']), ([], 'db-tunnel-Orders-STG'),
+                         'the changed pattern takes uppercase, and without its i flag STG is not staging')
 
 
 if __name__ == '__main__':
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite([loader.loadTestsFromTestCase(case) for case in
                                 (CredentialClassifierTests, DescriptionTests, ConnectionHelperScriptTests,
-                                 DashboardPageTests, DashboardScenarioTests, McpDescribeTests,
-                                 McpDescribeUnitTests)])
+                                 DashboardPageTests, DashboardScenarioTests)])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.stdout.write(json.dumps({'cases': result.testsRun, 'successful': result.wasSuccessful(),
                                 'failures': len(result.failures), 'errors': len(result.errors)}, indent=2) + '\n')

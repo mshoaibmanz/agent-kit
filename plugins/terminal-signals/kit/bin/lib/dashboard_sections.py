@@ -343,7 +343,7 @@ def described(entry: Described | None) -> tuple[Cell, str]:
         return Muted("not described"), ""
     if entry.status != "ok":
         return Badge(entry.status, "warn"), ""
-    names = tuple(name for name, _ in entry.tools)
+    names = entry.tools
     cell: Cell = Fold(f"{len(names)} tools", (Lines(names),)) if names else "0 tools"
     shown: Cell = (cell, Muted(f"{entry.server}, checked {entry.checked or '?'}")) if entry.server else cell
     return shown, entry.instructions or entry.server

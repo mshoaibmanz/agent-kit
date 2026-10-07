@@ -66,8 +66,7 @@ CACHE = os.path.join(STATE_DIR, "db-tunnels.tsv")
 AUTH_FAILED = os.path.join(STATE_DIR, "db-auth-failed")
 TUNNEL_PREFIX = "db-tunnel-"
 KEYCHAIN_SERVICE = "ro-mysql"
-# Anchored to a name segment so `postgres` does not read as `stg`. hooks/lib/db-registry
-# carries the same pattern.
+# Anchored to a name segment so `postgres` does not read as `stg`.
 STAGING_RE = re.compile(r"(?:^|[^a-z])(?:staging|stg)", re.IGNORECASE)
 ANNOTATION_RE = re.compile(r"#\s*ro-mysql:\s*(.*)")
 DB_USER_RE = re.compile(r"[A-Za-z0-9_.@-]+")
@@ -339,6 +338,39 @@ CONFIG_LINE_RE = re.compile(r"(\w+)\s*(?:=\s*|\s+)(.*)")
 MAX_INCLUDE_DEPTH = 16  # ssh's own limit
 
 
+def config_args(text: str) -> list[str] | None:
+    """A config line's arguments split as ssh's argv_split does: blanks separate, double or single
+    quotes group, a backslash escapes a quote, a backslash or (unquoted) a space, and an argument
+    starting with `#` ends the line. None: an unclosed quote, which ssh rejects."""
+    args: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] in " \t":
+            i += 1
+            continue
+        if text[i] == "#":
+            break
+        arg, quote = [], ""
+        while i < n:
+            c = text[i]
+            if c == "\\" and i + 1 < n and (text[i + 1] in "'\"\\" or (not quote and text[i + 1] == " ")):
+                arg.append(text[i + 1])
+                i += 1
+            elif not quote and c in " \t":
+                break
+            elif not quote and c in "'\"":
+                quote = c
+            elif quote and c == quote:
+                quote = ""
+            else:
+                arg.append(c)
+            i += 1
+        if quote:
+            return None
+        args.append("".join(arg))
+    return args
+
+
 @dataclasses.dataclass
 class HostBlock:
     """One `Host` or `Match` block of an ssh config file; the lines before the first are a block with
@@ -398,9 +430,10 @@ def config_blocks(path: str = SSH_CONFIG, depth: int = 0) -> list[HostBlock]:
                 block.db_user = fields["user"]
             continue
         m = CONFIG_LINE_RE.match(line)
-        if m is None:
+        args = config_args(m.group(2)) if m else None
+        if m is None or args is None:
             continue
-        key, args = m.group(1).lower(), m.group(2).split()
+        key = m.group(1).lower()
         if key in ("host", "match"):
             block = HostBlock(args if key == "host" else [], key == "match", path, i)
             blocks.append(block)
@@ -931,6 +964,17 @@ def read_cache(path: str = CACHE) -> dict[tuple[str, str], dict[str, str]]:
     return {(r["alias"], r["port"]): r for r in rows if "port" in r}
 
 
+def cached_state(row: dict[str, str]) -> tuple[str, str, list[str] | None, str]:
+    """(checked, via, databases, reason) of one --refresh cache row: databases is None when the
+    check failed (reason says why) or never ran (reason "not checked")."""
+    if not row:
+        return "", "", None, "not checked"
+    databases = row.get("databases", "")
+    if databases.startswith("?"):
+        return row.get("checked", ""), row.get("via", ""), None, databases[1:].strip()
+    return row.get("checked", ""), row.get("via", ""), [d for d in databases.split(",") if d], ""
+
+
 def refresh(tunnels: list[Tunnel], path: str = CACHE) -> None:
     today = datetime.date.today().isoformat()
     rows = []
@@ -971,7 +1015,8 @@ def show_tunnels(tunnels: list[Tunnel], do_refresh: bool) -> None:
         state = "up" if h == t.alias else "down" if h is None else f"down ({h} holds the port)"
         if h == LSOF_FAILED:
             state = "? (lsof failed)"
-        dbs = cache.get((t.alias, t.port), {}).get("databases", "? not checked")
+        _, _, databases, reason = cached_state(cache.get((t.alias, t.port), {}))
+        dbs = ",".join(databases) if databases is not None else f"? {reason}"
         rows.append((t.name, t.port, t.kind, tunnel_user(t, logins) or "?", state, dbs))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
     for r in rows:
@@ -996,8 +1041,9 @@ def show_tunnels(tunnels: list[Tunnel], do_refresh: bool) -> None:
         print(f"no Keychain password for {', '.join(via_login)} (login path used): run `ro-mysql --rotate` in a terminal")
     if no_creds:
         print(f"no Keychain password or login path for {', '.join(no_creds)}: run `ro-mysql --rotate` in a terminal")
-    with contextlib.suppress(OSError), open(AUTH_FAILED) as f:
-        print(f"auth failed: {f.read().strip()}; run `ro-mysql --rotate` in a terminal")
+    failed = auth_failure()
+    if failed:
+        print(f"auth failed: {failed[0]} on {failed[1]}; run `ro-mysql --rotate` in a terminal")
     checked = sorted({r.get("checked", "?") for r in cache.values()})
     print(f"databases checked {', '.join(checked) or 'never'}; `ro-mysql --tunnels --refresh` re-checks")
     print("query: ro-mysql --tunnel=<name> -D <db> -e 'SELECT ...'")
@@ -1080,7 +1126,9 @@ def execute(
 TUNNEL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 SSH_ALIAS_RE = re.compile(r"[A-Za-z0-9_.-]+")
 REMOTE_HOST_RE = re.compile(r"[A-Za-z0-9.-]+")
-REMOTE_RE = re.compile(rf"({REMOTE_HOST_RE.pattern}):([0-9]{{1,5}})")
+PORT_RE = re.compile(r"[0-9]{1,5}")
+REMOTE_RE = re.compile(rf"({REMOTE_HOST_RE.pattern}):({PORT_RE.pattern})")
+STAGING_SUFFIX = "-staging"
 LOCAL_PORTS = (1024, 65535)  # the add form reads these patterns and ranges from here
 REMOTE_PORTS = (1, 65535)
 ADD_USAGE = (
@@ -1129,7 +1177,7 @@ def parse_add(argv: list[str]) -> tuple[NewTunnel, bool]:
         die(f"add: --name {name!r}: lowercase letters, digits and dashes")
     name = name.removeprefix(TUNNEL_PREFIX)
     if staging and kind_of(name) != "STAGING":
-        name += "-staging"
+        name += STAGING_SUFFIX
     alias = TUNNEL_PREFIX + name
     if not staging and kind_of(alias) == "STAGING":
         die(f"add: {alias} reads as STAGING; pass --staging for a staging instance or pick another name")
@@ -1141,22 +1189,38 @@ def parse_add(argv: list[str]) -> tuple[NewTunnel, bool]:
     if target is None or not REMOTE_PORTS[0] <= int(target.group(2)) <= REMOTE_PORTS[1]:
         die(f"add: --remote {remote!r}: HOST:PORT, the port from {REMOTE_PORTS[0]} to {REMOTE_PORTS[1]}")
     port = values["local-port"]
-    if not port.isdigit() or not LOCAL_PORTS[0] <= int(port) <= LOCAL_PORTS[1]:
+    if not PORT_RE.fullmatch(port) or not LOCAL_PORTS[0] <= int(port) <= LOCAL_PORTS[1]:
         die(f"add: --local-port {port!r}: a number from {LOCAL_PORTS[0]} to {LOCAL_PORTS[1]}")
     return NewTunnel(alias, user, via, remote, str(int(port))), dry_run
 
 
-CONNECTION_KEYS = {
-    "hostname": "HostName",
-    "user": "User",
-    "port": "Port",
-    "proxyjump": "ProxyJump",
-    "proxycommand": "ProxyCommand",
-    "identityfile": "IdentityFile",
-    "identitiesonly": "IdentitiesOnly",
-    "certificatefile": "CertificateFile",
-}
 UNMATCHED_HOST = "ro-mysql-unmatched-host.invalid"  # no block names it: ssh -G shows the defaults
+# ssh -G keys the new block sets itself, or that only name the host asked about: never copied or compared.
+SELF_KEYS = {
+    "host", "localforward", "remoteforward", "dynamicforward", "clearallforwardings",
+    "exitonforwardfailure", "serveraliveinterval", "serveralivecountmax",
+}
+# Keys ssh adds to on every matching block instead of keeping the first value.
+ACCUMULATING = {"identityfile", "certificatefile", "sendenv", "setenv"}
+# The value that sets a key back to "not set", for a key the bastion lacks but a wildcard block
+# would give the new alias; ssh -G prints these the same as an unset key.
+UNSET = {"proxyjump": "none", "proxycommand": "none", "identityagent": "SSH_AUTH_SOCK"}
+# Keys whose ssh -G value is the rest of the line, or several arguments: written unquoted.
+UNQUOTED = {
+    "proxycommand", "remotecommand", "localcommand", "knownhostscommand", "userknownhostsfile",
+    "globalknownhostsfile", "ipqos", "rekeylimit", "canonicaldomains", "permitremoteopen",
+    "channeltimeout", "sendenv", "setenv", "logverbose", "canonicalizepermittedcnames",
+}
+KEYWORDS = {
+    k.lower(): k
+    for k in (
+        "HostName", "User", "Port", "ProxyJump", "ProxyCommand", "IdentityFile", "IdentitiesOnly",
+        "IdentityAgent", "CertificateFile", "HostKeyAlias", "UserKnownHostsFile", "HostKeyAlgorithms",
+        "PubkeyAcceptedAlgorithms", "PreferredAuthentications", "AddKeysToAgent", "ControlMaster",
+        "ControlPath", "ControlPersist", "StrictHostKeyChecking", "ConnectTimeout", "KexAlgorithms",
+        "Ciphers", "MACs", "ForwardAgent", "Compression", "BatchMode",
+    )
+}
 
 
 def resolved(host: str, config: str) -> dict[str, list[str]]:
@@ -1177,24 +1241,32 @@ def resolved(host: str, config: str) -> dict[str, list[str]]:
     return out
 
 
-def bastion_settings(bastion: dict[str, list[str]], defaults: dict[str, list[str]]) -> list[tuple[str, str]]:
-    """(keyword, value) of each connection key the bastion's config sets: its HostName, and every
-    other key whose value differs from what a host no block names gets."""
-    out = []
-    for key, keyword in CONNECTION_KEYS.items():
-        if key == "hostname" or bastion.get(key) != defaults.get(key):
-            out += [(keyword, value) for value in bastion.get(key, [])]
+def comparable(settings: dict[str, list[str]]) -> dict[str, list[str]]:
+    """ssh -G output without SELF_KEYS, a key set back to its UNSET value counted as not set."""
+    return {k: v for k, v in settings.items() if k not in SELF_KEYS and v != [UNSET.get(k)]}
+
+
+def bastion_settings(bastion: dict[str, list[str]], defaults: dict[str, list[str]]) -> dict[str, list[str]]:
+    """What the new block copies: the bastion's HostName and every key whose value differs from
+    what a host no block names gets; a key only that host gets is set back with its UNSET value."""
+    mine, base = comparable(bastion), comparable(defaults)
+    out = {}
+    keys = ["hostname"] + [k for k in mine if k != "hostname" and mine[k] != base.get(k)]
+    for key in keys + [k for k in base if k not in mine]:
+        if key in mine:
+            out[key] = mine[key]
+        elif key in UNSET:
+            out[key] = [UNSET[key]]
     return out
 
 
-def config_value(keyword: str, value: str) -> str:
-    # ProxyCommand takes the rest of the line; any other value with a space needs quotes.
-    return f'"{value}"' if keyword != "ProxyCommand" and re.search(r"\s", value) else value
+def config_value(key: str, value: str) -> str:
+    return value if key in UNQUOTED or not re.search(r"\s", value) else f'"{value}"'
 
 
-def tunnel_block(t: NewTunnel, settings: list[tuple[str, str]]) -> str:
+def tunnel_block(t: NewTunnel, settings: dict[str, list[str]]) -> str:
     lines = [f"Host {t.alias}", f"  # ro-mysql: user={t.user}"]
-    lines += [f"  {keyword} {config_value(keyword, value)}" for keyword, value in settings]
+    lines += [f"  {KEYWORDS.get(k, k)} {config_value(k, v)}" for k, values in settings.items() for v in values]
     lines += [
         f"  LocalForward {t.local_port} {t.remote}",
         "  ExitOnForwardFailure yes",
@@ -1226,13 +1298,37 @@ def forward_of(value: str) -> tuple[str, str]:
     return listen, f"{host.strip('[]')}:{port}"
 
 
-def differences(t: NewTunnel, got: dict[str, list[str]], bastion: dict[str, list[str]]) -> list[str]:
-    """The keys where the new alias resolves otherwise than the bastion, and `localforward` unless
-    the one forward is the new one."""
-    keys = [k for k in CONNECTION_KEYS if got.get(k) != bastion.get(k)]
-    if [forward_of(v) for v in got.get("localforward", [])] != [(t.local_port, t.remote)]:
-        keys.append("localforward")
-    return keys
+def differences(t: NewTunnel, got: dict[str, list[str]], bastion: dict[str, list[str]]) -> dict[str, str]:
+    """Each key of the full ssh -G output (SELF_KEYS aside) where the new alias resolves otherwise
+    than the bastion, and `localforward` unless the one forward is the new one, with why."""
+    mine, theirs = comparable(got), comparable(bastion)
+    out = {}
+    for key in sorted(set(mine) | set(theirs)):
+        if mine.get(key) != theirs.get(key):
+            gets, has = ", ".join(mine.get(key, [])) or "(not set)", ", ".join(theirs.get(key, [])) or "(not set)"
+            out[key] = f"{key}: {t.alias} would get {gets}; {t.via} has {has}"
+            if key in ACCUMULATING:
+                out[key] += f" (a Host * or Match block adds to every host it matches: exclude {t.alias} there)"
+    forwards = [forward_of(v) for v in got.get("localforward", [])]
+    if forwards != [(t.local_port, t.remote)]:
+        out["localforward"] = f"localforward: {t.alias} would forward {forwards or 'nothing'}, not only {t.remote}"
+    return out
+
+
+def fixable(
+    wrong: dict[str, str], settings: dict[str, list[str]], bastion: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Keys still differing that one more line in the block fixes: a single-valued key the bastion
+    has (a wildcard block named the alias but not the bastion), or one it lacks that UNSET resets."""
+    out = {}
+    for key in wrong:
+        if key in settings or key in ACCUMULATING or key == "localforward":
+            continue
+        if key in comparable(bastion):
+            out[key] = bastion[key]
+        elif key in UNSET:
+            out[key] = [UNSET[key]]
+    return out
 
 
 def backup_config(target: str, old: str, now: datetime.datetime | None = None) -> str:
@@ -1272,48 +1368,113 @@ def candidate(target: str, text: str) -> Iterator[str]:
             os.unlink(tmp)
 
 
+@contextlib.contextmanager
+def config_lock(target: str) -> Iterator[None]:
+    """A directory beside the config, so two `add` runs never write it at once."""
+    lock = f"{target}.ro-mysql-lock"
+    os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+    try:
+        os.mkdir(lock, 0o700)
+    except FileExistsError:
+        die(f"add: another ro-mysql add holds {lock}; if none is running, remove that directory")
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(lock)
+
+
+def read_text(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+class Prepared(NamedTuple):
+    old: str  # the config as read
+    text: str  # the config with the block
+    block: str
+    at: int | None
+    taken: list[str]  # an alias or local port the config already has
+    differ: list[str]  # where ssh -G resolves the new alias otherwise than the bastion
+    seen: dict[str, str]  # every file read, by path: a change since means build again
+
+    def refusal(self, t: NewTunnel, config: str) -> str:
+        hint = f"\nCheck the Host * and Match blocks of {config}; --dry-run prints the block" if self.differ else ""
+        return f"add: {t.alias} not added; nothing changed:\n  " + "\n  ".join(self.taken + self.differ) + hint
+
+
+def prepare(t: NewTunnel, config: str, target: str) -> Prepared:
+    """Build the block from the bastion's full ssh -G output and check the new config resolves the
+    alias like the bastion, adding a line per key a wildcard block shadows (three tries at most)."""
+    old = read_text(target)
+    blocks = config_blocks(config)
+    seen = {path: read_text(path) for path in {target, *(b.path for b in blocks)}}
+    taken = []
+    if t.alias.lower() in {a.lower() for b in blocks for a in b.aliases()}:
+        taken.append(f"{t.alias} is already in {config} or a file it Includes")
+    if t.local_port in {port for b in blocks for port, _ in b.forwards()}:
+        taken.append(f"local port {t.local_port} is already forwarded in {config} or a file it Includes; "
+                        "pick another --local-port")
+    bastion = resolved(t.via, config)
+    # ssh matches Host patterns case-sensitively; a hostname equal to --via means none matched.
+    named = {a for b in blocks for a in b.aliases()}
+    if t.via not in named and bastion.get("hostname", [t.via])[0].lower() == t.via.lower():
+        die(f"add: no `Host {t.via}` in {config} (ssh matches Host case-sensitively); "
+            "--via names the bastion's alias there")
+    settings = bastion_settings(bastion, resolved(UNMATCHED_HOST, config))
+    at = insert_at(blocks, config)
+    for _ in range(3):
+        block = tunnel_block(t, settings)
+        text = with_block(old, block, at)
+        with candidate(target, text) as tmp:
+            wrong = differences(t, resolved(t.alias, tmp), bastion)
+        more = fixable(wrong, settings, bastion)
+        if not more:
+            break
+        settings.update(more)
+    return Prepared(old, text, block, at, taken, list(wrong.values()), seen)
+
+
+def unchanged(p: Prepared) -> bool:
+    return all(read_text(path) == text for path, text in p.seen.items())
+
+
 def add(
     argv: list[str], config: str = SSH_CONFIG, ask: Callable[[str], str] = getpass.getpass
 ) -> None:
-    """`ro-mysql add`: refuse a known alias or forwarded port (Includes too), build the block from
-    the bastion's settings, check the new config with `ssh -G` (--dry-run prints the block there),
-    ask for the password, back up and replace the config, store the password per tunnel."""
+    """`ro-mysql add`: build the block from the bastion's settings and check the new config with
+    `ssh -G` (--dry-run prints the block and any problem, and writes nothing), refuse a known alias or
+    port (Includes too) or a difference, ask for the password, then under a lock re-read the config,
+    build again if it changed, back up the current file and replace it, and store the password."""
     t, dry_run = parse_add(argv)
     target = os.path.realpath(config)  # a linked config is written at its target
-    try:
-        with open(target) as f:
-            old = f.read()
-    except FileNotFoundError:
-        old = ""
-    blocks = config_blocks(config)
-    aliases = {a.lower() for b in blocks for a in b.aliases()}
-    if t.alias.lower() in aliases:
-        die(f"add: {t.alias} is already in {config} or a file it Includes; nothing changed")
-    if t.local_port in {port for b in blocks for port, _ in b.forwards()}:
-        die(f"add: local port {t.local_port} is already forwarded in {config} or a file it Includes; "
-            "pick another --local-port")
-    bastion = resolved(t.via, config)
-    # ssh resolving the alias to itself means no block (here or Included) names it.
-    if t.via.lower() not in aliases and bastion.get("hostname", [t.via])[0].lower() == t.via.lower():
-        die(f"add: no `Host {t.via}` in {config}; --via names the bastion's alias there")
-    block = tunnel_block(t, bastion_settings(bastion, resolved(UNMATCHED_HOST, config)))
-    at = insert_at(blocks, config)
-    with candidate(target, with_block(old, block, at)) as tmp:
-        wrong = differences(t, resolved(t.alias, tmp), bastion)
-        if wrong:
-            die(f"add: in the new config {t.alias} would not resolve like {t.via} ({', '.join(wrong)} differ); "
-                f"nothing changed. Check the Host * and Match blocks of {config}")
-        if dry_run:
-            print(block, end="")
-            where = f"above line {at + 1} (its first wildcard Host or Match)" if at is not None else "at its end"
-            print(f"ro-mysql: checked with ssh -G; it goes in {config} {where}", file=sys.stderr)
-            return
+    if dry_run:
+        p = prepare(t, config, target)
+        print(p.block, end="")
+        where = f"above line {p.at + 1} (its first wildcard Host or Match)" if p.at is not None else "at its end"
+        print(f"ro-mysql: checked with ssh -G; it goes in {config} {where}", file=sys.stderr)
+        for problem in p.taken + p.differ:
+            print(f"ro-mysql: warning: {problem}", file=sys.stderr)
+        return
+    with config_lock(target):
+        p = prepare(t, config, target)
+        if p.taken or p.differ:
+            die(p.refusal(t, config))
         try:
             password = ask(f"{t.alias} ({t.user}) password, blank skips storing: ")
         except (EOFError, KeyboardInterrupt):
             die("add: cancelled; nothing changed")
-        backup = backup_config(target, old) if old else None
-        os.replace(tmp, target)
+        if not unchanged(p):
+            print(f"ro-mysql: {config} changed during the prompt; building and checking again", file=sys.stderr)
+            p = prepare(t, config, target)
+            if p.taken or p.differ:
+                die(p.refusal(t, config))
+        backup = backup_config(target, p.old) if p.old else None
+        with candidate(target, p.text) as tmp:
+            os.replace(tmp, target)
     print(f"added {t.alias} to {config}" + (f" (backup {backup})" if backup else ""))
     account = keychain_account(Tunnel(t.alias, t.local_port, t.user), t.user)
     if not password:

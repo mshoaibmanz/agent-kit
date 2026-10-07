@@ -1,45 +1,53 @@
-"""`agent-kit mcp describe`: start each catalog server once, ask it what it is (initialize, then
-notifications/initialized, then tools/list) and cache its serverInfo, instructions and tools in
-<kit>/state/mcp-describe.json, which the dashboard reads. Opt-in: nothing runs it automatically.
-
-stdio servers always run; an http server runs only with static headers, since one without headers
-signs in with OAuth in the host ("needs sign-in"). A server gets the env or headers the render
-would give it, credentials resolved as the render resolves them. No env or header value is printed
-or cached: every one is masked out of what the server says before it is printed or cached, a
-failure is cached as its kind only (timeout, exit code, protocol error), never the server's words,
-a request carrying headers never follows a redirect, and a server's stderr is discarded. Each
-server gets one deadline for its whole exchange. Each stdio server runs in its own process group,
-killed when its answer is in."""
+"""`agent-kit mcp describe` (opt-in): ask each catalog server what it is and cache an allowlist of
+the answer (serverInfo name and version, an instructions excerpt, tool names) in
+<kit>/state/mcp-describe.json, every resolved credential masked out. An http server runs only with
+static headers and never follows a redirect; a failure is cached as its kind only. Each server gets
+one deadline for its whole exchange; a stdio server runs in its own process group, killed when its
+answer is in. README.md (dashboard) has the full contract."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
 import datetime as dt
+import http.client
 import json
 import os
 import select
 import signal
 import socket
+import ssl
 import subprocess
+import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
-from typing import Any, NamedTuple
+from typing import Any, Literal, get_args
 
 CACHE_NAME = "mcp-describe.json"
 PROTOCOL = "2025-06-18"
 CLIENT = {"name": "agent-kit-describe", "version": "1"}
 GRACE_S = 3
 REDACTED = "[redacted]"
-MIN_SECRET = 4  # shorter values (a flag, a port) are not masked out of the text
+INSTRUCTIONS_MAX = 600  # the dashboard shows a line of it
+TOOLS_MAX = 500
+NAME_MAX = 200
+READ_CHUNK = 4096
+BODY_MAX = 4 << 20
+AUTH_HEADERS = ("authorization", "proxy-authorization")  # `<scheme> <token>` values
+
+Status = Literal["ok", "error", "needs sign-in", "redirected", "protocol error"]
+STATUSES: tuple[str, ...] = get_args(Status)
 
 
 class Unanswered(Exception):
-    """The server did not answer in time, or not in JSON-RPC. Its text is a category of ours."""
+    """No usable answer. `status` is what the cache records; the text is a category of ours, never
+    the server's words."""
 
-    status = "error"
+    status: Status = "error"
 
 
 class ProtocolError(Unanswered):
@@ -47,20 +55,71 @@ class ProtocolError(Unanswered):
 
     status = "protocol error"
 
-    def __init__(self) -> None:
-        super().__init__("protocol error")
+
+class NeedsSignIn(Unanswered):
+    """401 or 403: the host signs in with OAuth, or the static headers are wrong."""
+
+    status = "needs sign-in"
 
 
-class Described(NamedTuple):
-    """One server's cached entry, validated: status is "ok", "error", "needs sign-in",
-    "redirected" or "protocol error"; the rest is filled for "ok" only."""
+class Redirected(Unanswered):
+    """A 3xx: never followed, so the headers go nowhere else."""
 
-    status: str
+    status = "redirected"
+
+
+def clip(value: object, limit: int) -> str:
+    return value[:limit] if isinstance(value, str) else ""
+
+
+@dataclasses.dataclass(frozen=True)
+class Described:
+    """One server's cached entry, the only shape written or read: name, version, instructions and
+    tools are filled for "ok" only."""
+
+    status: Status
     checked: str = ""
     error: str = ""
-    server: str = ""  # serverInfo's "name version"
+    name: str = ""
+    version: str = ""
     instructions: str = ""
-    tools: tuple[tuple[str, str], ...] = ()  # (name, description)
+    tools: tuple[str, ...] = ()
+
+    @property
+    def server(self) -> str:
+        return " ".join(v for v in (self.name, self.version) if v)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            k: list(v) if k == "tools" else v
+            for k, v in dataclasses.asdict(self).items()
+            if v
+        }
+
+    @classmethod
+    def from_json(cls, entry: object) -> Described | None:
+        """The entry as written by to_json, each field type-checked; None without a known status."""
+        if not isinstance(entry, dict) or entry.get("status") not in STATUSES:
+            return None
+        tools = entry.get("tools") if isinstance(entry.get("tools"), list) else []
+        return cls(
+            status=entry["status"],
+            checked=clip(entry.get("checked"), NAME_MAX),
+            error=clip(entry.get("error"), NAME_MAX),
+            name=clip(entry.get("name"), NAME_MAX),
+            version=clip(entry.get("version"), NAME_MAX),
+            instructions=clip(entry.get("instructions"), INSTRUCTIONS_MAX),
+            tools=tuple(t[:NAME_MAX] for t in tools[:TOOLS_MAX] if isinstance(t, str)),
+        )
+
+    def masked(self, credentials: list[str]) -> Described:
+        return dataclasses.replace(
+            self,
+            name=redact(self.name, credentials),
+            version=redact(self.version, credentials),
+            instructions=redact(self.instructions, credentials),
+            tools=tuple(redact(t, credentials) for t in self.tools),
+        )
 
 
 def cache_path(kit: Path) -> Path:
@@ -76,91 +135,103 @@ def stored(path: Path) -> dict[str, Any]:
     return servers if isinstance(servers, dict) else {}
 
 
-def text(value: object) -> str:
-    return value if isinstance(value, str) else ""
-
-
-def validated(entry: object) -> Described | None:
-    """A cache entry as a Described; None when it has no status."""
-    if not isinstance(entry, dict) or not isinstance(entry.get("status"), str):
-        return None
-    info = entry.get("serverInfo") if isinstance(entry.get("serverInfo"), dict) else {}
-    tools = entry.get("tools") if isinstance(entry.get("tools"), list) else []
-    return Described(
-        status=entry["status"],
-        checked=text(entry.get("checked")),
-        error=text(entry.get("error")),
-        server=" ".join(text(info.get(k)) for k in ("name", "version") if text(info.get(k))),
-        instructions=text(entry.get("instructions")) or text(info.get("title")),
-        tools=tuple((text(t.get("name")), text(t.get("description"))) for t in tools if isinstance(t, dict)),
-    )
-
-
 def read_cache(kit: Path) -> tuple[Path, dict[str, Described]]:
     """(the cache file, each server's validated entry by name); an invalid entry is left out."""
     path = cache_path(kit)
-    entries = {name: validated(entry) for name, entry in stored(path).items()}
+    entries = {name: Described.from_json(entry) for name, entry in stored(path).items()}
     return path, {name: entry for name, entry in entries.items() if entry is not None}
 
 
 def initialize(request_id: int) -> dict[str, Any]:
     params = {"protocolVersion": PROTOCOL, "capabilities": {}, "clientInfo": CLIENT}
-    return {"jsonrpc": "2.0", "id": request_id, "method": "initialize", "params": params}
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "initialize",
+        "params": params,
+    }
 
 
 INITIALIZED = {"jsonrpc": "2.0", "method": "notifications/initialized"}
 TOOLS = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
 
 
-def is_reply(message: object, request_id: int) -> bool:
-    """A response to request_id; a request or notification from the server (it has a method) is not."""
-    return isinstance(message, dict) and message.get("id") == request_id and "method" not in message
+def reply_in(text: str, request_id: int) -> dict[str, Any] | None:
+    """The JSON-RPC response to request_id that text holds; None for anything else (a log line, a
+    request or notification from the server, which has a method)."""
+    try:
+        message = json.loads(text)
+    except ValueError:
+        return None
+    if (
+        isinstance(message, dict)
+        and message.get("id") == request_id
+        and "method" not in message
+    ):
+        return message
+    return None
 
 
-def answer(init: dict[str, Any], tools: dict[str, Any]) -> dict[str, Any]:
-    """The cached entry from the initialize and tools/list replies."""
+def answer(init: dict[str, Any], tools: dict[str, Any]) -> Described:
+    """The allowlisted entry from the initialize and tools/list replies."""
     for reply in (init, tools):
         if "error" in reply:
             raise Unanswered("JSON-RPC error")
     result, listed = init.get("result", {}), tools.get("result", {})
     if not isinstance(result, dict) or not isinstance(listed, dict):
-        raise ProtocolError
-    info, instructions, items = result.get("serverInfo", {}), result.get("instructions") or "", listed.get("tools") or []
-    if not isinstance(info, dict) or not isinstance(instructions, str) or not isinstance(items, list):
-        raise ProtocolError
-    return {
-        "status": "ok",
-        "serverInfo": {k: str(v) for k, v in info.items() if isinstance(v, (str, int, float))},
-        "protocolVersion": str(result.get("protocolVersion", "")),
-        "instructions": instructions,
-        "tools": [
-            {"name": str(t.get("name", "")), "description": str(t.get("description") or "")}
-            for t in items
+        raise ProtocolError("protocol error")
+    info, instructions, items = (
+        result.get("serverInfo", {}),
+        result.get("instructions") or "",
+        listed.get("tools") or [],
+    )
+    if (
+        not isinstance(info, dict)
+        or not isinstance(instructions, str)
+        or not isinstance(items, list)
+    ):
+        raise ProtocolError("protocol error")
+    return Described(
+        status="ok",
+        name=clip(info.get("name"), NAME_MAX),
+        version=clip(info.get("version"), NAME_MAX),
+        instructions=clip(instructions, INSTRUCTIONS_MAX),
+        tools=tuple(
+            clip(t.get("name"), NAME_MAX)
+            for t in items[:TOOLS_MAX]
             if isinstance(t, dict)
-        ],
-    }
+        ),
+    )
 
 
-def secrets_of(spec: dict[str, Any]) -> list[str]:
-    """Every env and header value the server gets, and each word of one (a token after `Bearer`),
-    longest first so a value is masked before its parts."""
+def credentials_of(spec: Any, resolved: Any, field: str = "") -> list[str]:
+    """Every resolved credential value, longest first so a value is masked before its parts: what a
+    `$keychain` reference in spec resolved to, every header value whole, and a header's token after
+    an Authorization scheme (`Bearer x`: x). Whole values only, whatever their length; a plain env value is
+    not a credential."""
     found: set[str] = set()
-    for field in ("env", "headers"):
-        values = spec.get(field) if isinstance(spec.get(field), dict) else {}
-        for value in values.values():
-            found.update(v for v in (str(value), *str(value).split()) if len(v) >= MIN_SECRET)
+    if isinstance(spec, dict) and set(spec) == {"$keychain"}:
+        found.add(str(resolved))
+    elif isinstance(spec, dict) and isinstance(resolved, dict):
+        for key, value in resolved.items():
+            found.update(
+                credentials_of(spec.get(key), value, key if not field else field)
+            )
+            if field == "headers" and isinstance(value, str):
+                found.add(value)
+                scheme, _, token = value.strip().partition(" ")
+                if key.lower() in AUTH_HEADERS and token.strip() and scheme.isalpha():
+                    found.add(token.strip())
+    elif isinstance(spec, list) and isinstance(resolved, list):
+        for s, r in zip(spec, resolved):
+            found.update(credentials_of(s, r, field))
+    found.discard("")
     return sorted(found, key=len, reverse=True)
 
 
-def redact(value: Any, secrets: list[str]) -> Any:
-    if isinstance(value, str):
-        for secret in secrets:
-            value = value.replace(secret, REDACTED)
-        return value
-    if isinstance(value, list):
-        return [redact(v, secrets) for v in value]
-    if isinstance(value, dict):
-        return {k: redact(v, secrets) for k, v in value.items()}
+def redact(value: str, credentials: list[str]) -> str:
+    for credential in credentials:
+        value = value.replace(credential, REDACTED)
     return value
 
 
@@ -168,30 +239,28 @@ def stop(proc: subprocess.Popen[bytes]) -> None:
     """Close its stdin, SIGTERM its process group (npx and uvx start children), give it the grace
     period, then SIGKILL the group whether or not the leader has exited (a child may ignore
     SIGTERM), and reap the leader."""
-    for stream in (proc.stdin,):
-        if stream is not None:
-            try:
-                stream.close()
-            except OSError:
-                pass
-    try:
+    if proc.stdin is not None:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=GRACE_S)
-    except subprocess.TimeoutExpired:
-        pass
-    try:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
     proc.wait()
     if proc.stdout is not None:
         proc.stdout.close()
 
 
-def describe_stdio(spec: dict[str, Any], deadline: float) -> dict[str, Any]:
+def remaining(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise Unanswered("timeout")
+    return left
+
+
+def describe_stdio(spec: dict[str, Any], deadline: float) -> Described:
     argv = [str(spec["command"]), *[str(a) for a in spec.get("args") or []]]
     env = {**os.environ, **{k: str(v) for k, v in (spec.get("env") or {}).items()}}
     proc = subprocess.Popen(
@@ -216,16 +285,12 @@ def describe_stdio(spec: dict[str, Any], deadline: float) -> dict[str, Any]:
         while True:
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
-                try:
-                    message = json.loads(line)
-                except ValueError:
-                    continue  # a log line on stdout
-                if is_reply(message, request_id):
-                    return message
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise Unanswered("timeout")
-            ready, _, _ = select.select([proc.stdout], [], [], min(left, 1))
+                reply = reply_in(line.decode("utf-8", "replace"), request_id)
+                if reply is not None:
+                    return reply
+            ready, _, _ = select.select(
+                [proc.stdout], [], [], min(remaining(deadline), 1)
+            )
             if ready:
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
@@ -244,143 +309,185 @@ def describe_stdio(spec: dict[str, Any], deadline: float) -> dict[str, Any]:
         stop(proc)
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A redirect is an HTTPError (3xx), never a second request carrying the headers elsewhere."""
+@contextlib.contextmanager
+def watchdog(conn: http.client.HTTPConnection, deadline: float) -> Iterator[None]:
+    """Shut the connection's socket down at the deadline, so a read that keeps getting a byte at a
+    time (headers included) cannot outlast it."""
 
-    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
+    def cut() -> None:
+        if conn.sock is not None:
+            with contextlib.suppress(OSError):
+                conn.sock.shutdown(socket.SHUT_RDWR)
+
+    timer = threading.Timer(max(deadline - time.monotonic(), 0), cut)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
 
 
-OPENER = urllib.request.build_opener(NoRedirect)
-
-
-def remaining(deadline: float) -> float:
-    left = deadline - time.monotonic()
-    if left <= 0:
-        raise Unanswered("timeout")
-    return left
-
-
-def lines_until(response: Any, deadline: float) -> Any:
-    """The response's lines as they arrive, each read bounded by what is left of the deadline."""
-    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+def chunks(
+    conn: http.client.HTTPConnection,
+    response: http.client.HTTPResponse,
+    deadline: float,
+) -> Iterator[bytes]:
+    """The body in reads of at most READ_CHUNK bytes, the deadline checked before each and the socket
+    timeout set to what is left of it."""
+    total = 0
     while True:
         left = remaining(deadline)
-        if isinstance(sock, socket.socket) and sock.fileno() >= 0:  # closed once a sized body is read
-            sock.settimeout(left)
-        try:
-            line = response.readline(65536)
-        except (TimeoutError, socket.timeout):
-            raise Unanswered("timeout") from None
-        if not line:
+        if conn.sock is not None:
+            with contextlib.suppress(OSError):
+                conn.sock.settimeout(left)
+        chunk = response.read1(READ_CHUNK)
+        if not chunk:
+            remaining(
+                deadline
+            )  # a cut by the watchdog reads as the end: it is the timeout
             return
-        yield line.decode("utf-8", "replace")
+        total += len(chunk)
+        if total > BODY_MAX:
+            raise ProtocolError("protocol error")
+        yield chunk
 
 
-def event_reply(response: Any, request_id: int, deadline: float) -> dict[str, Any]:
+def lines(blocks: Iterator[bytes]) -> Iterator[str]:
+    buffer = b""
+    for block in blocks:
+        buffer += block
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            yield line.decode("utf-8", "replace").rstrip("\r")
+    if buffer:
+        yield buffer.decode("utf-8", "replace").rstrip("\r")
+
+
+def event_reply(blocks: Iterator[bytes], request_id: int) -> dict[str, Any]:
     """The matching JSON-RPC reply from an event stream, read event by event: it returns as soon as
     the reply arrives, however long the server keeps the stream open."""
     data: list[str] = []
-    for line in lines_until(response, deadline):
-        line = line.rstrip("\r\n")
+    for line in _with_end(lines(blocks)):
         if line.startswith("data:"):
             data.append(line[5:].lstrip())
             continue
         if line or not data:
             continue
-        try:
-            reply = json.loads("\n".join(data))
-        except ValueError:
-            reply = None
+        reply = reply_in("\n".join(data), request_id)
         data = []
-        if is_reply(reply, request_id):
+        if reply is not None:
             return reply
-    if data:
-        try:
-            reply = json.loads("\n".join(data))
-        except ValueError:
-            reply = None
-        if is_reply(reply, request_id):
-            return reply
-    raise ProtocolError
+    raise ProtocolError("protocol error")
 
 
-def post(url: str, headers: dict[str, str], message: dict[str, Any], deadline: float) -> tuple[dict[str, Any], str]:
+def _with_end(source: Iterator[str]) -> Iterator[str]:
+    """source, then a blank line: a stream that ends mid-event still dispatches it."""
+    yield from source
+    yield ""
+
+
+def connection(url: str, deadline: float) -> tuple[http.client.HTTPConnection, str]:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise Unanswered("not reached: a URL that is not http(s)")
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    if parts.scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parts.hostname,
+            parts.port,
+            timeout=remaining(deadline),
+            context=ssl.create_default_context(),
+        )
+    else:
+        conn = http.client.HTTPConnection(
+            parts.hostname, parts.port, timeout=remaining(deadline)
+        )
+    return conn, path
+
+
+def post(
+    url: str, headers: dict[str, str], message: dict[str, Any], deadline: float
+) -> tuple[dict[str, Any], str]:
     """(the JSON-RPC reply, the session id header) of one Streamable HTTP POST."""
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(message).encode(),
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "User-Agent": "agent-kit-describe/1",
-            **headers,
-        },
-    )
-    with OPENER.open(request, timeout=remaining(deadline)) as response:
-        session = response.headers.get("Mcp-Session-Id", "")
-        if "id" not in message:
-            return {}, session
-        if "text/event-stream" in response.headers.get("Content-Type", ""):
-            return event_reply(response, message["id"], deadline), session
-        body = "".join(lines_until(response, deadline))
+    conn, path = connection(url, deadline)
+    body = json.dumps(message).encode()
+    sent = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "User-Agent": "agent-kit-describe/1",
+        **headers,
+    }
     try:
-        reply = json.loads(body)
-    except ValueError:
-        raise ProtocolError from None
-    if not is_reply(reply, message["id"]):
-        raise ProtocolError
+        with watchdog(conn, deadline):
+            conn.request("POST", path, body=body, headers=sent)
+            try:
+                response = conn.getresponse()
+            except (http.client.HTTPException, OSError):
+                remaining(deadline)
+                raise
+            if response.status in (401, 403):
+                raise NeedsSignIn("needs sign-in")
+            if 300 <= response.status < 400:
+                raise Redirected("redirected")
+            if not 200 <= response.status < 300:
+                raise Unanswered(f"HTTP {response.status}")
+            session = response.getheader("Mcp-Session-Id", "") or ""
+            if "id" not in message:
+                return {}, session
+            blocks = chunks(conn, response, deadline)
+            if "text/event-stream" in (response.getheader("Content-Type") or ""):
+                return event_reply(blocks, message["id"]), session
+            reply = reply_in(b"".join(blocks).decode("utf-8", "replace"), message["id"])
+    finally:
+        conn.close()
+    if reply is None:
+        raise ProtocolError("protocol error")
     return reply, session
 
 
-def describe_http(spec: dict[str, Any], deadline: float) -> dict[str, Any]:
+def describe_http(spec: dict[str, Any], deadline: float) -> Described:
     headers = {str(k): str(v) for k, v in (spec.get("headers") or {}).items()}
     url = str(spec["url"])
     try:
         init, session = post(url, headers, initialize(1), deadline)
         if session:
             headers["Mcp-Session-Id"] = session
-        headers["MCP-Protocol-Version"] = str((init.get("result") or {}).get("protocolVersion") or PROTOCOL)
+        headers["MCP-Protocol-Version"] = str(
+            (init.get("result") or {}).get("protocolVersion") or PROTOCOL
+        )
         post(url, headers, INITIALIZED, deadline)
         tools, _ = post(url, headers, TOOLS, deadline)
-    except urllib.error.HTTPError as error:
-        error.close()
-        if error.code in (401, 403):
-            return {"status": "needs sign-in"}
-        if 300 <= error.code < 400:
-            return {"status": "redirected"}
-        raise Unanswered(f"HTTP {error.code}") from None
     except (TimeoutError, socket.timeout):
         raise Unanswered("timeout") from None
-    except (urllib.error.URLError, OSError) as error:
-        reason = getattr(error, "reason", error)
-        raise Unanswered(f"not reached: {type(reason).__name__}") from None
+    except (http.client.HTTPException, OSError) as error:
+        raise Unanswered(f"not reached: {type(error).__name__}") from None
     return answer(init, tools)
 
 
-def describe(api: ModuleType, spec: dict[str, Any], timeout: float) -> dict[str, Any]:
-    """One server's entry, every env and header value masked out of it. Credentials resolve here,
-    as the render resolves them; a failure names only its kind, never a value."""
+def describe(api: ModuleType, spec: dict[str, Any], timeout: float) -> Described:
+    """One server's entry, every resolved credential masked out of it. Credentials resolve here, as
+    the render resolves them; a failure names only its kind, never a value."""
     if "url" in spec and not spec.get("headers"):
-        return {"status": "needs sign-in"}
+        return Described("needs sign-in")
     try:
         resolved = api.resolve(spec)
     except SystemExit:
-        return {"status": "error", "error": "a Keychain item it needs is missing"}
+        return Described("error", error="a Keychain item it needs is missing")
     deadline = time.monotonic() + timeout
     try:
-        if "url" in resolved:
-            entry = describe_http(resolved, deadline)
-        else:
-            entry = describe_stdio(resolved, deadline)
-    except ProtocolError:
-        return {"status": ProtocolError.status}
+        entry = (
+            describe_http(resolved, deadline)
+            if "url" in resolved
+            else describe_stdio(resolved, deadline)
+        )
     except Unanswered as error:
-        return {"status": "error", "error": str(error)}
+        return Described(
+            error.status, error=str(error) if error.status == "error" else ""
+        )
     except OSError as error:
-        return {"status": "error", "error": f"not started: {type(error).__name__}"}
-    return redact(entry, secrets_of(resolved))
+        return Described("error", error=f"not started: {type(error).__name__}")
+    return entry.masked(credentials_of(spec, resolved))
 
 
 def cmd_describe(api: ModuleType, args: argparse.Namespace) -> int:
@@ -392,23 +499,28 @@ def cmd_describe(api: ModuleType, args: argparse.Namespace) -> int:
             raise SystemExit(f"agent-kit: not in the catalog: {', '.join(unknown)}")
         names = sorted(set(args.only))
     path = cache_path(Path(api.KIT))
-    cached = stored(path)
+    cached = {
+        name: entry.to_json()
+        for name, entry in read_cache(Path(api.KIT))[1].items()
+        if name in servers
+    }
     failed = 0
     for name in names:
         spec = servers[name] if isinstance(servers[name], dict) else {}
         print(f"mcp describe: {name} ...", flush=True)
-        entry = describe(api, spec, args.timeout)
-        entry["checked"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-        cached[name] = entry
-        if entry["status"] == "ok":
-            info = entry["serverInfo"]
-            print(f"  ok: {info.get('name', '?')} {info.get('version', '')}, {len(entry['tools'])} tools")
+        entry = dataclasses.replace(
+            describe(api, spec, args.timeout),
+            checked=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        cached[name] = entry.to_json()
+        if entry.status == "ok":
+            print(f"  ok: {entry.server or '?'}, {len(entry.tools)} tools")
         else:
-            failed += entry["status"] in ("error", ProtocolError.status)
-            print(f"  {entry['status']}" + (f": {entry['error']}" if entry.get("error") else ""))
-    for gone in sorted(set(cached) - set(servers)):
-        del cached[gone]
+            failed += entry.status in ("error", "protocol error")
+            print(f"  {entry.status}" + (f": {entry.error}" if entry.error else ""))
     path.parent.mkdir(parents=True, exist_ok=True)
-    api.atomic_write(path, json.dumps({"servers": cached}, indent=2, sort_keys=True) + "\n", 0o600)
+    api.atomic_write(
+        path, json.dumps({"servers": cached}, indent=2, sort_keys=True) + "\n", 0o600
+    )
     print(f"mcp describe: wrote {path}")
     return 1 if failed else 0

@@ -5,6 +5,7 @@ which may read the MySQL login-path store, and opens no tunnel."""
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from types import ModuleType
 from typing import Any
 
@@ -22,34 +23,44 @@ def ro_mysql(setup: Setup) -> ModuleType | None:
     return None
 
 
+JS_FLAGS = ((re.IGNORECASE, "i"), (re.MULTILINE, "m"), (re.DOTALL, "s"))
+
+
 def form_patterns(module: ModuleType) -> tuple[tuple[str, str], ...]:
     """What `ro-mysql add` accepts, as the form's data-p-* attributes: the form checks with
-    ro-mysql's own patterns and ranges, never a copy."""
+    ro-mysql's own patterns (each with its flags as <name>-flags) and ranges, never a copy."""
+    patterns = {
+        "name": module.TUNNEL_NAME_RE,
+        "user": module.DB_USER_RE,
+        "via": module.SSH_ALIAS_RE,
+        "host": module.REMOTE_HOST_RE,
+        "port": module.PORT_RE,
+        "staging": module.STAGING_RE,
+    }
+    out: list[tuple[str, str]] = []
+    for name, rx in patterns.items():
+        out += [(name, rx.pattern), (f"{name}-flags", "".join(f for flag, f in JS_FLAGS if rx.flags & flag))]
     return (
-        ("name", module.TUNNEL_NAME_RE.pattern),
-        ("user", module.DB_USER_RE.pattern),
-        ("via", module.SSH_ALIAS_RE.pattern),
-        ("host", module.REMOTE_HOST_RE.pattern),
+        *out,
         ("local-ports", "-".join(map(str, module.LOCAL_PORTS))),
         ("remote-ports", "-".join(map(str, module.REMOTE_PORTS))),
-        ("staging", module.STAGING_RE.pattern),
         ("prefix", module.TUNNEL_PREFIX),
-        ("suffix", "-staging"),
+        ("suffix", module.STAGING_SUFFIX),
         ("service", module.KEYCHAIN_SERVICE),
     )
 
 
-def tunnel_state(cached: dict[str, str], rejected: bool) -> Cell:
-    """The tunnel's state as ro-mysql last recorded it, never probed: a rejected login
-    (db-auth-failed), the last --refresh's error or login path, or not checked."""
+def tunnel_state(state: tuple[str, str, list[str] | None, str], rejected: bool) -> Cell:
+    """The tunnel's state as ro-mysql last recorded it (its cached_state), never probed: a rejected
+    login (db-auth-failed), the last --refresh's error or login path, or not checked."""
+    checked, via, databases, reason = state
     if rejected:
         return (Badge("login rejected", "bad"), Muted("run ro-mysql --rotate in your own terminal"))
-    if not cached:
+    if not checked:
         return Badge("not checked")
-    databases, via = cached.get("databases", ""), cached.get("via", "")
-    if databases.startswith("?"):
-        return (Badge("failed", "bad"), Muted(f"{cached.get('checked', '')}: {databases[1:].strip()}"))
-    return (Badge("ok", "ok"), Muted(f"{cached.get('checked', '')} {via}".strip()))
+    if databases is None:
+        return (Badge("failed", "bad"), Muted(f"{checked}: {reason}"))
+    return (Badge("ok", "ok"), Muted(f"{checked} {via}".strip()))
 
 
 def target(t: Any) -> str:
@@ -61,6 +72,9 @@ def sql_section(setup: Setup, sec: Section) -> None:
     config = Path.home() / ".ssh/config"
     sec.sources = [config]
     module = ro_mysql(setup)
+    if module is not None:
+        read = dict.fromkeys(Path(b.path) for b in module.config_blocks(str(config)))
+        sec.sources += [path for path in read if path != config]
     rows: TableRows = []
     staging = 0
     found: list[Any] = []
@@ -70,7 +84,7 @@ def sql_section(setup: Setup, sec: Section) -> None:
         shared = module.multi_port_aliases(found)
         failed = module.auth_failure()
         for t in found:
-            cached = cache.get((t.alias, t.port), {})
+            state = module.cached_state(cache.get((t.alias, t.port), {}))
             row = anchor("sql", t.name)
             if t.user and t.alias not in shared:
                 item = Credential(module.KEYCHAIN_SERVICE, module.keychain_account(t, t.user))
@@ -78,7 +92,7 @@ def sql_section(setup: Setup, sec: Section) -> None:
             else:
                 cred = Muted("No Keychain item (no annotated user, or a shared alias)")
             staging += t.kind == "STAGING"
-            databases = cached.get("databases", "?")  # a failed --refresh caches "? <reason>"
+            databases = state[2]
             rows.append(
                 Row(
                     (
@@ -87,8 +101,8 @@ def sql_section(setup: Setup, sec: Section) -> None:
                         Badge(t.kind, "warn" if t.kind == "PROD" else "ok"),
                         t.user or "?",
                         cred,
-                        ", ".join(databases.split(",")) if not databases.startswith("?") else "-",
-                        tunnel_state(cached, bool(t.user) and failed == (t.user, t.alias)),
+                        ", ".join(databases) if databases is not None else "-",
+                        tunnel_state(state, bool(t.user) and failed == (t.user, t.alias)),
                     ),
                     row,
                     target(t),

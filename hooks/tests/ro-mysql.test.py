@@ -284,15 +284,6 @@ HELD_BY_COMM = {"23309": ("2", "ssh -f -N -o BatchMode=yes db-tunnel-comm")}
 HELD_BY_APP = {"23307": ("3", "ssh -f -N -o BatchMode=yes db-tunnel-app")}
 
 
-def registry_matches() -> bool:
-    lib = os.path.join(HOOKS, "lib", "db-registry")
-    out = subprocess.run(
-        ["/bin/bash", "-c", 'source "$1" && db_tunnels "$2"', "_", lib, SSH_CONFIG],
-        capture_output=True, text=True,
-    ).stdout.splitlines()
-    return out == [f"{a} {p} {m.kind_of(a)}" for a, p, _ in EXPECTED_TUNNELS]
-
-
 def keychain_password_only_in_option_file() -> bool:
     fresh_logs()
     m.run(plan(["--tunnel=prod", *Q], keychain={"reader-b@db-tunnel-prod": "s3cret!"}))
@@ -745,8 +736,12 @@ def add_refuses_a_config_where_the_alias_resolves_otherwise() -> bool:
     text = "Include {SSH}/inc/*\n"
     config = scratch_home(text, SHADOWED)
     refused, shown, prompts = run_add(config, ADD_ARGS)
-    dry = run_add(config, [*ADD_ARGS, "--dry-run"])
-    return refused and not prompts and "user" in shown and dry[0] and untouched(config, text)
+    dry_refused, dry, _ = run_add(config, [*ADD_ARGS, "--dry-run"])
+    return (
+        refused and not prompts and "user: db-tunnel-billing would get fallback; jump has ops" in shown
+        and not dry_refused and dry.startswith("Host db-tunnel-billing\n") and "warning: user:" in dry
+        and untouched(config, text)
+    )
 
 
 def add_cancelled_at_the_prompt_writes_nothing() -> bool:
@@ -767,11 +762,124 @@ def add_cancelled_at_the_prompt_writes_nothing() -> bool:
     return all(results)
 
 
-def add_matches_the_bastion_alias_in_any_case() -> bool:
+def add_matches_the_bastion_alias_case_sensitively() -> bool:
     text = "Host Jump\n  User ops\n  Port 2222\n"
     config = scratch_home(text)
-    refused, _, _ = run_add(config, [*ADD_ARGS, "--dry-run"])
-    return not refused and untouched(config, text)
+    other_case = run_add(config, [*ADD_ARGS, "--dry-run"])
+    upper = run_add(config, [*ADD_ARGS[:5], "JUMP", *ADD_ARGS[6:], "--dry-run"])
+    exact = run_add(config, [*ADD_ARGS[:5], "Jump", *ADD_ARGS[6:], "--dry-run"])
+    return (
+        other_case[0] and "case-sensitively" in other_case[1] and upper[0] and not exact[0]
+        and "User ops" in exact[1] and untouched(config, text)
+    )
+
+
+FULL_BASTION = """\
+Host jump
+  HostName bastion.example.test
+  User ops
+  IdentityAgent {SSH}/agent.sock
+  HostKeyAlias corp-bastion
+  UserKnownHostsFile {SSH}/known_hosts.corp {SSH}/known_hosts.extra
+  PubkeyAcceptedAlgorithms +ssh-rsa
+  HostKeyAlgorithms +ssh-rsa
+  PreferredAuthentications publickey
+  ConnectTimeout 7
+  Compression yes
+"""
+
+
+def comparable(settings: dict[str, list[str]]) -> dict[str, list[str]]:
+    skip = {"host", "localforward", "exitonforwardfailure", "serveraliveinterval", "serveralivecountmax"}
+    return {k: v for k, v in settings.items() if k not in skip}
+
+
+def add_copies_and_verifies_the_bastions_full_config() -> bool:
+    config = scratch_home(FULL_BASTION)
+    refused, shown, _ = run_add(config, ADD_ARGS)
+    new, jump = ssh_g(config, "db-tunnel-billing"), ssh_g(config, "jump")
+    return not refused and comparable(new) == comparable(jump) and new["identityagent"] == jump["identityagent"] and (
+        len(new["userknownhostsfile"][0].split()) == 2
+    ), shown
+
+
+WILDCARD_DEFAULTS = "Host jump\n  HostName bastion.example.test\n  User ops\n\nHost * !jump\n  ProxyJump jump\n"
+
+
+def add_sets_back_what_a_wildcard_block_would_add() -> bool:
+    config = scratch_home(WILDCARD_DEFAULTS)
+    refused, shown, _ = run_add(config, ADD_ARGS)
+    with open(config) as f:
+        text = f.read()
+    new = ssh_g(config, "db-tunnel-billing")
+    return not refused and "  ProxyJump none\n" in text and "proxyjump" not in new
+
+
+def add_explains_an_identity_list_it_cannot_match_and_dry_run_still_prints() -> bool:
+    text = WILDCARD_DEFAULTS + "  IdentityFile ~/.ssh/inner_key\n"
+    config = scratch_home(text)
+    refused, shown, prompts = run_add(config, ADD_ARGS)
+    dry_refused, dry, _ = run_add(config, [*ADD_ARGS, "--dry-run"])
+    why = "adds to every host it matches: exclude db-tunnel-billing there"
+    return (
+        refused and not prompts and "identityfile:" in shown and why in shown and untouched(config, text)
+        and not dry_refused and dry.startswith("Host db-tunnel-billing\n") and "  ProxyJump none\n" in dry
+        and "warning: identityfile:" in dry
+    )
+
+
+QUOTED_INCLUDE = 'Include "{SSH}/team dir/*"\n\n' + BASE_CONFIG.replace("db-tunnel-orders", "db-tunnel-legacy")
+
+
+def add_reads_a_quoted_include() -> bool:
+    config = scratch_home(QUOTED_INCLUDE, {"team dir/x": INCLUDED["inc/team"]})
+    port = run_add(config, ADD_ARGS)
+    listed = [t[:2] for t in m.load_tunnels(config)]
+    return (
+        port[0] and "local port 15310 is already forwarded" in port[1] and untouched(config, QUOTED_INCLUDE)
+        and ("db-tunnel-orders", "15310") in listed
+        and m.config_args('"a b" c\\ d \'e\' # f') == ["a b", "c d", "e"] and m.config_args('"open') is None
+    )
+
+
+def add_keeps_an_edit_made_during_the_prompt() -> bool:
+    config = scratch_home()
+    edit = "\nHost db-tunnel-other\n  LocalForward 15399 other.db:3306\n"
+
+    def ask(_prompt: str) -> str:
+        with open(config, "a") as f:
+            f.write(edit)
+        return ADD_PASSWORD
+
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+        m.add(ADD_ARGS, config=config, ask=ask)
+    with open(config) as f:
+        text = f.read()
+    folder = os.path.dirname(config)
+    [backup] = [n for n in os.listdir(folder) if n.startswith("config.bak-")]
+    with open(os.path.join(folder, backup)) as f:
+        backed_up = f.read()
+    return (
+        text.startswith(BASE_CONFIG + edit) and "Host db-tunnel-billing" in text and backed_up == BASE_CONFIG + edit
+        and "changed during the prompt" in err.getvalue() and not os.path.exists(config + ".ro-mysql-lock")
+    )
+
+
+def add_refuses_while_another_add_holds_the_lock() -> bool:
+    config = scratch_home()
+    os.mkdir(config + ".ro-mysql-lock")
+    refused, shown, prompts = run_add(config, ADD_ARGS)
+    os.rmdir(config + ".ro-mysql-lock")
+    return refused and "another ro-mysql add holds" in shown and not prompts and untouched(config, BASE_CONFIG)
+
+
+def cached_state_reads_each_row_kind() -> bool:
+    return [m.cached_state(r) for r in (
+        {},
+        {"checked": "2026-01-02", "via": "via keychain", "databases": "a,b"},
+        {"checked": "2026-01-02", "via": "-", "databases": "? access denied"},
+    )] == [("", "", None, "not checked"), ("2026-01-02", "via keychain", ["a", "b"], ""),
+           ("2026-01-02", "-", None, "access denied")]
 
 
 def two_backups_in_one_second_get_two_names() -> bool:
@@ -787,10 +895,20 @@ ADD_CHECKS: dict[str, Callable[[], bool]] = {
     "add puts the block above a trailing Host *, so its User and Port win": add_goes_above_the_first_wildcard_host,
     "add copies the bastion's IdentityFiles, IdentitiesOnly, ProxyCommand and CertificateFile":
         add_copies_the_bastions_auth_and_transport,
-    "add (and --dry-run) refuse, before the prompt, a config where ssh -G resolves the alias otherwise":
+    "add refuses before the prompt, and --dry-run warns, where ssh -G resolves the alias otherwise":
         add_refuses_a_config_where_the_alias_resolves_otherwise,
     "add cancelled at the password prompt writes nothing": add_cancelled_at_the_prompt_writes_nothing,
-    "add matches --via against Host case-insensitively": add_matches_the_bastion_alias_in_any_case,
+    "add matches --via against Host case-sensitively, as ssh does": add_matches_the_bastion_alias_case_sensitively,
+    "add copies and verifies the bastion's full ssh -G config (IdentityAgent, HostKeyAlias, known hosts...)":
+        lambda: add_copies_and_verifies_the_bastions_full_config()[0],
+    "add sets ProxyJump none where a wildcard block would give the alias one":
+        add_sets_back_what_a_wildcard_block_would_add,
+    "add explains an IdentityFile list it cannot match; --dry-run still prints the block":
+        add_explains_an_identity_list_it_cannot_match_and_dry_run_still_prints,
+    "add reads a quoted Include (port refusal and discovery)": add_reads_a_quoted_include,
+    "add keeps an edit made during the prompt and backs up the current file": add_keeps_an_edit_made_during_the_prompt,
+    "add refuses while another add holds the lock": add_refuses_while_another_add_holds_the_lock,
+    "cached_state reads a checked, a failed and a missing row": cached_state_reads_each_row_kind,
     "two backups within one second get two names": two_backups_in_one_second_get_two_names,
 }
 
@@ -802,7 +920,6 @@ checks: dict[str, Callable[[], bool]] = {
     "kind: staging/stg name segments are STAGING, postgres is not": lambda: [
         m.kind_of(n) for n in ("app-staging", "shop-stg", "db-tunnel-comm-staging", "postgres", "prod-ro")
     ] == ["STAGING", "STAGING", "STAGING", "PROD", "PROD"],
-    "hooks/lib/db-registry derives the same alias/port/kind": registry_matches,
     "--tunnel picks by name and beats MYSQL_RO_PORT": lambda: plan(
         ["--tunnel=app-staging", *Q], env={"MYSQL_RO_PORT": "23306"}, keychain={"reader-b@db-tunnel-app-staging": "x"}
     ).tunnel.alias == "db-tunnel-app-staging",
