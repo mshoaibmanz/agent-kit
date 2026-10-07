@@ -13,6 +13,10 @@
                        <work root>/dashboard/index.html and open it. Read-only: Keychain items are
                        checked for presence only, the Claude drift is doctor's with MCP compared
                        without resolving credentials, and every change is a command to copy.
+  mcp describe [--only NAME ...] [--timeout S]
+                       start each catalog server once (stdio; http only with static headers),
+                       cache its serverInfo, instructions and tools in state/mcp-describe.json
+                       for the dashboard (bin/lib/mcp_describe.py). Opt-in, never automatic.
 
 Settings merge, per kit-owned leaf (dicts recurse; lists and scalars are leaves):
   live == last rendered  -> write the source value (the kit changed it, or nothing did)
@@ -511,7 +515,7 @@ def render_hooks(entries: list[dict[str, Any]], host: str) -> dict[str, Any]:
             groups[(event, matcher)] = group
             hooks.setdefault(event, []).append(group)
         hook = {"type": "command"}
-        hook.update({k: v for k, v in entry.items() if k not in ("event", "matcher", "hosts")})
+        hook.update({k: v for k, v in entry.items() if k not in ("event", "matcher", "hosts", "description")})
         group["hooks"].append(hook)
     return hooks
 
@@ -785,15 +789,16 @@ def render_settings(
 
 def mcp_catalog() -> dict[str, Any]:
     """The catalog as the host gets it: kit placeholders ({{KIT_DIR}}) filled for this kit and the
-    `credentials` declarations dropped (hosts.fill_servers). An install without the mcp component
-    has no catalog: an empty one."""
+    `credentials` and `description` fields dropped (hosts.fill_servers). An install without the mcp
+    component has no catalog: an empty one."""
     if not SERVERS.is_file():
         return {"mcpServers": {}}
     catalog = json.loads(SERVERS.read_text())
     servers = catalog.get("mcpServers")
     # A kit copied without bin/lib (a bare agent-kit) renders a plain catalog as is.
     if isinstance(servers, dict) and (
-        "{{" in json.dumps(servers) or any(isinstance(s, dict) and "credentials" in s for s in servers.values())
+        "{{" in json.dumps(servers)
+        or any(isinstance(s, dict) and {"credentials", "description"} & set(s) for s in servers.values())
     ):
         sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
         from hosts import fill_servers
@@ -1325,6 +1330,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return dashboard(sys.modules[__name__], args)
 
 
+def cmd_mcp_describe(args: argparse.Namespace) -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from mcp_describe import cmd_describe
+
+    return cmd_describe(sys.modules[__name__], args)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="agent-kit", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1384,6 +1396,14 @@ def main() -> int:
     db.add_argument("--no-open", action="store_true", help="write the page without opening it")
     db.add_argument("--check-updates", action="store_true", help="ask the preset's source for a newer commit")
     db.set_defaults(func=cmd_dashboard)
+    mc = sub.add_parser("mcp", help="MCP catalog tools").add_subparsers(dest="mcp_cmd", required=True)
+    de = mc.add_parser(
+        "describe",
+        help="start each catalog server once and cache its tools and instructions for the dashboard",
+    )
+    de.add_argument("--only", nargs="+", metavar="NAME", help="describe only these servers")
+    de.add_argument("--timeout", type=float, default=60, metavar="S", help="seconds per server (default 60)")
+    de.set_defaults(func=cmd_mcp_describe)
     args = ap.parse_args()
     return args.func(args)
 

@@ -40,6 +40,8 @@ def validate_catalog(catalog: Any) -> dict[str, Any]:
             raise ValueError('MCP catalog has an invalid server descriptor')
         if set(spec) - {'command', 'args', 'url', 'type', 'description', 'credentials'}:
             raise ValueError(f'MCP {name}: use native OAuth or a runtime wrapper, not inline secrets')
+        if not isinstance(spec.get('description', ''), str) or '\n' in spec.get('description', ''):
+            raise ValueError(f'MCP {name}: description takes one line of text')
         if 'credentials' in spec and not valid_declarations(spec['credentials']):
             raise ValueError(f'MCP {name}: credentials must list {{"service": <service>, "account": <account>}}')
         normalized = normalize_transport(spec)
@@ -84,11 +86,16 @@ PRESET_SCHEMA: dict[str, tuple[str, Callable[[dict[str, Any]], bool]]] = {
 
 
 def validate_preset(preset: dict[str, Any], spec: str) -> None:
-    """Refuse unknown tables or keys, wrong types, and anything that looks like an inline secret."""
-    unknown = set(preset) - set(PRESET_SCHEMA)
+    """Refuse unknown tables or keys, wrong types, and anything that looks like an inline secret. A
+    top-level description (one line) says what the preset and its pack are for."""
+    description = preset.get('description', '')
+    if not isinstance(description, str) or '\n' in description or inline_secret(description):
+        raise ValueError(f'preset {spec}: description takes one line of plain text')
+    tables = {key: value for key, value in preset.items() if key != 'description'}
+    unknown = set(tables) - set(PRESET_SCHEMA)
     if unknown:
         raise ValueError(f'preset {spec}: unknown table(s) {", ".join(sorted(unknown))}; expected {", ".join(PRESET_SCHEMA)}')
-    for table, value in preset.items():
+    for table, value in tables.items():
         takes, check = PRESET_SCHEMA[table]
         if not isinstance(value, dict) or not check(value):
             raise ValueError(f'preset {spec}: [{table}] takes {takes}')

@@ -8,13 +8,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import http.server
 import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
+import threading
+import time
+import tomllib
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -25,7 +30,8 @@ sys.path.insert(0, str(SOURCE / 'hooks/lib'))
 from credentials import MASK, mask_tokens, show_args, show_url  # noqa: E402
 from preset import validate_catalog  # noqa: E402
 
-SECTIONS = ('hosts', 'mcp', 'unmanaged', 'overlay', 'data', 'skills', 'roles', 'hooks', 'pack', 'work', 'actions')
+SECTIONS = ('hosts', 'mcp', 'unmanaged', 'overlay', 'data', 'sql', 'skills', 'roles', 'hooks', 'pack', 'work',
+            'actions')
 # Values a page must never hold, built so this file holds no token a scanner would flag.
 PLANTED = {
     'keychain value': 'kc-value-' + 'Zq81xw',
@@ -282,7 +288,7 @@ class DashboardPageTests(unittest.TestCase):
         self.assertRegex(nav(self.page, 'unmanaged'), r'<i class="dot warn"')
         self.assertIn('2 configured, 2 with drift', page_text(section(self.page, 'hosts')))
         self.assertRegex(page_text(section(self.page, 'hooks')), r'Hooks\s+\d+ hooks, 0 blocking')
-        self.assertIn('2 tunnels, 1 staging', page_text(section(self.page, 'data')))
+        self.assertIn('2 tunnels, 1 staging', page_text(section(self.page, 'sql')))
 
     def test_csp_allows_only_the_pages_own_script_and_style(self) -> None:
         policy = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', self.page)
@@ -296,7 +302,7 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_each_attention_item_links_to_its_row(self) -> None:
         targets = re.findall(r'<li><a href="#([^"]+)">', section(self.page, 'attention'))
-        for wanted in ('host-claude', 'mcp-wrapped', 'data-orders-stg', 'unmanaged-plugins'):
+        for wanted in ('host-claude', 'mcp-wrapped', 'sql-orders-stg', 'unmanaged-plugins'):
             self.assertIn(wanted, targets)
         for target in targets:
             self.assertIn(f' id="{target}"', self.page, f'a Needs attention link to no element: {target}')
@@ -371,7 +377,8 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_overlay_reads_kit_envs_layers_and_names_the_users_layer(self) -> None:
         overlay = page_text(section(self.page, 'overlay'))
-        self.assertRegex(overlay, r'REVIEW_BASE\s+main\s+kit\.env\s+preset\.env < kit\.env')
+        self.assertRegex(overlay, r'REVIEW_BASE\s+The branch reviews diff against first \(review-state\), before '
+                                  r'origin/HEAD, main and master\.\s+main\s+kit\.env\s+preset\.env < kit\.env')
         set_key = [c for c in commands(self.page) if 'KEY=value' in c]
         self.assertEqual(set_key, [append_line(self.fx.root / 'local/kit.env')])
 
@@ -386,15 +393,29 @@ class DashboardPageTests(unittest.TestCase):
 
     def test_data(self) -> None:
         data = page_text(section(self.page, 'data'))
-        self.assertRegex(data, r'orders-stg\s+15307\s+STAGING')
-        self.assertRegex(data, r'orders\s+15306\s+PROD\s+reader')
-        self.assertIn('orders-stg-ro', data, 'the login-path name from the tunnel cache')
         self.assertIn('example-project', data)
+        self.assertIn('Read-only MySQL for agents: one SELECT/SHOW/EXPLAIN/DESCRIBE/WITH statement per call,',
+                      data, "a wrapper's description is its docstring's first sentence")
+        self.assertIn('<div class="desc">Read-only BigQuery for agents:', section(self.page, 'data'))
+
+    def test_sql_instances_one_row_per_tunnel_from_the_parser_and_cache(self) -> None:
+        sql = section(self.page, 'sql')
+        text = page_text(sql)
+        self.assertRegex(text, r'db-tunnel-orders-stg\s+STAGING MySQL at db-stg\.example\.test:3306 through '
+                               r'db-tunnel-orders-stg\s+15307\s+STAGING\s+reader\s+Keychain ro-mysql / '
+                               r'reader@db-tunnel-orders-stg\s+missing')
+        self.assertRegex(text, r'orders\s+ok\s+2026-01-02 via login path orders-stg-ro', 'cached databases and state')
+        self.assertRegex(text, r'db-tunnel-orders\s+PROD MySQL at db\.example\.test:3306 through db-tunnel-orders\s+'
+                               r'15306\s+PROD\s+reader\s+Keychain ro-mysql / reader@db-tunnel-orders\s+present\s+-\s+'
+                               r'not checked')
+        self.assertIn('id="sql-add" data-ports="15306 15307" data-aliases="db-tunnel-orders db-tunnel-orders-stg"', sql)
+        self.assertIn('ro-mysql add --name', page_text(section(self.page, 'actions')))
 
     def test_skills_list_the_source_and_label_a_host_its_hosts_line_leaves_out(self) -> None:
         skills = page_text(section(self.page, 'skills'))
         self.assertIn('code-search', skills)
-        self.assertRegex(skills, r'pr-study\s+kit\s+claude\s+codex\s+Change\b.*?codex: left out by its hosts: line')
+        self.assertRegex(skills, r'pr-study\s+[^\n]*?\s+kit\s+claude\s+codex\s+Change\b.*?codex: left out by its hosts: line')
+        self.assertRegex(section(self.page, 'skills'), r'<b>pr-study</b><div class="desc">[^<]+</div>')
         self.assertIn('The saved selection is every skill', skills)
         self.assertFalse([c for c in commands(self.page) if '--skills' in c], 'a command pins a skill list')
 
@@ -406,6 +427,11 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn('vscode://file/', self.page)
         self.assertIn('Engine', page_text(section(self.page, 'pack')))
         self.assertIn('Review rounds', page_text(section(self.page, 'roles')))
+        self.assertRegex(section(self.page, 'roles'), r'</b><div class="desc">[^<]+</div>', "an agent's frontmatter")
+        self.assertIn('<b>comment-guard</b><div class="desc">Nudges when an edit adds code comments.</div>',
+                      section(self.page, 'hooks'))
+        self.assertIn('<div class="desc">Commit author the docs tell the agent to use; git config&#x27;s identity when '
+                      'unset.</div>', section(self.page, 'overlay'), 'the comment above the key in kit.env.example')
         actions = page_text(section(self.page, 'actions'))
         self.assertNotIn(' sync', actions)
         self.assertNotIn(' update', actions)
@@ -440,7 +466,7 @@ class DashboardScenarioTests(Fixture):
         (local / 'preset.env').write_text('REVIEW_BASE=develop\nTEAM_ONLY=x\n')
         page, _ = self.dashboard()
         overlay = page_text(section(page, 'overlay'))
-        self.assertRegex(overlay, r'REVIEW_BASE\s+main\s+kit\.env\s+kit\.env\s')
+        self.assertRegex(overlay, r'REVIEW_BASE\s+The branch reviews[^<]*?master\.\s+main\s+kit\.env\s+kit\.env\s')
         self.assertNotIn('TEAM_ONLY', overlay, 'a layer kit_env does not read')
         self.assertIn(append_line(local / 'kit.env'), commands(page))
 
@@ -466,7 +492,8 @@ class DashboardScenarioTests(Fixture):
         installed.write_text(json.dumps(servers))
         page, _ = self.dashboard(security=self.home / 'absent')
         self.assertRegex(page_text(section(page, 'mcp')), r'Keychain example/wrapped / me\s+not checked')
-        self.assertNotIn('add-generic-password', page)
+        self.assertNotIn('add-generic-password', re.sub(r'<script>.*?</script>', '', page, flags=re.S),
+                         "an add command outside the add-connection form's script")
         self.assertNotIn('Missing Keychain item', page)
 
     def test_a_fresh_install_needs_no_attention(self) -> None:
@@ -711,10 +738,222 @@ class CredentialClassifierTests(unittest.TestCase):
         self.assertEqual(filled, {'w': {'command': 'x'}})
 
 
+class DescriptionTests(unittest.TestCase):
+    """Every row the kit ships says what it is, in a `description` the hosts never receive."""
+
+    def test_every_registry_row_and_catalog_entry_has_a_description(self) -> None:
+        rows = json.loads((SOURCE / 'hooks/registry.json').read_text())
+        missing = [f"{r['event']} {r['command']}" for r in rows if not str(r.get('description', '')).strip()]
+        self.assertEqual(missing, [], 'registry rows without a description')
+        preset = tomllib.loads((SOURCE / 'presets/example.toml').read_text())
+        self.assertTrue(preset.get('description'), 'the example preset has no description')
+        catalogs = [json.loads((SOURCE / 'mcp/servers.json').read_text()).get('mcpServers', {}),
+                    preset.get('mcp', {}).get('servers', {})]
+        missing = [name for servers in catalogs for name, spec in servers.items() if not spec.get('description')]
+        self.assertEqual(missing, [], 'MCP catalog entries without a description')
+
+    def test_the_hosts_never_get_a_description(self) -> None:
+        from hosts import fill_servers
+
+        sys.path.insert(0, str(SOURCE / 'bin'))
+        api = load_agent_kit()
+        hooks = api.render_hooks([{'event': 'Stop', 'command': 'x', 'hosts': ['claude'], 'description': 'd'}], 'claude')
+        self.assertEqual(hooks, {'Stop': [{'hooks': [{'type': 'command', 'command': 'x'}]}]})
+        self.assertEqual(fill_servers({'w': {'command': 'x', 'description': 'd'}}, '/kit'), {'w': {'command': 'x'}})
+
+    def test_a_preset_description_is_one_line_of_text(self) -> None:
+        from preset import validate_preset
+
+        validate_preset({'description': 'Team defaults', 'kit': {'REVIEW_BASE': 'main'}}, 'p')
+        for wrong in (['a list'], 'two\nlines', 'gh' + 'p_' + 'A1b2C3d4E5f6G7h8I9j0'):
+            with self.assertRaisesRegex(ValueError, 'description takes one line'):
+                validate_preset({'description': wrong}, 'p')
+        with self.assertRaisesRegex(ValueError, 'description takes one line'):
+            validate_catalog({'mcpServers': {'x': {'command': 'x', 'description': ['no']}}})
+
+
+def load_agent_kit():
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader('agent_kit_for_test', str(SOURCE / 'bin/agent-kit'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+AH_CASES = '''
+const known = {ports: ['15306'], aliases: ['db-tunnel-orders']};
+const out = {};
+const p = ahParse('mysql://reader:hunter2@billing-db:3307/billing?via=jump&local_port=15310&staging=1');
+out.parsed = p.fields; out.password = p.password; out.clean = p.clean;
+out.qpass = ahParse('mysql://reader@billing-db/billing?via=jump&password=hunter2&local_port=15311');
+out.bad = ahParse('postgres://x@y');
+out.built = ahBuild(p.fields, known);
+out.collide = ahBuild({name: 'orders', user: 'reader', via: 'jump', host: 'db', port: '3306', local: '15306'}, known);
+out.stagingName = ahBuild({name: 'orders-stg', user: 'reader', via: 'jump', host: 'db', port: '3306', local: '15320'}, known);
+out.missing = ahBuild({name: 'Bad Name', user: '', via: 'db-tunnel-x', host: 'db', port: '3306', local: '80'}, known);
+console.log(JSON.stringify(out));
+'''
+
+
+@unittest.skipUnless(shutil.which('node'), 'node runs the page script')
+class ConnectionHelperScriptTests(unittest.TestCase):
+    """The add-connection form's two functions, run by node from the template itself."""
+
+    out: dict
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        template = (SOURCE / 'bin/lib/dashboard.html').read_text()
+        code = template[template.index('/*ah:begin*/'):template.index('/*ah:end*/')]
+        result = subprocess.run([str(shutil.which('node')), '-e', code + AH_CASES], capture_output=True, text=True,
+                                timeout=60, check=True)
+        cls.out = json.loads(result.stdout)
+
+    def test_a_pasted_uri_fills_the_fields_and_its_password_is_dropped(self) -> None:
+        self.assertEqual(self.out['parsed'], {'user': 'reader', 'host': 'billing-db', 'port': '3307',
+                                              'name': 'billing', 'via': 'jump', 'local': '15310', 'staging': True})
+        self.assertTrue(self.out['password'])
+        self.assertNotIn('hunter2', json.dumps(self.out))
+        self.assertEqual(self.out['clean'], 'mysql://reader@billing-db:3307/billing?via=jump&local_port=15310&staging=1')
+        self.assertTrue(self.out['qpass']['password'], 'a password query parameter counts too')
+        self.assertIn('error', self.out['bad'])
+
+    def test_one_add_command_and_the_manual_steps(self) -> None:
+        built = self.out['built']
+        self.assertEqual(built['cmd'], 'ro-mysql add --name billing --user reader --via jump --remote '
+                                       'billing-db:3307 --local-port 15310 --staging')
+        self.assertEqual(built['warnings'], [])
+        manual = built['manual']
+        self.assertIn('Host db-tunnel-billing-staging\n  # ro-mysql: user=reader\n', manual)
+        self.assertIn('  LocalForward 15310 billing-db:3307\n  ExitOnForwardFailure yes\n', manual)
+        self.assertIn('security add-generic-password -U -s ro-mysql -a reader@db-tunnel-billing-staging -w\n', manual)
+        self.assertTrue(manual.endswith('ro-mysql --tunnels --refresh'))
+
+    def test_a_known_port_or_alias_and_a_staging_name_are_flagged(self) -> None:
+        warnings = ' '.join(self.out['collide']['warnings'])
+        self.assertIn('Local port 15306 is already forwarded', warnings)
+        self.assertIn('db-tunnel-orders already exists', warnings)
+        self.assertIn('reads as STAGING', ' '.join(self.out['stagingName']['warnings']))
+        self.assertEqual(self.out['missing']['cmd'], '')
+        self.assertEqual(sorted(self.out['missing']['missing']), ['local', 'name', 'user', 'via'])
+
+
+FAKE_MCP = '''import json, os, subprocess, sys
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+log = open(os.environ['FAKE_MCP_LOG'], 'a')
+log.write(json.dumps({'child': child.pid, 'env_ok': os.environ.get('FAKE_SECRET') == sys.argv[1]}) + '\\n')
+for line in sys.stdin:
+    msg = json.loads(line)
+    log.write(json.dumps({'method': msg.get('method')}) + '\\n'); log.flush()
+    if msg.get('method') == 'initialize':
+        result = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}},
+                  'serverInfo': {'name': 'fake-docs', 'version': '1.2'},
+                  'instructions': 'Search the fake documentation before answering.'}
+    elif msg.get('method') == 'tools/list':
+        result = {'tools': [{'name': 'search', 'description': 'Find a page'}, {'name': 'read', 'description': 'Read one'}]}
+    else:
+        continue
+    print('a log line on stdout')
+    print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)
+'''
+
+
+class McpHandler(http.server.BaseHTTPRequestHandler):
+    """A Streamable HTTP MCP server that wants one static header and its session id."""
+
+    def log_message(self, *_args) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if self.headers.get('X-Team') != 'static-1':
+            self.send_response(401)
+            self.end_headers()
+            return
+        method = message.get('method')
+        if method == 'notifications/initialized':
+            self.send_response(202)
+            self.end_headers()
+            return
+        if method == 'initialize':
+            body, kind = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': {
+                'protocolVersion': '2025-06-18', 'serverInfo': {'name': 'web-docs', 'version': '3'}}}), 'application/json'
+        elif self.headers.get('Mcp-Session-Id') == 's-1':
+            reply = {'jsonrpc': '2.0', 'id': message['id'], 'result': {'tools': [{'name': 'lookup'}]}}
+            body, kind = f'event: message\ndata: {json.dumps(reply)}\n\n', 'text/event-stream'
+        else:
+            self.send_response(400)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', kind)
+        self.send_header('Mcp-Session-Id', 's-1')
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+
+class McpDescribeTests(Fixture):
+    def test_describe_caches_each_answer_kills_the_server_and_the_page_shows_it(self) -> None:
+        self.install()
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), McpHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f'http://127.0.0.1:{server.server_address[1]}/mcp'
+        script, log = self.home / 'fake_mcp.py', self.home / 'fake_mcp.log'
+        script.write_text(FAKE_MCP)
+        secret = PLANTED['catalog env value']
+        installed = self.root / 'mcp/servers.json'
+        catalog = json.loads(installed.read_text())
+        catalog['mcpServers'].update({
+            'fake': {'command': sys.executable, 'args': [str(script), secret],
+                     'env': {'FAKE_SECRET': secret, 'FAKE_MCP_LOG': str(log)}},
+            'web': {'url': url, 'headers': {'X-Team': 'static-1'}},
+            'webauth': {'url': url, 'headers': {'X-Team': 'wrong'}},
+            'oauth': {'url': url}})
+        installed.write_text(json.dumps(catalog))
+        result = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'mcp', 'describe', '--only', 'fake',
+                                 'web', 'webauth', 'oauth', '--timeout', '30'], capture_output=True, text=True,
+                                env=self.env(), timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cached = json.loads((self.root / 'state/mcp-describe.json').read_text())['servers']
+        self.assertEqual(cached['fake']['serverInfo'], {'name': 'fake-docs', 'version': '1.2'})
+        self.assertEqual(cached['fake']['tools'], [{'name': 'search', 'description': 'Find a page'},
+                                                   {'name': 'read', 'description': 'Read one'}])
+        self.assertEqual(cached['web']['tools'], [{'name': 'lookup', 'description': ''}])
+        self.assertEqual(cached['webauth']['status'], 'needs sign-in')
+        self.assertEqual(cached['oauth']['status'], 'needs sign-in')
+        self.assertNotIn('docs', cached, '--only describes only the named servers')
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(records[0]['env_ok'], 'the server got its catalog env')
+        self.assertEqual([r['method'] for r in records[1:]], ['initialize', 'notifications/initialized', 'tools/list'])
+        child = records[0]['child']
+        for _ in range(50):
+            if subprocess.run(['/bin/ps', '-p', str(child)], capture_output=True).returncode:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the server's child outlived describe: its process group was not killed")
+        for text in (result.stdout, result.stderr, json.dumps(cached)):
+            self.assertNotIn(secret, text)
+            self.assertNotIn('static-1', text)
+        page, _ = self.dashboard()
+        mcp = section(page, 'mcp')
+        self.assertRegex(mcp, r'<b>fake</b><div class="desc">Search the fake documentation before answering\.</div>')
+        self.assertIn('2 tools', page_text(mcp))
+        self.assertIn('needs sign-in', page_text(mcp))
+        self.assertIn('mcp describe', page_text(section(page, 'actions')))
+
+
 if __name__ == '__main__':
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite([loader.loadTestsFromTestCase(case) for case in
-                                (CredentialClassifierTests, DashboardPageTests, DashboardScenarioTests)])
+                                (CredentialClassifierTests, DescriptionTests, ConnectionHelperScriptTests,
+                                 DashboardPageTests, DashboardScenarioTests, McpDescribeTests)])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.stdout.write(json.dumps({'cases': result.testsRun, 'successful': result.wasSuccessful(),
                                 'failures': len(result.failures), 'errors': len(result.errors)}, indent=2) + '\n')

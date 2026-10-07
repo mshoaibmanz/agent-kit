@@ -35,6 +35,7 @@ from dashboard_sections import (  # noqa: E402
     roles_section,
     run,
     skills_section,
+    sql_section,
     work_section,
 )
 from dashboard_unmanaged import unmanaged_section  # noqa: E402
@@ -46,6 +47,7 @@ ORDER: tuple[tuple[str, str, Collector], ...] = (
     ("unmanaged", "Unmanaged sources", unmanaged_section),
     ("overlay", "Overlay settings", overlay_section),
     ("data", "Data wrappers", data_section),
+    ("sql", "SQL instances", sql_section),
     ("skills", "Skills", skills_section),
     ("roles", "Roles and agents", roles_section),
     ("hooks", "Hooks", hooks_section),

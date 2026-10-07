@@ -98,8 +98,17 @@ class Pre:
     text: str
 
 
+@dataclass(frozen=True)
+class AddHelper:
+    """The add-connection form. The page's one script fills it in the browser and sends nothing;
+    ports and aliases are the known tunnels', for its collision check."""
+
+    ports: tuple[str, ...]
+    aliases: tuple[str, ...]
+
+
 Cell = Union[str, int, Path, Badge, Strong, Muted, Code, Command, Fold, Lines, Table, tuple]
-Block = Union[Table, Para, Pre]
+Block = Union[Table, Para, Pre, AddHelper]
 
 
 @dataclass(frozen=True)
@@ -205,11 +214,48 @@ def table(value: Table) -> str:
     )
 
 
+AH_FIELDS = (
+    ("name", "Name", "orders"),
+    ("user", "DB user", "reader"),
+    ("via", "Bastion alias", "jump"),
+    ("host", "Remote host", "db.example.com"),
+    ("port", "Remote port", "3306"),
+    ("local", "Local port", "15310"),
+)
+
+
+def add_helper(value: AddHelper) -> str:
+    default = ' value="3306"'
+    fields = "".join(
+        f'<label>{esc(label)}<input data-f="{key}" type="text" autocomplete="off" spellcheck="false" '
+        f'placeholder="{esc(hint)}"{default if key == "port" else ""}></label>'
+        for key, label, hint in AH_FIELDS
+    )
+    return (
+        f'<div class="ah" id="sql-add" data-ports="{esc(" ".join(value.ports))}" '
+        f'data-aliases="{esc(" ".join(value.aliases))}"><h3>Add an instance</h3>'
+        '<p class="muted">Paste a connection URI or fill the fields. This form runs in the page and '
+        "sends nothing; a password in the URI is removed, never shown.</p>"
+        # The script sets the example placeholder: written here, the page's userinfo mask would hide it.
+        '<label class="wide">Connection URI<input id="ah-uri" type="text" autocomplete="off" '
+        'spellcheck="false"></label>'
+        f'<div class="ahf">{fields}<label class="chk"><input data-f="staging" type="checkbox">Staging</label></div>'
+        '<p class="alert" id="ah-warn" hidden></p>'
+        '<div class="cmd"><code id="ah-cmd"></code><button class="cp" type="button" data-c="" id="ah-cmd-cp">'
+        "copy</button></div>"
+        '<details><summary>Or by hand: the ssh block, the Keychain prompt and the check</summary>'
+        '<div class="cmd"><pre id="ah-manual"></pre><button class="cp" type="button" data-c="" id="ah-man-cp">'
+        "copy</button></div></details></div>"
+    )
+
+
 def block(value: Block) -> str:
     if isinstance(value, Table):
         return table(value)
     if isinstance(value, Pre):
         return f"<pre>{esc(value.text)}</pre>"
+    if isinstance(value, AddHelper):
+        return add_helper(value)
     return "<p>" + " ".join(cell(v) for v in value.items) + "</p>"
 
 

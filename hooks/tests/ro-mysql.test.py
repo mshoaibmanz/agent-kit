@@ -549,6 +549,120 @@ def rotate_needs_a_terminal() -> bool:
     return r.returncode == 2 and b"terminal" in r.stderr
 
 
+# `add` runs against a scratch HOME's ssh config; `ssh -G -F <it>` is the real ssh, offline.
+ADD_PASSWORD = "add-pw " + "Qx7'\"$z"
+BASE_CONFIG = """\
+Host jump
+  HostName bastion.example.test
+  User ops
+  Port 2222
+
+Host db-tunnel-orders
+  # ro-mysql: user=reader
+  HostName bastion.example.test
+  LocalForward 15306 orders.db.example.test:3306
+"""
+ADD_ARGS = ["--name", "billing", "--user", "reader", "--via", "jump", "--remote", "billing.db.example.test:3306",
+            "--local-port", "15310"]
+
+
+def scratch_home(text: str = BASE_CONFIG) -> str:
+    home = tempfile.mkdtemp(prefix="home-", dir=TMP)
+    os.makedirs(os.path.join(home, ".ssh"), mode=0o700)
+    config = os.path.join(home, ".ssh", "config")
+    with open(config, "w") as f:
+        f.write(text)
+    os.chmod(config, 0o644)
+    return config
+
+
+def run_add(config: str, argv: list[str], password: str = ADD_PASSWORD) -> tuple[bool, str, list[str]]:
+    """(refused, stdout+stderr, prompts) of one add run; the Keychain is the fake with a fresh log."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(KEYCHAIN + ".argv")
+    prompts: list[str] = []
+
+    def ask(prompt: str) -> str:
+        prompts.append(prompt)
+        return password
+
+    out, err = io.StringIO(), io.StringIO()
+    refused = False
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            m.add(argv, config=config, ask=ask)
+        except SystemExit:
+            refused = True
+    return refused, out.getvalue() + err.getvalue(), prompts
+
+
+def add_writes_the_block_and_stores_the_password() -> bool:
+    config = scratch_home()
+    refused, shown, prompts = run_add(config, ADD_ARGS)
+    with open(config) as f:
+        text = f.read()
+    backups = [n for n in os.listdir(os.path.dirname(config)) if n.startswith("config.bak-")]
+    backup = os.path.join(os.path.dirname(config), backups[0]) if len(backups) == 1 else ""
+    with open(KEYCHAIN + ".argv") as f:
+        argv_log = f.read()
+    block = (
+        "Host db-tunnel-billing\n  # ro-mysql: user=reader\n  HostName bastion.example.test\n  User ops\n"
+        "  Port 2222\n  LocalForward 15310 billing.db.example.test:3306\n  ExitOnForwardFailure yes\n"
+        "  ServerAliveInterval 30\n  ServerAliveCountMax 3\n"
+    )
+    found = ("db-tunnel-billing", "15310", "reader") in [tuple(t) for t in m.parse_tunnels(text)]
+    return (
+        not refused and len(prompts) == 1 and text == BASE_CONFIG + "\n" + block and found
+        and bool(backup) and open(backup).read() == BASE_CONFIG and os.stat(backup).st_mode & 0o777 == 0o600
+        and os.stat(config).st_mode & 0o777 == 0o644
+        and m.keychain_get("reader@db-tunnel-billing") == ADD_PASSWORD
+        and ADD_PASSWORD not in argv_log and ADD_PASSWORD.encode().hex() not in argv_log
+        and ADD_PASSWORD not in shown and "ro-mysql --tunnels --refresh" in shown
+    )
+
+
+def add_refuses_a_known_alias_or_port() -> bool:
+    config = scratch_home()
+    cases = [
+        ["--name", "orders", *ADD_ARGS[2:]],
+        [*ADD_ARGS[:-1], "15306"],
+        [*ADD_ARGS[:5], "nowhere", *ADD_ARGS[6:]],
+    ]
+    results = [run_add(config, argv) for argv in cases]
+    with open(config) as f:
+        unchanged = f.read() == BASE_CONFIG
+    no_backup = not [n for n in os.listdir(os.path.dirname(config)) if n.startswith("config.bak-")]
+    return all(refused and not prompts for refused, _, prompts in results) and unchanged and no_backup
+
+
+def add_dry_run_prints_and_writes_nothing() -> bool:
+    config = scratch_home()
+    refused, shown, prompts = run_add(config, [*ADD_ARGS, "--dry-run"])
+    with open(config) as f:
+        unchanged = f.read() == BASE_CONFIG
+    return not refused and not prompts and unchanged and shown.startswith("Host db-tunnel-billing\n") and (
+        "LocalForward 15310 billing.db.example.test:3306" in shown
+    ) and not os.path.exists(KEYCHAIN + ".argv")
+
+
+def add_staging_names_the_alias_and_a_staging_name_needs_the_flag() -> bool:
+    config = scratch_home()
+    _, shown, _ = run_add(config, [*ADD_ARGS, "--staging", "--dry-run"])
+    refused, _, _ = run_add(config, ["--name", "billing-stg", *ADD_ARGS[2:], "--dry-run"])
+    return shown.startswith("Host db-tunnel-billing-staging\n") and refused
+
+
+def add_never_takes_a_password_flag() -> bool:
+    config = scratch_home()
+    refused, shown, prompts = run_add(config, [*ADD_ARGS, "--password=" + ADD_PASSWORD])
+    return refused and not prompts and ADD_PASSWORD not in shown
+
+
+def add_needs_a_terminal() -> bool:
+    r = subprocess.run([sys.executable, PATH, "add", *ADD_ARGS], stdin=subprocess.DEVNULL, capture_output=True)
+    return r.returncode == 2 and b"terminal" in r.stderr
+
+
 checks: dict[str, Callable[[], bool]] = {
     "parse: db-tunnel hosts, ports, block users; wildcard/Match/other hosts skipped": lambda: [
         tuple(t) for t in m.load_tunnels(SSH_CONFIG)
@@ -677,6 +791,17 @@ checks: dict[str, Callable[[], bool]] = {
         tunnels_lists_missing_passwords_per_tunnel,
     "rotation groups tunnels by DB user and lists the unknown": rotation_groups,
     "--rotate refuses without a terminal": rotate_needs_a_terminal,
+    "add appends the block, backs the config up, stores the password out of argv and output":
+        add_writes_the_block_and_stores_the_password,
+    "add refuses a known alias, a forwarded port or an unknown bastion, before asking":
+        add_refuses_a_known_alias_or_port,
+    "add --dry-run prints the block and writes nothing": add_dry_run_prints_and_writes_nothing,
+    "add --staging names the alias STAGING; a staging name without it is refused":
+        add_staging_names_the_alias_and_a_staging_name_needs_the_flag,
+    "add refuses a password on the command line": add_never_takes_a_password_flag,
+    "add refuses without a terminal": add_needs_a_terminal,
+    "tunnel_targets describes each forward by its remote and HostName": lambda: m.tunnel_targets(BASE_CONFIG)
+    == {("db-tunnel-orders", "15306"): "orders.db.example.test:3306 through bastion.example.test"},
     "a bare tunnel name is refused, not read as a database on the default tunnel": lambda: "pass --tunnel=comm"
     in refusal(lambda: plan(["comm", *Q], logins=fixed_logins())),
     "-D <db> whose name matches a tunnel is still a database": lambda: "is a tunnel"

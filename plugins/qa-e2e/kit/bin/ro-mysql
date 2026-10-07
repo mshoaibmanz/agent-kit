@@ -5,6 +5,9 @@ executed in a server-enforced read-only session (works even with RW credentials)
 usage: ro-mysql [--tunnel=NAME] [--login-path=X] [-D db] [--vertical] -e 'SELECT ...'
        ro-mysql --tunnels [--refresh]   every tunnel: kind, DB user, state, databases
        ro-mysql --rotate                store new DB passwords in the Keychain (own terminal)
+       ro-mysql add --name SVC --user DBUSER --via BASTION --remote HOST:PORT --local-port N
+                    [--staging] [--dry-run]
+                                        add a tunnel to ~/.ssh/config and store its password
 env:   MYSQL_RO_PORT (target when --tunnel is absent), MYSQL_RO_HOST (must be local),
        MYSQL_RO_LOGIN_PATH (last-resort credentials), MYSQL_RO_MAX_MS (SELECT timeout, default
        15000)
@@ -19,6 +22,12 @@ refused until it is annotated. Passwords are per tunnel (Keychain service ro-mys
 reaches the client only through a 0600 option file removed when it exits. Without one, a same-kind
 login path of that user is used. --login-path forces one only if its user is the tunnel's.
 `-h`/`-P` are not accepted.
+
+`add` refuses an alias or local port the config already has, backs the config up beside it
+(config.bak-<time>), appends the Host block in one rename (HostName, User and Port from
+`ssh -G <bastion>`), then prompts for the password and stores it as --rotate does; the password
+never reaches argv or the screen. --dry-run prints the block and writes nothing. Its first word
+`add` is the subcommand, so a database named add is passed with -D.
 
 On ERROR 2003 the target's tunnel is re-opened and the same validated command re-run once. On
 ERROR 1045 the user and tunnel are recorded in ~/.claude/state/db-auth-failed until that pair next
@@ -1000,8 +1009,235 @@ def execute(
     return run(p)
 
 
+TUNNEL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+SSH_ALIAS_RE = re.compile(r"[A-Za-z0-9_.-]+")
+REMOTE_RE = re.compile(r"([A-Za-z0-9.-]+):([0-9]{1,5})")
+ADD_USAGE = (
+    "usage: ro-mysql add --name SVC --user DBUSER --via BASTION --remote HOST:PORT --local-port N "
+    "[--staging] [--dry-run]"
+)
+
+
+class NewTunnel(NamedTuple):
+    alias: str
+    user: str
+    via: str
+    remote: str
+    local_port: str
+
+
+def config_hosts(text: str) -> tuple[set[str], set[str]]:
+    """(every literal Host alias, every LocalForward local port) in an ssh config, any alias."""
+    aliases: set[str] = set()
+    ports: set[str] = set()
+    for raw in text.splitlines():
+        m = re.match(r"(\w+)\s*(?:=\s*|\s+)(.*)", raw.strip())
+        if m is None:
+            continue
+        key, args = m.group(1).lower(), m.group(2).split()
+        if key == "host":
+            aliases.update(a for a in args if not set(a) & set("*?!"))
+        elif key == "localforward" and args:
+            ports.add(args[0].rsplit(":", 1)[-1])
+    return aliases, ports
+
+
+def tunnel_targets(text: str) -> dict[tuple[str, str], str]:
+    """(alias, local port) -> `<remote> through <HostName>` for each db-tunnel-* forward: the
+    one-line description the dashboard shows."""
+    out: dict[tuple[str, str], str] = {}
+    aliases: list[str] = []
+    forwards: list[tuple[str, str]] = []
+    hostname = ""
+
+    def flush() -> None:
+        for alias in aliases:
+            for port, remote in forwards:
+                out[(alias, port)] = f"{remote} through {hostname or alias}"
+
+    for raw in text.splitlines():
+        m = re.match(r"(\w+)\s*(?:=\s*|\s+)(.*)", raw.strip())
+        if m is None:
+            continue
+        key, args = m.group(1).lower(), m.group(2).split()
+        if key in ("host", "match"):
+            flush()
+            aliases, forwards, hostname = [], [], ""
+            if key == "host":
+                aliases = [a for a in args if a.startswith(TUNNEL_PREFIX) and not set(a) & set("*?!")]
+        elif key == "hostname" and args:
+            hostname = args[0]
+        elif key == "localforward" and len(args) >= 2:
+            forwards.append((args[0].rsplit(":", 1)[-1], args[1]))
+    flush()
+    return out
+
+
+def parse_add(argv: list[str]) -> tuple[NewTunnel, bool]:
+    """`add`'s flags as a NewTunnel, and --dry-run. Every value is checked here, before ssh runs."""
+    values: dict[str, str] = {}
+    staging = dry_run = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        flag, eq, inline = a.partition("=")
+        if a == "--staging":
+            staging = True
+        elif a == "--dry-run":
+            dry_run = True
+        elif flag in ("--name", "--user", "--via", "--remote", "--local-port"):
+            if not eq:
+                i += 1
+                if i >= len(argv):
+                    die(f"missing value after {flag}\n{ADD_USAGE}")
+                inline = argv[i]
+            values[flag[2:]] = inline
+        elif a.startswith("--password") or a.startswith("-p"):
+            die("add prompts for the password; it never goes on the command line")
+        else:
+            die(f"add: unknown argument {a}\n{ADD_USAGE}")
+        i += 1
+    missing = [f"--{k}" for k in ("name", "user", "via", "remote", "local-port") if not values.get(k)]
+    if missing:
+        die(f"add: missing {', '.join(missing)}\n{ADD_USAGE}")
+    name, user, via, remote = values["name"], values["user"], values["via"], values["remote"]
+    if not TUNNEL_NAME_RE.fullmatch(name):
+        die(f"add: --name {name!r}: lowercase letters, digits and dashes")
+    name = name.removeprefix(TUNNEL_PREFIX)
+    if staging and kind_of(name) != "STAGING":
+        name += "-staging"
+    alias = TUNNEL_PREFIX + name
+    if not staging and kind_of(alias) == "STAGING":
+        die(f"add: {alias} reads as STAGING; pass --staging for a staging instance or pick another name")
+    if not DB_USER_RE.fullmatch(user) or not DB_USER_RE.fullmatch(keychain_account(Tunnel(alias, "", user), user)):
+        die(f"add: --user {user!r}: letters, digits and _.@- only")
+    if not SSH_ALIAS_RE.fullmatch(via) or via.startswith(TUNNEL_PREFIX):
+        die(f"add: --via {via!r} must be the bastion's own Host alias")
+    target = REMOTE_RE.fullmatch(remote)
+    if target is None or not 0 < int(target.group(2)) < 65536:
+        die(f"add: --remote {remote!r}: HOST:PORT")
+    port = values["local-port"]
+    if not port.isdigit() or not 1024 <= int(port) < 65536:
+        die(f"add: --local-port {port!r}: a number from 1024 to 65535")
+    return NewTunnel(alias, user, via, remote, str(int(port))), dry_run
+
+
+def bastion(via: str, config: str) -> dict[str, str]:
+    """hostname, user, port and proxyjump of the bastion as ssh resolves them from config."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-G", "-F", config, via],
+            capture_output=True, text=True, timeout=SSH_TIMEOUT_S, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        die(f"add: ssh -G {via} failed: {e}")
+    if r.returncode != 0:
+        die(f"add: ssh -G {via} failed: {last_line(r.stderr)}")
+    out: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("hostname", "user", "port", "proxyjump") and key not in out:
+            out[key] = value.strip()
+    return out
+
+
+def tunnel_block(t: NewTunnel, via: dict[str, str]) -> str:
+    lines = [f"Host {t.alias}", f"  # ro-mysql: user={t.user}", f"  HostName {via['hostname']}"]
+    if via.get("user"):
+        lines.append(f"  User {via['user']}")
+    if via.get("port", "22") != "22":
+        lines.append(f"  Port {via['port']}")
+    if via.get("proxyjump", "none") != "none":
+        lines.append(f"  ProxyJump {via['proxyjump']}")
+    lines += [
+        f"  LocalForward {t.local_port} {t.remote}",
+        "  ExitOnForwardFailure yes",
+        "  ServerAliveInterval 30",
+        "  ServerAliveCountMax 3",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def append_config(path: str, block: str, now: datetime.datetime | None = None) -> str | None:
+    """Back the config up beside itself (0600), then write it with block appended through one rename,
+    so a reader sees the old file or the new one. A linked config is written at its target. Returns
+    the backup's path (None when there was no config)."""
+    target = os.path.realpath(path)
+    try:
+        with open(target) as f:
+            old = f.read()
+        mode = os.stat(target).st_mode & 0o777
+    except FileNotFoundError:
+        old, mode = "", 0o600
+    backup = None
+    stamp = (now or datetime.datetime.now()).strftime("%Y%m%d-%H%M%S")
+    if old:
+        backup = f"{target}.bak-{stamp}"
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(old)
+    sep = "" if not old else "\n" if old.endswith("\n") else "\n\n"
+    folder = os.path.dirname(target)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".config.", dir=folder)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(old + sep + block)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return backup
+
+
+def add(
+    argv: list[str], config: str = SSH_CONFIG, ask: Callable[[str], str] = getpass.getpass
+) -> None:
+    """`ro-mysql add`: refuse a known alias or forwarded port, print the block (--dry-run stops
+    there), ask for the password, write the config, store the password per tunnel."""
+    t, dry_run = parse_add(argv)
+    try:
+        with open(config) as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    aliases, ports = config_hosts(text)
+    if t.alias in aliases:
+        die(f"add: {t.alias} is already in {config}; nothing changed")
+    if t.local_port in ports:
+        die(f"add: local port {t.local_port} is already forwarded in {config}; pick another --local-port")
+    via = bastion(t.via, config)
+    # An Include'd file may define it; ssh resolving the alias to itself means nothing does.
+    if t.via not in aliases and via.get("hostname", t.via) == t.via:
+        die(f"add: no `Host {t.via}` in {config}; --via names the bastion's alias there")
+    block = tunnel_block(t, via)
+    if dry_run:
+        print(block, end="")
+        return
+    password = ask(f"{t.alias} ({t.user}) password, blank skips storing: ")
+    backup = append_config(config, block)
+    print(f"added {t.alias} to {config}" + (f" (backup {backup})" if backup else ""))
+    account = keychain_account(Tunnel(t.alias, t.local_port, t.user), t.user)
+    if not password:
+        print("  no password stored: run `ro-mysql --rotate` in a terminal")
+    elif keychain_set(account, password):
+        print(f"  stored in the Keychain (service {KEYCHAIN_SERVICE}, account {account})")
+    else:
+        print(f"  the Keychain write failed for {account}: run `ro-mysql --rotate` in a terminal")
+    print("verify: ro-mysql --tunnels --refresh")
+
+
 def main() -> None:
     argv = sys.argv[1:]
+    if argv[:1] == ["add"]:
+        if "--dry-run" not in argv[1:] and not sys.stdin.isatty():
+            die("add prompts for the password: the user runs it in their own terminal (or pass --dry-run)")
+        add(argv[1:])
+        return
     if argv[:1] == ["--tunnels"]:
         if argv[1:] not in ([], ["--refresh"]):
             die("usage: ro-mysql --tunnels [--refresh]")
