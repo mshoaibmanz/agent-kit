@@ -103,7 +103,8 @@ def nav(page: str, key: str) -> str:
 
 
 def commands(page: str) -> list[str]:
-    return [html.unescape(c) for c in re.findall(r'<div class="cmd"><code>[^<]*</code><button class="cp" type="button" data-c="([^"]*)"', page)]
+    return [html.unescape(c) for c in re.findall(
+        r'<div class="cmd"><code(?: title="[^"]*")?>[^<]*</code><button class="cp" type="button" data-c="([^"]*)"', page)]
 
 
 class Fixture(InstallerUxFixture):
@@ -331,6 +332,10 @@ class DashboardPageTests(unittest.TestCase):
         self.assertTrue(any(Path(a[0]).name == 'security' for a in calls), 'the Keychain fixture was never asked')
         self.assertFalse((self.fx.home / 'mysql_config_editor.log').exists(), 'the login-path store was read')
 
+    def test_no_visible_word_names_the_home_folder(self) -> None:
+        self.assertNotIn(str(self.fx.home), page_text(self.page), 'a path under the home folder is written from ~')
+        self.assertIn(f'data-c="{self.fx.root}/bin/agent-kit', self.page, 'the copy button keeps the whole path')
+
     def test_nothing_is_written_into_the_kit_or_the_source(self) -> None:
         self.assertEqual(self.before, self.after, 'the dashboard wrote into the kit')
         self.assertEqual(self.fx.status(), self.fx.source_status, 'changed the source checkout')
@@ -368,7 +373,9 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn('security add-generic-password -s ro-mysql -a reader@db-tunnel-orders-stg -w', block)
         self.assertIn('Unmanaged: 1 in marketplace plugins', block)
         self.assertNotIn('render --host claude', block, 'render refuses files agent-setup wrote')
-        self.assertIn(f'--root-dir {self.fx.root} --apply --collision backup', block)
+        self.assertIn('--root-dir ~/.local/share/agent-kit --apply --collision backup', block)
+        self.assertIn(f'--root-dir {self.fx.root} --apply --collision backup',
+                      '\n'.join(commands(section(self.page, 'attention'))), 'the copy button keeps the whole path')
 
     def test_unmanaged(self) -> None:
         unmanaged = page_text(section(self.page, 'unmanaged'))
@@ -796,7 +803,7 @@ class CredentialClassifierTests(unittest.TestCase):
 
 
 def load_agent_kit():
-    from dashboard_sections import load_script
+    from dashboard_rows import load_script
 
     module = load_script(SOURCE / 'bin/agent-kit', 'agent_kit_for_test')
     assert module is not None

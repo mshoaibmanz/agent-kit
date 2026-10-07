@@ -7,7 +7,8 @@ import os
 import tomllib
 from pathlib import Path
 from dashboard_html import Action, Fold, Para, Section, Strong, Table
-from dashboard_sections import ENGINE, Setup, TableRows, read_json
+from dashboard_rows import TableRows
+from dashboard_sections import ENGINE, Setup, read_json
 from hosts import RENDERED_FILES, claude_state_file
 from kit_env import code_dirs
 

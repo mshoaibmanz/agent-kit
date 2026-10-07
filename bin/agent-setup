@@ -81,6 +81,14 @@ SAVED_KEYS = (*DEFAULTS, 'role_model', 'role_effort', 'host_root', 'project_root
 # when the checkout is broken: agent-setup and what it imports (kit_env reads hook-io).
 SETUP_CODE = ('bin/agent-setup', 'bin/lib', 'hooks/lib/host.py', 'hooks/lib/session.py', 'hooks/lib/kit_env.py',
               'hooks/lib/hook-io')
+# Each action and what it does: the action argument's choices and help, and the dashboard's text.
+ACTIONS = {
+    'setup': 'preview every file it would write, then write them with --apply and record a journal',
+    'doctor': 'report installed files changed since setup and missing dependencies',
+    'rollback': 'undo one install by its journal, stopping on any later edit',
+    'sync': 'reapply every saved choice, applying only what changed (agent-kit sync runs it)',
+    'update': 'fast-forward the recorded source checkout, then sync',
+}
 # What update forwards to sync; any other setup flag would change a saved choice.
 UPDATE_FLAGS = ('action', 'root_dir', 'source', 'dev', 'collision', 'confirm_hook_support')
 
@@ -1440,11 +1448,8 @@ def update(args: argparse.Namespace, root: Path, state: dict[str, Any]) -> int:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description='Choose components, preview changes, apply and roll back agent-kit.')
-    result.add_argument('action', choices=('setup', 'doctor', 'rollback', 'sync', 'update'), nargs='?', default='setup',
-                        help='setup: preview every file it would write, then write them with --apply and record a '
-                        'journal; doctor: report installed files changed since setup and missing dependencies; rollback: undo one install by its '
-                        'journal, stopping on any later edit; sync: reapply every saved choice, applying only what '
-                        'changed (agent-kit sync runs it); update: fast-forward the recorded source checkout, then sync')
+    result.add_argument('action', choices=tuple(ACTIONS), nargs='?', default='setup',
+                        help='; '.join(f'{name}: {text}' for name, text in ACTIONS.items()))
     result.add_argument('journal', nargs='?', help='rollback: the journal id of the install to undo')
     result.add_argument('--source', help='Source checkout; installed setup inherits its recorded original checkout')
     result.add_argument('--root-dir', default=os.environ.get('AGENT_KIT_DIR', str(Path.home() / '.local/share/agent-kit')))

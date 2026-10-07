@@ -154,7 +154,7 @@ PARITY = [
 
 
 def ro_mysql_module():
-    from dashboard_sections import load_script
+    from dashboard_rows import load_script
 
     module = load_script(SOURCE / 'bin/ro-mysql', 'ro_mysql_for_test')
     assert module is not None
@@ -236,7 +236,7 @@ class ConnectionHelperScriptTests(unittest.TestCase):
 
     def test_a_changed_ro_mysql_pattern_and_its_flags_flow_into_the_page(self) -> None:
         from dashboard_html import AddHelper, add_helper
-        from dashboard_sections import load_script
+        from dashboard_rows import load_script
         from dashboard_sql import form_patterns
 
         text = (SOURCE / 'bin/ro-mysql').read_text()

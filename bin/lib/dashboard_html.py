@@ -212,12 +212,19 @@ def anchor(view: str, name: str) -> str:
     return f"{view}-{re.sub(r'[^A-Za-z0-9_.-]+', '-', name).strip('-')}"
 
 
-def esc(value: object) -> str:
+def attr(value: object) -> str:
+    """value escaped as is: a link, tooltip or copy button keeps a path whole."""
     return html.escape(str(value), quote=True)
 
 
+def esc(value: object) -> str:
+    """value escaped for the page with every path under the home folder written from ~: no visible
+    word names the user's home; attr keeps the whole path for its tooltip and copy button."""
+    return attr(home_text(str(value)))
+
+
 def copy_button(text: str) -> str:
-    return f'<button class="cp" type="button" data-c="{esc(text)}">copy</button>'
+    return f'<button class="cp" type="button" data-c="{attr(text)}">copy</button>'
 
 
 def home_label(path: Path | str) -> str:
@@ -226,13 +233,19 @@ def home_label(path: Path | str) -> str:
     return "~" + text[len(user) :] if text == user or text.startswith(user + "/") else text
 
 
+def home_text(text: str) -> str:
+    """text with the home folder written ~ wherever it starts a path."""
+    user = str(Path.home()).rstrip("/")
+    return re.sub(rf"{re.escape(user)}(?![^/\s'\"\],;:)}}])", "~", text) if user else text
+
+
 def path_html(path: Path | str, label: str = "") -> str:
     """An editor link, the path as label (else ~-relative) and a copy button; the whole path is the
     label's tooltip and what the button copies."""
     text = str(path)
     return (
-        f'<span class="path"><a href="vscode://file{esc(quote(text))}" title="Open in editor">open</a>'
-        f'<code class="p" title="{esc(text)}">{esc(label or home_label(text))}</code>'
+        f'<span class="path"><a href="vscode://file{attr(quote(text))}" title="Open in editor">open</a>'
+        f'<code class="p" title="{attr(text)}">{esc(label or home_label(text))}</code>'
         f"{copy_button(text)}</span>"
     )
 
@@ -247,7 +260,7 @@ def file_link(value: FileLink) -> str:
     text = str(value.path)
     label = f"<span>{esc(value.label)}</span>" if value.label else ""
     return (
-        f'<a class="fl" href="vscode://file{esc(quote(text))}" title="{esc(text)}" '
+        f'<a class="fl" href="vscode://file{attr(quote(text))}" title="{attr(text)}" '
         f'aria-label="Open {esc(value.label or value.path.name)} in the editor">{FILE_ICON}{label}</a>'
     )
 
@@ -266,8 +279,8 @@ def cell(value: Cell) -> str:
     if isinstance(value, Code):
         return f"<code>{esc(value.text)}</code>"
     if isinstance(value, Command):
-        shown = value.shown or value.text
-        title = f' title="{esc(value.text)}"' if value.shown else ""
+        shown = home_text(value.shown or value.text)
+        title = f' title="{attr(value.text)}"' if shown != value.text else ""
         return f'<div class="cmd"><code{title}>{esc(shown)}</code>{copy_button(value.text)}</div>'
     if isinstance(value, Fold):
         return (
@@ -352,10 +365,10 @@ def add_helper(value: AddHelper) -> str:
         f'placeholder="{esc(f.placeholder)}"' + (f' value="{esc(f.value)}"' if f.value else "") + "></label>"
         for f in AH_FIELDS
     )
-    patterns = "".join(f' data-p-{esc(name)}="{esc(pattern)}"' for name, pattern in value.patterns)
+    patterns = "".join(f' data-p-{attr(name)}="{attr(pattern)}"' for name, pattern in value.patterns)
     return (
-        f'<div class="ah" id="sql-add" data-ports="{esc(" ".join(value.ports))}" '
-        f'data-aliases="{esc(" ".join(value.aliases))}"{patterns}><h3>Add an instance</h3>'
+        f'<div class="ah" id="sql-add" data-ports="{attr(" ".join(value.ports))}" '
+        f'data-aliases="{attr(" ".join(value.aliases))}"{patterns}><h3>Add an instance</h3>'
         '<p class="muted">Paste a connection URI or fill the fields. This form runs in the page and '
         "sends nothing; a password in the URI is removed, never shown.</p>"
         # The script sets the example placeholder: written here, the page's userinfo mask would hide it.
@@ -486,8 +499,6 @@ def doc_part(value: DocPart) -> str:
 
 def docs_view(docs: Docs) -> str:
     """The docs view: an article beside the setup cards, its short map, then one section per part."""
-    if not docs.parts:
-        return ""
     first = "".join(
         f'<li><a href="#{esc(key)}">{inline(line)}</a></li>' for key, line in docs.first
     )
@@ -500,15 +511,13 @@ def docs_view(docs: Docs) -> str:
 
 def toc(docs: Docs) -> str:
     links = "".join(f'<a href="#{esc(p.key)}">{esc(p.title)}</a>' for p in docs.parts)
-    return f'<nav class="toc" aria-label="{esc(docs.title)}">{links}</nav>' if docs.parts else ""
+    return f'<nav class="toc" aria-label="{esc(docs.title)}">{links}</nav>'
 
 
 def page(sections: list[Section], needs: list[Action], kit: Path, engine: Path, docs: Docs) -> str:
     links = [nav_link("attention", "Needs attention", len(needs), "warn" if needs else "")]
     links += [nav_link(s.key, s.title, s.count, level(s)) for s in sections]
-    tab = (
-        f'<a class="tab" href="#docs" data-v="docs">{esc(docs.title)}</a>' if docs.parts else ""
-    )
+    tab = f'<a class="tab" href="#docs" data-v="docs">{esc(docs.title)}</a>'
     text = TEMPLATE.read_text()
     return Template(text).substitute(
         script_hash=inline_hash(text, "script"),

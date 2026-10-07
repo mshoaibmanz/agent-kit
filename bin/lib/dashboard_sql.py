@@ -11,7 +11,8 @@ from typing import Any
 
 from credentials import Credential
 from dashboard_html import Action, AddHelper, Badge, Cell, Muted, Row, Section, Strong, Table, anchor
-from dashboard_sections import ENGINE, Setup, TableRows, credential_cell, load_script
+from dashboard_rows import TableRows, load_script
+from dashboard_sections import ENGINE, Setup, credential_cell
 
 
 def ro_mysql(setup: Setup) -> ModuleType | None:

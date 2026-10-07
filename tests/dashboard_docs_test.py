@@ -18,7 +18,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dashboard_test import Fixture, page_text  # noqa: E402
+from dashboard_test import Fixture, page_text, section  # noqa: E402
 from installer_ux_test import SOURCE  # noqa: E402
 
 HOOK = {'event': 'PreToolUse', 'matcher': 'Bash|Read', 'command': '~/.claude/hooks/demo-guard',
@@ -110,6 +110,61 @@ class DashboardDocsTests(Fixture):
         for figure in svgs(view):
             ET.fromstring(figure)  # well-formed, so a browser draws all of it
 
+    def install_from(self, kit: Path) -> None:
+        """agent-setup from the scratch kit into the fixture's root, with its defaults (no blocking hooks)."""
+        environment = {'HOME': str(self.home), 'PATH': str(self.shim), 'TMPDIR': str(self.tmp), 'LANG': 'C.UTF-8',
+                       'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null'}
+        result = subprocess.run([sys.executable, str(kit / 'bin/agent-setup'), '--source', str(kit), '--root-dir',
+                                 str(self.root), '--apply'], capture_output=True, text=True, env=environment,
+                                timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_no_visible_word_names_the_home_folder(self) -> None:
+        page, _ = self.dashboard(kit=self.scratch_kit())
+        self.assertNotIn(str(self.home), page_text(page), 'a path under the home folder is written from ~')
+        self.assertIn(f'title="{self.home}/kit', page, 'the whole path stays in the tooltip')
+        self.assertIn(f'data-c="{self.home}/kit', page, 'and in the copy button')
+
+    def test_a_source_checkout_newer_than_the_install_still_lists_its_commands(self) -> None:
+        kit = self.scratch_kit()
+        self.install_from(kit)
+        # The checkout moves on: its lib gains a name its own agent-setup imports; the install's lacks it.
+        hosts = kit / 'bin/lib/hosts.py'
+        hosts.write_text(hosts.read_text() + '\nNEWNAME = 1\n')
+        script = kit / 'bin/agent-setup'
+        script.write_text(script.read_text().replace(
+            'from hosts import (HOSTS,', 'from hosts import NEWNAME  # noqa: E402,F401\nfrom hosts import (HOSTS,', 1))
+        view = docs(self.dashboard()[0])
+        self.assertNotIn('not read:', view)
+        row = re.search(r'<tr id="docs-cmd-agent-setup">.*?</tr>', view, re.S)
+        assert row is not None
+        self.assertIn('<code>rollback</code> <span class="muted">undo one install by its journal', row.group())
+        flow = view[view.index('<section id="docs-flow"'):]
+        self.assertIn('review every file it would write', flow[:flow.index('</section>')], "agent-setup's own text")
+
+    def test_with_blocking_hooks_off_no_part_claims_a_guard_runs(self) -> None:
+        kit = self.scratch_kit()
+        self.install_from(kit)
+        # A skill only the install's skills/ holds: setup no longer lays it out.
+        (self.root / 'skills/left-behind').mkdir()
+        (self.root / 'skills/left-behind/SKILL.md').write_text(SKILL.replace('demo-skill', 'left-behind'))
+        page = self.dashboard()[0]
+        view = docs(page)
+        for key in ('review', 'safety'):
+            part = view[view.index(f'<section id="docs-{key}"'):]
+            self.assertIn('<p class="alert">Blocking hooks are off in this install', part[:part.index('</section>')], key)
+        guard = re.search(r'<tr id="docs-guard-bash-guards">.*?</tr>', view, re.S)
+        assert guard is not None
+        self.assertIn('>not installed</span>', guard.group())
+        self.assertNotIn('left-behind', view)
+        self.assertNotIn('left-behind', section(page, 'skills'))
+
+    def test_only_the_docs_hooks_table_is_compact(self) -> None:
+        page, _ = self.dashboard(kit=self.scratch_kit())
+        self.assertIn('<div class="tw"><table><thead><tr><th>Hook</th>', section(page, 'hooks'),
+                      'the Setup view keeps a Source column wide enough for a full path')
+        self.assertIn('<table class="hooks"><thead><tr><th>Hook</th>', docs(page))
+
     def test_a_registry_row_added_later_shows_up_with_no_code_change(self) -> None:
         kit = self.scratch_kit()
         before = docs(self.dashboard(kit=kit)[0])
@@ -141,6 +196,9 @@ class DashboardDocsTests(Fixture):
         self.assertGreater(style.index('tbody tr.hit td'), style.index('tbody tr:nth-child(even) td'),
                            'the highlight wins over the zebra row')
         self.assertGreater(style.index('tbody tr.hit td'), style.index('tbody tr:hover td'))
+        narrow = style[style.index('@media (max-width:600px)'):]
+        self.assertGreater(narrow.index('.tw tbody tr.hit td{'), narrow.index('.tw tbody tr td,'),
+                           'a stacked card row still shows the highlight')
 
     def test_an_unreadable_registry_is_the_part_s_alert_not_empty_tables(self) -> None:
         kit = self.scratch_kit()
@@ -167,6 +225,8 @@ class DashboardDocsTests(Fixture):
         (kit / 'local/skills/mine').mkdir(parents=True)
         (kit / 'local/skills/mine/SKILL.md').write_text(SKILL.replace('demo-skill', 'mine'))
         (kit / 'local/rules.md').write_text('# Mine\n\nPersonal rules this engine does not render.\n')
+        (kit / 'pack').mkdir(exist_ok=True)
+        (kit / 'pack/rules.md').write_text('# Team\n\nThe pack rules render appends.\n')
         pack = kit / 'pack/skills'
         for name, text in (('demo-skill', SKILL), ('pack-only', SKILL.replace('demo-skill', 'pack-only'))):
             (pack / name).mkdir(parents=True)
@@ -187,7 +247,11 @@ class DashboardDocsTests(Fixture):
         self.assertEqual(replaced, {'conventions'}, 'only a pack skill with other text than the engine copy')
         rules = re.findall(r'<tr id="docs-rule-([^"]+)">', view)
         self.assertEqual(rules[0], 'rules-AGENTS.md')
-        self.assertTrue(all(r.startswith('rules-') for r in rules), rules)
+        self.assertEqual(rules[-1], 'pack-rules.md', "render's rule_sources, the pack's block last")
+        self.assertTrue(all(r.startswith('rules-') for r in rules[:-1]), rules)
+        pack_rules = re.search(r'<tr id="docs-rule-pack-rules.md">.*?</tr>', view, re.S)
+        assert pack_rules is not None
+        self.assertIn('pack: appended for every host', pack_rules.group())
 
     def test_a_source_checkout_s_install_command_installs_somewhere_else(self) -> None:
         kit = self.scratch_kit()
@@ -200,6 +264,8 @@ class DashboardDocsTests(Fixture):
         self.assertNotEqual(Path(root), kit, 'setup refuses to install into the source checkout')
         self.assertFalse([c for c in commands if ' sync' in c or ' update' in c or 'rollback' in c],
                          'install-only steps on a kit with no install')
+        self.assertEqual({shlex.split(c)[0] for c in commands[1:]}, {f'{root}/bin/agent-kit'},
+                         'every later step runs the new install, not the checkout')
         install = [str(self.root) if word == 'INSTALL_DIR' else word for word in install if word != '--apply']
         environment = {'HOME': str(self.home), 'PATH': str(self.shim), 'TMPDIR': str(self.tmp), 'LANG': 'C.UTF-8',
                        'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null'}

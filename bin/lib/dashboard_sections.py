@@ -5,23 +5,19 @@ from __future__ import annotations
 
 import datetime as dt
 import functools
-import importlib.machinery
-import importlib.util
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
-import sys
 from collections import Counter
-from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any, NamedTuple
+from typing import Any
 
 from blocking import BLOCKING, hook_name
-from credentials import Credential, credential_name, declared_credentials, holds_secret, show_args, show_url
+from credentials import Credential, credential_name, declared_credentials, holds_secret
 from dashboard_html import (
     Action,
     Badge,
@@ -40,6 +36,18 @@ from dashboard_html import (
     Table,
     anchor,
 )
+from dashboard_rows import (
+    HookRow,
+    SkillEntry,
+    TableRows,
+    hook_table,
+    layer_cell,
+    role_table,
+    round_table,
+    script_module,
+    server_line,
+    skill_text,
+)
 from hosts import (
     HOSTS,
     account_dirs,
@@ -47,7 +55,6 @@ from hosts import (
     host_root_for,
     inventory,
     skill_dirs,
-    skill_hosts,
 )
 from kit_env import KEYS, kit_env, layers, parse
 from kit_text import PACK_DIR, RULES_FILES, default_host_root, fill_servers
@@ -58,34 +65,7 @@ import secret_store
 
 LIB = Path(__file__).resolve().parent
 ENGINE = LIB.parents[1]
-TableRows = list[Row | tuple[Cell, ...]]
-# How a shared row builder shows a file: the Setup view's full path cell, or the docs view's link.
-Linker = Callable[[Path], Cell]
 DATA_WRAPPERS = ("ro-mysql", "bqro")
-
-
-class HookRow(NamedTuple):
-    """One registry entry as agent-kit's validate_registry accepts it, each field a plain value."""
-
-    event: str
-    matcher: str  # "" when the entry has none: every tool
-    name: str
-    command: str
-    hosts: tuple[str, ...]
-    description: str
-    timeout: str
-    blocking: bool
-
-
-class SkillEntry(NamedTuple):
-    """One skill the kit installs, once: layer is kit, pack or overlay (the layer setup took it
-    from), md its SKILL.md, and replaces whether it stands in for an engine skill of that name with
-    other text."""
-
-    name: str
-    layer: str
-    md: Path
-    replaces: bool
 
 
 def read_json(path: Path) -> Any:
@@ -149,40 +129,6 @@ def setup_command(setup: Setup, *args: str, action: str = "") -> str:
     return shlex.join([*head, "--source", str(source), "--root-dir", str(setup.kit), *args])
 
 
-def load_script(path: Path, name: str) -> ModuleType | None:
-    """A kit bin script as a module, without writing bytecode beside it or keeping the import
-    paths it adds."""
-    if not path.is_file():
-        return None
-    loader = importlib.machinery.SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    if spec is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    dont_write, paths = sys.dont_write_bytecode, list(sys.path)
-    sys.dont_write_bytecode = True
-    sys.modules[name] = module  # a dataclass in the script looks its module up there
-    try:
-        loader.exec_module(module)
-    finally:
-        sys.dont_write_bytecode = dont_write
-        sys.path[:] = paths
-    return module
-
-
-def script_parser(path: Path) -> Any:
-    """The argparse parser a Python bin script builds in its own parser(), else None. Only a script
-    that defines one and guards its main is loaded: anything else might act on import."""
-    try:
-        text = path.read_text(errors="replace")
-    except OSError:
-        return None
-    if not re.search(r"^def parser\(", text, re.M) or "__name__ ==" not in text:
-        return None
-    module = load_script(path, "dashboard_cmd_" + re.sub(r"\W", "_", path.name))
-    return module.parser() if module is not None else None
-
-
 class Setup:
     """What every collector reads, once: the kit, its install record and each host's root."""
 
@@ -215,58 +161,62 @@ class Setup:
         except SystemExit as error:
             self.roles_error = str(error)
         self.inventories: dict[str, dict[str, Any]] = {}
-        self.registries: dict[Path, list[HookRow]] = {}
+        self.registries: dict[Path, list[HookRow] | ValueError] = {}
+        self.scripts: dict[str, ModuleType | None | Exception] = {}
 
     def registry(self, path: Path) -> list[HookRow]:
-        """The hook registry at path, validated once by agent-kit's own validate_registry; an
-        invalid one raises with what is wrong, so the part reading it shows that, not empty tables.
-        A kit with no registry file has no hooks."""
+        """The hook registry at path, read and validated once by agent-kit's own validate_registry;
+        an invalid one raises with what is wrong on every read, so each part reading it shows that,
+        not empty tables. A kit with no registry file has no hooks."""
         if path not in self.registries:
-            if not path.is_file():
-                return []
             try:
-                entries = json.loads(path.read_text())
+                self.registries[path] = self.read_registry(path)
             except ValueError as error:
-                raise ValueError(f"{path} is not JSON: {error}") from None
-            try:
-                self.api.validate_registry(entries)
-            except SystemExit as error:
-                said = str(error).replace(str(self.api.REGISTRY), str(path))
-                raise ValueError(" ".join(said.split())) from None
-            self.registries[path] = [
-                HookRow(
-                    event=e["event"],
-                    matcher=str(e.get("matcher") or ""),
-                    name=hook_name(str(e.get("command", ""))),
-                    command=str(e.get("command", "")),
-                    hosts=tuple(e["hosts"]),
-                    description=str(e.get("description") or ""),
-                    timeout=f"{e.get('timeout', '-')}{' async' if e.get('async') else ''}",
-                    blocking=hook_name(str(e.get("command", ""))) in BLOCKING,
-                )
-                for e in entries
-            ]
-        return self.registries[path]
+                self.registries[path] = error
+        found = self.registries[path]
+        if isinstance(found, ValueError):
+            raise ValueError(str(found))
+        return found
+
+    def read_registry(self, path: Path) -> list[HookRow]:
+        if not path.is_file():
+            return []
+        try:
+            entries = json.loads(path.read_text())
+        except ValueError as error:
+            raise ValueError(f"{path} is not JSON: {error}") from None
+        try:
+            self.api.validate_registry(entries, path)
+        except SystemExit as error:
+            raise ValueError(" ".join(str(error).split())) from None
+        return [
+            HookRow(
+                event=e["event"],
+                matcher=str(e.get("matcher") or ""),
+                name=hook_name(str(e.get("command", ""))),
+                command=str(e.get("command", "")),
+                hosts=tuple(e["hosts"]),
+                description=str(e.get("description") or ""),
+                timeout=f"{e.get('timeout', '-')}{' async' if e.get('async') else ''}",
+                blocking=hook_name(str(e.get("command", ""))) in BLOCKING,
+            )
+            for e in entries
+        ]
 
     @functools.cached_property
     def skills(self) -> list[SkillEntry]:
-        """Every skill once, as setup lays them out: the source checkout's, the pack's (setup copies
-        each into skills/ as well, so that copy is the pack's, not a second skill), and the
-        overlay's when the install record names any. A source checkout lists its own."""
-        source, installed = self.source() / "skills", self.kit / "skills"
-        pack = self.kit / PACK_DIR / PACK_SKILLS
-        record = self.config.get("overlay")
-        overlay = set(record.get("skills") or []) if isinstance(record, dict) else set()
-        names = sorted({md.parent.name for d in (source, installed, pack) for md in d.glob("*/SKILL.md")})
+        """Every skill once, as setup lays them out: the source checkout's (the kit's own without
+        one) and the pack's (setup copies each into skills/ as well, so that copy is the pack's, not
+        a second skill). A skill only the install's skills/ holds is one setup no longer lays out."""
+        source, pack = self.source() / "skills", self.kit / PACK_DIR / PACK_SKILLS
+        names = sorted({md.parent.name for d in (source, pack) for md in d.glob("*/SKILL.md")})
         out: list[SkillEntry] = []
         for name in names:
             engine = source / name / "SKILL.md"
-            if name in overlay and (installed / name / "SKILL.md").is_file():
-                layer, md = "overlay", installed / name / "SKILL.md"
-            elif (pack / name / "SKILL.md").is_file():
+            if (pack / name / "SKILL.md").is_file():
                 layer, md = "pack", pack / name / "SKILL.md"
             else:
-                layer, md = "kit", engine if engine.is_file() else installed / name / "SKILL.md"
+                layer, md = "kit", engine
             replaces = layer != "kit" and engine.is_file() and engine.read_bytes() != md.read_bytes()
             out.append(SkillEntry(name, layer, md, replaces))
         return out
@@ -293,10 +243,24 @@ class Setup:
         except (OSError, ValueError, SystemExit):
             return None
 
+    def script(self, name: str) -> ModuleType | None:
+        """bin/<name> as a module (dashboard_rows.script_module), loaded once from the install's own
+        copy: a newer source checkout's script imports names the bin/lib this page runs on lacks. A
+        script that fails to load raises that error each time it is asked for."""
+        if name not in self.scripts:
+            try:
+                self.scripts[name] = script_module(self.kit_bin(name))
+            except Exception as error:  # noqa: BLE001  a broken script is its caller's one line
+                self.scripts[name] = error
+        found = self.scripts[name]
+        if isinstance(found, Exception):
+            raise found
+        return found
+
     @functools.cached_property
     def setup_drift(self) -> list[Path]:
         """Paths agent-setup installed that changed since (its own managed_drift)."""
-        module = load_script(self.kit_bin("agent-setup"), "agent_setup_for_dashboard") if self.state else None
+        module = self.script("agent-setup") if self.state else None
         if module is None:
             return []
         return [Path(p) for p in module.managed_drift(self.state.get("managed", {}).values())]
@@ -446,18 +410,6 @@ def described(entry: Described | None) -> tuple[Cell, str]:
     return shown, entry.instructions or entry.server
 
 
-def server_line(setup: Setup, name: str) -> tuple[str, str, str]:
-    """(transport, its command or URL with any credential masked, the catalog's description) of one
-    catalog server, as both views show it."""
-    filled, raw = setup.filled.get(name), setup.catalog.get(name)
-    spec = filled if isinstance(filled, dict) else {}
-    description = str(raw.get("description") or "") if isinstance(raw, dict) else ""
-    if "url" in spec:
-        return "http", show_url(str(spec["url"])).text, description
-    target = show_args([str(spec.get("command", "")), *map(str, spec.get("args") or [])]).text
-    return "stdio", target, description
-
-
 def mcp_section(setup: Setup, sec: Section) -> None:
     sec.sources = [setup.catalog_path] + ([setup.catalog_input] if setup.catalog_input else [])
     if setup.fill_error:
@@ -602,21 +554,6 @@ def skills_section(setup: Setup, sec: Section) -> None:
     sec.summary = f"{len(setup.skills)} skills, {pack} from the pack"
 
 
-def skill_text(md: Path) -> tuple[str, set[str], str]:
-    """(SKILL.md's text, the hosts its hosts: line allows, that list as shown)."""
-    text = md.read_text(errors="replace")
-    try:
-        allowed = skill_hosts(md, text)
-    except ValueError:
-        return text, set(), "invalid hosts: line"
-    return text, allowed, ", ".join(sorted(allowed))
-
-
-def layer_cell(entry: SkillEntry) -> Cell:
-    badge = Badge(entry.layer, "ok" if entry.layer == "overlay" else "")
-    return (badge, Muted("replaces the engine's skill of this name")) if entry.replaces else badge
-
-
 def skill_toggle(
     setup: Setup, host: str, name: str, on: bool, selected: list[str] | None, layer: str
 ) -> Cell:
@@ -627,8 +564,6 @@ def skill_toggle(
         return Muted(f"{host}: read from the shared skills folder")
     if layer == "pack":
         return Muted("The team pack's; change it in the preset")
-    if layer == "overlay":
-        return Muted("Your overlay's; change it in its local/skills folder")
     if setup.config.get("source_checkout"):
         if selected is None:
             if on:
@@ -659,87 +594,6 @@ def roles_section(setup: Setup, sec: Section) -> None:
     reviewers = sum(bool(r.prefix) for r in roles.roles.values())
     sec.count = len(roles.roles)
     sec.summary = f"{len(roles.roles)} roles, {reviewers} of them review roles"
-
-
-def event_cell(row: HookRow) -> str:
-    """The event with its matcher folded in: PreToolUse · Bash, Read."""
-    return f"{row.event} · {', '.join(row.matcher.split('|'))}" if row.matcher else row.event
-
-
-def hook_table(
-    rows: list[HookRow],
-    hooks: Path,
-    prefix: str,
-    link: Linker,
-    installed: set[tuple[str, str]] | None = None,
-    timeout: bool = False,
-    **table: Any,
-) -> Table:
-    """The hooks table both views show, one row per registry entry: a row installed does not hold
-    is marked not installed, and timeout adds the Setup view's column."""
-    out: TableRows = []
-    ids: Counter[str] = Counter()
-    for hook in rows:
-        row = anchor(prefix, f"{hook.event}-{hook.name}")
-        ids[row] += 1
-        row += f"-{ids[row]}" if ids[row] > 1 else ""
-        kind: Cell = Badge("blocking", "warn") if hook.blocking else Badge("advisory")
-        if installed is not None and (hook.event, hook.name) not in installed:
-            kind = (kind, Badge("not installed"))
-        script = hooks / hook.name
-        cells: tuple[Cell, ...] = (
-            Strong(hook.name),
-            event_cell(hook),
-            kind,
-            tuple(Badge(h) for h in hook.hosts),
-            *((hook.timeout,) if timeout else ()),
-            link(script) if script.is_file() else Code(hook.command),
-        )
-        out.append(Row(cells, row, hook.description))
-    headers = ("Hook", "Event", "Kind", "Hosts", *(("Timeout",) if timeout else ()), "Source")
-    return Table(headers, out, layout="hooks", **table)
-
-
-def role_table(setup: Setup, prefix: str, link: Linker, live: bool = False, **table: Any) -> Table:
-    """The roles table both views show; live adds how each runs per host and whether Claude has
-    its rendered agent file."""
-    roles = setup.roles
-    assert roles is not None
-    hosts = [h for h in roles.hosts if h in HOSTS]
-    rows: TableRows = []
-    for name, role in roles.roles.items():
-        src = setup.kit / "agents" / f"{name}.md"
-        description = ""
-        if src.is_file():
-            description = str(frontmatter(src.read_text(errors="replace")).get("description", ""))
-        cells: list[Cell] = [
-            Strong(name),
-            Code(f"{role.provider}:{role.model}"),
-            role.effort,
-            Badge(role.prefix, "warn") if role.prefix else Muted("-"),
-            role.fallback or Muted("-"),
-            link(src) if src.is_file() else Muted("None (the main session)"),
-        ]
-        if live:
-            runs: list[Cell] = []
-            for host in hosts:
-                try:
-                    runs.append(f"{host}: {roles.invoke(role, host)}")
-                except SystemExit:
-                    runs.append(f"{host}: ?")
-            rendered = setup.roots["claude"] / "agents" / f"{name}.md"
-            cells += [Lines(tuple(runs)), Badge("rendered", "ok") if rendered.is_file() else Muted("-")]
-        rows.append(Row(tuple(cells), anchor(prefix, name), description))
-    headers = ("Role", "Model", "Effort", "Review prefix", "Fallback", "Agent file")
-    headers += ("Runs as", "Claude agent") if live else ()
-    return Table(headers, rows, **table)
-
-
-def round_table(setup: Setup, **table: Any) -> Table:
-    """roles.toml [review] as written: each list's key and its roles."""
-    review = setup.roles.review if setup.roles is not None else {}
-    rows: TableRows = [(Code(k), ", ".join(v)) for k, v in review.items()]
-    return Table(("[review] key", "Roles"), rows, **table)
 
 
 def hooks_section(setup: Setup, sec: Section) -> None:

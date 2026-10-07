@@ -582,9 +582,10 @@ def render(api: Any, args: Any) -> int:
         ownership[state] = wanted_hooks
         plans.append((hook_path, api.dump(merge_hooks(live, previous, wanted_hooks))))
     if "rules" in components:
+        shared, own = (s.path for s in api.rule_sources(host) if not s.appended)
         rules = api.with_team_rules(
             fill(
-                (api.KIT / "rules/AGENTS.md").read_text() + "\n" + (api.KIT / f"rules/hosts/{host}.md").read_text(),
+                shared.read_text() + "\n" + own.read_text(),
                 str(api.KIT),
                 host,
                 str(root),

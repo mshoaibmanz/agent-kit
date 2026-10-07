@@ -124,6 +124,7 @@ def layers(
 
 
 def wiring(
+    *,
     title: str,
     sources: list[str],
     hub: tuple[str, ...],

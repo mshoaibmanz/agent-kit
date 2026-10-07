@@ -11,7 +11,6 @@ import re
 import shlex
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 from dashboard_diagrams import Chip, HostBox, Layer, Moment, layers, lifecycle, review_loop, wiring
 from dashboard_html import (
@@ -32,22 +31,23 @@ from dashboard_html import (
     anchor,
     home_label,
 )
-from dashboard_sections import (
-    DATA_WRAPPERS,
+from dashboard_rows import (
     HookRow,
-    Setup,
     TableRows,
-    docstring_line,
-    documented_keys,
     hook_table,
-    kit_command,
     layer_cell,
     role_table,
     round_table,
-    script_parser,
     server_line,
-    setup_command,
     skill_text,
+)
+from dashboard_sections import (
+    DATA_WRAPPERS,
+    Setup,
+    docstring_line,
+    documented_keys,
+    kit_command,
+    setup_command,
 )
 from hosts import EVENTS, HOSTS, RENDERED_FILES, frontmatter, skill_dirs
 from kit_env import layers as env_layers
@@ -166,11 +166,10 @@ REVIEW_STEPS = {
     "fix": ("Fix", "address each finding by its prefix in one new commit"),
     "done": ("Merge-ready", "CI green, no open finding"),
 }
-# Render's constants for the rules blocks it appends, in order; one the engine lacks is skipped.
-APPENDED_RULES = {
-    "TEAM_RULES": "org pack: appended for every host",
-    "OVERLAY_RULES": "personal overlay: appended after the pack's",
-}
+GUARDS_OFF = (
+    "Blocking hooks are off in this install, so none of the guards or the git push gate described "
+    "here runs; agent-setup --blocking-hooks --apply turns them on."
+)
 
 
 def kit_file(setup: Setup, relative: str) -> Path:
@@ -254,8 +253,8 @@ def layers_part(setup: Setup, part: DocPart) -> None:
 
 
 def subcommands(parser: argparse.ArgumentParser | None) -> dict[str, str]:
-    """name -> help of every subcommand parser declares, nested ones as "mcp describe", and of each
-    choice of a positional argument, whose help gives each as "name: text; name: text"."""
+    """name -> help of every subcommand parser declares, nested ones as "mcp describe", and each
+    choice of a positional argument (its text is the script's ACTIONS, read by command_says)."""
     out: dict[str, str] = {}
     if parser is None:
         return out
@@ -266,11 +265,7 @@ def subcommands(parser: argparse.ArgumentParser | None) -> dict[str, str]:
                 for name, text in subcommands(action.choices.get(choice.dest)).items():
                     out[f"{choice.dest} {name}"] = text
         elif action.choices and not action.option_strings:
-            said = dict(
-                (m.group(1), m.group(2).strip())
-                for m in re.finditer(r"(?:^|;\s*)([\w-]+):\s*([^;]*)", action.help or "")
-            )
-            out.update({str(c): said.get(str(c), "") for c in action.choices})
+            out.update({str(c): "" for c in action.choices})
     return out
 
 
@@ -282,8 +277,13 @@ def sentence(text: str) -> str:
 def flow_part(setup: Setup, part: DocPart) -> None:
     source = setup.source()
     setup_script = source / "bin/agent-setup"
-    setup_parser = script_parser(setup_script)
-    kit_says, setup_says = subcommands(setup.api.parser()), subcommands(setup_parser)
+    try:
+        module = setup.script("agent-setup")
+    except (Exception, SystemExit):  # noqa: BLE001  the steps stand without its help text
+        module = None
+    actions = getattr(module, "ACTIONS", None)
+    setup_says: dict[str, str] = dict(actions) if isinstance(actions, dict) else {}
+    kit_says = subcommands(setup.api.parser())
     part.sources = from_files(setup, setup_script, setup.kit / "bin/agent-kit")
 
     def step(title: str, said: str, command: str) -> tuple[str, str, Command | None]:
@@ -304,20 +304,26 @@ def flow_part(setup: Setup, part: DocPart) -> None:
         )
     else:
         # agent-setup refuses to install into the source checkout itself.
-        default = setup_parser.get_default("root_dir") if setup_parser is not None else None
+        build = getattr(module, "parser", None)
+        default = build().get_default("root_dir") if callable(build) else None
         target = default if default and Path(default).resolve() != source.resolve() else "INSTALL_DIR"
         install = [str(setup_script), "--source", str(source), "--root-dir", str(target), "--apply"]
+
+        def installed(*args: str) -> str:
+            return shlex.join([f"{target}/bin/agent-kit", *args])
+
         host = (setup.configured or list(HOSTS))[0]
         steps = (
             step("Install", setup_says.get("setup", ""), shlex.join(install)),
-            step("Render", kit_says.get("render", ""), kit_command(setup, "render", "--host", host)),
-            step("Doctor", kit_says.get("doctor", ""), kit_command(setup, "doctor", "--host", "all")),
-            step("See it", kit_says.get("dashboard", ""), kit_command(setup, "dashboard")),
+            step("Render", kit_says.get("render", ""), installed("render", "--host", host)),
+            step("Doctor", kit_says.get("doctor", ""), installed("doctor", "--host", "all")),
+            step("See it", kit_says.get("dashboard", ""), installed("dashboard")),
         )
         part.blocks.append(
             Prose(
                 "This page reads a source checkout with no install record: install it into a "
-                "folder of its own first. Sync, update and rollback work on an install."
+                "folder of its own first, then run that install's `agent-kit` for the rest. Sync, "
+                "update and rollback work on an install."
             )
         )
     part.blocks.append(Steps(steps))
@@ -356,14 +362,14 @@ def hosts_part(setup: Setup, part: DocPart) -> None:
     sources = [s for s in sources if kit_file(setup, s.rstrip("/")).exists()]
     part.sources = from_files(setup, kit_file(setup, "bin/lib/hosts.py"))
     figure = wiring(
-        "Kit sources",
-        sources,
-        ("agent-setup", "agent-kit render"),
-        boxes,
-        "read",
-        "write",
-        "not configured",
-        "How the kit's sources reach each host",
+        title="Kit sources",
+        sources=sources,
+        hub=("agent-setup", "agent-kit render"),
+        hosts=boxes,
+        reads="read",
+        writes="write",
+        off="not configured",
+        label="How the kit's sources reach each host",
     )
     part.blocks.append(Figure(figure, "Render writes only the files each host reads."))
     part.blocks.append(
@@ -413,6 +419,7 @@ def lifecycle_part(setup: Setup, part: DocPart) -> None:
             title="Every hook row",
             note=note,
             fold=True,
+            layout="hooks",
         )
     )
     git_rows: TableRows = [(Strong(p.name), header_line(p), FileLink(p)) for p in git_hooks]
@@ -467,17 +474,27 @@ def header_line(path: Path) -> str:
     return line[:1].upper() + line[1:]
 
 
-def command_parser(setup: Setup, path: Path) -> Any:
-    """agent-kit's parser from the running engine (loading a second agent-kit would swap the
-    modules this page imported), any other script's from its own parser()."""
-    return setup.api.parser() if path.name == "agent-kit" else script_parser(path)
+def command_says(setup: Setup, name: str) -> dict[str, str]:
+    """subcommand -> its text, from the installed script: agent-kit's parser from the running
+    engine (loading a second agent-kit would swap the modules this page imported), any other's from
+    its own parser() and ACTIONS."""
+    if name == "agent-kit":
+        return subcommands(setup.api.parser())
+    module = setup.script(name)
+    if module is None:
+        return {}
+    actions = getattr(module, "ACTIONS", None)
+    return {**subcommands(module.parser()), **(actions if isinstance(actions, dict) else {})}
 
 
 def commands_part(setup: Setup, part: DocPart) -> None:
     folder = kit_file(setup, "bin")
     rows: TableRows = []
     for path in sorted(p for p in folder.iterdir() if p.is_file() and not p.name.startswith(".")):
-        subs = subcommands(command_parser(setup, path))
+        try:
+            subs = command_says(setup, path.name)
+        except (Exception, SystemExit):  # noqa: BLE001  one script that fails to load is its own "-"
+            subs = {}
         cells = tuple((Code(name), Muted(said)) for name, said in subs.items())
         rows.append(
             Row(
@@ -511,27 +528,24 @@ def commands_part(setup: Setup, part: DocPart) -> None:
 
 
 def rules_part(setup: Setup, part: DocPart) -> None:
-    """The files render joins into each host's rules: the engine's two, then each block render
-    appends (APPENDED_RULES), read from the kit render runs on."""
-    every = tuple(HOSTS)
-    kit = setup.kit
-    candidates: list[tuple[Path, tuple[str, ...], str]] = [
-        (kit / "rules/AGENTS.md", every, "engine: shared by every host"),
-        *((kit / f"rules/hosts/{h}.md", (h,), f"engine: {h} only") for h in HOSTS),
-    ]
-    for name, layer in APPENDED_RULES.items():
-        path = getattr(setup.api, name, None)
-        if isinstance(path, Path):
-            candidates.append((path, every, layer))
+    """The files render joins into each host's rules, as agent-kit's rule_sources lists them for
+    the kit render runs on."""
+    found: dict[Path, tuple[bool, str, list[str]]] = {}
+    for host in HOSTS:
+        for source in setup.api.rule_sources(host):
+            layer = f"{source.layer}: {'appended for ' if source.appended else ''}"
+            found.setdefault(source.path, (source.appended, layer, []))[2].append(host)
     rows: TableRows = []
-    for path, hosts, layer in candidates:
+    # The engine's files first, then the blocks appended after them, as render joins them.
+    for path, (_, layer, hosts) in sorted(found.items(), key=lambda item: item[1][0]):
         if not path.is_file():
             continue
         words = len(path.read_text(errors="replace").split())
+        reach = "every host" if len(hosts) == len(HOSTS) else f"{', '.join(hosts)} only"
         targets = tuple(Code(home_label(setup.roots[h] / RULES_FILES[h])) for h in hosts)
         rows.append(
             Row(
-                (Strong(label(setup, path)), layer, Lines(targets), f"{words} words", FileLink(path)),
+                (Strong(label(setup, path)), layer + reach, Lines(targets), f"{words} words", FileLink(path)),
                 anchor("docs-rule", label(setup, path)),
             )
         )
@@ -545,7 +559,7 @@ def rules_part(setup: Setup, part: DocPart) -> None:
         (Strong(p.name), first_heading(p), FileLink(p)) for p in docs if p.is_file()
     ]
     part.blocks.append(Table(("Doc", "Subject", "Source"), doc_rows, "Reference docs", fold=True))
-    part.sources = from_files(setup, kit / "rules")
+    part.sources = from_files(setup, setup.kit / "rules")
 
 
 def first_heading(path: Path) -> str:
@@ -563,6 +577,7 @@ def first_heading(path: Path) -> str:
 def review_part(setup: Setup, part: DocPart) -> None:
     roles = setup.roles
     part.sources = from_files(setup, Path(setup.api.ROLES), setup.kit / "agents")
+    part.alerts += guards_off(setup)
     review: dict[str, list[str]] = dict(roles.review) if roles is not None else {}
     keys = [k for k in setup.api.REVIEW_LISTS if k in review]
     rounds = [(f"[review] {k}", ", ".join(review[k]) or "-") for k in keys[:2]]
@@ -588,12 +603,25 @@ def review_part(setup: Setup, part: DocPart) -> None:
     part.blocks.append(round_table(setup, title="Review rounds", fold=True))
 
 
+def guards_off(setup: Setup) -> list[str]:
+    """The alert for a part whose text describes the blocking guards, when the install left them
+    out (agent-setup's default)."""
+    return [GUARDS_OFF] if setup.state and not setup.config.get("blocking_hooks") else []
+
+
 def safety_part(setup: Setup, part: DocPart) -> None:
     path, rows_ = registry(setup)
+    part.alerts += guards_off(setup)
+    installed = installed_hooks(setup)
+    held = None if installed is None else {name for _, name in installed}
     guards = list({r.name: r for r in reversed(rows_) if r.blocking}.values())[::-1]
     rows: TableRows = [
         Row(
-            (Strong(r.name), r.event, FileLink(kit_file(setup, f"hooks/{r.name}"))),
+            (
+                (Strong(r.name), Badge("not installed")) if held is not None and r.name not in held else Strong(r.name),
+                r.event,
+                FileLink(kit_file(setup, f"hooks/{r.name}")),
+            ),
             anchor("docs-guard", r.name),
             r.description,
         )

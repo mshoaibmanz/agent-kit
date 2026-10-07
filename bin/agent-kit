@@ -533,11 +533,11 @@ def render_roles_sh(roles: Roles, dry_run: bool) -> int:
     return 0
 
 
-def validate_registry(entries: Any) -> list[dict[str, Any]]:
-    """Fail on an entry that would render nowhere or wrongly; a missing hosts list used to drop the
-    hook silently."""
+def validate_registry(entries: Any, path: Path = REGISTRY) -> list[dict[str, Any]]:
+    """Fail on an entry of the registry read from path that would render nowhere or wrongly; a
+    missing hosts list used to drop the hook silently."""
     if not isinstance(entries, list):
-        raise SystemExit(f"agent-kit: {REGISTRY} must be a JSON list of hook entries")
+        raise SystemExit(f"agent-kit: {path} must be a JSON list of hook entries")
     bad = []
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -550,7 +550,7 @@ def validate_registry(entries: Any) -> list[dict[str, Any]]:
         if not isinstance(entry.get("event"), str) or not entry["event"]:
             bad.append(f"{label}: needs an event")
     if bad:
-        raise SystemExit(f"agent-kit: invalid {REGISTRY}:\n  " + "\n  ".join(bad))
+        raise SystemExit(f"agent-kit: invalid {path}:\n  " + "\n  ".join(bad))
     return entries
 
 
@@ -1024,25 +1024,44 @@ def cmd_render(args: argparse.Namespace) -> int:
 def claude_host_rules(path: Path | None = None, resume: int | None = None) -> str:
     """rules/hosts/claude.md with its placeholders filled: the file CLAUDE.md imports in its place.
     rules/AGENTS.md is imported as is, so a placeholder there would reach the model literally."""
-    if "{{" in read_or_empty(KIT / "rules/AGENTS.md"):
+    shared, own = (s.path for s in rule_sources("claude") if not s.appended)
+    if "{{" in read_or_empty(shared):
         raise SystemExit(
             "agent-kit: rules/AGENTS.md: Claude imports it unrendered, so it may hold no {{...}} "
             "placeholder; put host-specific text in rules/hosts/<host>.md"
         )
     host_root = str(path.parent) if path else None
-    filled = fill_for_host((KIT / "rules/hosts/claude.md").read_text(), host="claude", host_root=host_root,
-                           what="rules/hosts/claude.md", resume=resume)
+    filled = fill_for_host(own.read_text(), host="claude", host_root=host_root,
+                           what=str(own.relative_to(KIT)), resume=resume)
     return with_team_rules(filled, "claude", host_root, resume)
 
 
+class RuleSource(NamedTuple):
+    path: Path
+    layer: str  # engine or pack
+    appended: bool  # after the joined engine rules, its non-kit {{...}} left as its layer wrote it
+
+
+def rule_sources(host: str) -> list[RuleSource]:
+    """Every file render joins into host's rules, in order: the engine's shared rules, the host's
+    own, then each block appended after them. The dashboard's docs view lists these."""
+    return [
+        RuleSource(KIT / "rules/AGENTS.md", "engine", False),
+        RuleSource(KIT / f"rules/hosts/{host}.md", "engine", False),
+        RuleSource(TEAM_RULES, "pack", True),
+    ]
+
+
 def with_team_rules(rules: str, host: str, host_root: str | None = None, resume: int | None = None) -> str:
-    """rules (filled) with the team pack's rules block appended, when a pack installed one: its kit
-    placeholders filled, any other {{...}} left as the pack wrote it."""
-    team = read_or_empty(TEAM_RULES).strip()
-    if not team:
-        return rules
-    team = fill_for_host(team, host=host, host_root=host_root, what=str(TEAM_RULES), resume=resume, strict=False)
-    return rules.rstrip("\n") + "\n\n" + team + "\n"
+    """rules (filled) with each appended block of rule_sources that is installed: its kit
+    placeholders filled, any other {{...}} left as its layer wrote it."""
+    for source in rule_sources(host):
+        block = read_or_empty(source.path).strip() if source.appended else ""
+        if block:
+            block = fill_for_host(block, host=host, host_root=host_root, what=str(source.path), resume=resume,
+                                  strict=False)
+            rules = rules.rstrip("\n") + "\n\n" + block + "\n"
+    return rules
 
 
 def plan_claude_rules() -> tuple[Path, str, str, str]:
