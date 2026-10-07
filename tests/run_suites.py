@@ -281,7 +281,7 @@ def main() -> int:
     for suite in failed:
         lines = tail(runner.log(suite))
         sys.stdout.write(
-            f"\n==> {suite.name} ({suite.result}), last {len(lines)} lines of "
+            f"\n==> {suite.name} ({suite.result}), failing cases and last {TAIL_LINES} lines of "
             f"{runner.log(suite)}\n{''.join(lines)}"
         )
     sys.stdout.write(f"\n{'suite':<44} {'seconds':>8}  result\n")
@@ -296,7 +296,11 @@ def main() -> int:
 
 
 def tail(log: Path) -> list[str]:
-    return log.read_text(errors="replace").splitlines(keepends=True)[-TAIL_LINES:]
+    """The log's last TAIL_LINES lines, after each failing case line above them (a hook suite's
+    `FAIL <case>`, unittest's `FAIL:` or `ERROR:`), which the cut would otherwise hide in CI."""
+    lines = log.read_text(errors="replace").splitlines(keepends=True)
+    cases = [line for line in lines[:-TAIL_LINES] if line.startswith(("FAIL ", "FAIL:", "ERROR:"))]
+    return [*cases, *(["...\n"] if cases else []), *lines[-TAIL_LINES:]]
 
 
 if __name__ == "__main__":
