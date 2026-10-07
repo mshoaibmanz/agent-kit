@@ -184,9 +184,9 @@ def gate_cases(tmp: Path, env: dict[str, str]) -> None:
     rc, out, _ = gate(repo, env)
     check("gate: a pre-existing error (line moved) does not block", rc == 0 and out == "", out)
     (repo / "b.py").write_text('import not_installed_mod\n\ny = 1\n\n\ndef f() -> str:\n    return 1\n')
-    overlay(env, "VERIFY_OFF='typ*:python.stop'\n")
+    overlay(env, "VERIFY_OFF='typ*:python.types'\n")
     rc, out, _ = gate(repo, env)
-    check("gate: VERIFY_OFF turns the phase off for a matching repo", rc == 0 and out == "", out)
+    check("gate: VERIFY_OFF python.types turns the Python type check off for a matching repo", rc == 0 and out == "", out)
     overlay(env, "")
     rc, out, _ = gate(repo, env)
     check("gate: a NEW error in a changed file blocks", rc == 1 and "b.py:7" in out and "reportReturnType" in out, out)
@@ -227,11 +227,26 @@ def gate_cases(tmp: Path, env: dict[str, str]) -> None:
     noenv = new_repo(tmp, "noenv", {"a.py": "x = 1\n"})
     commit(noenv, {"a.py": "def f() -> str:\n    return 1\n"})
     rc, out, err = gate(noenv, env)
-    check("gate: no Python environment: Stop passes", rc == 0 and out == "", out + err)
+    check("gate: no Python environment: Stop passes and says nothing", rc == 0 and out == "" and err == "", out + err)
     rc, out, err = gate(noenv, env, "push")
     check("gate: the push says the skip, though a Stop came first", rc == 0 and "no environment" in err, out + err)
     rc, out, err = gate(noenv, env, "push")
-    check("gate: the skip is not said again", rc == 0 and err == "", err)
+    check("gate: every push says it", rc == 0 and "no environment" in err, out + err)
+
+    odd = new_repo(tmp, "odd", {"data.txt": "x\n", "my mod.py": "a = 1\n", '"q".py': "a = 1\n"}, venv=True)
+    (odd / "data.txt").write_bytes(b"caf\xe9\n")
+    (odd / "my mod.py").write_text('a = 1\ny: int = "s"\n')
+    (odd / '"q".py').write_text('a = 1\nz: int = "s"\n')
+    rc, out, _ = gate(odd, env)
+    check("gate: a non-UTF-8 file in the diff does not pass the gate", rc == 1 and "reportAssignmentType" in out, out)
+    check("gate: a file name with a space is checked", "my mod.py:2" in out, out)
+    check("gate: a C-quoted file name is checked", '"q".py:2' in out, out)
+
+    ihc = new_repo(tmp, "ihc", {"i.py": 'a = 1\np: int = "pre"\nb = 2\n'}, venv=True)
+    git(ihc, "config", "diff.interHunkContext", "5")
+    (ihc / "i.py").write_text('a = 10\np: int = "pre"\nb = 20\n')
+    rc, out, _ = gate(ihc, env)
+    check("gate: an unchanged line between two hunks is not counted (diff.interHunkContext)", rc == 0 and out == "", out)
 
     pushcfg = new_repo(tmp, "pushcfg", {"pyrightconfig.json": '{"venvPath": ".", "venv": ".venv"}\n', "a.py": "x = 1\n"},
                        venv=True)
@@ -294,7 +309,7 @@ def stop_case(repo: Path, env: dict[str, str], name: str, text: str) -> None:
         reason = json.loads(out).get("reason", "") if out.strip() else ""
     except ValueError:
         reason = ""
-    check(f"stop: review-trigger blocks on the new type error ({name})", "new type errors" in reason and name in reason,
+    check(f"stop: review-trigger blocks on the new type error ({name})", "type errors" in reason and name in reason,
           out + err)
     check(f"stop: the same block carries the self-check review ({name})", "SELF-CHECK" in reason.upper(), reason)
 
@@ -324,6 +339,26 @@ def tsc_cases(tmp: Path, env: dict[str, str]) -> None:
     rc, out, _ = gate(mixed, env)
     check("tsc: with a once-only skip beside it (no Python environment), the tree is shown once", rc == 0 and out == "",
           out)
+    inherit = new_repo(tmp, "inherit", {
+        "tsconfig.base.json": '{"compilerOptions": {"strict": false, "noEmit": true}}\n',
+        "tsconfig.json": '{"extends": "./tsconfig.base.json", "include": ["*.ts"]}\n', "a.ts": "export const x = 1;\n"})
+    (inherit / "a.ts").write_text("export const x = 1;\nexport const s: string = null;\n")
+    rc, out, _ = gate(inherit, env)
+    check("tsc: the change passes under the loose inherited config", rc == 0 and out == "", out)
+    (inherit / "tsconfig.base.json").write_text('{"compilerOptions": {"strict": true, "noEmit": true}}\n')
+    rc, out, _ = gate(inherit, env)
+    check("tsc: tightening only the inherited config is checked again", rc == 1 and "a.ts:2" in out, out)
+
+    solution = new_repo(tmp, "solution", {
+        "tsconfig.json": '{\n  // solution\n  "files": [],\n  "references": [{"path": "./tsconfig.app.json"}],\n}\n',
+        "tsconfig.app.json": '{"compilerOptions": {"strict": true, "composite": true}, "include": ["src"]}\n',
+        "src/app.ts": "export const a = 1;\n"})
+    (solution / "src/app.ts").write_text("export const a = 1;\nexport const b: string = 2;\n")
+    rc, out, _ = gate(solution, env)
+    check("tsc: a solution-style tsconfig.json checks the referenced project", rc == 1 and "src/app.ts:2" in out, out)
+    check("tsc: no build info is written into the repo", not list(solution.glob("*.tsbuildinfo")),
+          str(list(solution.glob("*"))))
+
     stop_case(mixed, env, "c.mts", "export const k: number = 'stop';\n" + "".join(f"export const v{i} = {i};\n"
                                                                                for i in range(25)))
 

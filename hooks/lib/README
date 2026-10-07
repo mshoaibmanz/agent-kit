@@ -50,4 +50,4 @@ guards need no key. Documented with placeholder values in ~/.claude/kit.env.exam
   SUBAGENT_RESUME_MAX  context tokens past which a subagent is replaced, not resumed (default 300000): setup and agent-kit render it into rules/hosts/claude.md and agent bodies ({{SUBAGENT_RESUME_MAX_K}})
   TICKET_PREFIXES    Jira project keys (comma-separated, 2-6 characters); when set, the only prefixes that name a ticket in a branch, worktree name or prompt (agent-task binding); optional
   TMP_SWEEP_DAYS     days a done item's tmp/ (closed, merged or harvested) waits before claude-gc's sweep report lists it (default 14)
-  VERIFY_OFF         verification checks to turn off (lib/verify.py): space-separated <repo-glob>:<what>, what being python.edit, python.stop, typescript.edit, typescript.stop or worktree
+  VERIFY_OFF         verification checks to turn off (lib/verify.py): space-separated <repo-glob>:<what>, what being python.edit, python.types, typescript.edit, typescript.types or worktree

@@ -63,7 +63,7 @@ rv_sweep
 # joins the self-check block rather than replacing it, so the review still runs in this chain.
 types=''
 if ! verify_out=$(python3 "${0%/*}/lib/verify.py" gate "$root" stop 2>/dev/null) && [ -n "$verify_out" ]; then
-  types="Fix the new type errors below; the push refuses them (a false positive: say why, then AGENT_PUSH_NOW=\"<reason>\" git push).
+  types="Fix the type errors below, on lines this branch added or changed; the push refuses them (a false positive: say why, then AGENT_PUSH_NOW=\"<reason>\" git push).
 $verify_out
 "
 fi

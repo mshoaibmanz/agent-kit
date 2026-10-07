@@ -62,11 +62,12 @@ pg_push_now() {
 # pg_check <remote> <url> <refs>: the agent checks for one push. <refs> is pre-push's stdin.
 pg_check() {
   local remote=$1 url=$2 refs=$3 lref lsha rref rsha files='' top sid now=1
-  local override tprefix shipped adding branch ctx='' pbr='' plsha='' prsha=''
+  local override tprefix shipped adding branch ctx='' pbr='' plsha='' prsha='' pushed=''
   pg_enforced "$url" || return 0
   while read -r lref lsha rref rsha; do
     [ -n "$lsha" ] || continue
     [ "$lsha" != "$PG_ZERO" ] || continue   # a deletion publishes nothing
+    pushed="$pushed $lsha"
     if [ -z "$pbr" ]; then
       case $rref in refs/heads/*) pbr=${rref#refs/heads/}; plsha=$lsha; [ "$rsha" = "$PG_ZERO" ] || prsha=$rsha ;; esac
     fi
@@ -130,13 +131,15 @@ Otherwise hold until the review cycle ends, keep follow-ups uncommitted, then co
     # After the review gate: a tested-but-unreviewed push is the case that produces the sprawl.
     tr_ran "$sid" "$top" || pg_refuse "no local test run is recorded for this session or worktree. $(host_noun rules): run a representative local test subset before pushing. If test infra is down: AGENT_PUSH_NOW=\"untested: <why>\" git push ..., then watch CI to a verdict in this session."
 
-    # The type gate on the commit being pushed, not the working files (verify.py; a push of the tree
-    # a Stop just checked reuses its result). A checker that cannot run passes and says so on stderr.
-    local verify_out
-    if ! verify_out=$(python3 "${BASH_SOURCE[0]%/*}/verify.py" gate "$top" push "${plsha:-HEAD}") && [ -n "$verify_out" ]; then
-      pg_refuse "new type errors in changed files ($override):
+    # The type gate on every commit being pushed, not the working files (verify.py; a push of the
+    # tree a Stop just checked reuses its result). A checker that cannot run passes and says so on stderr.
+    local verify_out sha
+    for sha in $(printf '%s\n' ${pushed:-HEAD} | sort -u); do
+      if ! verify_out=$(python3 "${BASH_SOURCE[0]%/*}/verify.py" gate "$top" push "$sha") && [ -n "$verify_out" ]; then
+        pg_refuse "type errors on lines this branch added or changed ($override):
 $verify_out"
-    fi
+      fi
+    done
   fi
   [ -z "$ctx" ] || pg_note "$ctx"
   return 0

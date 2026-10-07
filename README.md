@@ -155,14 +155,15 @@ The model hears only errors from correctness rules, and only those its change ma
   - Python: ruff. A repo with a ruff config is also fixed and formatted with it, and its rule selection applies; one without is checked with `--select F,E9,B` and never reformatted. Either way only F, E9, B and syntax errors are reported, without F401, F841 and B008.
   - TypeScript and JavaScript: the repo's eslint, errors only, when the repo has an eslint config.
 - **Stop and push** (`review-trigger` and the agent pre-push gate): the files the branch changed since it left its base branch are type-checked, errors only, and an error counts only on a line the branch added or changed (`git diff -U0` against the fork point). Errors the change causes on unchanged lines, such as a caller of a changed signature, are left to CI and tests. Unresolved imports are ignored.
-  - Python: basedpyright, else pyright, with the environment that `pyrightconfig.json` names, else `.venv` or `venv`. With no environment, the check is skipped and the push says so once.
-  - TypeScript: `tsc --noEmit -p <nearest tsconfig.json>`.
-  - Both check tracked files only. Stop checks the working tree; the push checks the commit being pushed, with that commit's `pyrightconfig.json`.
+  - Python: basedpyright, else pyright, with the environment that `pyrightconfig.json` names, else `.venv` or `venv`. With no environment, the check is skipped and every push says so.
+  - TypeScript: `tsc --noEmit -p` on the project that lists the file: the nearest `tsconfig.json`, else the project it references that does (a solution-style config).
+  - Both check tracked files only. Stop checks the working tree; the push checks every commit being pushed, each with its own `pyrightconfig.json`.
   - Stop shows a tree's errors once, together with the self-check review. The push refuses them until they are fixed or `AGENT_PUSH_NOW="<reason>"` is given; a push of the tree a Stop checked reuses that result. A check that runs past its deadline (40 s at Stop, 90 s at push) passes with a note, and nothing is recorded as passed.
+  - Known limit: a line separator (U+2028, U+2029) or a lone carriage return counts as a line break for the checker but not for git, so an error after one on the same line can be matched to the wrong line.
 
 A new worktree (EnterWorktree, or `git worktree add` in an agent shell) gets the main checkout's untracked `pyrightconfig.json`, with `venvPath`/`venv` pointing at the main checkout's environment.
 
-Everything is on by default. The overlay key `VERIFY_OFF` turns parts off: space-separated `<repo-glob>:<what>` entries, where `<what>` is `python.edit`, `python.stop`, `typescript.edit`, `typescript.stop` or `worktree`, e.g. `VERIFY_OFF='legacy-*:python.stop my-api:worktree'`.
+Everything is on by default. The overlay key `VERIFY_OFF` turns parts off: space-separated `<repo-glob>:<what>` entries, where `<what>` is `python.edit`, `python.types`, `typescript.edit`, `typescript.types` or `worktree`, e.g. `VERIFY_OFF='legacy-*:python.types my-api:worktree'`.
 
 The kit cannot quiet the pyright editor plugin's hint diagnostics. Claude Code takes the language server's settings only from the plugin's own entry, and `pyright.disableTaggedHints` is not a `pyrightconfig.json` key.
 

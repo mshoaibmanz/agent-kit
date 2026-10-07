@@ -9,16 +9,18 @@ pyrightconfig.json. Every check skips silently when its tool is missing.
     verify.py worktree <path>            copy the main checkout's untracked pyrightconfig.json, venv pinned
 
 The overlay key VERIFY_OFF turns checks off: space-separated <repo-glob>:<what>, what being
-python.edit, python.stop, typescript.edit, typescript.stop or worktree (globs allowed on both sides).
+python.edit, python.types, typescript.edit, typescript.types or worktree (globs allowed on both sides).
 """
 
 from __future__ import annotations
 
+import codecs
 from collections import Counter
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from fnmatch import fnmatch
+import functools
 import hashlib
 import json
 import os
@@ -30,7 +32,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypedDict, cast
 
 from kit_env import kit_env
 
@@ -80,7 +82,7 @@ def run(argv: list[str], cwd: str | Path | None = None, stdin: str | None = None
         return 124, ""
     try:
         proc = subprocess.run(argv, cwd=cwd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              text=True, timeout=timeout, check=False)
+                              encoding="utf-8", errors="replace", timeout=timeout, check=False)
     except OSError:
         return 127, ""
     except subprocess.TimeoutExpired:
@@ -307,15 +309,24 @@ def cmd_worktree(path: str) -> int:
     return 0
 
 
+class GateState(TypedDict, total=False):
+    key: str  # the fingerprint of the tree checked; empty when a check did not finish
+    text: str
+    shown: bool  # a Stop has shown text
+    once: list[str]  # environment facts behind a skipped check, said at every push
+
+
 @dataclass
 class Gate:
     """One gate run: the checkout, the tree checked (the checkout, or the pushed commit's files), the
-    lines the branch added or changed per file, and the deadline every checker shares."""
+    lines the branch added or changed per file, the checkers found and the deadline they share."""
     root: str
     tree: Path
     added: dict[str, set[int]]
     cache: Path
     deadline: float
+    python: tuple[str | None, Path | None]  # the checker and the environment
+    tsc: dict[str, tuple[str, str | None]]  # a changed file -> its nearest tsconfig.json and the tsc for it
 
     def left(self) -> float:
         return self.deadline - time.monotonic()
@@ -332,17 +343,23 @@ def fork_point(root: str, rev: str) -> str:
     return mb if mb and git(root, "rev-parse", "-q", "--verify", f"{mb}^{{commit}}") else ""
 
 
-def added_lines(root: str, *revs: str) -> dict[str, set[int]]:
-    """The new-side line numbers each file's diff adds or rewrites (`git diff -U0`), deletions left out."""
-    out = git(root, "-c", "core.quotePath=off", "diff", "-U0", "-M", "--no-prefix", "--no-color", "--no-ext-diff",
-              "--diff-filter=d", *revs)
+def branch_diff(root: str, *revs: str) -> str:
+    """The whole change, every file and deletion included, whatever the user's diff config says."""
+    return git(root, "-c", "core.quotePath=off", "diff", "-U0", "--inter-hunk-context=0", "-M", "--no-prefix",
+               "--no-color", "--no-ext-diff", *revs)
+
+
+def added_lines(diff: str) -> dict[str, set[int]]:
+    """The new-side line numbers each file's hunks add or rewrite."""
     added: dict[str, set[int]] = {}
     path, header = "", False
-    for row in out.splitlines():
+    for row in diff.splitlines():
         if row.startswith("diff --git "):
             header = True
         elif header and row.startswith("+++ "):
-            path = row[4:]
+            path = row[4:].rstrip("\t")  # git ends the line with a tab when the name has a space
+            if path.startswith('"'):
+                path = codecs.escape_decode(path[1:-1].encode())[0].decode("utf-8", "replace")
         elif hunk := HUNK.match(row):
             header = False
             start, count = int(hunk[1]), int(hunk[2] or 1)
@@ -371,7 +388,10 @@ def extract(root: str, rev: str, dest: Path) -> bool:
             return False
         spool.seek(0)
         with tarfile.open(fileobj=spool) as tar:
-            tar.extractall(dest, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(dest)
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(dest, filter="data")
+            else:
+                tar.extractall(dest)
     return True
 
 
@@ -405,7 +425,7 @@ def python_tools(root: str) -> tuple[str | None, Path | None]:
 
 
 def gate_python(g: Gate, files: list[str]) -> tuple[str, list[Diag]] | Skip:
-    checker, env = python_tools(g.root)
+    checker, env = g.python
     if not checker:
         return "pyright", []
     if env is None:
@@ -426,30 +446,58 @@ def gate_python(g: Gate, files: list[str]) -> tuple[str, list[Diag]] | Skip:
         if d.get("severity") == "error" and d.get("rule") not in PYRIGHT_DROP])
 
 
-def ts_projects(g: Gate, files: list[str]) -> dict[str, str | None]:
+def ts_configs(tree: Path, root: str, files: list[str]) -> dict[str, tuple[str, str | None]]:
     """Each changed file's nearest tsconfig.json (relative to the tree) and the tsc that checks it."""
-    projects: dict[str, str | None] = {}
+    found: dict[str, tuple[str, str | None]] = {}
     for f in files:
-        tsconfig = find_up(Path(g.tree, f).parent, g.tree, ("tsconfig.json",))
+        tsconfig = find_up(Path(tree, f).parent, tree, ("tsconfig.json",))
         if tsconfig is not None:
-            name = rel(str(tsconfig), g.tree)
-            projects[name] = which_up("tsc", Path(g.root, name).parent, g.root)
-    return projects
+            name = rel(str(tsconfig), tree)
+            found[f] = name, which_up("tsc", Path(root, name).parent, root)
+    return found
+
+
+@functools.lru_cache(maxsize=None)
+def show_config(tsc: str, tsconfig: str) -> dict[str, Any]:
+    _, out = run([tsc, "--showConfig", "-p", tsconfig], cwd=os.path.dirname(tsconfig))
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def ts_owner(tsc: str, tsconfig: str, path: str, depth: int = 4) -> str | None:
+    """The project that has path among its root files: tsconfig, else one of its references (a
+    solution-style tsconfig.json lists none of its own). A tsc that cannot show a config gets tsconfig."""
+    data = show_config(tsc, tsconfig)
+    folder = os.path.dirname(tsconfig)
+    if not data or any(os.path.normpath(os.path.join(folder, f)) == path for f in data.get("files", [])):
+        return tsconfig
+    for ref in data.get("references", []) if depth else []:
+        cfg = os.path.join(folder, ref.get("path", ""))
+        cfg = os.path.join(cfg, "tsconfig.json") if os.path.isdir(cfg) else cfg
+        owner = ts_owner(tsc, os.path.normpath(cfg), path, depth - 1) if os.path.isfile(cfg) else None
+        if owner:
+            return owner
+    return None
 
 
 def gate_typescript(g: Gate, files: list[str]) -> tuple[str, list[Diag]] | Skip:
+    projects: dict[str, str] = {}
+    for f, (name, checker) in g.tsc.items():
+        owner = ts_owner(checker, str(g.tree / name), os.path.normpath(g.tree / f)) if checker else None
+        if checker and owner:
+            projects.setdefault(owner, checker)
     found: list[Diag] = []
-    for name, checker in ts_projects(g, files).items():
-        if not checker:
-            continue
-        tsconfig = g.tree / name
-        buildinfo = g.cache / f"tsc-{hashlib.sha256(name.encode()).hexdigest()[:12]}.tsbuildinfo"
+    for tsconfig, checker in projects.items():
+        buildinfo = g.cache / f"tsc-{hashlib.sha256(rel(tsconfig, g.tree).encode()).hexdigest()[:12]}.tsbuildinfo"
+        folder = os.path.dirname(tsconfig)
         rc, out = run([checker, "--noEmit", "--pretty", "false", "--incremental", "--tsBuildInfoFile", str(buildinfo),
-                       "-p", str(tsconfig)], cwd=tsconfig.parent, timeout=g.left())
+                       "-p", tsconfig], cwd=folder, timeout=g.left())
         if rc == 124:
             return Skip("tsc did not finish within the deadline")
-        found += [Diag(rel(os.path.normpath(os.path.join(tsconfig.parent, m["file"])), g.tree), int(m["line"]),
-                       m["code"], m["msg"])
+        found += [Diag(rel(os.path.normpath(os.path.join(folder, m["file"])), g.tree), int(m["line"]), m["code"], m["msg"])
                   for m in (TSC_LINE.match(line.strip()) for line in out.splitlines()) if m]
     return "tsc", g.on_added(found)
 
@@ -458,87 +506,83 @@ GATES: dict[str, tuple[tuple[str, ...], Callable[[Gate, list[str]], tuple[str, l
     "python": (PY, gate_python), "typescript": (TS, gate_typescript)}
 
 
-def fingerprint(g: Gate, base: str, todo: dict[str, list[str]]) -> str:
-    """What a gate result depends on: the base, the checkers and environment found, the configs, and
-    the changed files' lines and content. Neither mode nor commit: a push of the tree a Stop checked
-    reuses its result, and installing a checker or creating an environment changes it."""
-    files = sorted(f for fs in todo.values() for f in fs)
-    facts: list[Any] = [base, sorted(todo), [[f, sorted(g.added[f])] for f in files]]
-    configs = list(files)
-    if "python" in todo:
-        facts.append([str(t) for t in python_tools(g.root)])
-        configs += ["pyrightconfig.json", "pyproject.toml"]
-    if "typescript" in todo:
-        projects = ts_projects(g, todo["typescript"])
-        facts.append(sorted(projects.items()))
-        configs += sorted(projects)
-    digest = hashlib.sha256(json.dumps(facts).encode())
-    for name in configs:
-        path = g.tree / name
-        digest.update(name.encode() + b"\0" + (path.read_bytes() if path.is_file() else b"-") + b"\0")
-    return digest.hexdigest()
+def fingerprint(g: Gate, base: str, diff: str) -> str:
+    """What a gate result depends on: the base and the whole change (configs, inherited ones included),
+    the checkers and environment found, an untracked pyrightconfig.json, and when the installed packages
+    last changed. Neither mode nor commit: a push of the tree a Stop checked reuses its result."""
+    checker, env = g.python
+    deps = list(env.glob("lib/python*/site-packages")) if env else []
+    deps += [Path(t).parents[1] / ".package-lock.json" for _, t in g.tsc.values() if t and Path(t).parent.name == ".bin"]
+    cfg = g.tree / "pyrightconfig.json"
+    facts = [base, diff, str(checker), str(env), sorted(g.tsc.items()), [p.stat().st_mtime_ns if p.exists() else 0 for p in deps],
+             cfg.read_text(errors="replace") if cfg.is_file() else ""]
+    return hashlib.sha256(json.dumps(facts).encode()).hexdigest()
+
+
+def check_all(g: Gate, todo: dict[str, list[str]], key: str) -> GateState:
+    """Every language's checker; a check that did not finish is said now and keeps the state unrecorded."""
+    parts: list[str] = []
+    skips: list[Skip] = []
+    for lang, files in todo.items():
+        found = GATES[lang][1](g, files)
+        if isinstance(found, Skip):
+            skips.append(found)
+        elif found[1]:
+            name, diags = found
+            noun = "error" if len(diags) == 1 else "errors"
+            parts.append(f"{name}: {len(diags)} type {noun} on lines this branch added or changed:\n{capped(diags)}")
+    for skip in skips:
+        if not skip.once:
+            sys.stderr.write(f"verify: {skip.reason}; not checked.\n")
+    return {"key": key if all(s.once for s in skips) else "", "text": "\n".join(parts), "shown": False,
+            "once": [s.reason for s in skips if s.once]}
 
 
 def cmd_gate(root: str, mode: str, rev: str) -> int:
-    """Prints the errors on lines the branch added or changed and exits 1, else exits 0. A check that
-    did not finish is said on stderr and never recorded as passed; an environment fact (no Python
-    environment) is said once, at the push. At Stop, a tree whose errors were already shown passes."""
+    """Prints the type errors on lines the branch added or changed and exits 1, else exits 0. At Stop,
+    a tree whose errors were already shown passes; the push refuses them every time."""
     deadline = time.monotonic() + float(os.environ.get("VERIFY_DEADLINE") or DEADLINE[mode])
     root = git_top(root)
     head = git(root, "rev-parse", "-q", "--verify", f"{rev or 'HEAD'}^{{commit}}") if root else ""
     base = fork_point(root, head) if head else ""
     if not base:
         return 0
-    added = added_lines(root, base) if mode == "stop" else added_lines(root, base, head)
+    diff = branch_diff(root, base) if mode == "stop" else branch_diff(root, base, head)
+    added = added_lines(diff)
     todo = {lang: [f for f in sorted(added) if f.endswith(exts)] for lang, (exts, _) in GATES.items()
-            if not is_off(root, f"{lang}.stop")}
+            if not is_off(root, f"{lang}.types")}
     todo = {lang: files for lang, files in todo.items() if files}
     if not todo:
         return 0
-    g = Gate(root, Path(root), added, cache_dir(root), deadline)
-    state_file = g.cache / "gate.json"
-    state = read_json(state_file)
-    with tempfile.TemporaryDirectory(dir=g.cache) as scratch:
+    cache = cache_dir(root)
+    state_file = cache / "gate.json"
+    state = cast(GateState, read_json(state_file))
+    with tempfile.TemporaryDirectory(dir=cache) as scratch:
+        tree = Path(root)
         clean = not git(root, "status", "--porcelain", "--untracked-files=no")
         if mode == "push" and not (head == git(root, "rev-parse", "HEAD") and clean):
-            g.tree = Path(scratch, "tree")
-            if not extract(root, head, g.tree):
+            tree = Path(scratch, "tree")
+            if not extract(root, head, tree):
                 return 0
-            provision(g.tree, root)
-        key = fingerprint(g, base, todo)
+            provision(tree, root)
+        g = Gate(root, tree, added, cache, deadline, python_tools(root) if "python" in todo else (None, None),
+                 ts_configs(tree, root, todo.get("typescript", [])))
+        key = fingerprint(g, base, diff)
         if state.get("key") != key:
-            parts, skips = [], []
-            for lang, files in todo.items():
-                found = GATES[lang][1](g, files)
-                if isinstance(found, Skip):
-                    skips.append(found)
-                elif found[1]:
-                    noun = "error" if len(found[1]) == 1 else "errors"
-                    parts.append(f"{found[0]}: {len(found[1])} {noun} on lines this branch added or changed:\n"
-                                 f"{capped(found[1])}")
-            for skip in skips:
-                if not skip.once:
-                    sys.stderr.write(f"verify: {skip.reason}; not checked.\n")
-            state = {"key": key if all(s.once for s in skips) else "", "text": "\n".join(parts), "shown": False,
-                     "once": [s.reason for s in skips if s.once], "noted": state.get("noted", [])}
-    # Stop's stderr reaches no one (review-trigger drops it), so only the push marks a fact as said.
-    noted = set(state.get("noted", []))
-    for reason in state.get("once", []):
-        if reason not in noted:
-            sys.stderr.write(f"verify: {reason}; not checked.\n")
-            if mode == "push":
-                noted.add(reason)
-    state["noted"] = sorted(noted)
+            state = check_all(g, todo, key)
+    # Stop's stderr reaches no one (review-trigger drops it); the push's is shown.
+    for reason in state.get("once", []) if mode == "push" else []:
+        sys.stderr.write(f"verify: {reason}; not checked.\n")
     return report(state, state_file, mode)
 
 
-def report(state: dict[str, Any], state_file: Path, mode: str) -> int:
+def report(state: GateState, state_file: Path, mode: str) -> int:
     shown = state.get("shown", False)
     state["shown"] = shown or mode == "stop"
     state_file.write_text(json.dumps(state))
     if not state.get("text") or (mode == "stop" and shown):
         return 0
-    sys.stdout.write(state["text"] + "\n")
+    sys.stdout.write(state.get("text", "") + "\n")
     return 1
 
 
