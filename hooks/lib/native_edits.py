@@ -217,7 +217,7 @@ def public_changes_owned(
         if kind == "file":
             if hashlib.sha256(after.encode()).hexdigest() != record.get("hash"):
                 return True
-        elif kind in ("text", "toml"):
+        elif kind in ("text", "toml", "shell"):
             if not isinstance(owned, str) or not owned:
                 raise ValueError("Malformed owned block")
             if text.count(owned) != 1 or after.count(owned) != 1:

@@ -56,7 +56,8 @@ class SetupTests(unittest.TestCase):
         for key in list(self.env):
             if key.startswith('GIT_CONFIG_') and key not in ('GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM'):
                 self.env.pop(key)
-        for key in ('AGENT_KIT_DIR', 'KIT_ENV', 'CLAUDE_CONFIG_DIR', 'CLAUDE_OUT_ROOT', 'AI_AGENT', 'AGENT_HOST', 'CLAUDECODE'):
+        for key in ('AGENT_KIT_DIR', 'KIT_ENV', 'CLAUDE_CONFIG_DIR', 'CLAUDE_OUT_ROOT', 'AI_AGENT', 'AGENT_HOST', 'CLAUDECODE',
+                    'ZDOTDIR', 'XDG_CONFIG_HOME'):
             self.env.pop(key, None)
 
     def tearDown(self) -> None:
@@ -222,7 +223,8 @@ class SetupTests(unittest.TestCase):
         for host in ('claude', 'codex', 'cursor'):
             with self.subTest(host=host):
                 self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
-                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--apply')
+                # Three kit roots share one HOME: only the first could own the shell PATH block.
+                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--no-path', '--apply')
                 text = (self.host / ('config.toml' if host == 'codex' else 'mcp.json')).read_text()
                 servers = tomllib.loads(text)['mcp_servers'] if host == 'codex' else json.loads(text)['mcpServers']
                 self.assertEqual(servers['sentry']['command'], str(self.root / 'bin/sentry-mcp'))
@@ -244,7 +246,8 @@ class SetupTests(unittest.TestCase):
         for host in ('claude', 'codex', 'cursor'):
             with self.subTest(host=host):
                 self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
-                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--apply')
+                # Three kit roots share one HOME: only the first could own the shell PATH block.
+                self.run_setup('--preset', str(preset), '--hosts', host, '--components', 'mcp', '--no-path', '--apply')
                 catalog = (self.root / 'mcp/servers.json').read_text()
                 self.assertNotIn('agent-kit-install-view-', catalog, 'the installed catalog names the deleted preview')
                 self.assertEqual(json.loads(catalog)['mcpServers']['own-sentry']['command'], '{{KIT_DIR}}/bin/sentry-mcp')
@@ -394,7 +397,7 @@ class SetupTests(unittest.TestCase):
         for host, name in rules_files.items():
             with self.subTest(host=host):
                 self.root, self.host = self.home / f'kit {host}', self.home / f'host {host}'
-                self.run_setup('--hosts', host, '--components', 'rules', '--apply')
+                self.run_setup('--hosts', host, '--components', 'rules', '--no-path', '--apply')
                 text = (self.host / name).read_text()
                 if host == 'cursor':
                     block = re.fullmatch(r'---\n.*?\n---\n(.*)', text, re.DOTALL).group(1)
@@ -869,6 +872,157 @@ class SetupTests(unittest.TestCase):
                 self.assertEqual(changed, [], f'selecting only {host} with {components}')
                 self.assertEqual(sorted(managed.keys() - self.state()['managed'].keys()), [], f'selecting only {host}')
         setup('doctor')
+
+    def shell_env(self, shell: str) -> dict:
+        return dict(self.env, SHELL=shell)
+
+    def path_setup(self, shell: str, *flags: str, success: bool = True) -> subprocess.CompletedProcess:
+        return self.run_setup('--hosts', 'claude', '--components', 'rules', *flags, success=success,
+                              env=self.shell_env(shell))
+
+    @staticmethod
+    def json_docs(text: str) -> list:
+        """An --apply run prints the plan, then the apply result."""
+        decoder, docs, index = json.JSONDecoder(), [], 0
+        while text[index:].strip():
+            index += len(text[index:]) - len(text[index:].lstrip())
+            doc, index = decoder.raw_decode(text, index)
+            docs.append(doc)
+        return docs
+
+    def rollback_all(self) -> None:
+        """Every journal, newest first, as each rollback restores the install before it."""
+        while (journal := self.state().get('id')):
+            self.run_setup('rollback', journal)
+
+    def login_finds(self, shell: str, *flags: str) -> str:
+        """What a new login shell of this kind, started in the scratch HOME, finds for agent-kit."""
+        if not shutil.which(shell):
+            self.skipTest(f'{shell} is not installed')
+        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'SHELL': shutil.which(shell), 'TERM': 'dumb'}
+        result = subprocess.run([shutil.which(shell), *flags, 'command -v agent-kit'], capture_output=True, text=True,
+                                env=env, stdin=subprocess.DEVNULL, timeout=30)
+        return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''
+
+    def test_path_block_zsh_apply_rerun_rollback(self) -> None:
+        rc = self.home / '.zshrc'
+        original = b'export EDITOR=vi\n\n\nalias ll="ls -l"'  # blank lines kept, no final newline
+        rc.write_bytes(original)
+        rc.chmod(0o600)
+        plan = json.loads(self.path_setup('/bin/zsh').stdout)
+        self.assertEqual(plan['path']['files'], [str(rc)])
+        self.assertTrue(plan['path']['writes'])
+        self.assertEqual(rc.read_bytes(), original, 'a preview wrote the startup file')
+        applied = self.json_docs(self.path_setup('/bin/zsh', '--apply').stdout)[-1]
+        self.assertIn(f'source {shlex.quote(str(rc))}', applied['path'])
+        text = rc.read_text()
+        self.assertTrue(text.startswith(original.decode()), 'the user\'s lines moved')
+        self.assertEqual(text.count('# BEGIN agent-kit shell'), 1)
+        self.assertIn(shlex.quote(str(self.root / 'bin')), text)
+        self.assertEqual(rc.stat().st_mode & 0o777, 0o600, 'the startup file\'s mode changed')
+        self.assertEqual(self.login_finds('zsh', '-lic'), str(self.root / 'bin/agent-kit'))
+        # A rerun, from a shell whose $SHELL differs, changes nothing: the file is saved with the install.
+        written = rc.read_bytes()
+        rerun = self.json_docs(self.path_setup('/bin/bash', '--apply').stdout)[-1]
+        self.assertEqual(rerun['installed'], 0)
+        self.assertNotIn('path', rerun)
+        self.assertEqual(rc.read_bytes(), written)
+        self.assertFalse((self.home / '.bashrc').exists())
+        self.run_setup('doctor')
+        self.rollback_all()
+        self.assertEqual(rc.read_bytes(), original, 'rollback did not restore the startup file byte for byte')
+        self.assertEqual(rc.stat().st_mode & 0o777, 0o600)
+
+    def test_path_block_new_file_and_doctor(self) -> None:
+        rc = self.home / '.zshrc'
+        self.path_setup('/bin/zsh', '--apply')
+        self.assertTrue(rc.read_text().startswith('# BEGIN agent-kit shell\n'))
+        rc.write_text('')  # the user took the block out
+        doctor = self.run_setup('doctor', success=False)
+        self.assertIn(f'{rc} lacks the agent-kit PATH block', doctor.stderr)
+        self.path_setup('/bin/zsh', '--apply')
+        self.run_setup('doctor')
+        rc.write_text(rc.read_text().replace(str(self.root / 'bin'), '/elsewhere/bin'))
+        doctor = self.run_setup('doctor', success=False)
+        self.assertIn('has a stale agent-kit PATH block', doctor.stderr)
+        refused = self.path_setup('/bin/zsh', '--apply', success=False)
+        self.assertIn(str(rc), refused.stdout + refused.stderr)
+        self.assertIn('/elsewhere/bin', rc.read_text(), 'the user\'s edit was overwritten')
+
+    def test_no_path_writes_nothing_and_removes_an_earlier_block(self) -> None:
+        plan = self.json_docs(self.path_setup('/bin/zsh', '--no-path', '--apply').stdout)[-1]
+        self.assertFalse((self.home / '.zshrc').exists())
+        self.assertFalse(self.state()['configuration']['shell_path'])
+        self.run_setup('doctor')
+        self.assertNotIn('path', plan)
+        self.path_setup('/bin/zsh', '--apply')
+        self.assertFalse((self.home / '.zshrc').exists())
+        summary = subprocess.run([sys.executable, str(SOURCE / 'bin/agent-setup'), '--source', str(SOURCE), '--root-dir',
+                                  str(self.root), '--host-root', str(self.host)], capture_output=True, text=True,
+                                 env=self.shell_env('/bin/zsh'), timeout=60).stdout
+        self.assertIn('PATH: --no-path', summary)
+        rc =self.home / '.zshrc'
+        rc.write_text('setopt autocd\n')
+        self.path_setup('/bin/zsh', '--path', '--apply')
+        self.assertIn('# BEGIN agent-kit shell', rc.read_text())
+        self.path_setup('/bin/zsh', '--no-path', '--apply')
+        self.assertEqual(rc.read_text(), 'setopt autocd\n')
+        self.assertNotIn(f'shell:{rc}', self.state()['managed'])
+
+    def test_path_block_bash_targets(self) -> None:
+        bashrc = self.home / '.bashrc'
+        bashrc.write_text('PS1="$ "\n')
+        self.path_setup('/bin/bash', '--apply')
+        self.assertIn('# BEGIN agent-kit shell', bashrc.read_text())
+        login = self.home / '.bash_profile'
+        if sys.platform == 'darwin':
+            # A macOS terminal starts a login shell, which reads ~/.bash_profile and not ~/.bashrc.
+            self.assertIn('# BEGIN agent-kit shell', login.read_text())
+            self.assertEqual(self.login_finds('bash', '-lic'), str(self.root / 'bin/agent-kit'))
+        else:
+            self.assertFalse(login.exists())
+            self.assertEqual(self.login_finds('bash', '-ic'), str(self.root / 'bin/agent-kit'))
+        self.rollback_all()
+        self.assertEqual(bashrc.read_text(), 'PS1="$ "\n')
+        self.assertFalse(login.exists(), 'rollback left the login file it created')
+
+    def test_path_block_bash_login_file_that_sources_bashrc(self) -> None:
+        profile = self.home / '.profile'
+        profile.write_text('[ -f ~/.bashrc ] && . ~/.bashrc\n')
+        self.path_setup('/bin/bash', '--apply')
+        self.assertEqual(profile.read_text(), '[ -f ~/.bashrc ] && . ~/.bashrc\n')
+        self.assertFalse((self.home / '.bash_profile').exists(), 'a new ~/.bash_profile would hide ~/.profile')
+        self.assertEqual(self.state()['configuration']['shell_rc'], [str(self.home / '.bashrc')])
+
+    def test_path_block_fish_and_shell_rc_override(self) -> None:
+        conf = self.home / '.config/fish/conf.d/agent-kit.fish'
+        self.path_setup('/usr/local/bin/fish', '--apply')
+        text = conf.read_text()
+        self.assertIn(f'contains -- {shlex.quote(str(self.root / "bin"))} $PATH; or set -gx PATH', text)
+        if shutil.which('fish'):
+            self.assertEqual(self.login_finds('fish', '-lic'), str(self.root / 'bin/agent-kit'))
+        # --shell-rc names another file: the block moves there, and the fish file the kit made goes.
+        custom = self.home / 'dotfiles/zshrc.local'
+        custom.parent.mkdir()
+        custom.write_text('# mine\n')
+        self.path_setup('/usr/local/bin/fish', '--shell-rc', str(custom), '--apply')
+        self.assertFalse(conf.exists())
+        self.assertIn('export PATH=', custom.read_text())
+        self.assertEqual(self.state()['configuration']['shell_rc'], [str(custom)])
+        self.rollback_all()
+        self.assertEqual(custom.read_text(), '# mine\n')
+        self.assertFalse(conf.exists())
+
+    def test_path_unknown_shell_and_linked_rc_are_skipped(self) -> None:
+        plan = json.loads(self.path_setup('/bin/tcsh').stdout)
+        self.assertEqual(plan['path']['files'], [])
+        self.assertTrue(any('is not zsh, bash or fish' in row['line'] for row in plan['summary']))
+        real = self.home / 'dotfiles-zshrc'
+        real.write_text('# managed elsewhere\n')
+        (self.home / '.zshrc').symlink_to(real)
+        self.path_setup('/bin/zsh', '--apply')
+        self.assertEqual(real.read_text(), '# managed elsewhere\n')
+        self.assertTrue((self.home / '.zshrc').is_symlink())
 
 
 if __name__ == '__main__':

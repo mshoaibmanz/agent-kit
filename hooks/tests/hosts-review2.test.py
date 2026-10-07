@@ -247,6 +247,9 @@ class RoundTwo(base.ReviewTests):
         hooks.parent.mkdir()
         group = {"hooks": [{"type": "command", "command": "fixture-hook"}]}
         hooks.write_text(json.dumps({"hooks": {"PreToolUse": [group]}, "user": 1}))
+        rc = self.root / ".zshrc"
+        block = "# BEGIN agent-kit shell\nexport PATH=/fixture/kit/bin:$PATH\n# END agent-kit shell"
+        rc.write_text("export EDITOR=vi\n\n" + block + "\n")
         state = self.kit / ".install-state/current.json"
         state.parent.mkdir()
         state.write_text(
@@ -259,6 +262,7 @@ class RoundTwo(base.ReviewTests):
                             "target": str(hooks),
                             "owned": {"PreToolUse": [group]},
                         },
+                        f"shell:{rc}": {"kind": "shell", "target": str(rc), "owned": block},
                     }
                 }
             )
@@ -266,6 +270,8 @@ class RoundTwo(base.ReviewTests):
         for target, before, after, denied in (
             (rule, "User header.", "Changed user header.", False),
             (rule, "Fixture rules.", "Changed kit rules.", True),
+            (rc, "EDITOR=vi", "EDITOR=nano", False),
+            (rc, "/fixture/kit/bin", "/elsewhere/bin", True),
             (hooks, '"user": 1', '"user": 2', False),
             (hooks, "fixture-hook", "removed-kit-hook", True),
         ):

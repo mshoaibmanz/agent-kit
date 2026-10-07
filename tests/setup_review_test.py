@@ -617,6 +617,7 @@ module.main()
                 "mcp",
                 "--mcp-catalog",
                 str(catalog),
+                "--no-path",  # three kit roots share one HOME: only one could own its PATH block
                 "--apply",
             )
             # The installed catalog keeps the description for the dashboard; no host file gets it.
@@ -949,6 +950,7 @@ module.main()
                 "mcp",
                 "--mcp-catalog",
                 str(catalog),
+                "--no-path",
                 "--apply",
             )
             if host == "codex":
