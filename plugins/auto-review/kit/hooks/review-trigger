@@ -5,6 +5,7 @@
 #   tally owed         -> a review agent returned findings: settled by a TALLY line in the final
 #                         message, else block once with RV_VERIFY
 #   end of our chain   -> clear the edit marker unless an agent round is still out
+#   new type errors    -> block once with them (lib/verify.py gate; the push refuses them)
 #   code edited        -> rv_decide self on the work since the last completed review: a small
 #                         delta (floor to ~40 lines) gets a self-check block, a larger one is left
 #                         to the push
@@ -57,11 +58,24 @@ fi
 rv_sweep
 { [ -n "$root" ] && rv_edited "$session_id" "$root"; } || exit 0
 
+# The type gate (lib/verify.py, its own deadline inside this hook's): errors on the lines the branch
+# added or changed, shown once per tree state; the push refuses them until they are fixed. It
+# joins the self-check block rather than replacing it, so the review still runs in this chain.
+types=''
+if ! verify_out=$(python3 "${0%/*}/lib/verify.py" gate "$root" stop 2>/dev/null) && [ -n "$verify_out" ]; then
+  types="Fix the type errors below, on lines this branch added or changed; the push refuses them (a false positive: say why, then AGENT_PUSH_NOW=\"<reason>\" git push).
+$verify_out
+"
+fi
+
 # The marker stays until a review completes: clearing it here, before sizing, let a Stop that
 # ran no review (unchanged tree, under the floor) wave the next push through. An unchanged tree
 # costs one snapshot and a silent exit.
-rv_snapshot "$root" || exit 0
-rv_decide "$session_id" self
-[ "$RV_KIND" = none ] && exit 0
+RV_KIND=none
+rv_snapshot "$root" && rv_decide "$session_id" self
+if [ "$RV_KIND" = none ]; then
+  [ -z "$types" ] || stop_block "$session_id" "$types$CLOSING"
+  exit 0
+fi
 rv_chain_open "$session_id"
-stop_block "$session_id" "$RV_TEXT $CLOSING"
+stop_block "$session_id" "$types$RV_TEXT $CLOSING"

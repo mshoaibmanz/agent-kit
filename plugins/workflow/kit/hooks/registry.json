@@ -99,8 +99,8 @@
   {
     "event": "PostToolUse",
     "matcher": "Edit|Write|MultiEdit",
-    "command": "~/.claude/hooks/python-format",
-    "description": "Lints and formats an edited Python file with ruff, in repos that adopted ruff.",
+    "command": "~/.claude/hooks/verify-edit",
+    "description": "Tells the model the lint errors an edit introduced (Python, TypeScript); formats with ruff in repos that adopted it.",
     "timeout": 15,
     "hosts": [
       "claude"
@@ -312,8 +312,8 @@
     "event": "Stop",
     "matcher": null,
     "command": "~/.claude/hooks/review-trigger",
-    "description": "Asks for the self-check review tier and the TALLY line before the turn ends.",
-    "timeout": 15,
+    "description": "Blocks once on new type errors in changed files, then asks for the self-check review tier and the TALLY line before the turn ends.",
+    "timeout": 60,
     "hosts": [
       "claude",
       "codex",

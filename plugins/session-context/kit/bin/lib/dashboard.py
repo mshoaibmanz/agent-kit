@@ -1,7 +1,8 @@
 """`agent-kit dashboard`: one self-contained, light-mode HTML page of the whole setup, generated from
 the live install. Read-only apart from the page itself: it reads the kit, the host roots, the
 overlay and the work root, and checks Keychain items for presence only. Every change it offers is a
-command to copy; the page has no server and loads nothing from the network.
+command to copy; the page loads nothing from the network. Only --watch serves it, on 127.0.0.1
+(dashboard_watch.py).
 
 Collectors live in dashboard_sections.py, dashboard_sql.py and dashboard_unmanaged.py, the renderer in
 dashboard_html.py with its template dashboard.html, and the credential masking in credentials.py."""
@@ -39,6 +40,7 @@ from dashboard_sections import (  # noqa: E402
 )
 from dashboard_sql import sql_section  # noqa: E402
 from dashboard_unmanaged import unmanaged_section  # noqa: E402
+from dashboard_watch import watch, watched  # noqa: E402
 
 Collector = Callable[[Setup, Section], None]
 ORDER: tuple[tuple[str, str, Collector], ...] = (
@@ -105,14 +107,30 @@ def cmd_dashboard(api: ModuleType, args: argparse.Namespace) -> int:
     from kit_env import work_root
 
     out = Path(args.out).expanduser() if args.out else Path(work_root()) / "dashboard/index.html"
-    text, masked = build(api, args.check_updates)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    api.atomic_write(out, text, 0o600)
-    print(
-        f"dashboard: wrote {out}" + (f" ({masked} token-shaped value(s) masked)" if masked else "")
-    )
-    if not args.no_open:
-        opener = "open" if sys.platform == "darwin" else "xdg-open"
-        if shutil.which(opener):
-            run([opener, str(out)])
+
+    def write(retrying: bool = False) -> str:
+        # A retry after a failed rebuild makes no --check-updates network calls.
+        text, masked = build(api, args.check_updates and not retrying)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        api.atomic_write(out, text, 0o600)
+        print(
+            f"dashboard: wrote {out}" + (f" ({masked} token-shaped value(s) masked)" if masked else ""),
+            flush=True,
+        )
+        return text
+
+    command = "open" if sys.platform == "darwin" else "xdg-open"
+    opener = None if args.no_open or not shutil.which(command) else lambda target: run([command, target])
+    if args.watch:
+        return watch(write, lambda: watch_paths(api), args.port, opener)
+    write()
+    if opener:
+        opener(str(out))
     return 0
+
+
+def watch_paths(api: ModuleType) -> list[Path]:
+    from kit_env import layers
+
+    setup = Setup(api, False)
+    return watched(setup.kit, layers(), {h: setup.roots[h] for h in setup.configured}, api.drift_sources())

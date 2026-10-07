@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# PostToolUse(Edit|Write|MultiEdit): a fast correctness lint of the edited file (ruff F/E9/B, the
+# repo's eslint) that tells the model only the errors this edit introduced. A repo with a ruff
+# config is also fixed and formatted with it. Never blocks; a missing tool is skipped.
+# Logic: lib/verify.py edit.
+command -v python3 >/dev/null 2>&1 || { cat >/dev/null; exit 0; }
+exec python3 "${0%/*}/lib/verify.py" edit

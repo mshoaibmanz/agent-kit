@@ -1,37 +1,5 @@
 #!/usr/bin/env bash
-# PostToolUse hook: lint+format Python files with ruff.
-# Silently no-ops for non-.py files, when ruff is missing, or when the repo has
-# NOT adopted ruff (no ruff config) — otherwise a global ruff would reformat
-# legacy files (quote style, line wrapping) on every edit, mangling the diff.
-set +e
-
-# True only if some ancestor of $1 (up to the git root) carries a ruff config.
-has_ruff_config() {
-  local d; d=$(cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
-  while [ -n "$d" ] && [ "$d" != "/" ]; do
-    if [ -f "$d/ruff.toml" ] || [ -f "$d/.ruff.toml" ]; then return 0; fi
-    [ -f "$d/pyproject.toml" ] && grep -q '^\[tool\.ruff' "$d/pyproject.toml" 2>/dev/null && return 0
-    [ -d "$d/.git" ] && return 1
-    d=$(dirname "$d")
-  done
-  return 1
-}
-
-input=$(cat)
-f=$(printf '%s' "$input" | jq -r '.tool_input.file_path // empty')
-
-case "$f" in
-  *.py) ;;
-  *) exit 0 ;;
-esac
-
-[ -f "$f" ] || exit 0
-
-ruff_bin="${CLAUDE_PROJECT_DIR:-.}/.venv/bin/ruff"
-[ -x "$ruff_bin" ] || ruff_bin=$(command -v ruff 2>/dev/null || true)
-if [ -n "$ruff_bin" ] && has_ruff_config "$f"; then
-  "$ruff_bin" check --fix "$f" >/dev/null 2>&1
-  "$ruff_bin" format "$f" >/dev/null 2>&1
-fi
-
-exit 0
+# Retired: verify-edit holds this registry slot now. A forward for sessions whose loaded settings still
+# name this path; delete it in the first release after 2026-11-01, when no running session predates
+# the rename.
+exec "${0%/*}/verify-edit"

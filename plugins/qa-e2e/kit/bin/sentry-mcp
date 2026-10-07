@@ -14,23 +14,34 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 from typing import NoReturn
 
-KIT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(KIT / "bin" / "lib"))
+# Code beside the script's target; the instances of the kit it runs from (kit_root: a dev install
+# links this file into its checkout, whose instances are not the install's).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "hooks", "lib"))
+
+from kit_env import kit_root  # noqa: E402
+
+KIT = kit_root(__file__)
 
 from sentry import (  # noqa: E402
-    HOST_OPTIONS,
+    LEGACY,
     TOKEN_ENV,
     KeychainDenied,
+    PLAIN_HOST_KEY,
     KeychainMissing,
     default_instance,
+    destination,
+    host_key,
+    host_values,
     load_instances,
     read_token,
 )
 
 PACKAGE = "@sentry/mcp-server@0.37.0"
+# The server sends its own error reports to the DSN these name; the server gets neither.
+DSN_ENV = frozenset(("SENTRY_DSN", "DEFAULT_SENTRY_DSN"))
 
 
 def die(message: str) -> NoReturn:
@@ -67,9 +78,30 @@ def main() -> None:
     if name is not None and name not in instances:
         die(f"unknown instance {name}; configured: {', '.join(instances) or 'none'} (mcp/sentry-instances.json)")
     inst = instances[name] if name is not None else default_instance(instances)
-    host_arg = any(a in HOST_OPTIONS or a.split("=", 1)[0] in HOST_OPTIONS for a in args)
-    if name is not None and host_arg:
+    # A token goes to its own instance's host only, checked before any store is read: every host
+    # value given, and where the server resolves them (destination, its default included).
+    hosts = host_values(args)
+    if name is not None and hosts:
         die(f"--instance {name} sets the host; drop --host/--url")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(TOKEN_ENV) and k not in DSN_ENV}
+    if inst is LEGACY:
+        configured = {host_key(i.host) for i in instances.values()}
+        given = (*hosts, env.get("SENTRY_URL", ""), env.get("SENTRY_HOST", ""))
+        keys = [*(host_key(h) for h in given if h), destination(args, env)]
+        taken = next((k for k in keys if k in configured), None)
+        if taken is not None:
+            die(f"{taken} is a configured instance's host; launch that instance with --instance")
+        if not all(PLAIN_HOST_KEY.fullmatch(k) for k in keys):
+            die("a --host/--url, SENTRY_URL or SENTRY_HOST value is not a plain host name")
+    else:
+        # Its own host over any inherited one; no URL, which the server would prefer.
+        inherited_url = env.pop("SENTRY_URL", "")
+        env["SENTRY_HOST"] = inst.host
+        own = host_key(inst.host)
+        given = (*hosts, inherited_url, destination(args, env))
+        other = next((host_key(h) for h in given if h and host_key(h) != own), None)
+        if other is not None:
+            die(f"instance {inst.name} is configured for {inst.host}; drop --host/--url or SENTRY_URL {other}")
     try:
         token = read_token(inst, instances.values())
     except KeychainMissing:
@@ -79,14 +111,8 @@ def main() -> None:
             f"could not read the Keychain item {inst.keychain} for instance {inst.name} (denied or locked). "
             "Check access in your trusted terminal before importing or rotating a credential."
         )
-    env = {k: v for k, v in os.environ.items() if not k.startswith(TOKEN_ENV)}
-    if inst.host and not host_arg:
-        if name is not None:
-            env["SENTRY_HOST"] = inst.host
-        else:
-            env.setdefault("SENTRY_HOST", inst.host)
     if check:
-        print(f"sentry-mcp: instance {inst.name} ok (host {env.get('SENTRY_HOST', 'from args')}, item {inst.keychain})")
+        print(f"sentry-mcp: instance {inst.name} ok (host {destination(args, env)}, item {inst.keychain})")
         return
     if shutil.which("npx") is None:
         die(f"npx is missing. Fix: {npx_hint()}")

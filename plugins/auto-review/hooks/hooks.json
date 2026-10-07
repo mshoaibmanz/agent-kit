@@ -28,7 +28,7 @@
           {
             "type": "command",
             "command": "env AGENT_KIT_DIR=\"${CLAUDE_PLUGIN_ROOT}/kit\" \"${CLAUDE_PLUGIN_ROOT}/kit/hooks/review-trigger\"",
-            "timeout": 15
+            "timeout": 60
           }
         ]
       }

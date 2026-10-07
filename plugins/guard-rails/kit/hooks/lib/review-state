@@ -88,7 +88,7 @@ _RV_SELF="yourself for NEW blocking correctness/security issues: no subagents, n
 
 rv_is_code() {
   case "$1" in
-    *.py|*.pyi|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.go|*.rs|*.java|*.kt|*.scala|*.sql|*.rb|*.php|*.cs|*.cpp|*.cc|*.c|*.h|*.hpp|*.swift|*.m|*.mm) return 0 ;;
+    *.py|*.pyi|*.ts|*.tsx|*.mts|*.cts|*.js|*.jsx|*.mjs|*.cjs|*.go|*.rs|*.java|*.kt|*.scala|*.sql|*.rb|*.php|*.cs|*.cpp|*.cc|*.c|*.h|*.hpp|*.swift|*.m|*.mm) return 0 ;;
     *) return 1 ;;
   esac
 }

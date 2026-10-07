@@ -32,7 +32,7 @@
       "worktree-hint"
     ],
     "python-hygiene": [
-      "python-format"
+      "verify-edit"
     ],
     "terminal-signals": [
       "notify-attn",

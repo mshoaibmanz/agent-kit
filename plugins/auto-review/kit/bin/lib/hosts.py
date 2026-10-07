@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
 from host import HOSTS, beside_user_layer, git_layer_env  # noqa: E402,F401  (the one host list; hooks/lib needs it standalone)
 from kit_env import kit_env, work_root  # noqa: E402
 from kit_text import RULES_FILES, default_host_root, fill, fill_servers  # noqa: E402
+import overlay  # noqa: E402
 
 EVENTS = {
     "PreToolUse": "preToolUse",
@@ -807,6 +808,15 @@ def inventory(
     ]
     if host == "codex" and set(config.get("hooks", {})) & set(EVENTS):
         errors.append("inline hooks and hooks.json are both configured")
+    record = json.loads(api.read_or_empty(api.KIT / ".install-state/current.json") or "{}")
+    installed = bool(record) and host_root_for(api.KIT, host) is not None
+    if host == "claude" and installed and (problem := overlay.claude_link_problem(root, api.KIT)):
+        errors.append(problem)
+    try:
+        overlay.read_overlay(api.KIT / "local")
+    except ValueError as error:
+        errors.append(str(error))
+    recorded = record.get("configuration", {}).get("overlay") or {}
     rules = [root / RULES_FILES[host]]
     if repo:
         if host == "codex":
@@ -870,6 +880,9 @@ def inventory(
         "duplicate_hooks": duplicate_hooks,
         "skills": skills,
         "incompatible_skills": incompatible,
+        # The personal overlay's skills (installed among skills) and the kit or pack ones they replace.
+        "overlay_skills": recorded.get("skills", []),
+        "overlay_overrides": recorded.get("overrides", {}),
         "skill_dirs": [str(path) for path in skill_dirs(host, root)],
         "rendered_files": [name for name in RENDERED_FILES[host] if (root / name).is_file()],
         "mcp_servers": sorted(mcp),

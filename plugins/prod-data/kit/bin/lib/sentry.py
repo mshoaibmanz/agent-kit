@@ -11,7 +11,8 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+from urllib.parse import unquote, urlsplit
 
 import secret_store
 from secret_store import ITEM_NOT_FOUND
@@ -30,6 +31,11 @@ INSTANCE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 # The service name is printed inside a shell command the user copies, so it stays shell-safe.
 SERVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 HOST = re.compile(r"(https?://)?[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?")
+# A host_key the legacy item may reach; anything else (an IDN, a stray character) is refused.
+PLAIN_HOST_KEY = re.compile(r"(\[[0-9a-f:.]+\]|[a-z0-9_.-]+)(:[0-9]+)?")
+DEFAULT_HOST = "sentry.io"
+DEFAULT_PORTS = {"https": 443, "http": 80}
+CONTROL_OR_SPACE = "".join(map(chr, range(0x21)))
 
 
 @dataclass
@@ -207,6 +213,41 @@ def read_token(inst: Instance, instances: Iterable[Instance]) -> str:
     if code == ITEM_NOT_FOUND:
         raise KeychainMissing(inst.keychain)
     raise KeychainDenied(inst.keychain)
+
+
+def host_key(host: str) -> str:
+    """A host or URL as the host it reaches, the way @sentry/mcp-server 0.37.0 resolves it (WHATWG
+    `new URL(v).host`): no scheme, userinfo, path or case, percent-decoded, one trailing dot and the
+    scheme's default port dropped. A value whose port does not parse keys as itself, lower-cased."""
+    text = re.sub(r"[\t\n\r]", "", host).strip(CONTROL_OR_SPACE).replace("\\", "/")
+    parts = urlsplit(text if "://" in text else f"https://{text}")
+    try:
+        port = parts.port
+    except ValueError:
+        return text.lower()
+    name = unquote(parts.hostname or "").lower()
+    name = name[:-1] if name.endswith(".") else name
+    name = f"[{name}]" if ":" in name else name
+    return name if port in (None, DEFAULT_PORTS.get(parts.scheme)) else f"{name}:{port}"
+
+
+def destination(args: list[str], env: Mapping[str, str]) -> str:
+    """The host_key of where the server sends its token: the last --url, else SENTRY_URL, else the
+    last --host, else SENTRY_HOST, else sentry.io."""
+    urls, hosts = host_values(args, ("--url",)), host_values(args, ("--host",))
+    url = urls[-1] if urls else env.get("SENTRY_URL", "")
+    host = hosts[-1] if hosts else env.get("SENTRY_HOST", "")
+    return host_key(url or host or DEFAULT_HOST)
+
+
+def host_values(args: list[str], options: Iterable[str] = HOST_OPTIONS) -> list[str]:
+    """The hosts the options (--host and --url) name in server args, in order."""
+    out = []
+    for at, arg in enumerate(args):
+        option, _, value = arg.partition("=")
+        if option in options:
+            out.append(value if "=" in arg else (args[at + 1] if at + 1 < len(args) else ""))
+    return out
 
 
 def _server_args(spec: Dict[str, Any]) -> list:

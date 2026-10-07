@@ -19,9 +19,9 @@ if sys.version_info < (3, 11):
              f'Fix: {_FIX or "install Python 3.11 or newer"}, then rerun with it.')
 
 import argparse
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -49,6 +49,9 @@ ENTRY_FIELDS = {'environment': 'env', 'servers': 'mcpServers', 'plugins': 'enabl
 # Top-level settings keys another kind owns entry by entry: the settings layer's values for them merge
 # into that kind's entries instead.
 LAYER_ELSEWHERE = {'env': 'environment', 'enabledPlugins': 'plugins', 'extraKnownMarketplaces': 'marketplaces'}
+# The numbered GIT_CONFIG_* entries and their count, which the kit's core.hooksPath entry shares with the user's.
+GIT_CONFIG_ENTRY = re.compile(r'GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)')
+MISSING = object()
 DOC_FIELDS = {**ENTRY_FIELDS, 'hooks': 'hooks', 'cursor-hooks': 'hooks'}
 SECRET_NAMES = {'auth.json', 'credentials.json', 'kit.env', 'settings.local.json', '.env'}
 TEXT_BEGIN = '<!-- BEGIN agent-kit setup -->'
@@ -64,8 +67,9 @@ from kit_env import code_dir, kit_env  # noqa: E402
 from kit_text import default_host_root, fill_servers, install_text, resume_max  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary)
-from pack import (PACK_DIR, PACK_SKILLS, McpPlan, extension_lists, installed_pack, mcp_plan,  # noqa: E402
-                  sync_pack_mcp)
+from mcp_plan import McpPlan, mcp_plan, sync_pack_mcp  # noqa: E402
+from pack import PACK_DIR, PACK_RULES, PACK_SKILLS, extension_lists, installed_pack, write_pack_file  # noqa: E402
+import overlay  # noqa: E402
 from preset import Preset, apply_preset, kit_skills, plugin_settings, source_status, validate_catalog  # noqa: E402
 from sentry import INSTANCES_FILE, expand_servers, merge_instances, read_instances  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
@@ -358,6 +362,14 @@ def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view:
     return {}
 
 
+def kit_shell(args: argparse.Namespace, root: Path, target: Path) -> dict[str, str]:
+    """The env keys the kit sets in Claude's settings.json, over the settings layer's own."""
+    return {'AI_AGENT': 'claude', 'AGENT_HOST': 'claude',
+            'KIT_ENV': str(root / 'local/setup-paths.env'), 'AGENT_KIT_DIR': str(root),
+            'CLAUDE_CONFIG_DIR': str(target),
+            'AGENT_GIT_HOOKS': 'on' if args.blocking_hooks else 'off'}
+
+
 def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, overlays: dict[str, str],
                  resume: int, preset: Preset, mcp: McpPlan) -> list[Change]:
     root = Path(args.root_dir).expanduser().absolute()
@@ -392,12 +404,8 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                 parts = shlex.split(row['command'])
                 row['command'] = shlex.join([str(root / 'hooks' / Path(parts[0]).name), *parts[1:]])
             changes.append(Change('hooks', target / 'settings.json', api.render_hooks(registry, 'claude'), 0o600))
-            shell = {'AI_AGENT': 'claude', 'AGENT_HOST': 'claude',
-                     'KIT_ENV': str(root / 'local/setup-paths.env'), 'AGENT_KIT_DIR': str(root),
-                     'CLAUDE_CONFIG_DIR': str(target),
-                     'AGENT_GIT_HOOKS': 'on' if args.blocking_hooks else 'off'}
             # The settings layer's env first; the kit's keys win over it.
-            shell = {**layer.get('env', {}), **shell}
+            shell = {**layer.get('env', {}), **kit_shell(args, root, target)}
             # The layer's GIT_CONFIG_* entry joins the user's own; taking it out keeps theirs.
             settings = target / 'settings.json'
             current = (load_json(settings, {}) or {}).get('env', {})
@@ -512,6 +520,15 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
             changes.append(Change('file', target / 'commands' / command.name, text.encode()))
     if host == 'claude' and 'hooks' in components:
         changes.append(Change('link', target / 'bin', str(root / 'bin')))
+    if host == 'claude':
+        # Claude's hooks, commands and skill texts read <config dir>/local, linked to the kit's overlay. A folder
+        # or another link there is the user's, even over setup's: kept, and both doctors report it.
+        local, problem = target / 'local', overlay.claude_link_problem(target, root)
+        kept = bool(problem) and (local.is_dir() or local.is_symlink())
+        if kept:
+            print('agent-setup: left in place: ' + problem, file=sys.stderr)
+        mine = not kept and (bool(problem) or (local.is_symlink() and os.readlink(local) == str(root / 'local')))
+        changes.append(Change('link' if mine else 'forget', local, str(root / 'local')))
     for change in changes:
         if change.kind not in ('hooks', 'cursor-hooks'):
             continue
@@ -531,9 +548,20 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
 
 
 def selected_skills(args: argparse.Namespace, preset: Preset) -> list[str]:
-    """The skills this install selects: --skills (every kit skill when unset) and the team pack's."""
+    """The skills this install selects: --skills (every kit skill when unset), the team pack's and the
+    personal overlay's (<root>/local/skills)."""
     names = args.skills if args.skills is not None else kit_skills(Path(args.source).expanduser().resolve())
-    return [*names, *(name for name in preset.pack_skills if name not in names)]
+    names = [*names, *(name for name in preset.pack_skills if name not in names)]
+    return [*names, *(name for name in overlay_skills(preset) if name not in names)]
+
+
+def overlay_skills(preset: Preset) -> list[str]:
+    return preset.overlay.skills if preset.overlay is not None else []
+
+
+def overlay_clashes(args: argparse.Namespace, preset: Preset) -> dict[str, str]:
+    return overlay.overrides(overlay_skills(preset), kit_skills(Path(args.source).expanduser().resolve()),
+                             preset.pack.skills if preset.pack is not None else [])
 
 
 def copy_source_code(source: str | Path, destination: str | Path) -> str:
@@ -551,7 +579,7 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
                       servers: dict[str, Any]) -> tuple[set[Path], McpPlan]:
     """The kit as this install selects it, in view; returns the paths in it that setup derived rather
     than copied from the source (the team pack's included), which a dev install keeps as copies, and
-    the MCP plan (pack.mcp_plan) whose servers it installs."""
+    the MCP plan (mcp_plan.mcp_plan) whose servers it installs."""
     source = Path(args.source).expanduser().resolve()
     derived = {Path('hooks/registry.json')}
     mcp = McpPlan({}, (), None)
@@ -566,9 +594,17 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
             skill = relative.startswith(PACK_SKILLS + '/')
             for path in (view / PACK_DIR / relative, *([view / relative] if skill else [])):
                 derived.add(path.relative_to(view))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-                path.chmod(0o755 if mode & 0o111 else 0o644)
+                write_pack_file(path, data, mode)
+    # The personal overlay over both: each of its skills replaces a kit or pack skill of that name
+    # whole, and its rules.md waits in view/local for the host renders (with_team_rules), which the
+    # plan never installs: local/ is the user's.
+    if preset.overlay is not None:
+        for name in preset.overlay.skills:
+            shutil.rmtree(view / 'skills' / name, ignore_errors=True)
+            for relative, (data, mode) in preset.overlay.skill_files(name).items():
+                derived.add(Path(relative))
+                write_pack_file(view / relative, data, mode)
+        write_pack_file(view / 'local' / PACK_RULES, preset.overlay.rules.encode(), 0o644)
     copy_source_code(source / 'hooks/lib/state', view / 'hooks/lib/state')
     matrix = source / '.claude-plugin/components.json'
     if matrix.is_file():
@@ -605,13 +641,15 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
     home = Path.home()
     changes = []
     selected = selected_skills(args, preset)
-    pack_skills = preset.pack.skills if preset.pack is not None else []
+    lenient = {*(preset.pack.skills if preset.pack is not None else []), *overlay_skills(preset)}
     extensions = extension_lists(view / 'skills', selected, str(root / 'skills')) if 'skills' in args.components else {}
     for path in sorted(view.rglob('*')):
         if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
             continue
         if path.is_file():
             relative = path.relative_to(view)
+            if relative.parts[0] == 'local':
+                continue
             if relative.parts[0] == 'skills':
                 selected_skill = 'skills' in args.components and relative.parts[1] in selected
                 reference_asset = relative.parts[1] == 'review-rubric' and path.name != 'SKILL.md'
@@ -628,7 +666,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.suffix == '.md':
                 filled = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
-                                      strict=relative.parts[1] not in pack_skills,
+                                      strict=relative.parts[1] not in lenient,
                                       extensions=extensions.get(relative.parts[1], [])).encode()
                 if filled != content:
                     derived.add(relative)
@@ -663,7 +701,8 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         if identity in unique and unique[identity] != change:
             raise ValueError(f'Two selected components conflict: {change.target}')
         unique[identity] = change
-    return list(unique.values()), mcp
+    # Removals first: a retired file may stand where a folder of new files goes, or the other way round.
+    return sorted(unique.values(), key=lambda change: change.kind != 'remove'), mcp
 
 
 def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change], preset: Preset) -> list[Change]:
@@ -690,10 +729,11 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
             if relative.parts[0] in ('local', 'state', '.install-state'):
                 continue
             # The source, not the view: the view leaves out an unselected component's files (mcp/servers.json).
-            retired = not (view / relative).exists() and not (source / relative).exists()
+            # It holds every skill whole (kit, pack, overlay): a skill file it lacks, or holds as a folder, goes.
+            retired = not (view / relative).is_file() and not (source / relative).is_file()
             if skills and relative.parts[0] == 'skills':
                 skill = relative.parts[1]
-                retired = retired or (skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md'))
+                retired = not (view / relative).is_file() or (skill not in selected and not (skill == 'review-rubric' and target.name != 'SKILL.md'))
         elif record['kind'] == 'file':
             # With roles selected the render owns the host's agents folder even when it writes nothing
             # there (Codex with native_agents = false), so what it wrote before is retired.
@@ -713,6 +753,19 @@ def prior_record(root: Path, target: Path, kind: str | None = None) -> dict:
                                          previous.get('managed', {}).get(str(target), {}))
 
 
+def layout_folder(target: Path, made: Callable[[Path], bool]) -> bool:
+    """Whether target is a folder holding only files made says setup wrote: an overlay skill turned a kit
+    file into a folder there (or back), and those files go first, by the plan or by rollback."""
+    return target.is_dir() and not target.is_symlink() and all(
+        made(path) for path in target.rglob('*') if path.is_symlink() or not path.is_dir())
+
+
+def retired_folder(root: Path, target: Path) -> bool:
+    """Whether target, under root, is a layout_folder of files an earlier install there recorded."""
+    return root in target.parents and layout_folder(
+        target, lambda path: file_digest(path) == prior_record(root, path, 'link' if path.is_symlink() else 'file').get('hash'))
+
+
 class Collision(ValueError):
     """A planned change where the user has their own content. Preflight lists it, --collision skip
     leaves it, and --collision backup replaces it when backup is true (the journal keeps theirs)."""
@@ -724,7 +777,10 @@ class Collision(ValueError):
 
 def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
     target = change.target
-    prior = prior_record(Path(args.root_dir).expanduser().absolute(), target, change.kind)
+    if change.kind == 'forget':  # no longer setup's: its record goes, the path stays as it is
+        return {'kind': 'forget', 'target': str(target), 'noop': True}
+    root = Path(args.root_dir).expanduser().absolute()
+    prior = prior_record(root, target, change.kind)
     record = {'kind': change.kind, 'target': str(target), 'mode': change.mode}
     present = target.exists() or target.is_symlink()
     backup = args.collision == 'backup'
@@ -737,12 +793,11 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
             record.update(hash=None, present=present, before_hash=current, noop=not present)
             return record
         if change.kind == 'file' and target.suffix == '.mdc' and not prior:
-            legacy = prior_record(Path(args.root_dir).expanduser().absolute(), target, 'text')
+            legacy = prior_record(root, target, 'text')
             if legacy and target.is_file() and not target.is_symlink():
                 if target.read_text() in (legacy.get('owned', ''), legacy.get('owned', '') + '\n') or backup:
                     prior = {'hash': digest(target.read_bytes())}
                     record['retired_identity'] = 'text:' + str(target)
-        root = Path(args.root_dir).expanduser().absolute()
         other = 'file' if change.kind == 'link' else 'link'
         if not prior and root in target.parents and (switched := prior_record(root, target, other)):
             # A kit file switching between a copy and a dev link: the earlier install's record, of
@@ -760,7 +815,8 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
         if same:
             record.update(hash=wanted_hash, present=present, before_hash=current_hash, noop=True)
             return record
-        if present and (not prior or current_hash is None or current_hash != prior.get('hash')) and not backup:
+        owned = bool(prior) and current_hash is not None and current_hash == prior.get('hash')
+        if present and not owned and not backup and not retired_folder(root, target):
             raise Collision(f'Existing user content is preserved; select --collision backup or skip, or another destination: {target}')
         record.update(hash=wanted_hash, present=present, before_hash=current_hash)
         return record
@@ -916,7 +972,7 @@ def apply_change(change: Change, record: dict, journal: Path, number: int) -> No
         atomic(target, (outside.rstrip() + '\n\n' + record['owned'] + '\n').lstrip().encode(), change.mode)
 
 
-def rollback_preflight(record: dict) -> bool:
+def rollback_preflight(record: dict, installed: Collection[str] = ()) -> bool:
     """Return true for the before-state; otherwise validate without changing any file."""
     target = Path(record['target'])
     kind = record['kind']
@@ -925,7 +981,7 @@ def rollback_preflight(record: dict) -> bool:
     if kind in ('file', 'link', 'remove'):
         current = file_digest(target)
         backup = Path(record['backup']) if record.get('backup') else None
-        if kind == 'remove' and (target.exists() or target.is_symlink()) and current != record.get('before_hash'):
+        if kind == 'remove' and current != record.get('before_hash') and not layout_folder(target, lambda path: str(path) in installed) and (target.exists() or target.is_symlink()):
             raise ValueError(f'Recreated deselected skill is preserved: {target}')
         if current == record.get('before_hash') and not (backup and (backup.exists() or backup.is_symlink())):
             return True
@@ -974,6 +1030,8 @@ def rollback_record(record: dict) -> None:
     if kind in ('file', 'link', 'remove'):
         current = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
         if current is None:
+            if layout_folder(target, made=lambda _: False):  # emptied: its files rolled back first
+                shutil.rmtree(target)
             if target.exists() or target.is_symlink():
                 raise ValueError(f'Recreated user content is preserved: {target}')
             if record.get('backup') and (Path(record['backup']).exists() or Path(record['backup']).is_symlink()):
@@ -1184,6 +1242,9 @@ def configured(args: argparse.Namespace, preset: Preset, answered: set[str], pre
         # The preset outlives this run: a later update without --preset applies the same values.
         configuration.update(preset=preset.record, preset_values=preset.saved())
     configuration['source_checkout'] = str(Path(args.source).expanduser().resolve())
+    # What the overlay's skills and rules were at this install: doctor says when they changed since.
+    configuration['overlay'] = {'digest': preset.overlay and preset.overlay.digest(), 'skills': overlay_skills(preset),
+                                'overrides': overlay_clashes(args, preset)}
     configuration['dev'] = args.dev
     configuration['confirm_hook_support'] = args.confirm_hook_support
     # Every selected host's root as installed, however it was named (--host-root, CLAUDE_CONFIG_DIR,
@@ -1223,7 +1284,7 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
             write_journal()
         managed = dict(previous.get('managed', {}))
         for change, record in planned.records:
-            if record['kind'] == 'remove':
+            if record['kind'] in ('remove', 'forget'):
                 managed.pop('file:' + record['target'], None)
                 managed.pop('link:' + record['target'], None)
             else:
@@ -1280,7 +1341,7 @@ def rollback(args: argparse.Namespace) -> int:
     records = journal['records']
     for number, record in enumerate(records):
         if number not in progress['completed']:
-            rollback_preflight(record)
+            rollback_preflight(record, {other['target'] for other in records})
     for number in reversed(range(len(records))):
         if number in progress['completed']:
             continue
@@ -1325,6 +1386,29 @@ def managed_drift(records: Iterable[dict[str, Any]]) -> list[str]:
     return drift
 
 
+def overlay_report(root: Path, state: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The overlay as doctor reports it (its skills and the kit or pack skills they override, as setup
+    installed them, and its rules size) and its problems: it changed since setup or no longer reads, or
+    Claude's <config dir>/local is not the link to it."""
+    configuration = state.get('configuration', {})
+    recorded = configuration.get('overlay') or {}
+    report = {'folder': str(root / 'local'), 'skills': recorded.get('skills', []), 'overrides': recorded.get('overrides', {})}
+    problems = []
+    try:
+        personal = overlay.read_overlay(root / 'local')
+    except ValueError as error:
+        problems.append(str(error))
+    else:
+        report['rules_words'] = len(personal.rules.split()) if personal else 0
+        if 'digest' in recorded and recorded['digest'] != (personal and personal.digest()):
+            problems.append(f'the overlay\'s skills or rules.md under {root / "local"} changed since setup: '
+                            'run agent-kit sync to install them')
+    claude = configuration.get('host_roots', {}).get('claude') or default_host_root('claude')
+    if 'claude' in configuration.get('hosts', []) and (problem := overlay.claude_link_problem(Path(claude), root)):
+        problems.append(problem)
+    return report, problems
+
+
 def doctor(args: argparse.Namespace) -> int:
     root = Path(args.root_dir).expanduser().absolute()
     state = load_json(root / '.install-state/current.json', {})
@@ -1340,6 +1424,8 @@ def doctor(args: argparse.Namespace) -> int:
                         '--collision skip to keep your edits, or --collision backup to replace them (the install '
                         'journal keeps your version)')
     configuration = state.get('configuration', {})
+    personal, found = overlay_report(root, state)
+    problems.extend(found)
     dev = None
     if configuration.get('dev'):
         source = Path(configuration.get('source_checkout', ''))
@@ -1351,6 +1437,8 @@ def doctor(args: argparse.Namespace) -> int:
         problems.extend(broken)
         if not broken and (pending := sync_pending(root, state)):
             problems.append(pending)
+    elif state and (layer := settings_layer_problem(args, root, state)):
+        problems.append(layer)
     preset = configuration.get('preset')
     if preset:
         preset['source_status'] = source_status(preset)
@@ -1359,10 +1447,68 @@ def doctor(args: argparse.Namespace) -> int:
         logged, how = host_login(host, getattr(args, host + '_bin'), host_target(args, host, Path.home()))
         logins[host] = {'logged_in': logged, 'checked': how}
     output({'wrappers': [str(root / 'bin' / name) for name in ('ro-mysql', 'bqro') if (root / 'bin' / name).is_file()], 'installed': bool(state), 'root': str(root), 'drift': drift,
-            'problems': problems, 'preset': preset, 'dev': dev, 'dependencies': deps, 'native_auth': logins})
+            'problems': problems, 'preset': preset, 'overlay': personal, 'dev': dev, 'dependencies': deps,
+            'native_auth': logins})
     for problem in problems:
         print('agent-setup doctor: ' + problem, file=sys.stderr)
     return 1 if problems else 0
+
+
+def settings_layer_problem(args: argparse.Namespace, root: Path, state: dict[str, Any]) -> str | None:
+    """A copy install's doctor: the installed kit's settings layer, refused or not yet what setup last
+    applied to Claude's settings.json. A dev install's sync preview covers the same."""
+    components = set(args.components) | ({'roles'} if args.blocking_hooks else set())
+    if 'claude' not in args.hosts or 'hooks' not in components:
+        return None
+    try:
+        api = kit_api(root)
+        layer = api.base_settings(root, ui_owned=api.host_paths()['uiOwned'], roles='roles' in components)
+    except (OSError, SyntaxError, SystemExit, ValueError) as error:
+        return f'the settings layer cannot be read: {" ".join(str(error).split())}'
+    target = host_target(args, 'claude', Path.home())
+    managed = state.get('managed', {})
+
+    def owned(kind: str) -> dict[str, Any]:
+        return managed.get(f'{kind}:{target / "settings.json"}', {}).get('owned', {})
+
+    def differ(prefix: str, want: dict[str, Any], have: dict[str, Any]) -> list[str]:
+        """Each entry added, changed or removed between the layer and the install record."""
+        return [prefix + key for key in sorted(set(want) | set(have))
+                if key not in want or key not in have or want[key] != have[key]]
+
+    # As host_changes builds them: the kit's own env keys are not the layer's, nor is any numbered
+    # GIT_CONFIG_* entry or its count (git_layer_env lays the kit's hooks entry and its no-ops among the
+    # user's, so the two cannot be told apart by name); a GIT_CONFIG_* key of the user's otherwise is
+    # compared. A preset's plugins and marketplaces win over the layer's.
+    kit_keys = set(kit_shell(args, root, target))
+
+    def layer_env(env: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in env.items() if key not in kit_keys and not GIT_CONFIG_ENTRY.fullmatch(key)}
+
+    enabled, markets = plugin_settings(state.get('configuration', {}).get('preset_values', {}).get('plugins', {}))
+    kinds = (('', 'settings', {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}),
+             ('env.', 'environment', layer_env(layer.get('env', {}))),
+             ('enabledPlugins.', 'plugins', {**layer.get('enabledPlugins', {}), **enabled}),
+             ('extraKnownMarketplaces.', 'marketplaces', {**layer.get('extraKnownMarketplaces', {}), **markets}))
+    live = load_json(target / 'settings.json', {}) or {}
+    stale, blocked = [], []
+    for prefix, kind, want in kinds:
+        have = layer_env(owned(kind)) if kind == 'environment' else owned(kind)
+        current = doc_field(live, ENTRY_FIELDS[kind]) if isinstance(live, dict) else {}
+        current = current if isinstance(current, dict) else {}
+        for key in differ('', want, have):
+            stale.append(prefix + key)
+            # As prepare_change decides: the user's own value there, neither applied nor wanted, is a
+            # collision that --apply refuses and --collision skip leaves in place.
+            if key in current and current[key] != have.get(key, MISSING) and current[key] != want.get(key, MISSING):
+                blocked.append(prefix + key)
+    if not stale:
+        return None
+    message = f'the settings layer differs from what setup applied to {target / "settings.json"} ({", ".join(stale)})'
+    if blocked:
+        return (f'{message}: your own value of {", ".join(blocked)} there blocks it; rerun agent-setup --apply '
+                '--collision backup to replace it (the install journal keeps yours), or drop the key from the layer')
+    return f'{message}: rerun agent-setup --apply'
 
 
 def sync_pending(root: Path, state: dict[str, Any]) -> str | None:
@@ -1600,6 +1746,10 @@ def resolve(args: argparse.Namespace, root: Path, state: dict[str, Any], saved: 
     else:
         args.confirm_hook_support = sorted(set(args.confirm_hook_support) - {'none'})
     notes = [Row(*note) for note in preset.notes]
+    if plans_install and (personal := overlay.read_overlay(root.absolute() / 'local')) is not None:
+        preset = replace(preset, overlay=personal)
+        notes.append(Row('Ready', overlay.summary(personal, root.absolute() / 'local')))
+        notes.extend(Row('Ready', line) for line in overlay.override_lines(overlay_clashes(args, preset)))
     if args.dev and plans_install:
         notes.append(Row('Ready', f'dev install: kit files link into {Path(args.source).expanduser().resolve()}, '
                                   'so an edit there is live; agent-kit sync re-renders the hosts'))

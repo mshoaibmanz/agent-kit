@@ -41,7 +41,7 @@ else is noise the next reader skims past.
 - Logging via `logging` or `structlog` — never `print()`.
 - Imports: stdlib → third-party → local; no wildcards.
 - Formatter `ruff format` (line length 100); linter `ruff check --fix`. On Claude Code the
-  `python-format` hook runs both after every edit, so there treat this as the standard to write
+  `verify-edit` hook runs both after every edit, so there treat this as the standard to write
   to. Other hosts have no such hook: run `ruff format <file>` and `ruff check --fix <file>`
   yourself after editing Python.
 - Avoid N+1 — bulk-query, loop in code.
