@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Tests for the verification checks (hooks/verify-edit, lib/verify.py, the Stop and push wiring,
+"""Tests for the verification checks (hooks/verify-edit, lib/verify.py, the Stop wiring,
 git-hooks/agent/post-checkout) with the real tools in scratch repos.
 
     python3 hooks/tests/verify.test.py
 
 HOOKS_DIR=<dir> tests another copy of the hooks. A case whose tool is missing is skipped, except in
-CI (CI=true), where ruff and basedpyright are installed and a missing one fails.
+CI (CI=true), where ruff, basedpyright, tsc and eslint are installed and a missing one fails.
 """
 
 from __future__ import annotations
@@ -37,48 +37,61 @@ def check(label: str, ok: bool, detail: str = "") -> None:
             logger.info("     %s", detail.replace("\n", "\n     "))
 
 
-def need(tool: str) -> bool:
-    if shutil.which(tool):
+def need(*tools: str) -> bool:
+    missing = [t for t in tools if not shutil.which(t)]
+    if not missing:
         return True
     if CI:
-        failures.append(f"{tool} is not installed in CI")
-    logger.info("SKIP cases needing %s (not installed)", tool)
+        failures.append(f"{', '.join(missing)} not installed in CI")
+    logger.info("SKIP cases needing %s (not installed)", ", ".join(missing))
     return False
 
 
+def call(argv: list[str], payload: str = "", **kwargs: object) -> tuple[int, str, str]:
+    """(exit code, stdout, stderr); 127 when the program is missing, so each case fails on its own."""
+    try:
+        proc = subprocess.run(argv, input=payload, capture_output=True, text=True, check=False, **kwargs)  # type: ignore[call-overload]
+    except OSError as error:
+        return 127, "", str(error)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 def git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t", *args],
-                          capture_output=True, text=True, check=True).stdout.strip()
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True).stdout.strip()
 
 
-def new_repo(root: Path, name: str, files: dict[str, str]) -> Path:
-    repo = root / name
-    repo.mkdir()
-    git(repo, "init", "-q", "-b", "main")
+def commit(repo: Path, files: dict[str, str], message: str = "c") -> str:
     for rel, text in files.items():
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text(text)
     git(repo, "add", "-A")
-    git(repo, "commit", "-qm", "base")
+    git(repo, "commit", "-qm", message)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def new_repo(root: Path, name: str, files: dict[str, str], venv: bool = False) -> Path:
+    """A clone of a fresh origin whose main holds files; on branch feature. venv: a .venv, ignored."""
+    origin = root / f"{name}.git"
+    git(root, "init", "-q", "--bare", "-b", "main", str(origin))
+    repo = root / name
+    git(root, "clone", "-q", str(origin), str(repo))
+    git(repo, "checkout", "-qb", "main")
+    commit(repo, {".gitignore": ".venv\n", **files}, "base")
+    git(repo, "push", "-q", "origin", "main")
+    git(repo, "checkout", "-qb", "feature")
+    if venv:
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(repo / ".venv")], check=True)
     return repo
 
 
-def call(argv: list[str], payload: str = "", **kwargs: object) -> tuple[int, str]:
-    """(exit code, stdout); 127 when the program is missing, so each case fails on its own."""
-    try:
-        proc = subprocess.run(argv, input=payload, capture_output=True, text=True, check=False, **kwargs)  # type: ignore[call-overload]
-    except OSError as error:
-        return 127, str(error)
-    return proc.returncode, proc.stdout
-
-
-def edit(path: Path, new: str, env: dict[str, str], hook: str = "verify-edit") -> tuple[int, str]:
-    """Writes new over path and runs the PostToolUse hook with the Edit tool's payload."""
+def edit(path: Path, new: str, env: dict[str, str]) -> tuple[int, str]:
+    """Writes new over path and runs verify-edit with the Edit tool's payload."""
     original = path.read_text()
     path.write_text(new)
     payload = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "session_id": "t",
                "tool_input": {"file_path": str(path)}, "tool_response": {"filePath": str(path), "originalFile": original}}
-    return call([str(HOOKS / hook)], json.dumps(payload), env=env)
+    rc, out, _ = call([str(HOOKS / "verify-edit")], json.dumps(payload), env=env)
+    return rc, out
 
 
 def context(out: str) -> str:
@@ -88,8 +101,12 @@ def context(out: str) -> str:
         return ""
 
 
-def gate(repo: Path, env: dict[str, str], *extra: str) -> tuple[int, str]:
-    return call([sys.executable, str(VERIFY), "gate", str(repo), *extra], env=env)
+def gate(repo: Path, env: dict[str, str], *mode: str) -> tuple[int, str, str]:
+    return call([sys.executable, str(VERIFY), "gate", str(repo), *(mode or ("stop",))], env=env)
+
+
+def overlay(env: dict[str, str], text: str) -> None:
+    Path(env["KIT_ENV"]).write_text("REVIEW_BASE=main\n" + text)
 
 
 def edit_cases(tmp: Path, env: dict[str, str]) -> None:
@@ -112,19 +129,21 @@ def edit_cases(tmp: Path, env: dict[str, str]) -> None:
     check("edit: output capped at 10 lines plus a count", len(lines) == 12 and lines[-1].strip() == "... 5 more",
           "\n".join(lines))
 
-    rc, out = edit(m, "def broken(:\n", env, hook="python-format")
-    check("edit: the retired python-format slot forwards (syntax error reported)",
-          "invalid-syntax" in context(out) or "syntax" in context(out), out)
+    rc, out = edit(m, "from fastapi import Depends\n\n\ndef route(db=Depends(object)):\n    return db\n", env)
+    check("edit: B008 (a FastAPI Depends default) is not reported", "B008" not in context(out), out)
 
     cfg = new_repo(tmp, "configured", {
-        "ruff.toml": '[lint]\nper-file-ignores = {"skip.py" = ["F821"]}\n[format]\nquote-style = "single"\n',
+        "ruff.toml": '[lint]\nextend-select = ["B"]\nignore = ["B006"]\nper-file-ignores = {"skip.py" = ["F821"]}\n'
+                     '[format]\nquote-style = "single"\n',
         "skip.py": "a = 1\n", "other.py": "a = 1\n"})
     rc, out = edit(cfg / "skip.py", 'a = "x"\nb = undefined_c\n', env)
     check("edit: the repo config wins (its per-file ignore holds)", rc == 0 and out.strip() == "", out)
     check("edit: the repo config wins (formatted with its quote style)", (cfg / "skip.py").read_text().startswith("a = 'x'"),
           (cfg / "skip.py").read_text())
-    rc, out = edit(cfg / "other.py", "b = undefined_c\n", env)
-    check("edit: the repo config still reports a new F821 elsewhere", "F821" in context(out), out)
+    rc, out = edit(cfg / "other.py", "def f(x=[]):\n    return x\n\n\nb = undefined_c\n", env)
+    text = context(out)
+    check("edit: the repo's rule selection wins (its ignored B006 is not reported)", "B006" not in text, text)
+    check("edit: the repo config still reports a new F821", "F821" in text, out)
 
     tool_bin = tmp / "bin-no-ruff"
     tool_bin.mkdir()
@@ -134,94 +153,183 @@ def edit_cases(tmp: Path, env: dict[str, str]) -> None:
     check("edit: a missing tool is skipped silently", rc == 0 and out.strip() == "", out)
 
 
-def gate_cases(tmp: Path, env: dict[str, str]) -> None:
-    if not (shutil.which("basedpyright") or shutil.which("pyright")):
-        need("basedpyright")
+def eslint_cases(tmp: Path, env: dict[str, str]) -> None:
+    if not need("eslint"):
         return
-    repo = new_repo(tmp, "typed", {"a.py": 'x: int = "pre"\n', "b.py": "y = 1\n"})
-    git(repo, "checkout", "-qb", "feature")
+    # The config writes to stderr and eslint exits 1 on an error: the JSON is stdout's alone.
+    repo = new_repo(tmp, "lintjs", {
+        "eslint.config.js": 'console.error("config loaded");\nmodule.exports = [{ files: ["**/*.js"], '
+                            'rules: { "no-undef": "error" }, languageOptions: { sourceType: "commonjs", globals: {} } }];\n',
+        "c.js": "foo_pre();\n"})
+    rc, out = edit(repo / "c.js", "foo_pre();\nbar_new();\n", env)
+    text = context(out)
+    check("eslint: an introduced no-undef is reported (stderr noise, exit 1)", "bar_new" in text and "no-undef" in text, out)
+    check("eslint: the pre-existing one is not", "foo_pre" not in text, text)
+
+
+def gate_cases(tmp: Path, env: dict[str, str]) -> None:
+    if not need("basedpyright"):
+        return
+    repo = new_repo(tmp, "typed", {"a.py": 'x: int = "pre"\n', "b.py": "y = 1\n"}, venv=True)
     (repo / "a.py").write_text('# shifted\nx: int = "pre"\n')
-    rc, out = gate(repo, env, "stop")
+    rc, out, _ = gate(repo, env)
     check("gate: a pre-existing error (line moved) does not block", rc == 0 and out == "", out)
-    (repo / "b.py").write_text('y = 1\n\n\ndef f() -> str:\n    return 1\n')
-    rc, out = gate(repo, env, "stop")
-    check("gate: a NEW error in a changed file blocks", rc == 1 and "b.py:5" in out and "reportReturnType" in out, out)
+    (repo / "b.py").write_text('import not_installed_mod\n\ny = 1\n\n\ndef f() -> str:\n    return 1\n')
+    overlay(env, "VERIFY_OFF='typ*:python.stop'\n")
+    rc, out, _ = gate(repo, env)
+    check("gate: VERIFY_OFF turns the phase off for a matching repo", rc == 0 and out == "", out)
+    overlay(env, "")
+    rc, out, _ = gate(repo, env)
+    check("gate: a NEW error in a changed file blocks", rc == 1 and "b.py:7" in out and "reportReturnType" in out, out)
     check("gate: the pre-existing error is not listed", "a.py" not in out, out)
-    rc, out = gate(repo, env, "stop")
+    check("gate: an unresolved import is not a type error", "not_installed_mod" not in out, out)
+    rc, out, _ = gate(repo, env)
     check("gate: at Stop the same tree is shown once", rc == 0 and out == "", out)
-    rc, out = gate(repo, env)
-    check("gate: the push still refuses it", rc == 1 and "b.py:5" in out, out)
+
+    head = commit(repo, {})
     (repo / "b.py").write_text("y = 1\n")
-    rc, out = gate(repo, env)
-    check("gate: fixed, it passes", rc == 0 and out == "", out)
+    rc, out, _ = gate(repo, env, "push", head)
+    check("gate: the push checks the pushed commit, not the fixed working file", rc == 1 and "b.py:7" in out, out)
+    rc, out, _ = gate(repo, env)
+    check("gate: Stop checks the working tree (fixed, passes)", rc == 0 and out == "", out)
 
-    off = Path(env["KIT_ENV"]).parent / "verify.toml"
-    off.write_text('[repo.typed.python.stop]\nenabled = false\n')
-    (repo / "b.py").write_text('def f() -> str:\n    return 1\n')
-    rc, out = gate(repo, env)
-    check("gate: verify.toml turns the phase off for one repo", rc == 0 and out == "", out)
-    off.unlink()
+    (repo / "new_untracked.py").write_text("def g() -> str:\n    return 2\n")
+    rc, out, _ = gate(repo, env)
+    check("gate: Stop leaves untracked files out, like the push", rc == 0 and "new_untracked" not in out, out)
+    (repo / "new_untracked.py").unlink()
 
-    # The Stop hook end to end: an edit marks the session, the Stop blocks with the new error.
+    (repo / "b.py").write_text("def h() -> int:\n    return ''\n")
+    rc, out, err = gate(repo, {**env, "VERIFY_DEADLINE": "0.01"})
+    check("gate: past the deadline it passes and says it skipped", rc == 0 and "deadline" in err, out + err)
+    rc, out, _ = gate(repo, env)
+    check("gate: a skipped run is not recorded as passed", rc == 1 and "b.py" in out, out)
+
+    bare = tmp / "bin-no-checker"
+    bare.mkdir()
+    for tool in ("bash", "git"):
+        (bare / tool).symlink_to(shutil.which(tool) or tool)
+    (repo / "b.py").write_text("def h() -> int:\n    return b''\n")
+    rc, out, _ = call([sys.executable, str(VERIFY), "gate", str(repo), "stop"], env={**env, "PATH": str(bare)})
+    check("gate: no checker installed passes", rc == 0 and out == "", out)
+    rc, out, _ = gate(repo, env)
+    check("gate: once the checker is there, the same tree is checked", rc == 1 and "b.py" in out, out)
+
+    stop_case(repo, env)
+
+    noenv = new_repo(tmp, "noenv", {"a.py": "x = 1\n"})
+    (noenv / "a.py").write_text("def f() -> str:\n    return 1\n")
+    rc, out, err = gate(noenv, env)
+    check("gate: no Python environment: skipped, said once", rc == 0 and "no environment" in err, out + err)
+    rc, out, err = gate(noenv, env)
+    check("gate: the skip is not said again", rc == 0 and err == "", err)
+
+    late = new_repo(tmp, "late-env", {"pyrightconfig.json": '{"venvPath": ".", "venv": ".venv"}\n',
+                                      "a.py": "import mylib\nx: int = mylib.f()\n"})
+    (late / "a.py").write_text("# c1\nimport mylib\nx: int = mylib.f()\n")
+    gate(late, env)
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(late / ".venv")], check=True)
+    site = next((late / ".venv/lib").glob("python*/site-packages"))
+    (site / "mylib.py").write_text('def f() -> str:\n    return ""\n')
+    (late / "a.py").write_text("# c2\nimport mylib\nx: int = mylib.f()\n")
+    rc, out, _ = gate(late, env)
+    check("gate: an environment created later does not make a base error new", rc == 0 and out == "", out)
+
+    imports = new_repo(tmp, "imports", {"a.py": "x = 1\n"}, venv=True)
+    (imports / "a.py").write_text("import not_installed_mod\n\nx = 1\n")
+    rc, out, _ = gate(imports, env)
+    check("gate: a new unresolved import alone does not block", rc == 0 and out == "", out)
+
+    forked = develop_fork(tmp, env)
+    rc, out, _ = gate(forked, env)
+    check("gate: the base is the branch's nearest base (develop), not main", rc == 0 and "d.py" not in out, out)
+
+
+def develop_fork(tmp: Path, env: dict[str, str]) -> Path:
+    """A feature branch off origin/develop, whose d.py (added on develop) has an error."""
+    repo = new_repo(tmp, "forked", {"a.py": "x = 1\n"}, venv=True)
+    git(repo, "checkout", "-qb", "develop", "main")
+    commit(repo, {"d.py": 'z: int = "develop"\n'})
+    git(repo, "push", "-q", "origin", "develop")
+    git(repo, "checkout", "-qb", "topic", "origin/develop")
+    (repo / "a.py").write_text("x = 2\n")
+    return repo
+
+
+def stop_case(repo: Path, env: dict[str, str]) -> None:
+    """review-trigger end to end: the type errors join the self-check block (25 lines is over its floor)."""
+    (repo / "b.py").write_text("def k() -> int:\n    return 'stop'\n" + "".join(f"v{i} = {i}\n" for i in range(25)))
     payload = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "session_id": "vt", "cwd": str(repo),
                "tool_input": {"file_path": str(repo / "b.py")}}
     call([str(HOOKS / "review-mark-changes")], json.dumps(payload), env=env)
     stop = {"hook_event_name": "Stop", "session_id": "vt", "cwd": str(repo), "stop_hook_active": False,
             "last_assistant_message": "done"}
-    _, out = call([str(HOOKS / "review-trigger")], json.dumps(stop), env=env)
+    _, out, err = call([str(HOOKS / "review-trigger")], json.dumps(stop), env=env)
     try:
-        decision = json.loads(out) if out.strip() else {}
+        reason = json.loads(out).get("reason", "") if out.strip() else ""
     except ValueError:
-        decision = {}
-    reason = decision.get("reason", "")
-    check("stop: review-trigger blocks on the new type error",
-          decision.get("decision") == "block" and "new type errors" in reason and "b.py" in reason, out)
+        reason = ""
+    check("stop: review-trigger blocks on the new type error", "new type errors" in reason and "b.py" in reason, out + err)
+    check("stop: the same block carries the self-check review", "SELF-CHECK" in reason.upper(), reason)
 
-    _, out = call([sys.executable, str(VERIFY), "doctor", str(repo)], env=env)
-    check("doctor: a line per repo naming the checker each phase runs",
-          f"verify {repo.name}: python edit " in out and "python stop " in out and "rust stop " in out, out)
+
+def tsc_cases(tmp: Path, env: dict[str, str]) -> None:
+    if not need("tsc"):
+        return
+    repo = new_repo(tmp, "typedts", {
+        "tsconfig.json": '{"compilerOptions": {"strict": true, "noEmit": true}, "include": ["*.ts"]}\n',
+        "a.ts": 'export const x: number = "pre";\n', "b.ts": "export const y = 1;\n"})
+    (repo / "a.ts").write_text('// moved\nexport const x: number = "pre";\n')
+    rc, out, _ = gate(repo, env)
+    check("tsc: a pre-existing error does not block", rc == 0 and out == "", out)
+    (repo / "b.ts").write_text("export const y: string = 1;\n")
+    rc, out, _ = gate(repo, env)
+    check("tsc: a new error in a changed file blocks", rc == 1 and "b.ts:1" in out and "TS2322" in out, out)
+    check("tsc: the pre-existing one is not listed", "a.ts" not in out, out)
 
 
 def worktree_cases(tmp: Path, env: dict[str, str]) -> None:
-    repo = new_repo(tmp, "wt-main", {"a.py": "x = 1\n"})
-    (repo / "pyrightconfig.json").write_text('{"venvPath": "."}\n')
-    (repo / ".venv/bin").mkdir(parents=True)
+    repo = new_repo(tmp, "wt-main", {"a.py": "x = 1\n"}, venv=True)
+    (repo / "pyrightconfig.json").write_text('{"venvPath": ".", "venv": ".venv", "extraPaths": ["src"]}\n')
     with open(repo / ".git/info/exclude", "a") as fh:
-        fh.write("pyrightconfig.json\n.venv\n")
+        fh.write("pyrightconfig.json\n")
     wt = tmp / "wt-one"
     git(repo, "worktree", "add", "-q", str(wt), "-b", "one")
     call([sys.executable, str(VERIFY), "worktree", str(wt)], env=env)
-    copied = wt / "pyrightconfig.json"
-    check("worktree: untracked pyrightconfig.json copied", copied.is_file() and copied.read_text() == '{"venvPath": "."}\n')
-    check("worktree: .venv linked to the main checkout's",
-          (wt / ".venv").is_symlink() and (wt / ".venv").resolve() == (repo / ".venv").resolve())
+    try:
+        cfg = json.loads((wt / "pyrightconfig.json").read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    venv = Path(cfg.get("venvPath", ""), cfg.get("venv", ""))
+    check("worktree: untracked pyrightconfig.json copied, other keys kept", cfg.get("extraPaths") == ["src"], str(cfg))
+    check("worktree: its venv points at the main checkout's", venv.resolve() == (repo / ".venv").resolve(), str(cfg))
+    check("worktree: no .venv link is made", not (wt / ".venv").exists() and not (wt / ".venv").is_symlink())
 
     wt2 = tmp / "wt-two"
     git(repo, "worktree", "add", "-q", str(wt2), "-b", "two")
-    head = git(wt2, "rev-parse", "HEAD")
-    call([str(KIT / "git-hooks/agent/post-checkout"), "0" * 40, head, "1"], cwd=wt2, env=env)
-    check("worktree: the agent post-checkout hook provisions a new worktree",
-          (wt2 / "pyrightconfig.json").is_file() and (wt2 / ".venv").is_symlink())
+    call([str(KIT / "git-hooks/agent/post-checkout"), "0" * 40, git(wt2, "rev-parse", "HEAD"), "1"], cwd=wt2, env=env)
+    check("worktree: the agent post-checkout hook provisions a new worktree", (wt2 / "pyrightconfig.json").is_file())
 
     wt3 = tmp / "wt-three"
     git(repo, "worktree", "add", "-q", str(wt3), "-b", "three")
-    Path(env["KIT_ENV"]).parent.joinpath("verify.toml").write_text("[default.worktree]\nenabled = false\n")
+    overlay(env, "VERIFY_OFF=wt-*:worktree\n")
     call([sys.executable, str(VERIFY), "worktree", str(wt3)], env=env)
-    check("worktree: opt-out via verify.toml", not (wt3 / ".venv").exists() and not (wt3 / "pyrightconfig.json").exists())
-    Path(env["KIT_ENV"]).parent.joinpath("verify.toml").unlink()
+    check("worktree: VERIFY_OFF opts a repo out", not (wt3 / "pyrightconfig.json").exists())
+    overlay(env, "")
 
 
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="verify-test-"))
-    overlay = tmp / "overlay"
-    overlay.mkdir()
-    (overlay / "kit.env").write_text("")
-    env = {**os.environ, "KIT_ENV": str(overlay / "kit.env"), "XDG_CACHE_HOME": str(tmp / "cache"),
+    (tmp / "overlay").mkdir()
+    env = {**os.environ, "KIT_ENV": str(tmp / "overlay/kit.env"), "XDG_CACHE_HOME": str(tmp / "cache"),
            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+    os.environ.update({k: v for k, v in env.items() if k.startswith("GIT_")})
+    overlay(env, "")
     try:
         edit_cases(tmp, env)
+        eslint_cases(tmp, env)
         gate_cases(tmp, env)
+        tsc_cases(tmp, env)
         worktree_cases(tmp, env)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

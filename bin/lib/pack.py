@@ -39,8 +39,6 @@ SECRET_FILE = re.compile(
     r'|\.netrc|\.npmrc|\.pypirc|\.pgpass|secrets\.ya?ml|credentials\.json|auth\.json|kit\.env|settings\.local\.json')
 SECRET_FILE_EXAMPLE = re.compile(r'\.env\.(?:example|sample|template)')
 PACK_TOML = 'agent-kit-preset.toml'
-# The team's verification defaults (README "Verification"), read from the kept copy by hooks/lib/verify.py.
-PACK_VERIFY = 'verify.toml'
 PACK_RULES = 'rules.md'
 PACK_SKILLS = 'skills'
 PACK_RULES_WORDS = 300
@@ -81,7 +79,7 @@ def holds_token(text: str) -> bool:
 
 
 def in_pack(path: str) -> bool:
-    return (path in (PACK_RULES, PACK_TOML, PACK_VERIFY, PACK_SKILLS, PACK_MCP) or path.startswith((PACK_SKILLS + '/', PACK_MCP + '/'))
+    return (path in (PACK_RULES, PACK_TOML, PACK_SKILLS, PACK_MCP) or path.startswith((PACK_SKILLS + '/', PACK_MCP + '/'))
             ) and not any(NOT_PACK.fullmatch(part) for part in path.split('/'))
 
 
@@ -157,8 +155,7 @@ def gh_entries(repo: str, commit: str, root: str, spec: str) -> Iterator[Entry]:
 
 
 def folder_entries(folder: Path) -> Iterator[Entry]:
-    """The pack in a local folder: its skills/, mcp/, rules.md, verify.toml and agent-kit-preset.toml,
-    nothing else of it."""
+    """The pack in a local folder: its skills/, mcp/, rules.md and agent-kit-preset.toml, nothing else of it."""
     def entry(path: Path) -> Entry | None:
         relative = path.relative_to(folder).as_posix()
         if path.is_symlink():
@@ -167,7 +164,7 @@ def folder_entries(folder: Path) -> Iterator[Entry]:
             return Entry(relative, 'file', path.read_bytes(), normal_mode(path.stat().st_mode))
         return None if path.is_dir() else Entry(relative, 'other', b'', 0)
 
-    for name in (PACK_RULES, PACK_TOML, PACK_VERIFY, PACK_SKILLS, PACK_MCP):
+    for name in (PACK_RULES, PACK_TOML, PACK_SKILLS, PACK_MCP):
         if os.path.lexists(folder / name) and (found := entry(folder / name)):
             yield found
     for tree in (folder / PACK_SKILLS, folder / PACK_MCP):

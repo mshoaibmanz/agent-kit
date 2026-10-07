@@ -6,8 +6,8 @@
 # ranges, `gh api`. Measured 2026-08-13..09-11: 205 such refusals across 30 sessions, each a
 # wasted turn. The refusal text arrives only after the first failure; this note arrives first.
 #
-# It also gives the new worktree the main checkout's untracked pyrightconfig.json and .venv
-# (lib/verify.py worktree), so type checking resolves imports there; verify.toml can turn that off.
+# It also gives the new worktree the main checkout's untracked pyrightconfig.json, pinned to the
+# main checkout's environment (lib/verify.py worktree), so type checking resolves imports there.
 command -v jq >/dev/null 2>&1 || exit 0
 wt=$(jq -r '.tool_response.worktreePath // empty' 2>/dev/null)
 [ -z "$wt" ] || python3 "${0%/*}/lib/verify.py" worktree "$wt" >/dev/null 2>&1

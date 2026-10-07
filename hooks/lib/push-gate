@@ -130,10 +130,10 @@ Otherwise hold until the review cycle ends, keep follow-ups uncommitted, then co
     # After the review gate: a tested-but-unreviewed push is the case that produces the sprawl.
     tr_ran "$sid" "$top" || pg_refuse "no local test run is recorded for this session or worktree. $(host_noun rules): run a representative local test subset before pushing. If test infra is down: AGENT_PUSH_NOW=\"untested: <why>\" git push ..., then watch CI to a verdict in this session."
 
-    # The type gate: errors the branch introduced in its changed files (verify.py; cached per tree,
-    # so a push right after the Stop that ran it costs nothing). A checker that cannot run passes.
+    # The type gate on the commit being pushed, not the working files (verify.py; a push of the tree
+    # a Stop just checked reuses its result). A checker that cannot run passes and says so on stderr.
     local verify_out
-    if ! verify_out=$(python3 "${BASH_SOURCE[0]%/*}/verify.py" gate "$top" 2>/dev/null) && [ -n "$verify_out" ]; then
+    if ! verify_out=$(python3 "${BASH_SOURCE[0]%/*}/verify.py" gate "$top" push "${plsha:-HEAD}") && [ -n "$verify_out" ]; then
       pg_refuse "new type errors in changed files ($override):
 $verify_out"
     fi

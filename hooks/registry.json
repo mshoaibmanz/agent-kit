@@ -100,7 +100,7 @@
     "event": "PostToolUse",
     "matcher": "Edit|Write|MultiEdit",
     "command": "~/.claude/hooks/verify-edit",
-    "description": "Tells the model the lint errors an edit introduced (Python, TypeScript, SQL); formats with ruff in repos that adopted it.",
+    "description": "Tells the model the lint errors an edit introduced (Python, TypeScript); formats with ruff in repos that adopted it.",
     "timeout": 15,
     "hosts": [
       "claude"
@@ -313,7 +313,7 @@
     "matcher": null,
     "command": "~/.claude/hooks/review-trigger",
     "description": "Blocks once on new type errors in changed files, then asks for the self-check review tier and the TALLY line before the turn ends.",
-    "timeout": 120,
+    "timeout": 60,
     "hosts": [
       "claude",
       "codex",

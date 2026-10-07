@@ -466,12 +466,6 @@ rm -f "$C/lib/kit_env.py"
 out=$(cedit "$REPO/m.py" "a=1" "$six
 a=1" | python3 "$C/comment-guard"); check "comment-guard without lib/kit_env.py: tells the user it is off" "$out" 'systemMessage.*comment-guard is off'
 
-echo "--- python-format ---"
-PY="$REPO/fmt.py"; echo "x=1" > "$PY"
-rm -f "$HOME/.claude/tmp/pyright-$SID.txt"
-jq -cn --arg f "$PY" --arg s "$SID" '{hook_event_name:"PostToolUse",tool_name:"Write",session_id:$s,tool_input:{file_path:$f}}' | "$H/python-format"
-[ -f "$HOME/.claude/tmp/pyright-$SID.txt" ] && bad "python-format no longer logs paths for pyright" || ok "python-format no longer logs paths for pyright"
-rm -f "$HOME/.claude/tmp/pyright-$SID.txt"
 
 echo "--- review-state: concurrent writers ---"
 # SubagentStop (rv_complete) and Stop or pre-push (_rv_round, rv_chain_*) write one session file

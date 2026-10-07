@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Agent post-checkout: a new worktree (git worktree add checks out from the null commit) gets the
-# main checkout's untracked pyrightconfig.json and .venv (hooks/lib/verify.py worktree), so type
-# checking resolves imports there. Run by ../dispatch in agent shells only; never fails a checkout.
+# main checkout's untracked pyrightconfig.json, pinned to its environment (hooks/lib/verify.py
+# worktree). Run by ../dispatch in agent shells only; never fails a checkout.
 case ${1:-x} in *[!0]*) exit 0 ;; esac
 [ "${3:-}" = 1 ] || exit 0
 L="$(cd -P "${0%/*}/../../hooks/lib" 2>/dev/null && pwd)" || exit 0

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Retired: verify-edit holds this registry slot now (ruff with the repo's config, plus a correctness
-# lint for Python, TypeScript and SQL that reports the errors an edit introduced). Kept as a forward,
-# not deleted: a session started before an update still runs this path until it restarts.
+# Retired: verify-edit holds this registry slot now. A forward for sessions whose loaded settings still
+# name this path; delete it in the first release after 2026-11-01, when no running session predates
+# the rename.
 exec "${0%/*}/verify-edit"

@@ -1377,10 +1377,6 @@ def cmd_doctor_claude(_args: argparse.Namespace) -> int:
             print(f"settings: live-only key, not in the source (render keeps it): {key}")
     if not any(finding.kind == "mcp" for finding in findings):
         print("mcp: in sync with the catalog")
-    # Verification tools are information, never a problem: each check skips while its tool is missing.
-    verify = subprocess.run([sys.executable, str(KIT / "hooks/lib/verify.py"), "doctor"],
-                            capture_output=True, text=True, check=False)
-    sys.stdout.write(verify.stdout)
     problems = len(findings)
     if "AGENT_KIT_DIR" in os.environ:
         print("accounts: not checked (AGENT_KIT_DIR is set, so this is not the installed kit)")

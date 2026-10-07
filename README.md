@@ -150,33 +150,23 @@ Keep user workflow values in `local/kit.env`; generated path choices live in `lo
 
 ## Verification
 
-Why it is shaped this way:
-- Measured wins: a per-edit syntax and undefined-name lint (+3 points on SWE-agent), compiler and type feedback in the loop, and test feedback over lint feedback (FeedbackEval).
-- Measured cost: in one month of a user's sessions, editor diagnostics took about 1.3M tokens, 76% of them unresolved imports, "not accessed" hints and deprecation hints, and about one real error in ten changed what the agent did next.
-- So the model hears only errors it introduced, only from correctness rules, and a missing tool is skipped, never reported per call.
+Evidence: a per-edit undefined-name lint and type feedback in the loop measurably help agents. Editor diagnostics cost one user about 1.3M tokens a month, three quarters of it unresolved-import and unused or deprecated hints.
 
-Two checks, both silent when their tool is missing (`agent-kit doctor` prints a `verify` line per tool and per repo):
-- **Per edit** (`hooks/verify-edit`, PostToolUse): checks the edited file and its text before the edit (the edit tool's `originalFile`, else the committed copy) and tells the model only the errors the edit added, at most 10 lines. Python: `ruff check --select F,E9,B` without the unused-import and unused-variable rules, which an edit-by-edit flow trips before the next edit uses the name. A repo with a ruff config is also fixed and formatted with it, and its per-file ignores apply; a repo without one is never reformatted. TypeScript and JavaScript: the repo's eslint (errors only) when it has a config, else `oxlint -D correctness` when installed. SQL: `sqlfluff parse` with the dialect from the repo's sqlfluff config. Rust: nothing per edit. It never blocks.
-- **Stop and push** (`review-trigger` and the agent pre-push gate, through `hooks/lib/verify.py gate`): type-checks the files the branch changed against its merge-base with the review base, errors only, and reports only errors the branch introduced. Python: basedpyright, else pyright. The base's errors come from the merge-base's files, extracted once per merge-base into `~/.cache/agent-kit/verify/` with the checkout's untracked `pyrightconfig.json`, `.venv` and `node_modules`; basedpyright compares through its own `--baselinefile`, pyright and tsc by rule and message, so moved lines do not count. TypeScript: `tsc --noEmit -p <nearest tsconfig.json>`, incremental. Rust: `cargo clippy` in each changed crate, errors only. A Stop shows a tree's new errors once; the push refuses them until they are fixed or `AGENT_PUSH_NOW="<reason>"` is given.
+The model hears only errors it introduced, from correctness rules. A check whose tool is missing is skipped silently.
+- **Per edit** (`hooks/verify-edit`): the edited file is checked before and after the edit (the edit tool's `originalFile`, else the committed copy). Only new errors reach the model, at most 10 lines, and the edit is never blocked.
+  - Python: ruff. A repo with a ruff config is also fixed and formatted with it, and its rule selection applies; one without is checked with `--select F,E9,B` and never reformatted. Either way only F, E9 and B codes are reported, without F401, F841 and B008.
+  - TypeScript and JavaScript: the repo's eslint, errors only, when the repo has an eslint config. One run per edit; an error counts when it is on a line the edit wrote.
+- **Stop and push** (`review-trigger` and the agent pre-push gate): the files the branch changed since it left its base branch are type-checked, errors only, and only errors the branch introduced count. The base errors come from the merge-base's files, extracted into `~/.cache/agent-kit/verify/<worktree>/`. Unresolved imports are ignored.
+  - Python: basedpyright (its own `--baselinefile`), else pyright, with the environment that `pyrightconfig.json` names, else `.venv` or `venv`. With no environment, the check is skipped and the skip is said once.
+  - TypeScript: `tsc --noEmit -p <nearest tsconfig.json>`.
+  - Both check tracked files only. Stop checks the working tree; the push checks the commit being pushed.
+  - Stop shows a tree's new errors once, together with the self-check review. The push refuses them until they are fixed or `AGENT_PUSH_NOW="<reason>"` is given. A check that runs past its deadline (40 s at Stop, 240 s at push) passes with a note, and nothing is recorded as passed.
 
-New worktrees (EnterWorktree, or `git worktree add` in an agent shell) get the main checkout's untracked `pyrightconfig.json` copied and its `.venv` linked, so type checks resolve imports there.
+A new worktree (EnterWorktree, or `git worktree add` in an agent shell) gets the main checkout's untracked `pyrightconfig.json`, with `venvPath`/`venv` pointing at the main checkout's environment.
 
-Configure in `verify.toml` beside `kit.env` in the overlay, over a team pack's `verify.toml`. Everything is on by default; a repo table wins over `[default]`, and the user's file over the pack's:
+Everything is on by default. The overlay key `VERIFY_OFF` turns parts off: space-separated `<repo-glob>:<what>` entries, where `<what>` is `python.edit`, `python.stop`, `typescript.edit`, `typescript.stop` or `worktree`, e.g. `VERIFY_OFF='legacy-*:python.stop my-api:worktree'`.
 
-```toml
-[default.python.edit]
-select = "repo"          # report every rule of the repo's ruff config, not just F/E9/B
-[repo.my-api.python.stop]
-enabled = false          # no type gate in this repo
-[repo.web.typescript.stop]
-cmd = "pnpm exec tsc"    # the tool to run; the kit adds its own arguments
-[repo.my-api.worktree]
-enabled = false          # do not copy pyrightconfig.json or link .venv into new worktrees
-```
-
-Keys: `<lang>.<phase>` with lang `python`, `typescript`, `sql` or `rust` and phase `edit` or `stop` (`sql` has only `edit`, `rust` only `stop`), each taking `enabled`, `cmd` and, for Python edits, `select`; and `worktree.enabled`.
-
-Editor diagnostics: Claude Code answers pyright's `workspace/configuration` request from the LSP server entry's `settings`, and the official pyright plugin's entry sets none, nor can `settings.json` add them. Pyright's switch for the hint-class diagnostics (`pyright.disableTaggedHints`) is a language-server setting, not a `pyrightconfig.json` key, so the kit cannot turn those hints off through the settings layer. Keep the plugin for navigation; the unresolved-import share goes away once worktrees carry `pyrightconfig.json` and `.venv`.
+The kit cannot quiet the pyright editor plugin's hint diagnostics. Claude Code takes the language server's settings only from the plugin's own entry, and `pyright.disableTaggedHints` is not a `pyrightconfig.json` key.
 
 ## Search code
 
