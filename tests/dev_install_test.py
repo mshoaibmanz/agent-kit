@@ -155,6 +155,22 @@ class DevInstallTests(PackRepos):
         refused = self.install(*FLAGS, '--dev', '--apply', code=2)
         self.assertEqual(refused.stderr.strip(), f"agent-setup: {user} sets UI-owned keys ['theme']; remove them or drop them from uiOwned")
 
+    def test_a_copy_installs_doctor_checks_the_settings_layer(self) -> None:
+        self.install(*FLAGS, '--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        user = self.root / 'local/settings.json'
+        user.write_text('{"includeCoAuthoredBy": false, "env": {"KIT_TEST_FLAG": "1"}}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('the settings layer differs from what setup applied', problems[0])
+        self.assertIn('(includeCoAuthoredBy, env.KIT_TEST_FLAG)', problems[0])
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [], 'setup applied the layer')
+        user.write_text('{"theme": "dark"}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(f"{user} sets UI-owned keys ['theme']", problems[0])
+
     def test_dev_mode_switches_from_copies_and_rollback_survives_a_broken_checkout(self) -> None:
         self.install(*FLAGS, '--apply')
         copy = (self.root / 'bin/agent-kit').read_bytes()

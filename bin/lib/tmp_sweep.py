@@ -2,7 +2,7 @@
 `scan --report PATH` writes the report, `apply --report PATH --sha256 HASH` applies exactly that report.
 Only items/*/tmp/ of a done item (agent_task.DONE_STATUSES), after TMP_SWEEP_DAYS; generated bulk and
 files over 1 MB are deleted, small source and data files move to the item's out/salvage/, anything else
-stays. A checkout holding a local-only commit, a stash or uncommitted work is kept wherever it sits.
+stays. A checkout holding a local-only commit or tag, a stash or uncommitted work is kept wherever it sits.
 Checkouts and files over 5 MB elsewhere in the item are listed as report lines, never applied."""
 
 from __future__ import annotations
@@ -91,17 +91,44 @@ def tree_size(path: Path) -> int:
     return total
 
 
-def git_settled(folder: Path) -> bool:
-    """Nothing uncommitted and no commit that only this checkout holds. `--all` walks HEAD (a detached
-    commit), tags and refs/stash too, which `--branches` misses."""
+def git_out(folder: Path, *args: str) -> str | None:
+    """git's stdout, or None when it fails. No credential prompt: a remote that asks for one fails."""
     try:
-        status = subprocess.run(["git", "-C", str(folder), "status", "--porcelain"],
-                                capture_output=True, text=True, timeout=60, check=False)
-        local = subprocess.run(["git", "-C", str(folder), "rev-list", "--all", "--not", "--remotes", "-n", "1"],
-                               capture_output=True, text=True, timeout=60, check=False)
+        proc = subprocess.run(["git", "-C", str(folder), *args], capture_output=True, text=True, timeout=60,
+                              check=False, stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def tags_pushed(folder: Path) -> bool:
+    """Every local tag exists, with the same object, on some remote. Git keeps no remote-tracking tags,
+    so this asks each remote; a remote it cannot reach proves nothing."""
+    local = git_out(folder, "for-each-ref", "--format=%(objectname) %(refname)", "refs/tags")
+    if local is None:
         return False
-    return status.returncode == 0 and not status.stdout.strip() and local.returncode == 0 and not local.stdout.strip()
+    wanted = set(local.split("\n")) - {""}
+    if not wanted:
+        return True
+    remotes = git_out(folder, "remote")
+    for remote in (remotes or "").split():
+        listed = git_out(folder, "ls-remote", "--tags", "--refs", remote)
+        if listed is not None:
+            wanted -= {line.replace("\t", " ") for line in listed.split("\n")}
+        if not wanted:
+            return True
+    return False
+
+
+def git_settled(folder: Path) -> bool:
+    """Nothing uncommitted and nothing that only this checkout holds. `--all` walks HEAD (a detached
+    commit), tags and refs/stash too, which `--branches` misses; a tag on a pushed commit is checked
+    against the remotes."""
+    status = git_out(folder, "status", "--porcelain")
+    if status is None or status.strip():
+        return False
+    local = git_out(folder, "rev-list", "--all", "--not", "--remotes", "-n", "1")
+    return local is not None and not local.strip() and tags_pushed(folder)
 
 
 def unsettled_checkouts(folder: Path) -> list[Path]:

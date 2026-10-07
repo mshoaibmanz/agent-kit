@@ -250,6 +250,36 @@ class Sweep(Fixture):
         self.assertFalse((d / "tmp/home/big.bin").exists())
         self.assertEqual(subprocess.run(["git", "stash", "list"], cwd=stashed, capture_output=True, text=True).stdout.count("\n"), 1)
 
+    def test_a_tag_no_remote_has_keeps_the_checkout(self) -> None:
+        origin = self.origin()
+        d = self.item("p", "done", "closed", "2020-01-01")
+        tmp = d / "tmp"
+        pushed = self.clone(origin, tmp / "pushed-tag")
+        git("tag", "-a", "-m", "release", "v1", cwd=pushed)
+        git("push", "-q", "origin", "v1", cwd=pushed)
+        light = self.clone(origin, tmp / "light-tag")
+        git("tag", "local-only", cwd=light)
+        annotated = self.clone(origin, tmp / "annotated-tag")
+        git("tag", "-a", "-m", "mine", "mine", cwd=annotated)
+        moved = self.clone(origin, tmp / "moved-tag")
+        git("commit", "-q", "--allow-empty", "-m", "second", cwd=moved)
+        git("push", "-q", "origin", "HEAD:main", cwd=moved)
+        git("tag", "-f", "v1", "HEAD", cwd=moved)
+        age(d)
+
+        proc = self.gc()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = {Path(p).relative_to(d).as_posix(): v for p, v in self.lines().items() if Path(p).is_relative_to(d)}
+        self.assertEqual(lines["tmp/pushed-tag"], ("delete", "git checkout"), "a pushed tag is settled")
+        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag"):
+            self.assertEqual(lines[name], ("keep", "git checkout with unpushed work"), name)
+
+        proc = self.gc("--sweep-tmp", "--report-sha256", hashlib.sha256(self.report().read_bytes()).hexdigest())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(pushed.exists())
+        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag"):
+            self.assertTrue((d / name).exists(), name)
+
     def test_git_bookkeeping_neither_delays_nor_refuses_a_clean_checkout(self) -> None:
         d = self.item("p", "done", "closed", "2020-01-01")
         pushed = self.clone(self.origin(), d / "tmp/pushed")

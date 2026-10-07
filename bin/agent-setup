@@ -64,8 +64,8 @@ from kit_env import code_dir, kit_env  # noqa: E402
 from kit_text import default_host_root, fill_servers, install_text, resume_max  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary)
-from pack import (PACK_DIR, PACK_SKILLS, McpPlan, extension_lists, installed_pack, mcp_plan,  # noqa: E402
-                  sync_pack_mcp)
+from mcp_plan import McpPlan, mcp_plan  # noqa: E402
+from pack import PACK_DIR, PACK_SKILLS, extension_lists, installed_pack, sync_pack_mcp  # noqa: E402
 from preset import Preset, apply_preset, kit_skills, plugin_settings, source_status, validate_catalog  # noqa: E402
 from sentry import INSTANCES_FILE, expand_servers, merge_instances, read_instances  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
@@ -358,6 +358,14 @@ def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view:
     return {}
 
 
+def kit_shell(args: argparse.Namespace, root: Path, target: Path) -> dict[str, str]:
+    """The env keys the kit sets in Claude's settings.json, over the settings layer's own."""
+    return {'AI_AGENT': 'claude', 'AGENT_HOST': 'claude',
+            'KIT_ENV': str(root / 'local/setup-paths.env'), 'AGENT_KIT_DIR': str(root),
+            'CLAUDE_CONFIG_DIR': str(target),
+            'AGENT_GIT_HOOKS': 'on' if args.blocking_hooks else 'off'}
+
+
 def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, overlays: dict[str, str],
                  resume: int, preset: Preset, mcp: McpPlan) -> list[Change]:
     root = Path(args.root_dir).expanduser().absolute()
@@ -392,12 +400,8 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
                 parts = shlex.split(row['command'])
                 row['command'] = shlex.join([str(root / 'hooks' / Path(parts[0]).name), *parts[1:]])
             changes.append(Change('hooks', target / 'settings.json', api.render_hooks(registry, 'claude'), 0o600))
-            shell = {'AI_AGENT': 'claude', 'AGENT_HOST': 'claude',
-                     'KIT_ENV': str(root / 'local/setup-paths.env'), 'AGENT_KIT_DIR': str(root),
-                     'CLAUDE_CONFIG_DIR': str(target),
-                     'AGENT_GIT_HOOKS': 'on' if args.blocking_hooks else 'off'}
             # The settings layer's env first; the kit's keys win over it.
-            shell = {**layer.get('env', {}), **shell}
+            shell = {**layer.get('env', {}), **kit_shell(args, root, target)}
             # The layer's GIT_CONFIG_* entry joins the user's own; taking it out keeps theirs.
             settings = target / 'settings.json'
             current = (load_json(settings, {}) or {}).get('env', {})
@@ -1351,6 +1355,8 @@ def doctor(args: argparse.Namespace) -> int:
         problems.extend(broken)
         if not broken and (pending := sync_pending(root, state)):
             problems.append(pending)
+    elif state and (layer := settings_layer_problem(args, root, state)):
+        problems.append(layer)
     preset = configuration.get('preset')
     if preset:
         preset['source_status'] = source_status(preset)
@@ -1363,6 +1369,38 @@ def doctor(args: argparse.Namespace) -> int:
     for problem in problems:
         print('agent-setup doctor: ' + problem, file=sys.stderr)
     return 1 if problems else 0
+
+
+def settings_layer_problem(args: argparse.Namespace, root: Path, state: dict[str, Any]) -> str | None:
+    """A copy install's doctor: the installed kit's settings layer, refused or not yet what setup last
+    applied to Claude's settings.json. A dev install's sync preview covers the same."""
+    components = set(args.components) | ({'roles'} if args.blocking_hooks else set())
+    if 'claude' not in args.hosts or 'hooks' not in components:
+        return None
+    try:
+        api = kit_api(root)
+        layer = api.base_settings(root, ui_owned=api.host_paths()['uiOwned'], roles='roles' in components)
+    except (OSError, SyntaxError, SystemExit, ValueError) as error:
+        return f'the settings layer cannot be read: {" ".join(str(error).split())}'
+    target = host_target(args, 'claude', Path.home())
+    managed = state.get('managed', {})
+
+    def owned(kind: str) -> dict[str, Any]:
+        return managed.get(f'{kind}:{target / "settings.json"}', {}).get('owned', {})
+
+    rest = {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}
+    applied = owned('settings')
+    stale = sorted(key for key in set(rest) | set(applied)
+                   if key not in rest or key not in applied or rest[key] != applied[key])
+    kit_keys = kit_shell(args, root, target)
+    stale += sorted(f'env.{key}' for key, value in layer.get('env', {}).items()
+                    if key not in kit_keys and not key.startswith('GIT_CONFIG_') and owned('environment').get(key) != value)
+    for field, kind in (('enabledPlugins', 'plugins'), ('extraKnownMarketplaces', 'marketplaces')):
+        stale += sorted(f'{field}.{key}' for key in layer.get(field, {}) if key not in owned(kind))
+    if not stale:
+        return None
+    return (f'the settings layer differs from what setup applied to {target / "settings.json"} '
+            f'({", ".join(stale)}): rerun agent-setup --apply')
 
 
 def sync_pending(root: Path, state: dict[str, Any]) -> str | None:

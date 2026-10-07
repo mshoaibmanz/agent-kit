@@ -14,10 +14,13 @@ import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
+import time
 import unittest
+import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from installer_ux_test import SOURCE, InstallerUxFixture  # noqa: E402
@@ -544,6 +547,47 @@ class DashboardScenarioTests(Fixture):
                                 env=self.env(kit=self.root), timeout=120, stdin=subprocess.DEVNULL)
         self.assertNotIn('Traceback', result.stderr)
         self.assertEqual({'claude', 'codex', 'cursor'}, {r['host'] for r in json.loads(result.stdout)}, result.stdout)
+
+    def test_watch_serves_the_page_and_regenerates_it_when_a_config_file_changes(self) -> None:
+        self.install()
+        out = self.home / 'out/index.html'
+        fetch = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+        proc = subprocess.Popen([sys.executable, str(self.root / 'bin/agent-kit'), 'dashboard', '--watch', '--no-open',
+                                 '--out', str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=self.env(kit=self.root), stdin=subprocess.DEVNULL)
+        try:
+            assert proc.stdout is not None
+            lines = [proc.stdout.readline(), proc.stdout.readline()]
+            serving = re.search(r'serving (http://127\.0\.0\.1:\d+/)', ''.join(lines))
+            self.assertIsNotNone(serving, ''.join(lines))
+            assert serving is not None
+            url = serving.group(1)
+            served = fetch(url, timeout=10).read().decode()
+            self.assertIn('<script src="/reload.js" data-version="1"></script>', served)
+            policy = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', served)
+            assert policy is not None
+            self.assertIn("connect-src 'self'", policy.group(1))
+            self.assertIn("script-src 'self' 'sha256-", policy.group(1))
+            self.assertIn('location.reload()', fetch(url + 'reload.js', timeout=10).read().decode())
+            self.assertNotIn('reload.js', out.read_text(), 'the page on disk stays self-contained')
+            self.assertNotIn('watched-server', served)
+
+            catalog = self.root / 'mcp/servers.json'
+            servers = json.loads(catalog.read_text())
+            servers['mcpServers']['watched-server'] = {'command': 'npx', 'args': ['-y', 'example-watched']}
+            catalog.write_text(json.dumps(servers))
+            deadline = time.monotonic() + 30
+            while fetch(url + 'version', timeout=10).read().decode() == '1' and time.monotonic() < deadline:
+                time.sleep(0.5)
+            self.assertIn('watched-server', fetch(url, timeout=10).read().decode())
+            self.assertIn('watched-server', out.read_text())
+        finally:
+            proc.send_signal(signal.SIGINT)
+            rest, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, rest + err)
+        self.assertIn('dashboard: regenerated (', rest)
+        self.assertTrue(rest.endswith('dashboard: stopped\n'), rest)
+        self.assertNotIn('Traceback', err)
 
     def test_doctor_reports_a_hook_removed_since_setup(self) -> None:
         self.install()
