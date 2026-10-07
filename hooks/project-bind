@@ -8,11 +8,13 @@
                              recent open items once (and again only when the offer changes); stay
                              unbound. Nothing is created from a prompt.
                              Bound: sticky, except that the cheap rules re-run when the checkout
-                             changed since the last prompt (entering a worktree re-binds, announced).
+                             changed since the last prompt and move it to another EXISTING item
+                             (announced); nothing is created for a bound session.
                              A binding /clear inherited is re-resolved on the first prompt a rule
                              answers. A `/bind` prompt is left to the command.
-  PostToolUse(EnterWorktree) the cheap rules at once, so entering a ticket worktree binds (or
-                             creates) its item before the next prompt.
+  PostToolUse(EnterWorktree) the cheap rules at once, under the same limit: an unbound session's
+                             ticket worktree binds (or creates) its item before the next prompt. A
+                             subagent's payload (agent_id) is ignored.
   PreToolUse(Write)          unbound, and the first durable file lands under the work root: bind to
                              the project or item the path is in (silent; no decision).
   PostToolUse(Write|Edit)    a write under projects/<p>/ re-runs `agent-task index <p>`; a bind made
@@ -73,14 +75,14 @@ def on_prompt(p: dict) -> None:
             return
         at.set_binding_wt(sid, pl.top)
         d = at.decide("", pl, cheap_only=True)
-        if d and d.target != at.where_label(cur):
+        if at.may_move(d, cur):
             rebind(sid, d, pl, cur, "UserPromptSubmit")
         return
     d = at.decide(prompt, pl)
     if cur:
         # Inherited across /clear: a certain rule moves it; otherwise it stays (and stays inherited
         # until a prompt names a ticket).
-        if d and d.target != at.where_label(cur):
+        if at.may_move(d, cur):
             rebind(sid, d, pl, cur, "UserPromptSubmit", " (the old binding was kept from before /clear)")
         elif d or at.tickets_in(prompt, known=True):
             at.keep_binding(sid)
@@ -95,7 +97,8 @@ def on_prompt(p: dict) -> None:
 
 def on_enter_worktree(p: dict) -> None:
     sid = p.get("session_id", "")
-    if not sid:
+    # A subagent's payload carries its parent's session_id: its worktree is not the session's.
+    if not sid or p.get("agent_id"):
         return
     resp = p.get("tool_response")
     paths = [s for s in _strings(resp) if "/.claude/worktrees/" in s and os.path.isdir(s)] if resp else []
@@ -106,7 +109,7 @@ def on_enter_worktree(p: dict) -> None:
     cur = at.bound(sid)
     at.set_binding_wt(sid, pl.top)
     d = at.decide("", pl, cheap_only=True)
-    if d and (not cur or d.target != at.where_label(cur)):
+    if at.may_move(d, cur):
         rebind(sid, d, pl, cur, "PostToolUse")
 
 

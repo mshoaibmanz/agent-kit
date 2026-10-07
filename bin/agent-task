@@ -28,7 +28,6 @@ offered this repo's three most recently touched open items.
                                 offers each script in the item's tmp/ that the project's scripts/
                                 lacks for promotion (prompt, or the flags), prints the harvest prompts
                                 plus proposed knowledge lines, then status closed
-  agent-task prune [--days n] [--apply]         report tmp/, out/ clones and files >5MB in idle items (dry run)
   agent-task retro "<note>" | --stdin [--source model|user|auto] [--tag t] [--session id]
   agent-task retro --pending                    one `<id> <line>` per unprocessed line
   agent-task retro --mark <id> ...              mark those lines (ids from --pending) processed
@@ -90,7 +89,10 @@ def cmd_bind(a: argparse.Namespace) -> int:
     if a.branch:
         here.branch = a.branch
     was = at.bound(sid)
-    b = at.bind(sid, target, desc=desc, here=here, repo=a.repo, rule="explicit", pick_item=True)
+    try:
+        b = at.bind(sid, target, desc=desc, here=here, repo=a.repo, rule="explicit", pick_item=True)
+    except at.AmbiguousTicket as e:
+        die(f"not bound: {e}")
     print(f"Bound session {sid[:8]} to {at.where_label(b)} ({b.folder}). Tab: {b.label}.")
     if not b.item and not b.project.legacy:
         live = [d.name for d in b.project.items() if at._item_status(d) not in at.DONE_STATUSES]
@@ -246,24 +248,6 @@ def cmd_harvest(a: argparse.Namespace) -> int:
     if not p.legacy and item:
         at.update_item(p, item, status=a.status_to or "harvested", harvested=at.today(), **({"pr": a.pr} if a.pr else {}), **({"closed": at.today()} if a.status_to == "closed" else {}))
         at.index(p.name)
-    return 0
-
-
-def cmd_prune(a: argparse.Namespace) -> int:
-    days = a.days if a.days is not None else 14
-    report = at.prune_report(days)
-    total = 0
-    print(f"# prune {'(APPLY)' if a.apply else '(dry run: nothing is deleted; --apply removes tmp/ contents and clones)'}: items idle {days}+ days under {at.work_root()}")
-    for r in report:
-        print(f"{r['item']}  idle {r['idle_days']}d")
-        for kind, path, size in r["found"]:
-            total += size
-            note = "  (reported only; judge by hand)" if kind == "big" else ""
-            print(f"  {kind:5} {size / 1048576:8.1f}M  {path}{note}")
-    print(f"total {total / 1048576:.1f}M in {len(report)} items")
-    if a.apply:
-        for line in at.prune_apply(report):
-            print(line)
     return 0
 
 
@@ -495,7 +479,6 @@ def main() -> int:
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--bindings", action="store_true")
     ap.add_argument("--apply", action="store_true")
-    ap.add_argument("--days", type=int, default=None)
     ap.add_argument("--pr", default="")
     ap.add_argument("--promote", action="append", default=[])
     ap.add_argument("--no-promote", action="store_true")
@@ -504,7 +487,7 @@ def main() -> int:
     if a.sub == "ls" and a.paths is not None:
         a.paths = True
     a.status_to = ""
-    cmds = {"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "close": cmd_close, "prune": cmd_prune, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge}
+    cmds = {"bind": cmd_bind, "resolve": cmd_resolve, "where": cmd_where, "ls": cmd_ls, "index": cmd_index, "brief": cmd_brief, "harvest": cmd_harvest, "close": cmd_close, "retro": cmd_retro, "migrate": cmd_migrate, "slice": cmd_slice, "session-start": cmd_session_start, "nudge": cmd_nudge}
     if a.help or a.sub not in cmds:
         print(__doc__)
         return 0 if a.help or not a.sub else 2

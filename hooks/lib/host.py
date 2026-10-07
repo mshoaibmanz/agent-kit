@@ -29,30 +29,38 @@ def git_layer_env(
     """The GIT_CONFIG_* keys that put core.hooksPath=hooks_dir into an agent's shell beside the
     command-scope entries env already holds; with enabled false, the keys that take it out again.
 
-    The layer's entry keeps its index when env already has it (its value, or a GIT_CONFIG_KEY_n
-    named in owned, an earlier render's), else it goes after the others. Git applies the entries in
-    index order, so the layer wins over a core.hooksPath of the user's and the dispatcher chains to
-    that one. Removing an entry that others follow would renumber the user's keys, so it stays as
-    a no-op entry instead. ValueError: a GIT_CONFIG_COUNT that git itself would reject.
+    Git applies the entries in index order and the last core.hooksPath wins, so the layer's entry
+    must be the last one: then it wins over a core.hooksPath of the user's and the dispatcher chains
+    to that one. Its entry (its value, or a GIT_CONFIG_KEY_n named in owned, an earlier render's;
+    the last such) keeps its index while no core.hooksPath follows it, else it becomes a no-op entry
+    and the layer's goes after all the others. Removing or moving an entry would renumber the user's
+    keys, so a dropped one stays as a no-op instead. ValueError: a GIT_CONFIG_COUNT that git itself
+    would reject.
     """
     raw = str(env.get("GIT_CONFIG_COUNT", "") or "0")
     if not raw.isdigit():
         raise ValueError(f"GIT_CONFIG_COUNT is not a count: {raw!r}")
     count, owned = int(raw), set(owned)
-    index = next(
-        (
-            i
-            for i in range(count)
-            if f"GIT_CONFIG_KEY_{i}" in owned
-            or (
-                env.get(f"GIT_CONFIG_KEY_{i}", "").lower() == "core.hookspath"
-                and env.get(f"GIT_CONFIG_VALUE_{i}") == hooks_dir
-            )
-        ),
-        count,
-    )
+
+    def hooks_path(i: int) -> bool:
+        return env.get(f"GIT_CONFIG_KEY_{i}", "").lower() == "core.hookspath"
+
+    mine = [
+        i
+        for i in range(count)
+        if f"GIT_CONFIG_KEY_{i}" in owned or (hooks_path(i) and env.get(f"GIT_CONFIG_VALUE_{i}") == hooks_dir)
+    ]
+    index = mine[-1] if mine else count
     key, value = f"GIT_CONFIG_KEY_{index}", f"GIT_CONFIG_VALUE_{index}"
     if enabled:
+        if any(hooks_path(i) for i in range(index + 1, count)):
+            return {
+                "GIT_CONFIG_COUNT": str(count + 1),
+                key: "agent-kit.gitHooks",
+                value: "off",
+                f"GIT_CONFIG_KEY_{count}": "core.hooksPath",
+                f"GIT_CONFIG_VALUE_{count}": hooks_dir,
+            }
         return {
             "GIT_CONFIG_COUNT": str(max(count, index + 1)),
             key: "core.hooksPath",

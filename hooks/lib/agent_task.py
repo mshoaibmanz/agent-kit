@@ -18,7 +18,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kit_env import kit_dir, kit_env_path
+from kit_env import kit_dir, kit_env, kit_env_path
 from kit_env import work_root as _work_root
 
 
@@ -30,6 +30,7 @@ def agent_task_bin() -> str:
 # A release branch's spelling (DEMO-119-REL, DEMO-119-REL-TEST, DEMO-119-TEST) names no ticket, the
 # same rule as branch_ticket: a smoke prompt naming it once made a project of one.
 TICKET_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,5}-[0-9]+)\b(?!-(?i:rel)\b|-TEST\b)")
+TICKET_PREFIX_RE = re.compile(r"[A-Z][A-Z0-9]{1,5}")
 # Look like ticket keys, never are one.
 NOT_TICKETS = {
     "UTF", "SHA", "ISO", "GPT", "RFC", "MD", "MD5", "HTTP", "TLS", "SSL", "PEP", "ES", "AES", "RSA",
@@ -90,10 +91,24 @@ def known_prefixes() -> frozenset[str]:
     return frozenset(keys)
 
 
+@functools.cache
+def configured_prefixes() -> frozenset[str]:
+    """TICKET_PREFIXES from the overlay or preset: when set, the only prefixes that name a ticket."""
+    try:
+        raw = kit_env().get("TICKET_PREFIXES", "")
+    except OSError:
+        raw = ""
+    return frozenset(x.strip().upper() for x in raw.split(",") if x.strip())
+
+
 def is_ticket(key: str, *, known: bool = False) -> bool:
+    """TICKET_RE's prefix rule (2-6 characters), then TICKET_PREFIXES when set, else (known=True)
+    the Jira prefs' keys when there are any."""
     prefix = key.split("-")[0]
-    if prefix in NOT_TICKETS:
+    if prefix in NOT_TICKETS or not TICKET_PREFIX_RE.fullmatch(prefix):
         return False
+    if configured_prefixes():
+        return prefix in configured_prefixes()
     return not known or not known_prefixes() or prefix in known_prefixes()
 
 
@@ -265,17 +280,26 @@ def from_key(key: str, root: Path | None = None) -> Binding | None:
         name, _, item = key[len("project:") :].partition("/")
         p = project_dir(name, root)
         return Binding(parse_project(p), item) if p else None
+    # A bare key was written when it named tasks/<key>: that folder (or the item it links to) wins over
+    # a projects/<key> made since, so a session never silently changes work folder.
+    exact = root / "tasks" / key
+    if "/" not in key and exact.is_dir():
+        return _legacy_binding(exact, root)
     name, _, item = key.partition("/")
     p = project_dir(name, root)
     if p:
         return Binding(parse_project(p), item)
     leg = find_legacy(key, root)
-    if leg:
-        alias = legacy_alias(leg, root)
-        if alias and project_dir(alias[0], root):
-            return Binding(parse_project(project_dir(alias[0], root)), alias[1])  # type: ignore[arg-type]
-        return Binding(legacy_project(leg))
-    return None
+    return _legacy_binding(leg, root) if leg else None
+
+
+def _legacy_binding(leg: Path, root: Path) -> Binding:
+    """A tasks/<name> folder's binding: the project item it links to, else the legacy folder itself."""
+    alias = legacy_alias(leg, root)
+    pd = project_dir(alias[0], root) if alias else None
+    if alias and pd:
+        return Binding(parse_project(pd), alias[1])
+    return Binding(legacy_project(leg))
 
 
 def normalize_key(key: str, root: Path | None = None) -> str:
@@ -708,12 +732,13 @@ def decide(prompt: str, pl: Place, *, cheap_only: bool = False, root: Path | Non
     if len(mapped) == 1:
         # A worktree named <TICKET>-* on a branch that names no ticket (widget-cache-v2).
         return Decision("worktree", mapped[0], why=pl.top)
+    wt_ambiguous: list[str] = []
     if wt_ticket and not mapped:
-        owners = [p for p in projects(root) if not p.legacy and wt_ticket in p.tickets]
-        target = f"{owners[0].name}/{wt_ticket}" if len(owners) == 1 else wt_ticket
-        return Decision("worktree-new", target, why=pl.top)
+        target, wt_ambiguous = ticket_target(wt_ticket, root)
+        if target:
+            return Decision("worktree-new", target, why=pl.top)
     if cheap_only:
-        return Decision()
+        return Decision(candidates=wt_ambiguous)
     items, projs = work_paths_in(prompt, root)
     if len(items) == 1:
         return Decision("path", items[0])
@@ -728,11 +753,53 @@ def decide(prompt: str, pl: Place, *, cheap_only: bool = False, root: Path | Non
         return Decision("ticket", one.pop(), why=next(k for k, t in found.items() if t))
     ambiguous = sorted({x for t in found.values() for x in t} | set(items))
     if not ambiguous and len(keys) == 1:
-        owners = [p.name for p in projects(root) if not p.legacy and keys[0] in p.tickets]
+        owners = ticket_owners(keys[0], root)
         if len(owners) == 1:
             return Decision("ticket-project", owners[0], why=keys[0])
         ambiguous = owners
+    ambiguous = wt_ambiguous + [c for c in ambiguous if c not in wt_ambiguous]
     return Decision(candidates=ambiguous + [c for c in recent_items(pl.repo, root=root) if c not in ambiguous])
+
+
+def ticket_owners(ticket: str, root: Path | None = None) -> list[str]:
+    """The projects whose PROJECT.md or item folders list <ticket>."""
+    return sorted(p.name for p in projects(root) if not p.legacy and ticket in p.tickets)
+
+
+class AmbiguousTicket(ValueError):
+    def __init__(self, ticket: str, candidates: list[str]) -> None:
+        super().__init__(f"{ticket} belongs to more than one place: {', '.join(candidates)}. Bind one: /bind <project>/{ticket}")
+        self.candidates = candidates
+
+
+def ticket_target(ticket: str, root: Path | None = None) -> tuple[str, list[str]]:
+    """Where a ticket binds, for bind() and decide() alike: (target, []) with target the one item the
+    index maps it to, else <the one project that lists it>/<ticket>, else the bare ticket (bind()
+    makes a project of one); ('', candidates) when two items or two projects claim it."""
+    mapped = _targets([r for r in load_index(root) if r.get("ticket") == ticket])
+    if len(mapped) > 1:
+        return "", mapped
+    if mapped:
+        return mapped[0], []
+    owners = ticket_owners(ticket, root)
+    if len(owners) > 1:
+        return "", owners
+    return (f"{owners[0]}/{ticket}" if owners else ticket), []
+
+
+def may_move(d: Decision, cur: Binding | None, root: Path | None = None) -> bool:
+    """Whether a re-bind the session did not ask for (a checkout change, EnterWorktree, a prompt after
+    /clear) may act on <d>: always for an unbound session; a bound one moves only to a different,
+    existing project or item, so nothing is ever created for it."""
+    if not d:
+        return False
+    if cur is None:
+        return True
+    if d.target == where_label(cur) or d.rule == "worktree-new":
+        return False
+    name, _, item = d.target.partition("/")
+    pd = project_dir(name, root)
+    return bool(pd and (not item or (pd / "items" / item).is_dir()))
 
 
 def recent_items(repo: str, n: int = 3, root: Path | None = None) -> list[str]:
@@ -798,12 +865,11 @@ def bind(sid: str, target: str, *, desc: str = "", here: Place | None = None, re
         if pdir:
             item = t
         else:
-            mapped = _targets([r for r in load_index(root) if r.get("ticket") == t])
-            hits = [p for p in projects(root) if not p.legacy and t in p.tickets]
-            if len(mapped) == 1:
-                name, item = mapped[0].split("/", 1)
-            elif hits:
-                name, item = hits[0].name, t
+            found, ambiguous = ticket_target(t, root)
+            if not found:
+                raise AmbiguousTicket(t, ambiguous)
+            if "/" in found:
+                name, item = found.split("/", 1)
             else:
                 create_project(t, scope=desc.replace("-", " "), terms=desc.replace("-", " "), repos=repo, status="project-of-one", root=root)
                 record_retro(f"created project of one {t}", source="auto", tag="project", session=sid, where=f"{t}/{t}", root=root)
@@ -1016,12 +1082,13 @@ def slice_text(b: Binding, how: str = "", cap: int = SLICE_CAP, handoff: bool = 
     open_items = [d.name for d in p.items() if _item_status(d) not in DONE_STATUSES]
     head = [
         *([how] if how else []),
-        f"PROJECT: {p.name}{' · item ' + b.item if b.item else ''}. Folder: {b.folder}. Project root: {p.path}.",
+        # The root is spelled out once; a long work root would otherwise push the scripts past the cap.
+        f"PROJECT: {p.name}{' · item ' + b.item if b.item else ''}. Folder: {b.folder}. Project root: {p.path} (the paths below are relative to it).",
         f"Scope: {p.meta.get('scope') or '(unset: fill scope, terms and repos in PROJECT.md)'} | status: {p.meta.get('status', '?')}"
         + (f" | open items: {', '.join(open_items[:8])}" + (f" (+{len(open_items) - 8})" if len(open_items) > 8 else "") if open_items else ""),
-        f"Reuse before re-deriving: knowledge/ and scripts/ are project-level; a reusable script goes to {p.path}/scripts/ with a `  - use:` line under it in INDEX.md. "
+        "Reuse before re-deriving: knowledge/ and scripts/ are project-level; a reusable script goes to scripts/ with a `  - use:` line under it in INDEX.md. "
         + ("PR evidence goes to the item's out/, disposable files to its tmp/. " if b.item else "")
-        + f"INDEX.md lists every file: {p.path}/INDEX.md.",
+        + "INDEX.md lists every file.",
     ]
     titles = knowledge_titles(p.path)
     mid = (["Knowledge: " + "; ".join(titles)] if titles else ["Knowledge: none recorded yet (knowledge/{findings,decisions,code-map,queries}.md)."])
@@ -1029,7 +1096,7 @@ def slice_text(b: Binding, how: str = "", cap: int = SLICE_CAP, handoff: bool = 
     if handoff and b.item:
         hf = b.folder / "HANDOFF.md"
         if hf.is_file():
-            tail = [f"HANDOFF: {hf}. Read it before starting. It opens:", *_handoff_opening(hf)]
+            tail = [f"HANDOFF: {hf.relative_to(p.path)}. Read it before starting. It opens:", *_handoff_opening(hf)]
     scripts = proven_scripts(p.path)
     if scripts:
         room = cap - len("\n".join(head + mid + tail)) - 40
@@ -1045,72 +1112,6 @@ def slice_text(b: Binding, how: str = "", cap: int = SLICE_CAP, handoff: bool = 
     if len(text) > cap:
         text = text[: cap - 4].rsplit("\n", 1)[0] + "\n..."
     return text
-
-
-BIG_FILE = 5 * 1024 * 1024
-
-
-def _tree_size(d: Path) -> int:
-    total = 0
-    for top, dirs, names in os.walk(d):
-        for n in names:
-            with contextlib.suppress(OSError):
-                total += os.lstat(os.path.join(top, n)).st_size
-    return total
-
-
-def prune_report(days: int = 14, root: Path | None = None) -> list[dict]:
-    """What `agent-task prune` would remove, per item idle <days>+ days: tmp/, clones (a folder
-    holding `.git`) under out/, and other files over 5MB. Reads only."""
-    root = root or work_root()
-    now = time.time()
-    out = []
-    for p in projects(root):
-        if p.legacy:
-            continue
-        for d in p.items():
-            idle = int((now - touched(d)) // 86400)
-            if idle < days:
-                continue
-            found: list[tuple[str, Path, int]] = []
-            if (d / "tmp").is_dir() and any((d / "tmp").iterdir()):
-                found.append(("tmp", d / "tmp", _tree_size(d / "tmp")))
-            clones: list[Path] = []
-            for top, dirs, names in os.walk(d / "out"):
-                if ".git" in dirs or ".git" in names:
-                    clones.append(Path(top))
-                    found.append(("clone", Path(top), _tree_size(Path(top))))
-                    dirs[:] = []
-            for top, dirs, names in os.walk(d):
-                tp = Path(top)
-                if tp == d / "tmp" or tp in clones:
-                    dirs[:] = []
-                    continue
-                dirs[:] = [x for x in dirs if tp / x != d / "tmp" and tp / x not in clones]
-                for n in names:
-                    with contextlib.suppress(OSError):
-                        size = os.lstat(tp / n).st_size
-                        if size > BIG_FILE:
-                            found.append(("big", tp / n, size))
-            if found:
-                out.append({"item": f"{p.name}/{d.name}", "idle_days": idle, "found": found})
-    return out
-
-
-def prune_apply(report: list[dict]) -> list[str]:
-    """Delete what the report lists as tmp/ contents and clones; big files are reported for the
-    user to judge, never deleted here."""
-    done = []
-    for r in report:
-        for kind, path, size in r["found"]:
-            if kind == "tmp":
-                for x in path.iterdir():
-                    shutil.rmtree(x) if x.is_dir() and not x.is_symlink() else x.unlink()
-                done.append(f"emptied {path} ({size // 1024}K)")
-            elif kind == "clone":
-                shutil.rmtree(path)
-                done.append(f"removed {path} ({size // 1024}K)")
-    return done
 
 
 def durable_lines(hf: Path, n: int = 15) -> list[str]:

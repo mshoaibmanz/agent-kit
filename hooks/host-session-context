@@ -42,14 +42,18 @@ def main() -> int:
     if sid:
         kit = kit_root(__file__)
         source = data.get("source") or "startup"
-        task = subprocess.run(
-            [str(kit / "bin" / "agent-task"), "session-start", "--session", sid, "--source", source if source in ("startup", "resume", "clear", "compact") else "startup", "--cwd", cwd],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=20,
-        )
-        if task.returncode == 0 and task.stdout.strip():
+        # A slow or missing agent-task drops only its slice; the repo guidance above still goes out.
+        try:
+            task = subprocess.run(
+                [str(kit / "bin" / "agent-task"), "session-start", "--session", sid, "--source", source if source in ("startup", "resume", "clear", "compact") else "startup", "--cwd", cwd],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            task = None
+        if task and task.returncode == 0 and task.stdout.strip():
             context += "\n" + task.stdout.strip()
     sys.stdout.write(
         json.dumps(

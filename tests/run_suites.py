@@ -106,7 +106,8 @@ class Runner:
         self.run_dir = run_dir
         self.stream = stream
         self.children: set[subprocess.Popen[bytes]] = set()
-        self.guard = threading.Lock()
+        # Re-entrant: the SIGTERM handler calls stop() on the main thread, which may hold it.
+        self.guard = threading.RLock()
         self.stopping = False
 
     def log(self, suite: Suite) -> Path:
@@ -129,6 +130,9 @@ class Runner:
                 start_new_session=True,
             )
             with self.guard:
+                # stop() may have run between the check above and Popen: it never saw this child.
+                if self.stopping:
+                    kill_group(process)
                 self.children.add(process)
             if self.stream and process.stdout:
                 for line in process.stdout:
@@ -149,13 +153,17 @@ class Runner:
         return suite
 
     def stop(self) -> None:
-        self.stopping = True
         with self.guard:
+            self.stopping = True
             for process in self.children:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                kill_group(process)
+
+
+def kill_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
 
 
 def main() -> int:

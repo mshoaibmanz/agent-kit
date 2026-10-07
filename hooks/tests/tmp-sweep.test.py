@@ -184,6 +184,79 @@ class Sweep(Fixture):
         self.assertIn("skip (item reopened)", proc.stdout)
         self.assertTrue((tmp / "rows.csv").exists())
 
+    def origin(self) -> Path:
+        """A bare origin with one commit on main, to clone checkouts whose branches are all pushed."""
+        origin, seed = self.base / "origin.git", self.base / "seed"
+        git("init", "-q", "--bare", str(origin), cwd=self.base)
+        seed.mkdir()
+        git("init", "-q", cwd=seed)
+        (seed / "a.txt").write_text("a\n")
+        git("add", "a.txt", cwd=seed)
+        git("commit", "-qm", "seed", cwd=seed)
+        git("push", "-q", str(origin), "HEAD:refs/heads/main", cwd=seed)
+        return origin
+
+    def clone(self, origin: Path, dest: Path) -> Path:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        git("clone", "-q", "-b", "main", str(origin), str(dest), cwd=self.base)
+        return dest
+
+    def test_local_only_commits_stashes_and_nested_checkouts_are_kept(self) -> None:
+        origin = self.origin()
+        d = self.item("p", "done", "closed", "2020-01-01")
+        tmp = d / "tmp"
+        pushed = self.clone(origin, tmp / "pushed")
+        detached = self.clone(origin, tmp / "detached")
+        git("checkout", "-q", "--detach", cwd=detached)
+        (detached / "b.txt").write_text("b\n")
+        git("add", "b.txt", cwd=detached)
+        git("commit", "-qm", "detached only", cwd=detached)
+        stashed = self.clone(origin, tmp / "stashed")
+        (stashed / "a.txt").write_text("changed\n")
+        git("stash", "-q", cwd=stashed)
+        (tmp / "home/.claude").mkdir(parents=True)
+        nested = self.clone(origin, tmp / "home/work/repo")
+        (nested / "c.txt").write_text("c\n")
+        git("add", "c.txt", cwd=nested)
+        git("commit", "-qm", "local only", cwd=nested)
+        (tmp / "home/big.bin").write_bytes(b"0" * (1024 * 1024 + 1))
+        self.clone(origin, d / "out/clone")
+        (d / "out/dump.bin").write_bytes(b"0" * (5 * 1024 * 1024 + 1))
+        age(d)
+        harvested = self.item("p", "harvested", "harvested")
+        (harvested / "tmp/h.py").write_text("1\n")
+        age(harvested)
+
+        proc = self.gc()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = {Path(p).relative_to(d).as_posix(): v for p, v in self.lines().items() if Path(p).is_relative_to(d)}
+        self.assertEqual(lines["tmp/pushed"], ("delete", "git checkout"))
+        self.assertEqual(lines["tmp/detached"], ("keep", "git checkout with unpushed work"))
+        self.assertEqual(lines["tmp/stashed"], ("keep", "git checkout with unpushed work"))
+        self.assertEqual(lines["tmp/home/work/repo"], ("keep", "git checkout with unpushed work"))
+        self.assertNotIn("tmp/home", lines, "a scratch home holding unpushed work is not deleted whole")
+        self.assertEqual(lines["tmp/home/big.bin"], ("delete", "file over 1 MB"))
+        self.assertEqual(lines["out/clone"], ("report", "checkout outside tmp/"))
+        self.assertEqual(lines["out/dump.bin"], ("report", "file over 5 MB outside tmp/"))
+        self.assertIn(("salvage", "small source or data"), [v for p, v in self.lines().items() if p.endswith("/harvested/tmp/h.py")],
+                      "a harvested item is done")
+
+        git("commit", "-q", "--allow-empty", "-m", "made after the report", cwd=pushed)
+        # Keep the report's fingerprint (newest mtime) so only the settled recheck can refuse it.
+        fingerprint = next(line.split("\t")[4] for line in self.report().read_text().splitlines()
+                           if line.startswith("delete\t") and line.split("\t")[1].endswith("/tmp/pushed"))
+        for top, dirs, files in os.walk(pushed):
+            for name in dirs + files:
+                os.utime(os.path.join(top, name), ns=(int(fingerprint), int(fingerprint)), follow_symlinks=False)
+        os.utime(pushed, ns=(int(fingerprint), int(fingerprint)))
+        proc = self.gc("--sweep-tmp", "--report-sha256", hashlib.sha256(self.report().read_bytes()).hexdigest())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"skip (holds a checkout with unpushed work or a stash): {pushed.resolve()}", proc.stdout)
+        for kept in ("tmp/pushed", "tmp/detached", "tmp/stashed", "tmp/home/work/repo/c.txt", "out/clone", "out/dump.bin"):
+            self.assertTrue((d / kept).exists(), kept)
+        self.assertFalse((d / "tmp/home/big.bin").exists())
+        self.assertEqual(subprocess.run(["git", "stash", "list"], cwd=stashed, capture_output=True, text=True).stdout.count("\n"), 1)
+
     def test_grace_comes_from_tmp_sweep_days(self) -> None:
         d = self.item("p", "done", "closed")
         (d / "tmp/a.py").write_text("1\n")

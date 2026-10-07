@@ -6,6 +6,7 @@ lib's constant in a subprocess), so no case reads the real Keychain."""
 
 from __future__ import annotations
 
+import http.server
 import importlib.machinery
 import importlib.util
 import json
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -267,12 +269,94 @@ class Wrapper(Fixture):
         self.assertFalse(cache.exists())
 
 
+def load_sentry_map():  # type: ignore[no-untyped-def]
+    loader = importlib.machinery.SourceFileLoader("sentry_map", str(SOURCE / "bin/sentry-map"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class Recorder(http.server.BaseHTTPRequestHandler):
+    """Answers GET from the server's `routes` (path -> (status, headers, body)) and records each
+    request's path and Authorization header."""
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.server.seen.append((self.path, self.headers.get("Authorization")))  # type: ignore[attr-defined]
+        status, headers, body = self.server.routes.get(self.path.split("?")[0], (404, {}, []))  # type: ignore[attr-defined]
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+
+class Origins(Fixture):
+    """The token goes only to the instance's own origin: a second local server on another port plays
+    the other origin and records any Authorization header that reaches it."""
+
+    def serve(self) -> tuple[http.server.ThreadingHTTPServer, str]:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Recorder)
+        server.routes, server.seen = {}, []  # type: ignore[attr-defined]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home, self.home_url = self.serve()
+        self.other, self.other_url = self.serve()
+        self.other.routes["/api/0/organizations/"] = (200, {}, [{"slug": "stolen"}])  # type: ignore[attr-defined]
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE,
+                   {"local": {"host": self.home_url, "keychain": "agent-kit-test/sentry-local"}})
+        self.items.write_text(f"agent-kit-test/sentry-local={TOKEN}\n")
+        self.mod = load_sentry_map()
+        self.inst = sentry.load_instances(self.kit, self.overlay)["local"]
+
+    def test_a_redirect_to_another_origin_is_refused_before_the_token_leaves(self) -> None:
+        self.home.routes["/api/0/organizations/"] = (302, {"Location": f"{self.other_url}/api/0/organizations/"}, [])  # type: ignore[attr-defined]
+        with self.assertRaisesRegex(RuntimeError, "another origin"):
+            self.mod.crawl(self.inst)
+        self.assertEqual(self.other.seen, [])  # type: ignore[attr-defined]
+
+    def test_a_same_origin_redirect_is_followed(self) -> None:
+        self.home.routes["/old/"] = (302, {"Location": "/api/0/organizations/"}, [])  # type: ignore[attr-defined]
+        self.home.routes["/api/0/organizations/"] = (200, {}, [{"slug": "o"}])  # type: ignore[attr-defined]
+        client = self.mod.Client(self.inst, TOKEN)
+        self.assertEqual(client.get_all(f"{self.home_url}/old/"), [{"slug": "o"}])
+
+    def test_pagination_and_region_urls_on_another_origin_get_no_token(self) -> None:
+        self.home.routes["/api/0/organizations/"] = (  # type: ignore[attr-defined]
+            200, {"Link": f'<{self.other_url}/api/0/organizations/>; rel="next"; results="true"'}, [])
+        with self.assertRaisesRegex(RuntimeError, "another origin"):
+            self.mod.crawl(self.inst)
+        self.home.routes["/api/0/organizations/"] = (200, {}, [{"slug": "o", "links": {"regionUrl": self.other_url}}])  # type: ignore[attr-defined]
+        self.home.routes["/api/0/organizations/o/projects/"] = (200, {}, [{"slug": "p"}])  # type: ignore[attr-defined]
+        self.home.routes["/api/0/organizations/o/events/"] = (200, {}, {"data": []})  # type: ignore[attr-defined]
+        result = self.mod.crawl(self.inst)
+        self.assertEqual([(o["slug"], o["region_url"], [p["slug"] for p in o["projects"]]) for o in result["orgs"]],
+                         [("o", self.home_url, ["p"])])
+        self.assertEqual(self.other.seen, [])  # type: ignore[attr-defined]
+        self.assertTrue(all(auth == f"Bearer {TOKEN}" for _path, auth in self.home.seen))  # type: ignore[attr-defined]
+
+    def test_token_variables_never_collide(self) -> None:
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {
+            "prod-a": {"host": "a.invalid", "keychain": "k/a"}, "prod_a": {"host": "b.invalid", "keychain": "k/b"},
+            "beta": {"host": "c.invalid", "keychain": "k/c"}})
+        names = {name: inst.env_name for name, inst in sentry.load_instances(self.kit, self.overlay).items()}
+        self.assertEqual(names, {"prod-a": "SENTRY_ACCESS_TOKEN_PROD_2DA", "prod_a": "SENTRY_ACCESS_TOKEN_PROD_5FA",
+                                 "beta": "SENTRY_ACCESS_TOKEN_BETA"})
+
+
 class Match(unittest.TestCase):
     def setUp(self) -> None:
-        loader = importlib.machinery.SourceFileLoader("sentry_map", str(SOURCE / "bin/sentry-map"))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        self.mod = importlib.util.module_from_spec(spec)
-        loader.exec_module(self.mod)
+        self.mod = load_sentry_map()
         self.rows = [{"project": p, "org": o} for p, o in (
             ("web-billing-api-ledger", "acme"), ("web-billing-api-gateway", "acme-alt"), ("auth-portal", "acme"),
         )]

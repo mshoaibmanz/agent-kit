@@ -5,6 +5,7 @@ against a synthetic work root. HOOKS_DIR=<dir> tests another copy of the hooks (
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -146,6 +147,28 @@ WT556 = REPO / ".claude/worktrees/DEMO-556-bar"
 git("-C", str(REPO), "worktree", "add", "-q", "-b", "DEMO-556-bar", str(WT556))
 r = resolve("", "--cwd", str(WT556))
 check("worktree-new: ...under the one project that lists the ticket", r["rule"] == "worktree-new" and r["target"] == "wtproj/DEMO-556", str(r))
+WTLONG = REPO / ".claude/worktrees/abcdefg-12-x"
+git("-C", str(REPO), "worktree", "add", "-q", "-b", "abcdefg-12-x", str(WTLONG))
+r = resolve("", "--cwd", str(WTLONG))
+check("a branch prefix over 6 characters names no ticket (TICKET_RE's rule)", r["rule"] == "" and "ABCDEFG" not in json.dumps(r), str(r))
+WTPORT = REPO / ".claude/worktrees/port-02-guards"
+git("-C", str(REPO), "worktree", "add", "-q", "-b", "port-02-guards", str(WTPORT))
+OVP = T / "ov-prefixes"
+OVP.mkdir()
+(OVP / "kit.env").write_text("TICKET_PREFIXES=DEMO,CORE\n")
+r = json.loads(task("resolve", "", "--cwd", str(WTPORT), env=dict(ENV, KIT_ENV=str(OVP / "kit.env"))).stdout or "{}")
+check("TICKET_PREFIXES set: port-02-guards names no ticket", r.get("rule") == "" and "PORT" not in json.dumps(r), str(r))
+r = json.loads(task("resolve", "", "--cwd", str(WT556), env=dict(ENV, KIT_ENV=str(OVP / "kit.env"))).stdout or "{}")
+check("...and a listed prefix still does", r.get("rule") == "worktree-new" and r.get("target") == "wtproj/DEMO-556", str(r))
+project("wtproj2", "scope: second owner\ntickets: DEMO-558")
+project("wtproj3", "scope: third owner\ntickets: DEMO-558")
+SAMB = "5a5a5a5a-aaaa-4000-8000-000000000000"
+out = task("bind", "DEMO-558", "--session", SAMB)
+check("bind <TICKET> two projects list refuses and names both, creating nothing", out.returncode != 0 and "wtproj2" in out.stderr and "wtproj3" in out.stderr and binding(SAMB) == "" and not (ROOT / "projects/DEMO-558").exists() and not (ROOT / "projects/wtproj2/items/DEMO-558").exists(), out.stdout + out.stderr)
+WT558 = REPO / ".claude/worktrees/DEMO-558-amb"
+git("-C", str(REPO), "worktree", "add", "-q", "-b", "DEMO-558-amb", str(WT558))
+r = resolve("", "--cwd", str(WT558))
+check("...and a DEMO-558-* worktree is no rule, offering both (one ticket_target for bind and decide)", r["rule"] == "" and set(r["candidates"][:2]) == {"wtproj2", "wtproj3"}, str(r))
 WTH = REPO / ".claude/worktrees/hosts"
 git("-C", str(REPO), "worktree", "add", "-q", "-b", "hosts", str(WTH))
 r = resolve("", "--cwd", str(WTH))
@@ -222,8 +245,19 @@ out = prompt(S31, "next", cwd=WT555)
 ctx = ctx_of(out)
 check("entering a mapped worktree mid-session rebinds, announcing the change", binding(S31) == "project:DEMO-555/DEMO-555" and ctx.startswith("bound: DEMO-555/DEMO-555 (rule: worktree; was invoices/DEMO-1500)"), binding(S31) + ctx)
 out = hook("project-bind", {"hook_event_name": "PostToolUse", "tool_name": "EnterWorktree", "session_id": S31, "cwd": str(REPO), "tool_input": {"name": "DEMO-556-bar"}, "tool_response": {"worktreePath": str(WT556), "message": "ok"}})
+check("PostToolUse(EnterWorktree) never creates an item for a bound session", binding(S31) == "project:DEMO-555/DEMO-555" and ctx_of(out) == "" and not (ROOT / "projects/wtproj/items/DEMO-556").exists(), binding(S31) + out.stdout + out.stderr)
+out = prompt(S31, "next", cwd=WTPORT)
+check("...nor a project of one: a prompt in port-02-guards (checkout changed) stays bound", binding(S31) == "project:DEMO-555/DEMO-555" and not (ROOT / "projects/PORT-02").exists(), binding(S31) + out.stdout)
+out = hook("project-bind", {"hook_event_name": "PostToolUse", "tool_name": "EnterWorktree", "session_id": S31, "cwd": str(REPO), "tool_input": {"name": "port-02-guards"}, "tool_response": {"worktreePath": str(WTPORT), "message": "ok"}})
+check("...nor does EnterWorktree into port-02-guards", binding(S31) == "project:DEMO-555/DEMO-555" and ctx_of(out) == "" and not (ROOT / "projects/PORT-02").exists(), binding(S31) + out.stdout + out.stderr)
+S34 = "34343434-aaaa-4000-8000-000000000000"
+out = hook("project-bind", {"hook_event_name": "PostToolUse", "tool_name": "EnterWorktree", "session_id": S34, "agent_id": "sub-1", "cwd": str(REPO), "tool_input": {"name": "DEMO-556-bar"}, "tool_response": {"worktreePath": str(WT556), "message": "ok"}})
+check("a subagent's EnterWorktree (agent_id) binds nothing", binding(S34) == "" and not (ROOT / "projects/wtproj/items/DEMO-556").exists(), binding(S34) + out.stdout)
+out = hook("project-bind", {"hook_event_name": "PostToolUse", "tool_name": "EnterWorktree", "session_id": S34, "cwd": str(REPO), "tool_input": {"name": "DEMO-556-bar"}, "tool_response": {"worktreePath": str(WT556), "message": "ok"}})
 ctx = ctx_of(out)
-check("PostToolUse(EnterWorktree) binds the new worktree's item at once", binding(S31) == "project:wtproj/DEMO-556" and "rule: worktree-new; was DEMO-555/DEMO-555" in ctx, binding(S31) + ctx + out.stderr)
+check("PostToolUse(EnterWorktree) binds an unbound session's new worktree item at once", binding(S34) == "project:wtproj/DEMO-556" and "rule: worktree-new" in ctx, binding(S34) + ctx + out.stderr)
+out = prompt(S31, "next", cwd=WT556)
+check("a bound session entering a worktree of an EXISTING item moves to it", binding(S31) == "project:wtproj/DEMO-556" and "rule: worktree; was DEMO-555/DEMO-555" in ctx_of(out), binding(S31) + out.stdout)
 S32 = "32323232-aaaa-4000-8000-000000000000"
 o = task("session-start", "--session", S32, "--source", "startup", env=dict(ENV, CLAUDE_PROJECT_DIR=str(WT555))).stdout
 check("session start inside a mapped worktree binds before the first prompt", binding(S32) == "project:DEMO-555/DEMO-555" and o.startswith("bound: DEMO-555/DEMO-555 (rule: worktree)"), o)
@@ -423,7 +457,13 @@ check("...lists knowledge entry titles, not counts", "findings: Fees round per l
 shown = re.findall(r"^- scripts/s(\d+)\.py", sl, re.M)
 check("...at most 10 scripts, only ones with a use:/proved: line", 0 < len(shown) <= 10 and all(int(n) % 2 == 0 for n in shown) and "  - use: replay case" in sl, sl)
 check("...no data/ and no unproven script", "rows.csv" not in sl and "s001.py" not in sl, sl)
-check("...says where a reusable script goes", f"{big}/scripts/ with a `  - use:` line" in sl, sl)
+check("...says where a reusable script goes, relative to the project root it names once", f"Project root: {big} (the paths below are relative to it)" in sl and "goes to scripts/ with a `  - use:` line" in sl and sl.count(str(big)) == 2, sl)
+LONGROOT = T / "w"
+LONGROOT = LONGROOT.with_name("w" + "x" * max(0, 120 - len(str(LONGROOT))))
+shutil.copytree(big, LONGROOT / "projects/big")
+lsl = task("slice", "--session", "78787878-aaaa", env=dict(ENV, CLAUDE_OUT_ROOT=str(LONGROOT))) if task("bind", "big/BIG-1", "--session", "78787878-aaaa", env=dict(ENV, CLAUDE_OUT_ROOT=str(LONGROOT))).returncode == 0 else None
+lsl_text = lsl.stdout if lsl else ""
+check(f"...a {len(str(LONGROOT))}-character work root still leaves room for the proven scripts", len(str(LONGROOT)) >= 120 and "Proven scripts:" in lsl_text and len(lsl_text.rstrip()) <= 2000, lsl_text)
 check("...ends with the item's HANDOFF opening", "HANDOFF: " in sl and "Handoff BIG-1" in sl, sl[-400:])
 bf = Path(task("brief", "big/BIG-1", "--name", "cap").stdout.strip())
 check("brief embeds the slice, not the INDEX", bf.is_file() and "Proven scripts:" in bf.read_text() and "s001.py" not in bf.read_text(), bf.read_text()[-600:] if bf.is_file() else "")
@@ -576,6 +616,13 @@ S41, S42 = "41414141-aaaa-4000-8000-000000000000", "42424242-aaaa-4000-8000-0000
 (BD / S41[:8]).write_text("DEMO-1500-invoices\n")
 w = task("where", "--path", "--session", S41)
 check("a legacy tasks/ key resolves through its link to the item, and the file migrates on read", w.stdout.strip() == str(rp / "items/DEMO-1500") and binding(S41) == "project:invoices/DEMO-1500", w.stdout + binding(S41))
+S43 = "43434343-aaaa-4000-8000-000000000000"
+(ROOT / "tasks/samename").mkdir()
+(ROOT / "tasks/samename/HANDOFF.md").write_text("# legacy samename\n")
+project("samename", "scope: a project made after the legacy folder")
+(BD / S43[:8]).write_text("samename\n")
+w = task("where", "--path", "--session", S43)
+check("a bare legacy key keeps its tasks/ folder when projects/<same name> appears", w.stdout.strip() == str(ROOT / "tasks/samename") and binding(S43) == "samename", w.stdout + binding(S43))
 (BD / S42[:8]).write_text("invoices/DEMO-1500\n")
 (BD / "tab-tty-ttys099").write_text("DEMO-1500-invoices\t" + S42 + "\n")
 dry = task("migrate", "--bindings").stdout
@@ -593,23 +640,17 @@ check("...and leaves a closed ledger entry with its PR (never blocked)", cl.retu
 idx = json.loads((ROOT / ".index.json").read_text())
 check("...which the index reflects", any(x["item"] == "DEMO-501" and x["status"] == "closed" for x in idx["items"]))
 
-print("--- prune: a dry-run report of disposable files in idle items ---")
+print("--- no second cleaner: the tmp sweep (claude-gc) is the only one ---")
 old = rp / "items/OLD-1"
 task("bind", "invoices/OLD-1", "--session", HELPER)
 (old / "tmp" / "home").mkdir(parents=True)
-(old / "tmp" / "home" / "f.txt").write_text("x" * 2048)
+(old / "tmp" / "home" / "unfinished.py").write_text("x = 1\n")
 (old / "out" / "clone" / ".git").mkdir(parents=True)
-(old / "out" / "clone" / "a.py").write_text("x")
-with open(old / "out" / "big.bin", "wb") as fh:
-    fh.truncate(6 * 1024 * 1024)
 past = time.time() - 30 * 86400
 for f in [old, *old.rglob("*")]:
     os.utime(f, (past, past))
-pr = task("prune")
-check("prune reports tmp/, clones and files over 5MB in an item idle 14+ days", "invoices/OLD-1  idle 30d" in pr.stdout and f"tmp  " in pr.stdout and str(old / "out/clone") in pr.stdout and str(old / "out/big.bin") in pr.stdout and "dry run" in pr.stdout, pr.stdout)
-check("...lists no active item and deletes nothing", "DEMO-1500" not in pr.stdout and (old / "tmp/home/f.txt").is_file() and (old / "out/clone/.git").is_dir(), pr.stdout)
 pa = task("prune", "--apply")
-check("prune --apply empties tmp/ and removes clones, never the big file", not (old / "tmp/home").exists() and not (old / "out/clone").exists() and (old / "out/big.bin").is_file() and (old / "tmp").is_dir(), pa.stdout)
+check("agent-task prune is gone, and an idle open item keeps its tmp/ and out/ clone", pa.returncode != 0 and (old / "tmp/home/unfinished.py").is_file() and (old / "out/clone/.git").is_dir(), pa.stdout + pa.stderr)
 ct = HOOKS.parent / "bin" / "claude-task"
 if ct.exists():
     S10 = "aaaaaaaa-aaaa-4000-8000-000000000000"

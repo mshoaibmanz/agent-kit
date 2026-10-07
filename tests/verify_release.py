@@ -4,6 +4,7 @@ from pathlib import Path
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,12 @@ with tempfile.TemporaryDirectory(prefix='verify-release-', dir=os.environ.get('T
         if row.get('source') != {'source': 'git-subdir', 'url': 'https://github.com/mshoaibmanz/agent-kit.git',
                                  'path': f'plugins/{row["name"]}', 'ref': 'dist'}:
             failures.append(f'marketplace source for {row["name"]} is not plugins/{row["name"]} on dist')
+    # dist publishes only a commit ci has passed on main: never on a bare push or by hand.
+    dist_flow = (root / '.github/workflows/dist.yml').read_text()
+    if not all(text in dist_flow for text in ('workflow_run:', 'workflows: [ci]', 'types: [completed]',
+                                               "conclusion == 'success'", "event == 'push'")) \
+            or re.search(r'^\s*(push|workflow_dispatch):', dist_flow, re.M):
+        failures.append('dist.yml publishes without a green ci run on main')
     if any(plugins.rglob('critic.md')):
         failures.append('retired critic agent')
     if any('version' in json.loads(path.read_text()) for path in plugins.glob('*/.claude-plugin/plugin.json')):

@@ -1,14 +1,15 @@
-"""claude-gc's work-root tmp/ sweep (README "Inspect and roll back"): `scan --report PATH` writes the report,
-`apply --report PATH --sha256 HASH` applies exactly that report. Only items/*/tmp/ of a closed or
-merged item, after TMP_SWEEP_DAYS; generated bulk and files over 1 MB are deleted, small source and
-data files move to the item's out/salvage/, anything else stays."""
+"""claude-gc's work-root tmp/ sweep, the kit's only work-root cleaner (README "Inspect and roll back"):
+`scan --report PATH` writes the report, `apply --report PATH --sha256 HASH` applies exactly that report.
+Only items/*/tmp/ of a done item (agent_task.DONE_STATUSES), after TMP_SWEEP_DAYS; generated bulk and
+files over 1 MB are deleted, small source and data files move to the item's out/salvage/, anything else
+stays. A checkout holding a local-only commit, a stash or uncommitted work is kept wherever it sits.
+Checkouts and files over 5 MB elsewhere in the item are listed as report lines, never applied."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import hashlib
-import json
 import os
 import shutil
 import subprocess
@@ -18,9 +19,12 @@ import time
 from pathlib import Path
 from typing import Iterator, NamedTuple
 
-CLOSED = frozenset(("closed", "merged"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
+from agent_task import DONE_STATUSES, read_task  # noqa: E402
+
 DEFAULT_DAYS = 14
 MAX_SALVAGE = 1024 * 1024
+BIG_FILE = 5 * 1024 * 1024
 SALVAGE_SUFFIXES = frozenset((".py", ".sh", ".sql", ".ipynb", ".md", ".csv", ".json", ".txt"))
 BULK_DIRS = frozenset((
     ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
@@ -28,11 +32,12 @@ BULK_DIRS = frozenset((
 ))
 # A folder holding one of these is a home a test or a host sandbox made, not work.
 HOME_MARKERS = frozenset((".claude", ".codex", ".cursor", ".config", ".local", "Library"))
-REPORT_HEADER = "# tmp-sweep v1: action, path, kind, bytes, fingerprint. Only delete and salvage lines are applied."
+REPORT_HEADER = ("# tmp-sweep v1: action, path, kind, bytes, fingerprint. Only delete and salvage lines are applied; "
+                 "report lines are for you to judge.")
 
 
 class Entry(NamedTuple):
-    action: str  # delete | salvage | keep
+    action: str  # delete | salvage | keep | report
     path: Path
     kind: str
     size: int
@@ -40,7 +45,6 @@ class Entry(NamedTuple):
 
 
 def work_root() -> Path:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
     from kit_env import work_root as resolve
 
     return Path(resolve())
@@ -49,7 +53,6 @@ def work_root() -> Path:
 def sweep_days() -> int:
     """TMP_SWEEP_DAYS from the overlay, else DEFAULT_DAYS."""
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
         from kit_env import kit_env
 
         raw = kit_env().get("TMP_SWEEP_DAYS", "")
@@ -59,13 +62,13 @@ def sweep_days() -> int:
 
 
 def item_status(item: Path) -> tuple[str, str]:
-    try:
-        data = json.loads((item / "task.json").read_text())
-    except (OSError, ValueError):
-        return "open", ""
-    if not isinstance(data, dict):
-        return "open", ""
-    return str(data.get("status", "open")), str(data.get("closed", ""))
+    """(status, the date it was closed or harvested), read as agent-task reads task.json."""
+    data = read_task(item)
+    return str(data.get("status", "open")), str(data.get("closed") or data.get("harvested") or "")
+
+
+def is_done(item: Path) -> bool:
+    return item_status(item)[0] in DONE_STATUSES
 
 
 def newest_mtime(path: Path) -> int:
@@ -95,15 +98,27 @@ def tree_size(path: Path) -> int:
 
 
 def git_settled(folder: Path) -> bool:
-    """Nothing uncommitted and no commit that only this checkout holds."""
+    """Nothing uncommitted and no commit that only this checkout holds. `--all` walks HEAD (a detached
+    commit), tags and refs/stash too, which `--branches` misses."""
     try:
         status = subprocess.run(["git", "-C", str(folder), "status", "--porcelain"],
                                 capture_output=True, text=True, timeout=60, check=False)
-        local = subprocess.run(["git", "-C", str(folder), "rev-list", "--branches", "--not", "--remotes", "-n", "1"],
+        local = subprocess.run(["git", "-C", str(folder), "rev-list", "--all", "--not", "--remotes", "-n", "1"],
                                capture_output=True, text=True, timeout=60, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return status.returncode == 0 and not status.stdout.strip() and local.returncode == 0 and not local.stdout.strip()
+
+
+def unsettled_checkouts(folder: Path) -> list[Path]:
+    """Every checkout at or under folder (links not followed) that git_settled refuses."""
+    found = []
+    for top, dirs, files in os.walk(folder):
+        if ".git" in dirs or ".git" in files:
+            if not git_settled(Path(top)):
+                found.append(Path(top))
+        dirs[:] = [d for d in dirs if d != ".git" and not os.path.islink(os.path.join(top, d))]
+    return found
 
 
 def generated(folder: Path) -> str | None:
@@ -120,10 +135,13 @@ def generated(folder: Path) -> str | None:
 
 
 def bulk_kind(folder: Path) -> str | None:
+    """The kind of bulk folder may go whole; None to descend into it. A checkout with unsettled work
+    (its own or a nested one) is kept whole; any other bulk folder holding one is descended into, so
+    the sweep keeps that checkout and judges the rest piece by piece."""
     kind = generated(folder)
-    if kind == "git checkout" and not git_settled(folder):
-        return "git checkout with unpushed work"
-    return kind
+    if kind is None or not unsettled_checkouts(folder):
+        return kind
+    return "git checkout with unpushed work" if kind == "git checkout" else None
 
 
 def classify(tmp: Path) -> Iterator[Entry]:
@@ -152,40 +170,62 @@ def classify(tmp: Path) -> Iterator[Entry]:
                 yield Entry("salvage", path, "small source or data", stat.st_size, fingerprint)
 
 
-def tmp_folders(root: Path) -> Iterator[tuple[Path, Path]]:
-    """(item, item/tmp) for every item folder that has a real tmp/ folder."""
+def item_folders(root: Path) -> Iterator[tuple[Path, Path | None]]:
+    """(item, item/tmp, or None without a real tmp/ folder) for every real item folder."""
     for item in sorted(root.glob("projects/*/items/*")):
-        tmp = item / "tmp"
-        if item.is_dir() and not item.is_symlink() and tmp.is_dir() and not tmp.is_symlink():
-            yield item, tmp
+        if item.is_dir() and not item.is_symlink():
+            tmp = item / "tmp"
+            yield item, (tmp if tmp.is_dir() and not tmp.is_symlink() else None)
 
 
-def ready(item: Path, tmp: Path, days: int, now: float) -> str | None:
-    """None when the item's tmp/ may be swept, else why not."""
+def ready(item: Path, tmp: Path | None, days: int, now: float) -> str | None:
+    """None when the item may be swept, else why not."""
     status, closed = item_status(item)
-    if status not in CLOSED:
+    if status not in DONE_STATUSES:
         return f"status {status}"
     cutoff = now - days * 86400
     if closed:
         try:
             if dt.datetime.strptime(closed[:10], "%Y-%m-%d").timestamp() > cutoff:
-                return f"closed {closed[:10]}, under {days} days ago"
+                return f"{status} {closed[:10]}, under {days} days ago"
         except ValueError:
             pass
-    if newest_mtime(tmp) / 1e9 > cutoff:
+    if tmp is not None and newest_mtime(tmp) / 1e9 > cutoff:
         return f"tmp/ changed in the last {days} days"
     return None
+
+
+def report_only(item: Path) -> Iterator[Entry]:
+    """Checkouts and files over 5 MB outside tmp/ (clones and dumps under out/): listed for the user,
+    never applied."""
+    for top, dirs, files in os.walk(item):
+        here = Path(top)
+        if here == item:
+            dirs[:] = [d for d in dirs if d != "tmp"]
+        elif ".git" in dirs or ".git" in files:
+            yield Entry("report", here, "checkout outside tmp/", tree_size(here), str(newest_mtime(here)))
+            dirs[:] = []
+            continue
+        dirs[:] = sorted(d for d in dirs if not (here / d).is_symlink())
+        for name in sorted(files):
+            path = here / name
+            stat = path.lstat()
+            if not path.is_symlink() and stat.st_size > BIG_FILE:
+                yield Entry("report", path, "file over 5 MB outside tmp/", stat.st_size, f"{stat.st_size}:{stat.st_mtime_ns}")
 
 
 def scan(root: Path, days: int, now: float | None = None) -> tuple[list[Entry], list[str]]:
     now = time.time() if now is None else now
     entries, skipped = [], []
-    for item, tmp in tmp_folders(root):
+    for item, tmp in item_folders(root):
         reason = ready(item, tmp, days, now)
         if reason:
-            skipped.append(f"{item.relative_to(root)}: {reason}")
+            if tmp is not None:
+                skipped.append(f"{item.relative_to(root)}: {reason}")
             continue
-        entries.extend(classify(tmp))
+        if tmp is not None:
+            entries.extend(classify(tmp))
+        entries.extend(report_only(item))
     return entries, skipped
 
 
@@ -266,7 +306,7 @@ def apply(root: Path, report: Path, expected: str, log=print) -> int:
             continue
         item, tmp = owner
         if item not in days_checked:
-            days_checked[item] = item_status(item)[0] in CLOSED
+            days_checked[item] = is_done(item)
         if not days_checked[item]:
             log(f"skip (item reopened): {path}")
             counts["skipped"] += 1
@@ -282,6 +322,10 @@ def apply(root: Path, report: Path, expected: str, log=print) -> int:
             current = f"{stat.st_size}:{stat.st_mtime_ns}"
         if current != fingerprint or (action == "salvage" and path.is_dir()):
             log(f"skip (changed since the report): {path}")
+            counts["skipped"] += 1
+            continue
+        if action == "delete" and path.is_dir() and unsettled_checkouts(path):
+            log(f"skip (holds a checkout with unpushed work or a stash): {path}")
             counts["skipped"] += 1
             continue
         if action == "delete":
@@ -326,8 +370,9 @@ def main(argv: list[str] | None = None) -> int:
     days = a.days if a.days is not None else sweep_days()
     entries, skipped = scan(root.resolve(), days)
     digest = write_report(report, report_text(root.resolve(), days, entries, skipped, a.apply_hint))
-    counts = {action: sum(1 for e in entries if e.action == action) for action in ("delete", "salvage", "keep")}
-    print(f"tmp sweep report: {counts['delete']} to delete, {counts['salvage']} to salvage, {counts['keep']} kept "
+    counts = {action: sum(1 for e in entries if e.action == action) for action in ("delete", "salvage", "keep", "report")}
+    print(f"tmp sweep report: {counts['delete']} to delete, {counts['salvage']} to salvage, {counts['keep']} kept, "
+          f"{counts['report']} outside tmp/ for you to judge "
           f"(report: {report}; sha256 {digest}; apply with: {a.apply_hint.replace('<sha256>', digest)})")
     return 0
 

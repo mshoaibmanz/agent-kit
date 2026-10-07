@@ -248,6 +248,8 @@ empty "no remote: the parent's commit in another repo does not deny a subagent's
 post "git commit -m two" "$SID" "$LR2" '{"agent_id":"agent-1"}' | "$H/commit-cohesion"
 out=$(pre "git commit -m three" "$SID" "$LR2" '{"agent_id":"agent-2"}' | "$H/commit-cohesion")
 empty "no remote: a sibling subagent's commit does not deny the next subagent's" "$out"
+out=$(pre "git commit -m three" "$SID" "$LR2" '{"agent_id":"agent-1"}' | "$H/commit-cohesion")
+check "no remote: a subagent's own second commit in one turn denies" "$out" 'you are a subagent'
 out=$(pre "git commit -m two" "$SID" "$LR" '{"agent_id":"agent-3"}' | "$H/commit-cohesion")
 check "no remote: the parent's own repo still holds back a subagent" "$out" 'you are a subagent'
 # B-8: `git -C "$WT"` names a repo cmd-repo cannot resolve; the no-remote cwd is only a guess.

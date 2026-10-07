@@ -127,6 +127,26 @@ class HostTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             layer({"GIT_CONFIG_COUNT": "two"}, "/kit/git-hooks")
 
+        # The user appended their own core.hooksPath after the kit's entry: the kit's moves last.
+        later = {**both, "GIT_CONFIG_COUNT": "4", "GIT_CONFIG_KEY_2": "core.hooksPath", "GIT_CONFIG_VALUE_2": "/user/hooks",
+                 "GIT_CONFIG_KEY_3": "user.name", "GIT_CONFIG_VALUE_3": "x"}
+        moved = layer(later, "/kit/git-hooks", owned=["GIT_CONFIG_KEY_1"])
+        self.assertEqual(moved, {"GIT_CONFIG_COUNT": "5", "GIT_CONFIG_KEY_1": "agent-kit.gitHooks", "GIT_CONFIG_VALUE_1": "off",
+                                 "GIT_CONFIG_KEY_4": "core.hooksPath", "GIT_CONFIG_VALUE_4": "/kit/git-hooks"})
+        merged = {**later, **moved}
+        self.assertEqual(layer(merged, "/kit/git-hooks", owned=["GIT_CONFIG_KEY_1", "GIT_CONFIG_KEY_4"]),
+                         {"GIT_CONFIG_COUNT": "5", "GIT_CONFIG_KEY_4": "core.hooksPath", "GIT_CONFIG_VALUE_4": "/kit/git-hooks"},
+                         "the next render keeps the moved entry where it is")
+        git_env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", **merged}
+        for name in [k for k in git_env if k.startswith("GIT_CONFIG_") and k not in merged and k not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")]:
+            git_env.pop(name)
+        effective = subprocess.run(["git", "config", "--get", "core.hooksPath"], capture_output=True, text=True,
+                                   env=git_env, cwd=self.root, check=False).stdout.strip()
+        self.assertEqual(effective, "/kit/git-hooks", "git reads the kit's entry, not the user's later one")
+        self.assertEqual({k: merged[k] for k in ("GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_2", "GIT_CONFIG_VALUE_2", "GIT_CONFIG_KEY_3")},
+                         {"GIT_CONFIG_KEY_0": "core.fsmonitor", "GIT_CONFIG_KEY_2": "core.hooksPath",
+                          "GIT_CONFIG_VALUE_2": "/user/hooks", "GIT_CONFIG_KEY_3": "user.name"}, "the user's entries keep their numbers")
+
     def test_codex_git_layer_joins_a_users_own_entries(self) -> None:
         root = self.root / ".codex"
         root.mkdir()
@@ -171,6 +191,19 @@ class HostTests(unittest.TestCase):
             {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_1": "core.hooksPath",
              "GIT_CONFIG_VALUE_1": str(self.kit / "git-hooks")},
         )
+
+    def test_session_context_survives_an_agent_task_that_cannot_run(self) -> None:
+        repo = self.root / "repo"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+        (self.kit / "bin/agent-task").unlink()
+        result = subprocess.run(
+            [str(self.kit / "hooks/host-session-context")],
+            input=json.dumps({"session_id": "s1", "cwd": str(repo)}),
+            env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(context.startswith("Personal repository guidance"), context)
 
     def test_cursor_native_schema_and_secret_free_mcp(self) -> None:
         result = self.run_kit("cursor")

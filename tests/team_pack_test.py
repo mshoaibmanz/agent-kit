@@ -488,8 +488,7 @@ exit 1''')
         server.chmod(0o755)
         pack = self.pack()
         (pack / 'agent-kit-preset.toml').write_text(
-            f'[kit]\nCODE_DIRS_JSON = ["{code}"]\nTICKET_PREFIXES = "ABC,OPS"\nGH_ORG = "example-org"\n'
-            'GH_REPOS = "api,example-org/web"\nMODEL_LIBS = "src/*/models/tables.py"\nPUBLISH_HOST = "pages.example.com"\n'
+            f'[kit]\nCODE_DIRS_JSON = ["{code}"]\nTICKET_PREFIXES = "ABC,OPS"\n'
             '[plugins.codex]\nmarketplace = "openai-codex"\nsource = "github:openai/codex-plugin-cc"\n'
             '[plugins.thermos]\nmarketplace = "team-plugins"\n'
             '[mcp.servers.tools]\ncommand = "{{CODE_DIR}}/tools-mcp/.venv/bin/tools-mcp"\n'
@@ -497,9 +496,7 @@ exit 1''')
         flags = ('--hosts', 'claude', '--components', 'rules', 'mcp')
         self.setup('--preset', str(pack), *flags, '--apply')
         preset_env = (self.root / 'local/preset.env').read_text()
-        for line in ('TICKET_PREFIXES=ABC,OPS', 'GH_ORG=example-org', 'GH_REPOS=api,example-org/web',
-                     'MODEL_LIBS=src/*/models/tables.py', 'PUBLISH_HOST=pages.example.com'):
-            self.assertIn(line, preset_env)
+        self.assertIn('TICKET_PREFIXES=ABC,OPS', preset_env)
         settings = json.loads((self.home / '.claude/settings.json').read_text())
         self.assertEqual(settings['enabledPlugins'], {'codex@openai-codex': True, 'thermos@team-plugins': True})
         self.assertEqual(settings['extraKnownMarketplaces'],
@@ -537,8 +534,9 @@ exit 1''')
     def test_a_preset_with_a_malformed_engine_key_plugin_or_clone_command_is_refused(self) -> None:
         cases = {
             'lowercase ticket keys': ('[kit]\nTICKET_PREFIXES = "abc"\n', 'TICKET_PREFIXES takes Jira project keys'),
-            'a URL as the publish host': ('[kit]\nPUBLISH_HOST = "https://pages.example.com"\n', 'PUBLISH_HOST takes a host name'),
-            'a token as a repo': (f'[kit]\nGH_REPOS = "{TOKEN}"\n', 'GH_REPOS looks like an inline secret'),
+            'a ticket prefix over 6 characters': ('[kit]\nTICKET_PREFIXES = "ABCDEFG"\n', 'TICKET_PREFIXES takes Jira project keys'),
+            'a key no kit code reads': ('[kit]\nGH_ORG = "example-org"\n', '[kit] takes one-line strings'),
+            'a token as a value': (f'[kit]\nREVIEW_BASE = "{TOKEN}"\n', 'REVIEW_BASE looks like an inline secret'),
             'a plugin marketplace URL': ('[plugins.codex]\nmarketplace = "m"\nsource = "https://example.com/m.git"\n',
                                          '[plugins] takes [plugins.<name>] tables'),
             'a plugin without a marketplace': ('[plugins.codex]\nsource = "github:o/r"\n', '[plugins] takes'),

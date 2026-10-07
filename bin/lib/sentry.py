@@ -61,10 +61,12 @@ class Instance:
     @property
     def env_name(self) -> str:
         """The variable a machine without a store reads: the catalog's own server keeps the
-        historical SENTRY_ACCESS_TOKEN, every other instance has its own."""
+        historical SENTRY_ACCESS_TOKEN, every other instance has its own: letters and digits kept and
+        every other byte as _XX (hex), as bin/ro-mysql's env_name, so prod-a and prod_a never share one."""
         if self.server.lower() == TEMPLATE_SERVER:
             return TOKEN_ENV
-        return TOKEN_ENV + "_" + re.sub(r"[^A-Z0-9]", "_", self.name.upper())
+        return TOKEN_ENV + "_" + "".join(
+            c.upper() if c.isascii() and c.isalnum() else f"_{ord(c):02X}" for c in self.name)
 
     def enable_command(self, store: Optional[str] = None) -> str:
         store = store or secret_store()

@@ -2,7 +2,7 @@
 
 The lock lives outside every checkout and outside TMPDIR (each caller points TMPDIR at its own
 fixture directory). The kernel drops a flock when its holder dies, so there is no stale lock to
-clear. A runner exports SUITE_LOCK_HELD to its children so a nested run_hooks.py does not wait
+clear. A runner exports AGENT_KIT_SUITE_LOCK_HELD to its children so a nested run_hooks.py does not wait
 on its own parent.
 """
 

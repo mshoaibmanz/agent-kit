@@ -26,11 +26,7 @@ PRESET_ANSWERS = {'CODE_SEARCH_GH_OWNER': 'github_owner', 'CODE_DIRS_JSON': 'rep
 _NAME = r'[A-Za-z0-9][A-Za-z0-9_.-]*'
 # Keys with a fixed shape; a value that does not fit is refused by name. Lists are comma-separated.
 KEY_FORMS = {
-    'TICKET_PREFIXES': (r'[A-Z][A-Z0-9]+(,[A-Z][A-Z0-9]+)*', 'Jira project keys, e.g. ABC,OPS'),
-    'GH_ORG': (_NAME, 'a GitHub org or user'),
-    'GH_REPOS': (rf'({_NAME}/)?{_NAME}(,({_NAME}/)?{_NAME})*', 'repos, name or owner/name, e.g. api,web'),
-    'MODEL_LIBS': (r'[^\s,]+(,[^\s,]+)*', 'git pathspecs of ORM model files, e.g. src/*/models/tables.py'),
-    'PUBLISH_HOST': (r'[A-Za-z0-9.-]+(:[0-9]{1,5})?', 'a host name, no scheme or path'),
+    'TICKET_PREFIXES': (r'[A-Z][A-Z0-9]{1,5}(,[A-Z][A-Z0-9]{1,5})*', 'Jira project keys of 2-6 characters, e.g. ABC,OPS'),
 }
 PRESET_KIT_KEYS = (*PRESET_ANSWERS, 'REVIEW_BASE', 'RELEASE_BRANCH_RE', 'BQRO_PROJECT', 'GIT_AUTHOR',
                    'SUBAGENT_RESUME_MAX', *KEY_FORMS)

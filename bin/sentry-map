@@ -56,10 +56,47 @@ def warn(message: str) -> None:
         sys.stderr.write(f"sentry-map: warning: {message}\n")
 
 
+def origin(url: str) -> tuple[str, str, int]:
+    """(scheme, host, port) with the scheme's default port filled in."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    return scheme, (parts.hostname or "").lower(), port or {"https": 443, "http": 80}.get(scheme, -1)
+
+
+class OtherOrigin(RuntimeError):
+    pass
+
+
+class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only within the instance's origin: urllib would otherwise resend the
+    Authorization header to wherever the redirect points (an SSO page, another host)."""
+
+    def __init__(self, allowed: tuple[str, str, int]) -> None:
+        self.allowed = allowed
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if origin(target) != self.allowed:
+            raise OtherOrigin(f"refused a redirect to another origin ({urllib.parse.urlsplit(target).netloc})")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class Client:
+    """The token goes only to the instance's own origin: every request, pagination link, region URL
+    and redirect is checked against it before the Authorization header is sent."""
+
     def __init__(self, inst: Instance, token: str) -> None:
         self.inst = inst
         self._token = token
+        self.origin = origin(inst.base_url)
+        self._opener = urllib.request.build_opener(SameOriginRedirects(self.origin))
+
+    def trusted(self, url: str) -> bool:
+        return origin(url) == self.origin
 
     def get_all(self, url: str) -> list[Any]:
         out: list[Any] = []
@@ -71,11 +108,13 @@ class Client:
         return out
 
     def _get(self, url: str) -> tuple[Any, str]:
+        if not self.trusted(url):
+            raise OtherOrigin(f"refused a request to another origin ({urllib.parse.urlsplit(url).netloc})")
         req = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {self._token}", "User-Agent": USER_AGENT}
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with self._opener.open(req, timeout=60) as resp:
                 return json.loads(resp.read()), resp.headers.get("Link", "")
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"HTTP {e.code} from {urllib.parse.urlsplit(url).path}") from None
@@ -97,6 +136,10 @@ def crawl(inst: Instance) -> dict[str, Any]:
     for org in client.get_all(f"{inst.base_url}/api/0/organizations/"):
         slug = org["slug"]
         region = (org.get("links") or {}).get("regionUrl") or inst.base_url
+        if not client.trusted(region):
+            # sentry.io names a regional host (us.sentry.io); the instance's own origin serves the
+            # same API, and the token never leaves it.
+            region = inst.base_url
         projects = client.get_all(f"{region}/api/0/organizations/{slug}/projects/?all_projects=1")
         last_seen: dict[str, str] = {}
         query = urllib.parse.urlencode(

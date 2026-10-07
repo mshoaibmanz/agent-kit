@@ -32,6 +32,7 @@ suites=(
   tests/installed_guard_test.py
   tests/gc_portability_test.py
   tests/leak_check_test.py
+  tests/run_suites_test.py
   hooks/tests
 )
 
