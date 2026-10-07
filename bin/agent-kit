@@ -13,11 +13,13 @@
   doctor               drift per key, MCP drift, broken links, `claude-account check`
   sync [--dry-run]     an agent-setup install: its source checkout's `agent-setup sync`, which
                        reapplies every saved choice and lists what changed
-  dashboard [--out F] [--no-open] [--check-updates]
+  dashboard [--out F] [--no-open] [--check-updates] [--watch [--port N]]
                        write one self-contained HTML page of the setup (bin/lib/dashboard.py) to
                        <work root>/dashboard/index.html and open it. Read-only: Keychain items are
                        checked for presence only, the Claude drift is doctor's with MCP compared
                        without resolving credentials, and every change is a command to copy.
+                       --watch serves it on 127.0.0.1, regenerates it when a config file changes
+                       (checked every 2 s) and the open page reloads itself; Ctrl-C stops.
   mcp describe [--only NAME ...] [--timeout S]
                        start each catalog server once (stdio; http only with static headers),
                        cache its serverInfo, instructions and tools in state/mcp-describe.json
@@ -1302,6 +1304,12 @@ def setup_drift() -> list[str]:
     return list(module.managed_drift(state.get("managed", {}).values()))
 
 
+def drift_sources() -> list[Path]:
+    """The kit files claude_findings reads besides the live config, which the dashboard's --watch
+    fingerprints; agents/ and state/rendered/ as folders."""
+    return [BASE, HOST_DIR / "host.json", ROLES, REGISTRY, SERVERS, KIT / "rules/hosts/claude.md", AGENT_SRC, STATE]
+
+
 def claude_findings(mcp: Literal["values", "names"] = "values", host: dict[str, Any] | None = None) -> list[Finding]:
     """Each way the live Claude config differs from the kit's sources. mcp="values" compares each
     rendered server with its Keychain references resolved, which reads their values; mcp="names"
@@ -1525,6 +1533,9 @@ def main() -> int:
     db.add_argument("--out", help="the page to write (default <work root>/dashboard/index.html)")
     db.add_argument("--no-open", action="store_true", help="write the page without opening it")
     db.add_argument("--check-updates", action="store_true", help="ask the preset's source for a newer commit")
+    db.add_argument("--watch", action="store_true",
+                    help="serve the page on localhost and regenerate it when a config file changes (Ctrl-C stops)")
+    db.add_argument("--port", type=int, default=0, help="the --watch port on 127.0.0.1 (default: any free port)")
     db.set_defaults(func=cmd_dashboard)
     mc = sub.add_parser("mcp", help="MCP catalog tools").add_subparsers(dest="mcp_cmd", required=True)
     de = mc.add_parser(

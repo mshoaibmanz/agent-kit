@@ -4,7 +4,7 @@ the user's work."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 import io
 from pathlib import Path
 import subprocess
@@ -12,9 +12,10 @@ import tarfile
 from typing import Any
 
 
-def git(folder: Path, *arguments: str, timeout: int = 120, text: bool = True) -> subprocess.CompletedProcess:
+def git(folder: Path, *arguments: str, timeout: int = 120, text: bool = True,
+        env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(['git', '-C', str(folder), *arguments], capture_output=True, text=text, timeout=timeout,
-                          stdin=subprocess.DEVNULL)
+                          stdin=subprocess.DEVNULL, env=env)
 
 
 def short(commit: str | None) -> str:

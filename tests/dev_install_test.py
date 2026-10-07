@@ -155,6 +155,82 @@ class DevInstallTests(PackRepos):
         refused = self.install(*FLAGS, '--dev', '--apply', code=2)
         self.assertEqual(refused.stderr.strip(), f"agent-setup: {user} sets UI-owned keys ['theme']; remove them or drop them from uiOwned")
 
+    def test_a_copy_installs_doctor_checks_the_settings_layer(self) -> None:
+        self.install(*FLAGS, '--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        user = self.root / 'local/settings.json'
+        user.write_text('{"includeCoAuthoredBy": false, "env": {"KIT_TEST_FLAG": "1"}}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('the settings layer differs from what setup applied', problems[0])
+        self.assertIn('(includeCoAuthoredBy, env.KIT_TEST_FLAG)', problems[0])
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [], 'setup applied the layer')
+        user.write_text('{"env": {"KIT_TEST_FLAG": "1", "KIT_TEST_GONE": "x"}, "enabledPlugins": {"mine@own": true},'
+                        ' "extraKnownMarketplaces": {"own": {"source": {"source": "github", "repo": "o/one"}}}}\n')
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        user.write_text('{"env": {"KIT_TEST_FLAG": "2"}, "enabledPlugins": {"mine@own": false},'
+                        ' "extraKnownMarketplaces": {"own": {"source": {"source": "github", "repo": "o/two"}}}}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('(env.KIT_TEST_FLAG, env.KIT_TEST_GONE, enabledPlugins.mine@own, '
+                      'extraKnownMarketplaces.own)', problems[0], 'removed, changed and dropped entries')
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        # A GIT_CONFIG_* entry of the user's own is compared like any env key; the kit's hooks entry is not.
+        user.write_text('{"env": {"GIT_CONFIG_GLOBAL": "/dev/null"}}\n')
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        user.write_text('{}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('(env.GIT_CONFIG_GLOBAL)', problems[0])
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        user.write_text('{"theme": "dark"}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn(f"{user} sets UI-owned keys ['theme']", problems[0])
+
+    def test_a_users_later_hooks_path_moves_the_kits_entry_and_each_render_stays_a_valid_git_config(self) -> None:
+        self.install(*FLAGS, '--blocking-hooks', '--apply')
+        settings = self.home / '.claude/settings.json'
+        data = json.loads(settings.read_text())
+        count = int(data['env']['GIT_CONFIG_COUNT'])
+        data['env'] |= {'GIT_CONFIG_COUNT': str(count + 1), f'GIT_CONFIG_KEY_{count}': 'core.hooksPath',
+                        f'GIT_CONFIG_VALUE_{count}': str(self.home / 'my-hooks')}
+        settings.write_text(json.dumps(data))
+        for run in ('the run that moves the entry', 'the run after it'):
+            self.install('--apply')
+            env = json.loads(settings.read_text())['env']
+            entries = {key: value for key, value in env.items() if key.startswith('GIT_CONFIG_')}
+            count = int(entries.pop('GIT_CONFIG_COUNT'))
+            self.assertEqual(set(entries), {f'GIT_CONFIG_{kind}_{i}' for i in range(count) for kind in ('KEY', 'VALUE')},
+                             f'{run}: every index below GIT_CONFIG_COUNT is set')
+            git = subprocess.run(['git', 'config', '--get', 'core.hooksPath'], capture_output=True, text=True,
+                                 cwd=self.home, env={'PATH': os.environ['PATH'], 'HOME': str(self.home),
+                                                     'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null',
+                                                     'GIT_CONFIG_COUNT': str(count), **entries})
+            self.assertEqual((git.returncode, git.stdout.strip()), (0, str(self.root / 'git-hooks')), f'{run}: {git.stderr}')
+            self.assertEqual(self.doctor()['problems'], [], f'{run}: the kit\'s own entries are not layer drift')
+
+    def test_doctor_names_the_collision_that_a_skipped_settings_key_leaves(self) -> None:
+        self.install(*FLAGS, '--apply')
+        settings = self.home / '.claude/settings.json'
+        data = json.loads(settings.read_text())
+        data['includeCoAuthoredBy'] = True
+        settings.write_text(json.dumps(data))
+        (self.root / 'local/settings.json').write_text('{"includeCoAuthoredBy": false}\n')
+        self.install('--apply', '--collision', 'skip')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('(includeCoAuthoredBy): your own value of includeCoAuthoredBy there blocks it', problems[0])
+        self.assertIn('rerun agent-setup --apply --collision backup', problems[0])
+        self.install('--apply', '--collision', 'backup')
+        self.assertEqual(self.doctor()['problems'], [])
+        self.assertIs(json.loads(settings.read_text())['includeCoAuthoredBy'], False)
+
     def test_dev_mode_switches_from_copies_and_rollback_survives_a_broken_checkout(self) -> None:
         self.install(*FLAGS, '--apply')
         copy = (self.root / 'bin/agent-kit').read_bytes()

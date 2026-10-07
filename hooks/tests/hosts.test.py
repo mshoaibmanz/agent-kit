@@ -134,9 +134,18 @@ class HostTests(unittest.TestCase):
         self.assertEqual(moved, {"GIT_CONFIG_COUNT": "5", "GIT_CONFIG_KEY_1": "agent-kit.gitHooks", "GIT_CONFIG_VALUE_1": "off",
                                  "GIT_CONFIG_KEY_4": "core.hooksPath", "GIT_CONFIG_VALUE_4": "/kit/git-hooks"})
         merged = {**later, **moved}
-        self.assertEqual(layer(merged, "/kit/git-hooks", owned=["GIT_CONFIG_KEY_1", "GIT_CONFIG_KEY_4"]),
-                         {"GIT_CONFIG_COUNT": "5", "GIT_CONFIG_KEY_4": "core.hooksPath", "GIT_CONFIG_VALUE_4": "/kit/git-hooks"},
-                         "the next render keeps the moved entry where it is")
+        again = layer(merged, "/kit/git-hooks", owned=list(moved))
+        self.assertEqual(again, {"GIT_CONFIG_COUNT": "5", "GIT_CONFIG_KEY_1": "agent-kit.gitHooks", "GIT_CONFIG_VALUE_1": "off",
+                                 "GIT_CONFIG_KEY_4": "core.hooksPath", "GIT_CONFIG_VALUE_4": "/kit/git-hooks"},
+                         "the next render keeps the moved entry where it is, and its no-op")
+        # As agent-setup writes it: an owned key the render does not return again is dropped.
+        merged = {**{k: v for k, v in merged.items() if k not in moved}, **again}
+        entries = {k for k in merged if k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+        self.assertEqual(entries, {f"GIT_CONFIG_{kind}_{i}" for i in range(int(merged["GIT_CONFIG_COUNT"]))
+                                   for kind in ("KEY", "VALUE")}, "every index below the count is set")
+        off = layer(merged, "/kit/git-hooks", owned=list(again), enabled=False)
+        self.assertEqual(off, {"GIT_CONFIG_COUNT": "4", "GIT_CONFIG_KEY_1": "agent-kit.gitHooks", "GIT_CONFIG_VALUE_1": "off"},
+                         "taken out last: the count drops, the earlier no-op stays")
         git_env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null", **merged}
         for name in [k for k in git_env if k.startswith("GIT_CONFIG_") and k not in merged and k not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")]:
             git_env.pop(name)

@@ -250,6 +250,57 @@ class Sweep(Fixture):
         self.assertFalse((d / "tmp/home/big.bin").exists())
         self.assertEqual(subprocess.run(["git", "stash", "list"], cwd=stashed, capture_output=True, text=True).stdout.count("\n"), 1)
 
+    def test_a_tag_no_remote_has_keeps_the_checkout(self) -> None:
+        origin = self.origin()
+        d = self.item("p", "done", "closed", "2020-01-01")
+        tmp = d / "tmp"
+        pushed = self.clone(origin, tmp / "pushed-tag")
+        git("tag", "-a", "-m", "release", "v1", cwd=pushed)
+        git("push", "-q", "origin", "v1", cwd=pushed)
+        light = self.clone(origin, tmp / "light-tag")
+        git("tag", "local-only", cwd=light)
+        annotated = self.clone(origin, tmp / "annotated-tag")
+        git("tag", "-a", "-m", "mine", "mine", cwd=annotated)
+        moved = self.clone(origin, tmp / "moved-tag")
+        git("commit", "-q", "--allow-empty", "-m", "second", cwd=moved)
+        git("push", "-q", "origin", "HEAD:main", cwd=moved)
+        git("tag", "-f", "v1", "HEAD", cwd=moved)
+        # An ssh remote is asked in batch mode, so a passphrase or host-key prompt fails, not waits.
+        over_ssh = self.clone(origin, tmp / "ssh-tag")
+        git("tag", "mine", cwd=over_ssh)
+        git("remote", "set-url", "origin", "ssh://git.example.invalid/repo.git", cwd=over_ssh)
+        ssh_log = self.base / "ssh.log"
+        fake_ssh = self.base / "fake-ssh"
+        fake_ssh.write_text(f'#!/bin/sh\necho "$*" >> {ssh_log}\nexit 255\n')
+        fake_ssh.chmod(0o755)
+        # The checkout's own ssh command is the one asked, in batch mode; with none, GIT_SSH is.
+        git("config", "core.sshCommand", str(fake_ssh), cwd=over_ssh)
+        over_git_ssh = self.clone(origin, tmp / "git-ssh-tag")
+        git("tag", "mine", cwd=over_git_ssh)
+        git("remote", "set-url", "origin", "ssh://git.example.invalid/repo.git", cwd=over_git_ssh)
+        git_ssh_log = self.base / "git-ssh.log"
+        fake_git_ssh = self.base / "fake git ssh"
+        fake_git_ssh.write_text(f'#!/bin/sh\necho "$*" >> "{git_ssh_log}"\nexit 255\n')
+        fake_git_ssh.chmod(0o755)
+        self.env.pop("GIT_SSH_COMMAND", None)
+        self.env["GIT_SSH"] = str(fake_git_ssh)
+        age(d)
+
+        proc = self.gc()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = {Path(p).relative_to(d).as_posix(): v for p, v in self.lines().items() if Path(p).is_relative_to(d)}
+        self.assertEqual(lines["tmp/pushed-tag"], ("delete", "git checkout"), "a pushed tag is settled")
+        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag", "tmp/ssh-tag", "tmp/git-ssh-tag"):
+            self.assertEqual(lines[name], ("keep", "git checkout with unpushed work"), name)
+        self.assertIn("-o BatchMode=yes", ssh_log.read_text())
+        self.assertIn("-o BatchMode=yes", git_ssh_log.read_text(), "GIT_SSH, quoted (its path has spaces)")
+
+        proc = self.gc("--sweep-tmp", "--report-sha256", hashlib.sha256(self.report().read_bytes()).hexdigest())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(pushed.exists())
+        for name in ("tmp/light-tag", "tmp/annotated-tag", "tmp/moved-tag", "tmp/ssh-tag", "tmp/git-ssh-tag"):
+            self.assertTrue((d / name).exists(), name)
+
     def test_git_bookkeeping_neither_delays_nor_refuses_a_clean_checkout(self) -> None:
         d = self.item("p", "done", "closed", "2020-01-01")
         pushed = self.clone(self.origin(), d / "tmp/pushed")
