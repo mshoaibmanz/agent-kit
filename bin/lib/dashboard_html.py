@@ -1,6 +1,7 @@
 """The dashboard's one renderer: typed section data (plain values) to escaped HTML, laid into the
 dashboard.html template beside this file. Nothing else in the dashboard writes markup but
-dashboard_diagrams.py, which draws the How the kit works view's SVG figures."""
+dashboard_diagrams.py, which draws the docs view's SVG figures. Neither holds the docs' words:
+dashboard_docs writes them."""
 
 from __future__ import annotations
 
@@ -49,9 +50,20 @@ class Code:
 
 @dataclass(frozen=True)
 class Command:
-    """A shell command to copy; every path in it is already shlex-quoted."""
+    """A shell command to copy; every path in it is already shlex-quoted. shown, when set, is what
+    the page prints (paths shortened to placeholders); the copy button always copies text."""
 
     text: str
+    shown: str = ""
+
+
+@dataclass(frozen=True)
+class FileLink:
+    """A compact editor link to a file: an icon, then label when there is one; the whole path is
+    its tooltip."""
+
+    path: Path
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,12 +93,17 @@ class Row:
 
 @dataclass
 class Table:
+    """fold: a reference table, closed by default under its title and row count. layout: a class
+    on the table (fixed: column widths from the first row, nothing pushes the table wider)."""
+
     headers: tuple[str, ...]
     rows: list[Row | tuple[Cell, ...]]
     title: str = ""
     empty: str = "None"
     note: str = ""
     anchor: str = ""  # the title's element id
+    fold: bool = False
+    layout: str = ""
 
 
 @dataclass(frozen=True)
@@ -128,12 +145,12 @@ class Figure:
 
 @dataclass(frozen=True)
 class Steps:
-    """An ordered flow: (title, text, command) per step; text is Prose markup, command may be empty."""
+    """An ordered flow: (title, text, command) per step; text is Prose markup, command may be None."""
 
-    items: tuple[tuple[str, str, str], ...]
+    items: tuple[tuple[str, str, Command | None], ...]
 
 
-Cell = Union[str, int, Path, Badge, Strong, Muted, Code, Command, Fold, Lines, Table, tuple]
+Cell = Union[str, int, Path, Badge, Strong, Muted, Code, Command, FileLink, Fold, Lines, Table, tuple]
 Block = Union[Table, Para, Pre, AddHelper, Prose, Figure, Steps]
 
 
@@ -168,15 +185,26 @@ class Section:
 
 @dataclass
 class DocPart:
-    """One part of the How the kit works view: key is its element id (docs-<name>), lead the Prose
-    under its title, sources the files it is generated from."""
+    """One part of the docs view: key is its element id (docs-<name>), lead the Prose under its
+    title, sources the files it is generated from."""
 
     key: str
     title: str
     lead: str = ""
     blocks: list[Block] = field(default_factory=list)
-    sources: list[Path] = field(default_factory=list)
+    sources: list[Path | FileLink] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Docs:
+    """The docs view: its tab and heading title, the Prose intro, a short map (part key, Prose line)
+    read first, and its parts. dashboard_docs writes every word of it."""
+
+    title: str
+    intro: str
+    parts: list[DocPart]
+    first: tuple[tuple[str, str], ...] = ()
 
 
 def anchor(view: str, name: str) -> str:
@@ -192,18 +220,43 @@ def copy_button(text: str) -> str:
     return f'<button class="cp" type="button" data-c="{esc(text)}">copy</button>'
 
 
-def path_html(path: Path | str) -> str:
-    """An editor link, the path (truncated by the page, whole in its title) and a copy button."""
+def home_label(path: Path | str) -> str:
+    """path with the home folder written ~."""
+    text, user = str(path), str(Path.home())
+    return "~" + text[len(user) :] if text == user or text.startswith(user + "/") else text
+
+
+def path_html(path: Path | str, label: str = "") -> str:
+    """An editor link, the path as label (else ~-relative) and a copy button; the whole path is the
+    label's tooltip and what the button copies."""
     text = str(path)
     return (
         f'<span class="path"><a href="vscode://file{esc(quote(text))}" title="Open in editor">open</a>'
-        f'<code class="p" title="{esc(text)}">{esc(text)}</code>{copy_button(text)}</span>'
+        f'<code class="p" title="{esc(text)}">{esc(label or home_label(text))}</code>'
+        f"{copy_button(text)}</span>"
+    )
+
+
+FILE_ICON = (
+    '<svg class="ic" viewBox="0 0 16 16" aria-hidden="true">'
+    '<path d="M4 1.5h5.5L13 5v9.5H4z M9.5 1.5V5H13"/></svg>'
+)
+
+
+def file_link(value: FileLink) -> str:
+    text = str(value.path)
+    label = f"<span>{esc(value.label)}</span>" if value.label else ""
+    return (
+        f'<a class="fl" href="vscode://file{esc(quote(text))}" title="{esc(text)}" '
+        f'aria-label="Open {esc(value.label or value.path.name)} in the editor">{FILE_ICON}{label}</a>'
     )
 
 
 def cell(value: Cell) -> str:
     if isinstance(value, Path):
         return path_html(value)
+    if isinstance(value, FileLink):
+        return file_link(value)
     if isinstance(value, Badge):
         return f'<span class="b {esc(value.kind)}">{esc(value.text)}</span>'
     if isinstance(value, Strong):
@@ -213,7 +266,9 @@ def cell(value: Cell) -> str:
     if isinstance(value, Code):
         return f"<code>{esc(value.text)}</code>"
     if isinstance(value, Command):
-        return f'<div class="cmd"><code>{esc(value.text)}</code>{copy_button(value.text)}</div>'
+        shown = value.shown or value.text
+        title = f' title="{esc(value.text)}"' if value.shown else ""
+        return f'<div class="cmd"><code{title}>{esc(shown)}</code>{copy_button(value.text)}</div>'
     if isinstance(value, Fold):
         return (
             f"<details><summary>{cell(value.summary)}</summary>"
@@ -238,28 +293,40 @@ def clamp(text: str, limit: int = DESCRIPTION_LIMIT) -> str:
     return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
 
 
-def row(value: Row | tuple[Cell, ...]) -> str:
+def row(value: Row | tuple[Cell, ...], headers: tuple[str, ...] = ()) -> str:
+    """One <tr>; with headers, each cell carries its column's name (data-h), which a narrow page
+    prints beside the cell once the table stacks into cards."""
     value = value if isinstance(value, Row) else Row(value)
     ident = f' id="{esc(value.anchor)}"' if value.anchor else ""
     cells = [cell(c) for c in value.cells]
     if value.description and cells:
         cells[0] += f'<div class="desc">{esc(clamp(value.description))}</div>'
-    return f"<tr{ident}>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
+    names = [f' data-h="{esc(h)}"' for h in headers] + [""] * len(cells)
+    return f"<tr{ident}>" + "".join(f"<td{n}>{c}</td>" for n, c in zip(names, cells)) + "</tr>"
 
 
 def table(value: Table) -> str:
     ident = f' id="{esc(value.anchor)}"' if value.anchor else ""
-    title = f"<h3{ident}>{esc(value.title)}</h3>" if value.title else ""
     note = f"<p>{esc(value.note)}</p>" if value.note else ""
+    if value.fold and value.title:
+        count = f'<span class="n">{len(value.rows)}</span>'
+        title = f'<summary><h3{ident}>{esc(value.title)}</h3>{count}</summary>'
+    else:
+        title = f"<h3{ident}>{esc(value.title)}</h3>" if value.title else ""
     if not value.rows:
-        return f'{title}{note}<p class="muted">{esc(value.empty)}</p>'
-    head = "".join(f"<th>{esc(h)}</th>" for h in value.headers)
-    body = "".join(row(r) for r in value.rows)
-    # A wide table scrolls inside its card, not the page.
-    return (
-        f'{title}{note}<div class="tw"><table><thead><tr>{head}</tr></thead>'
-        f"<tbody>{body}</tbody></table></div>"
-    )
+        body = f'<p class="muted">{esc(value.empty)}</p>'
+    else:
+        head = "".join(f"<th>{esc(h)}</th>" for h in value.headers)
+        rows = "".join(row(r, value.headers) for r in value.rows)
+        layout = f' class="{esc(value.layout)}"' if value.layout else ""
+        # A wide table scrolls inside its card, not the page.
+        body = (
+            f'<div class="tw"><table{layout}><thead><tr>{head}</tr></thead>'
+            f"<tbody>{rows}</tbody></table></div>"
+        )
+    if value.fold and value.title:
+        return f'<details class="ref">{title}{note}{body}</details>'
+    return f"{title}{note}{body}"
 
 
 class FormField(NamedTuple):
@@ -315,8 +382,15 @@ def prose(text: str) -> str:
     out = []
     for chunk in re.split(r"\n\s*\n", text.strip()):
         lines = [line.strip() for line in chunk.splitlines() if line.strip()]
-        if lines and all(line.startswith("- ") for line in lines):
-            out.append("<ul>" + "".join(f"<li>{inline(line[2:])}</li>" for line in lines) + "</ul>")
+        if lines and lines[0].startswith("- "):
+            # An item runs on until the next line starting "- ".
+            items: list[str] = []
+            for line in lines:
+                if line.startswith("- "):
+                    items.append(line[2:])
+                else:
+                    items[-1] += " " + line
+            out.append("<ul>" + "".join(f"<li>{inline(item)}</li>" for item in items) + "</ul>")
         elif lines:
             out.append(f"<p>{inline(' '.join(lines))}</p>")
     return f'<div class="prose">{"".join(out)}</div>' if out else ""
@@ -324,7 +398,7 @@ def prose(text: str) -> str:
 
 def steps(value: Steps) -> str:
     items = "".join(
-        f"<li><b>{esc(title)}</b>{prose(text)}{cell(Command(command)) if command else ''}</li>"
+        f"<li><b>{esc(title)}</b>{prose(text)}{cell(command) if command else ''}</li>"
         for title, text, command in value.items
     )
     return f'<ol class="steps">{items}</ol>'
@@ -400,8 +474,8 @@ def inline_hash(text: str, tag: str) -> str:
 
 
 def doc_part(value: DocPart) -> str:
-    sources = "".join(path_html(p) for p in value.sources)
-    sources = f'<div class="src"><span class="muted">From</span> {sources}</div>' if sources else ""
+    sources = " ".join(cell(p) for p in value.sources)
+    sources = f'<div class="src">{sources}</div>' if sources else ""
     alerts = "".join(f'<p class="alert">{esc(a)}</p>' for a in value.alerts)
     body = "".join(block(b) for b in value.blocks)
     return (
@@ -410,39 +484,31 @@ def doc_part(value: DocPart) -> str:
     )
 
 
-DOCS_INTRO = (
-    "What the kit is made of and how it reaches each agent host, generated from the kit's own files "
-    "each time this page is built. The concept text is short and fixed; every list, table and "
-    "diagram below is read from the source named beside it."
-)
-
-
-def docs_view(parts: list[DocPart]) -> str:
-    """The How the kit works view: an article beside the setup cards, one doc section per part."""
-    if not parts:
+def docs_view(docs: Docs) -> str:
+    """The docs view: an article beside the setup cards, its short map, then one section per part."""
+    if not docs.parts:
         return ""
+    first = "".join(
+        f'<li><a href="#{esc(key)}">{inline(line)}</a></li>' for key, line in docs.first
+    )
+    first = f'<ol class="map">{first}</ol>' if first else ""
     return (
-        '<article id="docs" class="view"><header class="docs-head"><h1>How the kit works</h1>'
-        f"{prose(DOCS_INTRO)}</header>{''.join(doc_part(p) for p in parts)}</article>"
+        f'<article id="docs" class="view"><header class="docs-head"><h1>{esc(docs.title)}</h1>'
+        f"{prose(docs.intro)}{first}</header>{''.join(doc_part(p) for p in docs.parts)}</article>"
     )
 
 
-def toc(parts: list[DocPart]) -> str:
-    links = "".join(f'<a href="#{esc(p.key)}">{esc(p.title)}</a>' for p in parts)
-    return f'<nav class="toc" aria-label="How the kit works">{links}</nav>' if parts else ""
+def toc(docs: Docs) -> str:
+    links = "".join(f'<a href="#{esc(p.key)}">{esc(p.title)}</a>' for p in docs.parts)
+    return f'<nav class="toc" aria-label="{esc(docs.title)}">{links}</nav>' if docs.parts else ""
 
 
-def page(
-    sections: list[Section],
-    needs: list[Action],
-    kit: Path,
-    engine: Path,
-    docs: list[DocPart] | None = None,
-) -> str:
+def page(sections: list[Section], needs: list[Action], kit: Path, engine: Path, docs: Docs) -> str:
     links = [nav_link("attention", "Needs attention", len(needs), "warn" if needs else "")]
     links += [nav_link(s.key, s.title, s.count, level(s)) for s in sections]
-    docs = docs or []
-    tab = '<a class="tab" href="#docs" data-v="docs">How the kit works</a>' if docs else ""
+    tab = (
+        f'<a class="tab" href="#docs" data-v="docs">{esc(docs.title)}</a>' if docs.parts else ""
+    )
     text = TEMPLATE.read_text()
     return Template(text).substitute(
         script_hash=inline_hash(text, "script"),

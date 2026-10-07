@@ -1452,7 +1452,7 @@ def cmd_mcp_describe(args: argparse.Namespace) -> int:
     return cmd_describe(sys.modules[__name__], args)
 
 
-def main() -> int:
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="agent-kit", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1522,7 +1522,11 @@ def main() -> int:
     de.add_argument("--only", nargs="+", metavar="NAME", help="describe only these servers")
     de.add_argument("--timeout", type=float, default=60, metavar="S", help="seconds per server (default 60)")
     de.set_defaults(func=cmd_mcp_describe)
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    args = parser().parse_args()
     return args.func(args)
 
 

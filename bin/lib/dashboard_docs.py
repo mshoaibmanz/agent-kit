@@ -1,44 +1,71 @@
-"""The How the kit works view: one DocPart per subject, generated each build from the kit's own
-files (the hook registry, SKILL.md frontmatter, rules, the host table in hosts.py, bin scripts,
-kit.env.example, the MCP catalog and roles.toml). Only the short concept text in LEADS is written
-by hand; every list, table and figure is read from the source the part names."""
+"""The docs view: one DocPart per subject, built each time the page is. Its lists and tables are
+read from the files each part names (the hook registry, SKILL.md frontmatter, the rules files render
+joins, the host table in hosts.py, the bin scripts' own argument parsers, kit.env.example, the MCP
+catalog and roles.toml), through the row builders the Setup view uses. The concept text is
+hand-written: LEADS, FIRST, EVENT_WHEN, REVIEW_STEPS and the figures' labels."""
 
 from __future__ import annotations
 
+import argparse
 import re
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from blocking import BLOCKING, hook_name
 from dashboard_diagrams import Chip, HostBox, Layer, Moment, layers, lifecycle, review_loop, wiring
 from dashboard_html import (
     Badge,
-    Cell,
     Code,
+    Command,
+    Docs,
     DocPart,
+    FileLink,
     Figure,
     Lines,
     Muted,
+    Prose,
     Row,
     Steps,
     Strong,
     Table,
     anchor,
+    home_label,
 )
 from dashboard_sections import (
+    DATA_WRAPPERS,
+    HookRow,
     Setup,
     TableRows,
     docstring_line,
     documented_keys,
+    hook_table,
     kit_command,
-    read_json,
+    layer_cell,
+    role_table,
+    round_table,
+    script_parser,
+    server_line,
     setup_command,
+    skill_text,
 )
-from hosts import EVENTS, HOSTS, RENDERED_FILES, frontmatter, skill_dirs, skill_hosts
+from hosts import EVENTS, HOSTS, RENDERED_FILES, frontmatter, skill_dirs
 from kit_env import layers as env_layers
-from kit_text import HOST_HOME_ENV, RULES_FILES
+from kit_text import HOST_HOME_ENV, PACK_DIR, RULES_FILES
 
+TITLE = "How the kit works"
+INTRO = """
+What the kit is made of and how it reaches each agent host. Every list, table and diagram is read
+from the kit's own files each time this page is built, and each part links the files it read; only
+the short concept text is written by hand.
+"""
+FIRST = (
+    ("docs-layers", "Three layers: the public engine, an org pack and your overlay. The more personal one wins."),
+    ("docs-flow", "`agent-setup` installs and records your choices; `agent-kit sync` re-renders after an edit."),
+    ("docs-hosts", "Every host gets the same rules, hooks, skills and MCP servers, each in its own format."),
+    ("docs-lifecycle", "Hooks run at fixed points of a session; a blocking one can refuse the step."),
+    ("docs-review", "Tests, a self-check and review rounds stand between an edit and merge-ready."),
+)
 LEADS = {
     "layers": """
 The kit is three layers. The **public engine** is the source checkout: hooks, skills, rules, roles,
@@ -52,7 +79,8 @@ by hand; setup and render write each host from these layers.
 """,
     "flow": """
 Setup previews every file before it writes one and records each choice, so a later run repeats
-them without asking. Each step below is a command to run in your own terminal.
+them without asking. Each step is a command to run in your own terminal; its text is the command's
+own help.
 """,
     "hosts": """
 Each host gets the same kit in its own format: the rules become its global instructions file,
@@ -63,9 +91,8 @@ Render tracks the entries it wrote and leaves your own settings beside them.
 """,
     "lifecycle": """
 Hooks are small scripts a host runs at fixed points of a session. **SessionStart** injects context;
-**UserPromptSubmit** reads the prompt (binding the session to its task, nudges); **PreToolUse**
-can refuse a tool call before it runs; **PostToolUse** records what happened (edits, test runs,
-pushes); **Stop** checks the turn before it ends.
+**UserPromptSubmit** reads the prompt; **PreToolUse** can refuse a tool call before it runs;
+**PostToolUse** records what happened; **Stop** checks the turn before it ends.
 
 A blocking hook can refuse; an advisory one only adds a line. Setup installs the blocking ones
 only with `--blocking-hooks`. Outside the host, a git layer that only agent shells see runs
@@ -73,18 +100,18 @@ only with `--blocking-hooks`. Outside the host, a git layer that only agent shel
 """,
     "skills": """
 A skill is a folder with a `SKILL.md`: frontmatter (name, description, the hosts it supports) and
-the instructions a host loads when the description matches the task. The layer column says where
-each one comes from.
+the instructions a host loads when the description matches the task. Each skill is listed once,
+under the layer setup takes it from.
 """,
     "commands": """
 The kit's commands live in `bin/`; each purpose below is its own docstring or header comment, and
-the subcommands are its own argument parser's. Slash commands are prompt files a host offers as
+the subcommands come from its own argument parser. Slash commands are prompt files a host offers as
 `/name`.
 """,
     "rules": """
 Rules are the always-loaded instructions. Render joins the engine's shared rules with the host's
-own file, adds the team pack's rules, and writes the result into each host's global instructions
-file between kit markers. Reference docs are read on demand, never loaded whole.
+own file, appends each block the table lists after them, and writes the result into each host's
+global instructions file between kit markers. Reference docs are read on demand, never loaded whole.
 """,
     "review": """
 Verification runs inside the session; review runs before and after the push.
@@ -99,11 +126,10 @@ Verification runs inside the session; review runs before and after the push.
   fixes land as a new commit until a round finds nothing new.
 """,
     "safety": """
-- **Production data is read-only by construction.** `ro-mysql` runs one statement per call in a
-  server-enforced read-only session; `bqro` dry-runs first and refuses anything but SELECT. The
+- **Production data is read-only by construction.** The data wrappers allow reads only, and the
   shell guard refuses raw database clients, so the wrappers are the only way in.
-- **Secrets stay in the OS secret store** (Keychain on macOS, Secret Service on Linux). The catalog
-  names a credential by service and account; render resolves it, and this page checks presence only.
+- **Secrets stay in the OS secret store.** The catalog names a credential by service and account;
+  render resolves it, and this page checks presence only.
 - **Edits stay on the kit's sources.** A guard refuses edits to files render writes into a host's
   folder: change the source, then render.
 - **Risky shell commands are refused before they run**: production writes, raw database clients
@@ -115,9 +141,8 @@ documents, with its own comment as their meaning (this view shows no values). MC
 the catalog setup installed: a credential there is a reference to the secret store, not a value.
 """,
 }
-# When each host event fires: the hosts' lifecycle, in the order the timeline draws it. An event
-# the registry uses that is not here is drawn after these, so none is dropped.
-EVENT_ORDER = {
+# When each event fires, in session order; the registry decides which appear (others go last).
+EVENT_WHEN = {
     "SessionStart": "start, resume, clear or compact",
     "UserPromptSubmit": "each prompt, before the model reads it",
     "PreToolUse": "before a tool call; can refuse it",
@@ -129,15 +154,22 @@ EVENT_ORDER = {
     "Stop": "the turn is about to end",
     "SessionEnd": "the session closes",
 }
-GIT_HOOKS = {
-    "commit-msg": "git commit, agent shells only",
-    "pre-push": "git push, agent shells only",
+GIT_WHEN = "in agent shells only"
+# The steps around the first two [review] lists in agent-kit's REVIEW_LISTS order.
+REVIEW_STEPS = {
+    "before": (
+        ("Edit", "each source edit is marked for review and unlocks a test run"),
+        ("Tests", "through the repo's own wrapper; each run is recorded"),
+        ("Stop", "a self-check sized to the change, then a TALLY line"),
+        ("Push gate", "git pre-push: review, tests, sprawl, force"),
+    ),
+    "fix": ("Fix", "address each finding by its prefix in one new commit"),
+    "done": ("Merge-ready", "CI green, no open finding"),
 }
-REVIEW_LABELS = {
-    "round1": "Round 1",
-    "later": "Later rounds",
-    "once": "Once per branch",
-    "sensitive_adds": "A sensitive change adds",
+# Render's constants for the rules blocks it appends, in order; one the engine lacks is skipped.
+APPENDED_RULES = {
+    "TEAM_RULES": "org pack: appended for every host",
+    "OVERLAY_RULES": "personal overlay: appended after the pack's",
 }
 
 
@@ -148,50 +180,37 @@ def kit_file(setup: Setup, relative: str) -> Path:
     return source if source.exists() else setup.kit / relative
 
 
+def label(setup: Setup, path: Path) -> str:
+    """path relative to the source checkout or the kit, else written from ~."""
+    for root in (setup.source(), setup.kit):
+        if path.is_relative_to(root) and path != root:
+            return str(path.relative_to(root))
+    return home_label(path)
+
+
+def from_files(setup: Setup, *paths: Path) -> list[Path | FileLink]:
+    return [FileLink(p, label(setup, p)) for p in paths if p.exists()]
+
+
+def shown(setup: Setup, command: str) -> Command:
+    """command to copy, printed with the kit and source paths as <kit> and <source>."""
+    text, source = command, str(setup.source())
+    if source != str(setup.kit):
+        text = text.replace(source, "<source>")
+    return Command(command, text.replace(str(setup.kit), "<kit>"))
+
+
+def registry(setup: Setup) -> tuple[Path, list[HookRow]]:
+    path = kit_file(setup, "hooks/registry.json")
+    return path, setup.registry(path)
+
+
 def installed_hooks(setup: Setup) -> set[tuple[str, str]] | None:
     """(event, hook) pairs the install's own registry holds; None when it is the source's."""
     installed = setup.kit / "hooks/registry.json"
     if installed.resolve() == kit_file(setup, "hooks/registry.json").resolve():
         return None
-    rows = read_json(installed)
-    rows = rows if isinstance(rows, list) else []
-    return {
-        (str(r.get("event", "")), hook_name(str(r.get("command", ""))))
-        for r in rows
-        if isinstance(r, dict)
-    }
-
-
-def home(path: Path | str) -> str:
-    text, user = str(path), str(Path.home())
-    return "~" + text[len(user) :] if text == user or text.startswith(user + "/") else text
-
-
-def registry(setup: Setup) -> tuple[Path, list[dict[str, Any]]]:
-    path = kit_file(setup, "hooks/registry.json")
-    rows = read_json(path)
-    return path, [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
-
-
-def skill_rows(setup: Setup) -> list[tuple[str, str, Path]]:
-    """(name, layer, SKILL.md) for every skill of every layer: the engine's, the pack's and the
-    personal overlay's."""
-    out: list[tuple[str, str, Path]] = []
-    seen: set[Path] = set()
-    for layer, folder in (
-        ("kit", setup.source() / "skills"),
-        ("kit", setup.kit / "skills"),
-        ("pack", setup.kit / "pack/skills"),
-        ("overlay", setup.kit / "local/skills"),
-    ):
-        for md in sorted(folder.glob("*/SKILL.md")):
-            if md.resolve() in seen or (
-                layer == "kit" and any(n == md.parent.name for n, _, _ in out)
-            ):
-                continue
-            seen.add(md.resolve())
-            out.append((md.parent.name, layer, md))
-    return out
+    return {(r.event, r.name) for r in setup.registry(installed)}
 
 
 def layers_part(setup: Setup, part: DocPart) -> None:
@@ -206,74 +225,102 @@ def layers_part(setup: Setup, part: DocPart) -> None:
             return "not present"
         return ", ".join(names) or "empty"
 
-    source, pack, local = setup.source(), setup.kit / "pack", setup.kit / "local"
+    source, pack, local = setup.source(), setup.kit / PACK_DIR, setup.kit / "local"
     overlay_files = [p for p in env_layers() if p.exists() and p.parent != local]
     stack = [
         Layer(
-            "Public engine", home(source), entries(source, ("local", "pack", "state", "LICENSES"))
+            "Public engine",
+            home_label(source),
+            entries(source, ("local", PACK_DIR, "state", "LICENSES")),
         ),
-        Layer("Org pack", home(pack), entries(pack) if pack.is_dir() else "no pack installed"),
+        Layer("Org pack", home_label(pack), entries(pack) if pack.is_dir() else "no pack installed"),
         Layer(
             "Personal overlay",
-            home(local),
+            home_label(local),
             entries(local) if local.is_dir() else "no local/ folder yet",
         ),
     ]
-    part.sources = [p for p in (source, pack, local) if p.exists()]
-    part.blocks.append(
-        Figure(layers(stack, list(HOSTS)), "Lowest layer at the bottom; a higher layer wins.")
+    part.sources = from_files(setup, source, pack, local)
+    figure = layers(
+        stack, "Rendered into", list(HOSTS), "a higher layer wins", "The kit's layers and the hosts they render into"
     )
-    rows: TableRows = [(Strong(layer.title), layer.where, layer.holds) for layer in stack]
+    part.blocks.append(Figure(figure, "Lowest layer at the bottom; a higher layer wins."))
+    rows: TableRows = [(Strong(layer.title), Code(layer.where), layer.holds) for layer in stack]
     rows += [
-        (Strong("Overlay keys elsewhere"), home(p), "a kit.env layer kit_env reads")
+        (Strong("Overlay keys elsewhere"), Code(home_label(p)), "a kit.env layer kit_env reads")
         for p in overlay_files
     ]
     part.blocks.append(Table(("Layer", "Where", "Holds"), rows, "What each layer holds"))
 
 
+def subcommands(parser: argparse.ArgumentParser | None) -> dict[str, str]:
+    """name -> help of every subcommand parser declares, nested ones as "mcp describe", and of each
+    choice of a positional argument, whose help gives each as "name: text; name: text"."""
+    out: dict[str, str] = {}
+    if parser is None:
+        return out
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for choice in action._choices_actions:
+                out[choice.dest] = choice.help or ""
+                for name, text in subcommands(action.choices.get(choice.dest)).items():
+                    out[f"{choice.dest} {name}"] = text
+        elif action.choices and not action.option_strings:
+            said = dict(
+                (m.group(1), m.group(2).strip())
+                for m in re.finditer(r"(?:^|;\s*)([\w-]+):\s*([^;]*)", action.help or "")
+            )
+            out.update({str(c): said.get(str(c), "") for c in action.choices})
+    return out
+
+
+def sentence(text: str) -> str:
+    text = text.strip()
+    return text[:1].upper() + text[1:] + ("" if text.endswith(".") else ".") if text else ""
+
+
 def flow_part(setup: Setup, part: DocPart) -> None:
     source = setup.source()
-    part.sources = [source / "bin/agent-setup", setup.kit / "bin/agent-kit"]
-    part.blocks.append(
-        Steps(
-            (
-                (
-                    "Install",
-                    "Detects the hosts, previews every file it would write, then applies with "
-                    "`--apply` and records a journal.",
-                    setup_command(setup, "--apply"),
-                ),
-                (
-                    "Sync",
-                    "Re-renders every host from the recorded source checkout: the step after you "
-                    "edit a kit source or your overlay.",
-                    kit_command(setup, "sync"),
-                ),
-                (
-                    "Update",
-                    "Fast-forwards the source checkout to its upstream, then syncs with the new "
-                    "commit's own installer.",
-                    setup_command(setup, action="update"),
-                ),
-                (
-                    "Doctor",
-                    "Reports drift between the kit and each host; `agent-setup doctor` checks the "
-                    "install record itself.",
-                    kit_command(setup, "doctor", "--host", "all"),
-                ),
-                (
-                    "Roll back",
-                    "Undoes one install by its journal and stops on any later edit.",
-                    setup_command(setup, "JOURNAL_ID", action="rollback"),
-                ),
-                (
-                    "See it",
-                    "Writes this page from the live install.",
-                    kit_command(setup, "dashboard"),
-                ),
+    setup_script = source / "bin/agent-setup"
+    setup_parser = script_parser(setup_script)
+    kit_says, setup_says = subcommands(setup.api.parser()), subcommands(setup_parser)
+    part.sources = from_files(setup, setup_script, setup.kit / "bin/agent-kit")
+
+    def step(title: str, said: str, command: str) -> tuple[str, str, Command | None]:
+        return title, sentence(said), shown(setup, command)
+
+    if setup.state:
+        steps = (
+            step("Install", setup_says.get("setup", ""), setup_command(setup, "--apply")),
+            step("Sync", kit_says.get("sync", ""), kit_command(setup, "sync")),
+            step("Update", setup_says.get("update", ""), setup_command(setup, action="update")),
+            step("Doctor", kit_says.get("doctor", ""), kit_command(setup, "doctor", "--host", "all")),
+            step(
+                "Roll back",
+                setup_says.get("rollback", ""),
+                setup_command(setup, "JOURNAL_ID", action="rollback"),
+            ),
+            step("See it", kit_says.get("dashboard", ""), kit_command(setup, "dashboard")),
+        )
+    else:
+        # agent-setup refuses to install into the source checkout itself.
+        default = setup_parser.get_default("root_dir") if setup_parser is not None else None
+        target = default if default and Path(default).resolve() != source.resolve() else "INSTALL_DIR"
+        install = [str(setup_script), "--source", str(source), "--root-dir", str(target), "--apply"]
+        host = (setup.configured or list(HOSTS))[0]
+        steps = (
+            step("Install", setup_says.get("setup", ""), shlex.join(install)),
+            step("Render", kit_says.get("render", ""), kit_command(setup, "render", "--host", host)),
+            step("Doctor", kit_says.get("doctor", ""), kit_command(setup, "doctor", "--host", "all")),
+            step("See it", kit_says.get("dashboard", ""), kit_command(setup, "dashboard")),
+        )
+        part.blocks.append(
+            Prose(
+                "This page reads a source checkout with no install record: install it into a "
+                "folder of its own first. Sync, update and rollback work on an install."
             )
         )
-    )
+    part.blocks.append(Steps(steps))
 
 
 def hosts_part(setup: Setup, part: DocPart) -> None:
@@ -282,26 +329,22 @@ def hosts_part(setup: Setup, part: DocPart) -> None:
     rows: TableRows = []
     for host in HOSTS:
         root = setup.roots[host]
-        folders = [home(d) + "/" for d in skill_dirs(host, root)]
+        folders = [Code(home_label(d) + "/") for d in skill_dirs(host, root)]
         files = (
             *RENDERED_FILES[host],
             *(d.name + "/" for d in skill_dirs(host, root) if d.parent == root),
         )
-        boxes.append(HostBox(host, home(root), files, host in setup.configured))
-        events = sorted({r.get("event", "") for r in rows_ if host in r.get("hosts", [])})
+        boxes.append(HostBox(host, home_label(root), files, host in setup.configured))
+        events = sorted({r.event for r in rows_ if host in r.hosts})
         named = [f"{e} ({EVENTS[e]})" if host == "cursor" and e in EVENTS else e for e in events]
-        count = sum(host in r.get("hosts", []) for r in rows_)
+        count = sum(host in r.hosts for r in rows_)
         env = HOST_HOME_ENV.get(host)
+        state = Badge("configured", "ok") if host in setup.configured else Badge("not configured")
         rows.append(
             Row(
                 (
-                    (
-                        Strong(host),
-                        Badge("configured", "ok")
-                        if host in setup.configured
-                        else Badge("not configured"),
-                    ),
-                    (Code(home(root)), Muted(f"or ${env}") if env else ""),
+                    (Strong(host), state),
+                    (Code(home_label(root)), Muted(f"or ${env}") if env else ""),
                     Lines(tuple(Code(f) for f in RENDERED_FILES[host])),
                     Lines(tuple(folders)),
                     (f"{count} hook rows", Muted(", ".join(named) or "-")),
@@ -311,15 +354,24 @@ def hosts_part(setup: Setup, part: DocPart) -> None:
         )
     sources = ["hooks/registry.json", "rules/", "skills/", "roles.toml", "mcp/servers.json"]
     sources = [s for s in sources if kit_file(setup, s.rstrip("/")).exists()]
-    part.sources = [kit_file(setup, "bin/lib/hosts.py")]
-    part.blocks.append(
-        Figure(wiring(sources, boxes), "Render writes only the files each host reads.")
+    part.sources = from_files(setup, kit_file(setup, "bin/lib/hosts.py"))
+    figure = wiring(
+        "Kit sources",
+        sources,
+        ("agent-setup", "agent-kit render"),
+        boxes,
+        "read",
+        "write",
+        "not configured",
+        "How the kit's sources reach each host",
     )
+    part.blocks.append(Figure(figure, "Render writes only the files each host reads."))
     part.blocks.append(
         Table(
             ("Host", "Config root", "Files render writes", "Skills read from", "Hook events"),
             rows,
             "Per host",
+            fold=True,
         )
     )
 
@@ -327,106 +379,69 @@ def hosts_part(setup: Setup, part: DocPart) -> None:
 def lifecycle_part(setup: Setup, part: DocPart) -> None:
     path, rows_ = registry(setup)
     by_event: dict[str, list[Chip]] = {}
-    for entry in rows_:
-        name = hook_name(str(entry.get("command", "")))
-        chips = by_event.setdefault(str(entry.get("event", "")), [])
-        if all(c.text != name for c in chips):
-            chips.append(Chip(name, name in BLOCKING))
-    order = [e for e in EVENT_ORDER if e in by_event] + sorted(set(by_event) - set(EVENT_ORDER))
-    moments = [Moment(e, EVENT_ORDER.get(e, ""), tuple(by_event[e])) for e in order]
+    for hook in rows_:
+        chips = by_event.setdefault(hook.event, [])
+        if all(c.text != hook.name for c in chips):
+            chips.append(Chip(hook.name, hook.blocking))
+    order = [e for e in EVENT_WHEN if e in by_event] + [e for e in by_event if e not in EVENT_WHEN]
+    moments = [Moment(e, EVENT_WHEN.get(e, ""), tuple(by_event[e])) for e in order]
     git = kit_file(setup, "git-hooks/agent")
     git_hooks = sorted(p for p in git.iterdir() if p.is_file()) if git.is_dir() else []
-    moments += [
-        Moment(
-            f"git {p.name}", GIT_HOOKS.get(p.name, "git, agent shells only"), (Chip(p.name, True),)
-        )
-        for p in git_hooks
-    ]
-    part.sources = [path, *([git] if git_hooks else [])]
-    part.blocks.append(
-        Figure(
-            lifecycle(moments), "Each hook appears once per event, however many matchers it has."
-        )
+    moments += [Moment(f"git {p.name}", GIT_WHEN, (Chip(p.name, True),)) for p in git_hooks]
+    part.sources = from_files(setup, path, *([git] if git_hooks else []))
+    figure = lifecycle(
+        moments,
+        "can refuse (blocking)",
+        "advisory",
+        "no hook",
+        "Which hooks fire at each point of a session",
     )
-    rows: TableRows = []
-    ids: dict[str, int] = {}
+    part.blocks.append(Figure(figure, "Each hook appears once per event, however many matchers it has."))
     installed = installed_hooks(setup)
-    for entry in rows_:
-        command = str(entry.get("command", ""))
-        name = hook_name(command)
-        event = str(entry.get("event", ""))
-        script = kit_file(setup, f"hooks/{name}")
-        key = anchor("docs-hook", f"{event}-{name}")
-        ids[key] = ids.get(key, 0) + 1
-        kind: Cell = Badge("blocking", "warn") if name in BLOCKING else Badge("advisory")
-        if installed is not None and (event, name) not in installed:
-            kind = (kind, Badge("not installed"))
-        rows.append(
-            Row(
-                (
-                    Strong(name),
-                    event,
-                    Lines(tuple(Code(m) for m in str(entry.get("matcher") or "*").split("|"))),
-                    kind,
-                    tuple(Badge(h) for h in entry.get("hosts", [])),
-                    script if script.is_file() else Code(command),
-                ),
-                key + (f"-{ids[key]}" if ids[key] > 1 else ""),
-                str(entry.get("description", "")),
-            )
-        )
     note = (
         ""
         if installed is None
         else "A row the install's own registry does not hold is marked not installed."
     )
     part.blocks.append(
-        Table(
-            ("Hook", "Event", "Matcher", "Kind", "Hosts", "Source"),
-            rows,
-            "Every hook row",
+        hook_table(
+            rows_,
+            kit_file(setup, "hooks"),
+            "docs-hook",
+            FileLink,
+            installed,
+            title="Every hook row",
             note=note,
+            fold=True,
         )
     )
-    git_rows: TableRows = [(Strong(p.name), header_line(p), p) for p in git_hooks]
+    git_rows: TableRows = [(Strong(p.name), header_line(p), FileLink(p)) for p in git_hooks]
     if git_rows:
         part.blocks.append(
-            Table(("Git hook", "What it does", "Source"), git_rows, "Git hooks in agent shells")
+            Table(("Git hook", "What it does", "Source"), git_rows, "Git hooks in agent shells", fold=True)
         )
 
 
 def skills_part(setup: Setup, part: DocPart) -> None:
     rows: TableRows = []
-    names = [n for n, _, _ in skill_rows(setup)]
-    for name, layer, md in skill_rows(setup):
-        text = md.read_text(errors="replace")
-        try:
-            allowed: Cell = ", ".join(sorted(skill_hosts(md, text)))
-        except ValueError:
-            allowed = Muted("invalid hosts: line")
-        same = names.count(name) > 1 and layer != "kit"
+    for entry in setup.skills:
+        text, _, allowed = skill_text(entry.md)
         rows.append(
             Row(
-                (
-                    Strong(name),
-                    (
-                        Badge(layer, "ok" if layer == "overlay" else ""),
-                        Muted("same name as a lower layer's") if same else "",
-                    ),
-                    allowed,
-                    md,
-                ),
-                anchor("docs-skill", f"{layer}-{name}"),
+                (Strong(entry.name), layer_cell(entry), allowed, FileLink(entry.md)),
+                anchor("docs-skill", f"{entry.layer}-{entry.name}"),
                 frontmatter(text).get("description", ""),
             )
         )
-    part.sources = [
-        p
-        for p in (setup.source() / "skills", setup.kit / "pack/skills", setup.kit / "local/skills")
-        if p.is_dir()
-    ]
+    part.sources = from_files(setup, setup.source() / "skills", setup.kit / PACK_DIR / "skills")
     part.blocks.append(
-        Table(("Skill", "Layer", "Hosts", "Source"), rows, "Every skill", empty="No skills found.")
+        Table(
+            ("Skill", "Layer", "Hosts", "Source"),
+            rows,
+            "Every skill",
+            empty="No skills found.",
+            fold=True,
+        )
     )
 
 
@@ -448,78 +463,76 @@ def header_line(path: Path) -> str:
         text = " ".join(c for c in comment if c)
         end = re.search(r"\.(\s|$)", text)
         line = text[: end.start() + 1] if end else text
-    return re.sub(rf"^{re.escape(path.name)}\s*(?::|—|-)\s*", "", line)
+    line = re.sub(rf"^(?:\w+ )?{re.escape(path.name)}\s*(?::|—|-)\s*", "", line)
+    return line[:1].upper() + line[1:]
 
 
-SUBCOMMAND = re.compile(
-    r"""\.add_parser\(\s*["']([\w-]+)["'](?:[^()]|\([^()]*\))*?help=["']([^"']*)["']""", re.S
-)
-ACTIONS = re.compile(r"""add_argument\(\s*["']action["']\s*,\s*choices=\(([^)]*)\)""")
-
-
-def subcommands(path: Path) -> list[Cell]:
-    """The subcommands a bin script's own argument parser declares, with their help."""
-    try:
-        text = path.read_text(errors="replace")
-    except OSError:
-        return []
-    out: list[Cell] = [(Code(name), Muted(help_)) for name, help_ in SUBCOMMAND.findall(text)]
-    for found in ACTIONS.findall(text):
-        out += [Code(name) for name in re.findall(r"""["']([\w-]+)["']""", found)]
-    return out
+def command_parser(setup: Setup, path: Path) -> Any:
+    """agent-kit's parser from the running engine (loading a second agent-kit would swap the
+    modules this page imported), any other script's from its own parser()."""
+    return setup.api.parser() if path.name == "agent-kit" else script_parser(path)
 
 
 def commands_part(setup: Setup, part: DocPart) -> None:
     folder = kit_file(setup, "bin")
     rows: TableRows = []
     for path in sorted(p for p in folder.iterdir() if p.is_file() and not p.name.startswith(".")):
-        subs = subcommands(path)
+        subs = subcommands(command_parser(setup, path))
+        cells = tuple((Code(name), Muted(said)) for name, said in subs.items())
         rows.append(
             Row(
-                (Strong(path.name), Lines(tuple(subs)) if subs else Muted("-"), path),
+                (Strong(path.name), Lines(cells) if cells else Muted("-"), FileLink(path)),
                 anchor("docs-cmd", path.name),
                 header_line(path),
             )
         )
-    part.blocks.append(Table(("Command", "Subcommands", "Source"), rows, "bin/ commands"))
+    part.blocks.append(Table(("Command", "Subcommands", "Source"), rows, "bin/ commands", fold=True))
     slash = kit_file(setup, "commands")
     slash_rows: TableRows = []
     for md in sorted(slash.glob("*.md")) if slash.is_dir() else []:
         meta = frontmatter(md.read_text(errors="replace"))
         slash_rows.append(
             Row(
-                (Strong(f"/{md.stem}"), md),
+                (Strong(f"/{md.stem}"), FileLink(md)),
                 anchor("docs-slash", md.stem),
                 meta.get("description", ""),
             )
         )
     part.blocks.append(
-        Table(("Slash command", "Source"), slash_rows, "Slash commands", empty="No slash commands.")
+        Table(
+            ("Slash command", "Source"),
+            slash_rows,
+            "Slash commands",
+            empty="No slash commands.",
+            fold=True,
+        )
     )
-    part.sources = [p for p in (folder, slash) if p.exists()]
+    part.sources = from_files(setup, folder, slash)
 
 
 def rules_part(setup: Setup, part: DocPart) -> None:
-    every = ", ".join(HOSTS)
-    candidates: list[tuple[str, str, str]] = [
-        ("rules/AGENTS.md", every, "engine: shared by every host"),
-        *((f"rules/hosts/{h}.md", h, f"engine: {h} only") for h in HOSTS),
-        ("pack/rules.md", every, "org pack: the team's rules"),
-        ("local/rules.md", every, "personal overlay"),
+    """The files render joins into each host's rules: the engine's two, then each block render
+    appends (APPENDED_RULES), read from the kit render runs on."""
+    every = tuple(HOSTS)
+    kit = setup.kit
+    candidates: list[tuple[Path, tuple[str, ...], str]] = [
+        (kit / "rules/AGENTS.md", every, "engine: shared by every host"),
+        *((kit / f"rules/hosts/{h}.md", (h,), f"engine: {h} only") for h in HOSTS),
     ]
+    for name, layer in APPENDED_RULES.items():
+        path = getattr(setup.api, name, None)
+        if isinstance(path, Path):
+            candidates.append((path, every, layer))
     rows: TableRows = []
-    for relative, hosts, layer in candidates:
-        path = kit_file(setup, relative)
+    for path, hosts, layer in candidates:
         if not path.is_file():
             continue
         words = len(path.read_text(errors="replace").split())
-        targets = tuple(
-            Code(home(setup.roots[h] / RULES_FILES[h])) for h in HOSTS if h in hosts.split(", ")
-        )
+        targets = tuple(Code(home_label(setup.roots[h] / RULES_FILES[h])) for h in hosts)
         rows.append(
             Row(
-                (Strong(relative), layer, Lines(targets), f"{words} words", path),
-                anchor("docs-rule", relative),
+                (Strong(label(setup, path)), layer, Lines(targets), f"{words} words", FileLink(path)),
+                anchor("docs-rule", label(setup, path)),
             )
         )
     part.blocks.append(
@@ -528,9 +541,11 @@ def rules_part(setup: Setup, part: DocPart) -> None:
     docs = [kit_file(setup, "README.md"), kit_file(setup, "hooks/lib/README")]
     references = kit_file(setup, "references")
     docs += sorted(references.glob("*.md")) if references.is_dir() else []
-    doc_rows: TableRows = [(Strong(p.name), first_heading(p), p) for p in docs if p.is_file()]
-    part.blocks.append(Table(("Doc", "Subject", "Source"), doc_rows, "Reference docs"))
-    part.sources = [kit_file(setup, "rules")]
+    doc_rows: TableRows = [
+        (Strong(p.name), first_heading(p), FileLink(p)) for p in docs if p.is_file()
+    ]
+    part.blocks.append(Table(("Doc", "Subject", "Source"), doc_rows, "Reference docs", fold=True))
+    part.sources = from_files(setup, kit / "rules")
 
 
 def first_heading(path: Path) -> str:
@@ -547,102 +562,58 @@ def first_heading(path: Path) -> str:
 
 def review_part(setup: Setup, part: DocPart) -> None:
     roles = setup.roles
-    part.sources = [Path(setup.api.ROLES), setup.kit / "agents"]
+    part.sources = from_files(setup, Path(setup.api.ROLES), setup.kit / "agents")
     review: dict[str, list[str]] = dict(roles.review) if roles is not None else {}
-    first = ", ".join(review.get("round1", [])) or "-"
-    later = ", ".join(review.get("later", [])) or "-"
+    keys = [k for k in setup.api.REVIEW_LISTS if k in review]
+    rounds = [(f"[review] {k}", ", ".join(review[k]) or "-") for k in keys[:2]]
     stages = [
-        ("Edit", "each source edit is marked for review and unlocks a test run"),
-        ("Tests", "through the repo's own wrapper; each run is recorded"),
-        ("Stop", "a self-check sized to the change, then a TALLY line"),
-        ("Push gate", "git pre-push: review, tests, sprawl, force"),
-        ("Round 1", first),
-        ("Fix", "address each finding by its prefix in one new commit"),
-        ("Later rounds", later),
-        ("Merge-ready", "CI green, no open finding"),
+        *REVIEW_STEPS["before"],
+        *rounds[:1],
+        REVIEW_STEPS["fix"],
+        *rounds[1:],
+        REVIEW_STEPS["done"],
     ]
-    notes = [
-        f"{REVIEW_LABELS.get(k, k)}: {', '.join(v)}"
-        for k, v in review.items()
-        if k not in ("round1", "later")
-    ]
-    part.blocks.append(
-        Figure(
-            review_loop(stages, notes), "The rounds and their roles come from roles.toml [review]."
-        )
+    notes = [f"[review] {k}: {', '.join(review[k])}" for k in keys[2:]]
+    figure = review_loop(
+        stages,
+        notes,
+        "until a round finds nothing new",
+        "The verification and review loop before a push and after it",
     )
+    part.blocks.append(Figure(figure, "The rounds and their roles come from roles.toml [review]."))
     if roles is None:
         part.alerts.append(setup.roles_error or "This kit has no roles.toml.")
         return
-    rows: TableRows = []
-    for name, role in roles.roles.items():
-        src = setup.kit / "agents" / f"{name}.md"
-        description = (
-            str(frontmatter(src.read_text(errors="replace")).get("description", ""))
-            if src.is_file()
-            else ""
-        )
-        rows.append(
-            Row(
-                (
-                    Strong(name),
-                    Code(f"{role.provider}:{role.model}"),
-                    role.effort,
-                    Badge(role.prefix, "warn") if role.prefix else Muted("-"),
-                    role.fallback or Muted("-"),
-                    src if src.is_file() else Muted("the main session"),
-                ),
-                anchor("docs-role", name),
-                description,
-            )
-        )
-    part.blocks.append(
-        Table(
-            ("Role", "Model", "Effort", "Finding prefix", "Fallback", "Agent file"), rows, "Roles"
-        )
-    )
-    rounds: TableRows = [
-        (REVIEW_LABELS.get(k, k), Code(k), ", ".join(v)) for k, v in review.items()
-    ]
-    part.blocks.append(Table(("Round", "roles.toml key", "Roles"), rounds, "Review rounds"))
+    part.blocks.append(role_table(setup, "docs-role", FileLink, title="Roles", fold=True))
+    part.blocks.append(round_table(setup, title="Review rounds", fold=True))
 
 
 def safety_part(setup: Setup, part: DocPart) -> None:
     path, rows_ = registry(setup)
-    rows: TableRows = []
-    seen: set[str] = set()
-    for entry in rows_:
-        name = hook_name(str(entry.get("command", "")))
-        if name not in BLOCKING or name in seen:
-            continue
-        seen.add(name)
-        rows.append(
-            Row(
-                (Strong(name), str(entry.get("event", "")), kit_file(setup, f"hooks/{name}")),
-                anchor("docs-guard", name),
-                str(entry.get("description", "")),
-            )
+    guards = list({r.name: r for r in reversed(rows_) if r.blocking}.values())[::-1]
+    rows: TableRows = [
+        Row(
+            (Strong(r.name), r.event, FileLink(kit_file(setup, f"hooks/{r.name}"))),
+            anchor("docs-guard", r.name),
+            r.description,
         )
-    part.blocks.append(Table(("Guard", "First event", "Source"), rows, "Hooks that can refuse"))
-    tools = [kit_file(setup, f"bin/{n}") for n in ("ro-mysql", "bqro")]
+        for r in guards
+    ]
+    part.blocks.append(Table(("Guard", "First event", "Source"), rows, "Hooks that can refuse", fold=True))
+    tools = [kit_file(setup, f"bin/{n}") for n in DATA_WRAPPERS]
     tools += [kit_file(setup, f"bin/lib/{n}.py") for n in ("secret_store", "credentials")]
-    tool_rows: TableRows = [(Strong(p.name), header_line(p), p) for p in tools if p.is_file()]
+    tool_rows: TableRows = [
+        (Strong(p.name), header_line(p), FileLink(p)) for p in tools if p.is_file()
+    ]
     part.blocks.append(
-        Table(("Tool", "What it does", "Source"), tool_rows, "Data wrappers and the secret store")
+        Table(
+            ("Tool", "What it does", "Source"),
+            tool_rows,
+            "Data wrappers and the secret store",
+            fold=True,
+        )
     )
-    part.sources = [path]
-
-
-def transport(spec: Any) -> str:
-    if not isinstance(spec, dict):
-        return "?"
-    return (
-        "http"
-        if spec.get("url")
-        else "stdio"
-        if spec.get("command")
-        else str(spec.get("type", "?"))
-    )
+    part.sources = from_files(setup, path)
 
 
 def config_part(setup: Setup, part: DocPart) -> None:
@@ -651,31 +622,35 @@ def config_part(setup: Setup, part: DocPart) -> None:
         for k, meaning in sorted(documented_keys(setup).items())
     ]
     part.blocks.append(
-        Table(("kit.env key",), keys, "Overlay keys", empty="kit.env.example documents no key.")
-    )
-    servers: TableRows = [
-        Row(
-            (Strong(name), transport(spec)),
-            anchor("docs-mcp", name),
-            str(spec.get("description", "")) if isinstance(spec, dict) else "",
+        Table(
+            ("kit.env key",),
+            keys,
+            "Overlay keys",
+            empty="kit.env.example documents no key.",
+            fold=True,
         )
-        for name, spec in sorted(setup.catalog.items())
-    ]
+    )
+    servers: TableRows = []
+    for name in sorted(setup.catalog):
+        transport, target, description = server_line(setup, name)
+        servers.append(
+            Row((Strong(name), transport, Code(target)), anchor("docs-mcp", name), description)
+        )
     part.blocks.append(
         Table(
-            ("MCP server", "Transport"), servers, "MCP catalog", empty="The catalog has no server."
+            ("MCP server", "Transport", "Command / URL"),
+            servers,
+            "MCP catalog",
+            empty="The catalog has no server.",
+            fold=True,
         )
     )
-    presets = (
-        sorted(kit_file(setup, "presets").glob("*.toml"))
-        if kit_file(setup, "presets").is_dir()
-        else []
-    )
+    presets_dir = kit_file(setup, "presets")
+    presets = sorted(presets_dir.glob("*.toml")) if presets_dir.is_dir() else []
     if presets:
-        part.blocks.append(Table(("Example preset",), [(p,) for p in presets], "Preset examples"))
-    part.sources = [
-        p for p in (kit_file(setup, "kit.env.example"), setup.catalog_path) if p.exists()
-    ]
+        rows: TableRows = [(Strong(p.name), FileLink(p)) for p in presets]
+        part.blocks.append(Table(("Example preset", "Source"), rows, "Preset examples", fold=True))
+    part.sources = from_files(setup, kit_file(setup, "kit.env.example"), setup.catalog_path)
 
 
 Builder = Callable[[Setup, DocPart], None]
@@ -693,7 +668,7 @@ PARTS: tuple[tuple[str, str, Builder], ...] = (
 )
 
 
-def doc_parts(setup: Setup) -> list[DocPart]:
+def doc_parts(setup: Setup) -> Docs:
     """Every part; one that fails to build is its title, its concept text and the failure."""
     out = []
     for key, title, builder in PARTS:
@@ -704,4 +679,4 @@ def doc_parts(setup: Setup) -> list[DocPart]:
             first = str(error).splitlines()[0] if str(error) else ""
             part.blocks, part.alerts = [], [f"not read: {type(error).__name__}: {first}"]
         out.append(part)
-    return out
+    return Docs(TITLE, INTRO, out, FIRST)

@@ -5,9 +5,11 @@ and that the page still loads nothing and keeps its CSP."""
 
 from __future__ import annotations
 
+import html
 import json
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,9 +26,17 @@ HOOK = {'event': 'PreToolUse', 'matcher': 'Bash|Read', 'command': '~/.claude/hoo
 TOOL = '''#!/usr/bin/env python3
 """demo-tool: Prints the demo inventory. A second sentence the purpose leaves out."""
 import argparse
-ap = argparse.ArgumentParser()
-sub = ap.add_subparsers()
-sub.add_parser("inventory", help="list every demo item")
+
+
+def parser():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers()
+    sub.add_parser("inventory", help="list every demo item")
+    return ap
+
+
+if __name__ == "__main__":
+    parser().parse_args()
 '''
 SKILL = '''---
 name: demo-skill
@@ -44,7 +54,7 @@ def docs(page: str) -> str:
 
 
 def svgs(view: str) -> list[str]:
-    return re.findall(r'<svg\b.*?</svg>', view, re.S)
+    return re.findall(r'<svg class="dg.*?</svg>', view, re.S)
 
 
 class DashboardDocsTests(Fixture):
@@ -79,7 +89,7 @@ class DashboardDocsTests(Fixture):
         self.assertIn('Refuses the demo command before it runs.', hook.group())
         self.assertIn('>advisory</span>', hook.group())
         self.assertIn(f'vscode://file{kit}/hooks/demo-guard', hook.group(), 'links to its script')
-        self.assertIn('<code>Bash</code><br><code>Read</code>', hook.group(), 'one matcher per line')
+        self.assertIn('PreToolUse · Bash, Read', hook.group(), 'the matcher folded into the event')
         skill = re.search(r'<tr id="docs-skill-kit-demo-skill">.*?</tr>', view, re.S)
         assert skill is not None, 'the fixture skill row'
         self.assertIn('Explains the demo fixture to a reader.', skill.group())
@@ -127,6 +137,94 @@ class DashboardDocsTests(Fixture):
         self.assertTrue(policy.group(1).startswith("default-src 'none'; style-src 'sha256-"), policy.group(1))
         self.assertEqual(len(re.findall(r'<script\b', page)), 1)
         self.assertEqual(len(re.findall(r'<style\b', page)), 1)
+        style = page[page.index('<style>'):page.index('</style>')]
+        self.assertGreater(style.index('tbody tr.hit td'), style.index('tbody tr:nth-child(even) td'),
+                           'the highlight wins over the zebra row')
+        self.assertGreater(style.index('tbody tr.hit td'), style.index('tbody tr:hover td'))
+
+    def test_an_unreadable_registry_is_the_part_s_alert_not_empty_tables(self) -> None:
+        kit = self.scratch_kit()
+        registry = kit / 'hooks/registry.json'
+        for text, said in (('{"not": "a list"', 'is not JSON'),
+                           ('{"event": "Stop"}', 'must be a JSON list'),
+                           ('[{"event": "Stop", "hosts": "claude", "command": "x"}]', 'non-empty hosts list'),
+                           ('[{"hosts": ["claude"], "command": "x"}]', 'needs an event'),
+                           ('["<script>alert(1)</script>"]', 'not an object')):
+            with self.subTest(registry=text):
+                registry.write_text(text)
+                view = docs(self.dashboard(kit=kit)[0])
+                for key in ('hosts', 'lifecycle', 'safety'):
+                    part = view[view.index(f'<section id="docs-{key}"'):]
+                    part = part[:part.index('</section>')]
+                    self.assertIn('<p class="alert">not read: ValueError: ', part, key)
+                    self.assertIn(said, page_text(part), key)
+                    self.assertNotIn('<tr id="docs-hook-', part, 'an empty or partial table')
+                self.assertNotIn('<script>alert', view, 'the bad entry is escaped')
+                self.assertIn('<tr id="docs-skill-kit-demo-skill">', view, 'the other parts still render')
+
+    def test_rules_and_skills_list_only_what_render_and_setup_read(self) -> None:
+        kit = self.scratch_kit()
+        (kit / 'local/skills/mine').mkdir(parents=True)
+        (kit / 'local/skills/mine/SKILL.md').write_text(SKILL.replace('demo-skill', 'mine'))
+        (kit / 'local/rules.md').write_text('# Mine\n\nPersonal rules this engine does not render.\n')
+        pack = kit / 'pack/skills'
+        for name, text in (('demo-skill', SKILL), ('pack-only', SKILL.replace('demo-skill', 'pack-only'))):
+            (pack / name).mkdir(parents=True)
+            (pack / name / 'SKILL.md').write_text(text)
+        # setup copies a pack skill into skills/ as well; the engine's copy of another differs
+        (kit / 'skills/pack-only').mkdir()
+        (kit / 'skills/pack-only/SKILL.md').write_text((pack / 'pack-only/SKILL.md').read_text())
+        (pack / 'conventions').mkdir()
+        (pack / 'conventions/SKILL.md').write_text(SKILL.replace('demo-skill', 'conventions'))
+        view = docs(self.dashboard(kit=kit)[0])
+        self.assertNotIn('local/rules.md', view, 'render does not read it')
+        self.assertNotIn('docs-skill-overlay-', view, 'setup recorded no overlay skill')
+        self.assertNotIn('<b>mine</b>', view)
+        rows = re.findall(r'<tr id="docs-skill-(\w+)-(pack-only|demo-skill|conventions)">(.*?)</tr>', view, re.S)
+        self.assertEqual(sorted((layer, name) for layer, name, _ in rows),
+                         [('pack', 'conventions'), ('pack', 'demo-skill'), ('pack', 'pack-only')], 'each skill once')
+        replaced = {name for _, name, row in rows if 'replaces the engine' in row}
+        self.assertEqual(replaced, {'conventions'}, 'only a pack skill with other text than the engine copy')
+        rules = re.findall(r'<tr id="docs-rule-([^"]+)">', view)
+        self.assertEqual(rules[0], 'rules-AGENTS.md')
+        self.assertTrue(all(r.startswith('rules-') for r in rules), rules)
+
+    def test_a_source_checkout_s_install_command_installs_somewhere_else(self) -> None:
+        kit = self.scratch_kit()
+        view = docs(self.dashboard(kit=kit)[0])
+        flow = view[view.index('<section id="docs-flow"'):]
+        commands = [html.unescape(c) for c in re.findall(r'data-c="([^"]*)"', flow[:flow.index('</section>')])]
+        install = shlex.split(commands[0])
+        source, root = install[install.index('--source') + 1], install[install.index('--root-dir') + 1]
+        self.assertEqual(source, str(kit))
+        self.assertNotEqual(Path(root), kit, 'setup refuses to install into the source checkout')
+        self.assertFalse([c for c in commands if ' sync' in c or ' update' in c or 'rollback' in c],
+                         'install-only steps on a kit with no install')
+        install = [str(self.root) if word == 'INSTALL_DIR' else word for word in install if word != '--apply']
+        environment = {'HOME': str(self.home), 'PATH': str(self.shim), 'TMPDIR': str(self.tmp), 'LANG': 'C.UTF-8',
+                       'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null'}
+        result = subprocess.run([sys.executable, *install], capture_output=True, text=True, env=environment,
+                                timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('separate from the source checkout', result.stdout + result.stderr)
+
+    def test_only_a_script_with_its_own_parser_is_loaded(self) -> None:
+        kit = self.scratch_kit()
+        marker = self.home / 'loaded'
+        (kit / 'bin/acts-on-import').write_text(
+            f'#!/usr/bin/env python3\n"""Acts on import."""\nopen({str(marker)!r}, "w").write("x")\n'
+            'sub.add_parser("never", help="a regex would list this")\n')
+        view = docs(self.dashboard(kit=kit)[0])
+        self.assertFalse(marker.exists(), 'a script without parser() ran')
+        row = re.search(r'<tr id="docs-cmd-acts-on-import">.*?</tr>', view, re.S)
+        assert row is not None
+        self.assertNotIn('never', row.group())
+        setup = re.search(r'<tr id="docs-cmd-agent-setup">.*?</tr>', view, re.S)
+        assert setup is not None
+        self.assertIn('<code>rollback</code> <span class="muted">undo one install by its journal', setup.group())
+        kit_row = re.search(r'<tr id="docs-cmd-agent-kit">.*?</tr>', view, re.S)
+        assert kit_row is not None
+        self.assertIn('<code>mcp describe</code>', kit_row.group(), 'a nested subcommand')
 
     def test_the_review_rounds_and_keys_come_from_the_kit_s_own_files(self) -> None:
         kit = self.scratch_kit()

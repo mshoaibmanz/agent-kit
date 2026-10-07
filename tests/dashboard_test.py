@@ -358,7 +358,8 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn('https://mcp.example.com/x', mcp)
         self.assertIn(f'--client-secret={MASK}', mcp)
         self.assertIn(f'X-Api-Key: {MASK}', mcp)
-        self.assertIn(str(self.fx.root / 'mcp/servers.json'), mcp, 'the installed catalog is the source')
+        self.assertIn('~/.local/share/agent-kit/mcp/servers.json', mcp, 'the installed catalog is the source')
+        self.assertIn(f'data-c="{self.fx.root / "mcp/servers.json"}"', section(self.page, 'mcp'), 'copied whole')
 
     def test_needs_attention_names_drift_credentials_and_unmanaged_counts(self) -> None:
         block = page_text(section(self.page, 'attention'))
@@ -469,7 +470,7 @@ class DashboardScenarioTests(Fixture):
         doctor = subprocess.run([sys.executable, str(self.root / 'bin/agent-kit'), 'doctor'], capture_output=True,
                                 text=True, env=self.env(kit=self.root), timeout=120, stdin=subprocess.DEVNULL)
         page, _ = self.dashboard()
-        row = re.search(r'<tr id="host-claude"><td><b>claude</b></td>.*?</tr>', page)
+        row = re.search(r'<tr id="host-claude"><td[^>]*><b>claude</b></td>.*?</tr>', page)
         assert row is not None
         cell = re.search(r'</summary>(.*?)</details>', row.group())
         assert cell is not None
@@ -499,8 +500,9 @@ class DashboardScenarioTests(Fixture):
         installed.write_text(json.dumps({'mcpServers': {'odd': {'command': '{{NO_SUCH_PLACEHOLDER}}/x'}}}))
         page, _ = self.dashboard()
         self.assertIn('MCP catalog placeholders not filled', page_text(section(page, 'mcp')))
-        self.assertIn('not read: AttributeError', page_text(section(page, 'hooks')))
-        self.assertIn('Hooks: not read: AttributeError', page_text(section(page, 'attention')))
+        self.assertIn('not read: ValueError: agent-kit: invalid', page_text(section(page, 'hooks')))
+        self.assertIn('entry 0: not an object', page_text(section(page, 'hooks')), 'what is wrong with it')
+        self.assertIn('Hooks: not read: ValueError', page_text(section(page, 'attention')))
         for key in SECTIONS:
             if key != 'hooks':
                 self.assertNotIn('not read:', section(page, key))
