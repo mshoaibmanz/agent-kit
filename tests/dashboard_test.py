@@ -8,12 +8,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import http.client
 import importlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -30,6 +32,8 @@ sys.path.insert(0, str(SOURCE / 'hooks/lib'))
 from credentials import MASK, mask_tokens, show_args, show_url  # noqa: E402
 from preset import validate_catalog  # noqa: E402
 import secret_store  # noqa: E402
+
+FETCH = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
 
 SECTIONS = ('hosts', 'mcp', 'unmanaged', 'overlay', 'data', 'sql', 'skills', 'roles', 'hooks', 'pack', 'work',
             'actions')
@@ -548,46 +552,102 @@ class DashboardScenarioTests(Fixture):
         self.assertNotIn('Traceback', result.stderr)
         self.assertEqual({'claude', 'codex', 'cursor'}, {r['host'] for r in json.loads(result.stdout)}, result.stdout)
 
+    def start_watch(self) -> tuple[subprocess.Popen, str]:
+        """agent-kit dashboard --watch on the install; returns the process and the page's URL."""
+        proc = subprocess.Popen([sys.executable, str(self.root / 'bin/agent-kit'), 'dashboard', '--watch', '--no-open',
+                                 '--out', str(self.home / 'out/index.html')], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=self.env(kit=self.root), stdin=subprocess.DEVNULL)
+        assert proc.stdout is not None
+        lines = [proc.stdout.readline(), proc.stdout.readline()]
+        serving = re.search(r'serving (http://127\.0\.0\.1:\d+/)', ''.join(lines))
+        if serving is None:
+            proc.kill()
+            self.fail(''.join(lines) + proc.communicate()[1])
+        return proc, serving.group(1)
+
+    def stop_watch(self, proc: subprocess.Popen) -> tuple[str, str]:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+        rest, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, rest + err)
+        self.assertTrue(rest.endswith('dashboard: stopped\n'), rest)
+        self.assertNotIn('Traceback', err)
+        return rest, err
+
+    def next_version(self, url: str, after: str) -> str:
+        """The served version once it moves past after (unchanged after 30 s)."""
+        deadline = time.monotonic() + 30
+        version = after
+        while version == after and time.monotonic() < deadline:
+            time.sleep(0.5)
+            version = FETCH(url + 'version', timeout=10).read().decode()
+        return version
+
     def test_watch_serves_the_page_and_regenerates_it_when_a_config_file_changes(self) -> None:
         self.install()
         out = self.home / 'out/index.html'
-        fetch = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
-        proc = subprocess.Popen([sys.executable, str(self.root / 'bin/agent-kit'), 'dashboard', '--watch', '--no-open',
-                                 '--out', str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                env=self.env(kit=self.root), stdin=subprocess.DEVNULL)
+        proc, url = self.start_watch()
         try:
-            assert proc.stdout is not None
-            lines = [proc.stdout.readline(), proc.stdout.readline()]
-            serving = re.search(r'serving (http://127\.0\.0\.1:\d+/)', ''.join(lines))
-            self.assertIsNotNone(serving, ''.join(lines))
-            assert serving is not None
-            url = serving.group(1)
-            served = fetch(url, timeout=10).read().decode()
+            served = FETCH(url, timeout=10).read().decode()
             self.assertIn('<script src="/reload.js" data-version="1"></script>', served)
             policy = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', served)
             assert policy is not None
             self.assertIn("connect-src 'self'", policy.group(1))
             self.assertIn("script-src 'self' 'sha256-", policy.group(1))
-            self.assertIn('location.reload()', fetch(url + 'reload.js', timeout=10).read().decode())
+            script = FETCH(url + 'reload.js', timeout=10).read().decode()
+            self.assertIn('location.reload()', script)
+            self.assertIn('setTimeout(poll,2000)', script, 'the page polls as often as the watch')
             self.assertNotIn('reload.js', out.read_text(), 'the page on disk stays self-contained')
             self.assertNotIn('watched-server', served)
+
+            port = int(url.rsplit(':', 1)[1].strip('/'))
+            for host, status in ((f'127.0.0.1:{port}', 200), (f'localhost:{port}', 200), ('attacker.example', 403),
+                                 (f'attacker.example:{port}', 403), ('127.0.0.1:1', 403)):
+                connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+                connection.request('GET', '/version', headers={'Host': host})
+                self.assertEqual(connection.getresponse().status, status, host)
+                connection.close()
 
             catalog = self.root / 'mcp/servers.json'
             servers = json.loads(catalog.read_text())
             servers['mcpServers']['watched-server'] = {'command': 'npx', 'args': ['-y', 'example-watched']}
             catalog.write_text(json.dumps(servers))
-            deadline = time.monotonic() + 30
-            while fetch(url + 'version', timeout=10).read().decode() == '1' and time.monotonic() < deadline:
-                time.sleep(0.5)
-            self.assertIn('watched-server', fetch(url, timeout=10).read().decode())
+            self.assertEqual(self.next_version(url, '1'), '2')
+            self.assertIn('watched-server', FETCH(url, timeout=10).read().decode())
             self.assertIn('watched-server', out.read_text())
         finally:
-            proc.send_signal(signal.SIGINT)
-            rest, err = proc.communicate(timeout=30)
-        self.assertEqual(proc.returncode, 0, rest + err)
+            rest, _ = self.stop_watch(proc)
         self.assertIn('dashboard: regenerated (', rest)
-        self.assertTrue(rest.endswith('dashboard: stopped\n'), rest)
-        self.assertNotIn('Traceback', err)
+
+    def test_watch_sees_new_files_and_survives_a_failed_rebuild(self) -> None:
+        self.install()
+        proc, url = self.start_watch()
+        try:
+            (self.root / 'local/settings.json').write_text('{"includeCoAuthoredBy": false}\n')
+            self.assertEqual(self.next_version(url, '1'), '2', 'a file created in local/ was not seen')
+            # The page's folder gone: the rebuild fails, and the last page stays served.
+            shutil.rmtree(self.home / 'out')
+            (self.root / 'local/kit.env').write_text('REVIEW_BASE=main\n')
+            time.sleep(5)
+            self.assertIsNone(proc.poll(), 'the watch died with its rebuild')
+            self.assertEqual(FETCH(url + 'version', timeout=10).read().decode(), '2')
+            (self.home / 'out').mkdir()
+            (self.root / 'local/kit.env').write_text('REVIEW_BASE=develop\n')
+            self.assertEqual(self.next_version(url, '2'), '3')
+            self.assertTrue((self.home / 'out/index.html').is_file())
+        finally:
+            rest, err = self.stop_watch(proc)
+        self.assertIn('dashboard: regenerating failed', err)
+
+    def test_watch_covers_each_hosts_rendered_files(self) -> None:
+        from dashboard_watch import watched
+
+        kit, roots = self.home / 'kit', {'claude': self.home / '.claude', 'cursor': self.home / '.cursor'}
+        paths = set(watched(kit, self.home / 'overlay', roots))
+        for wanted in ('.claude/settings.json', '.claude/settings.local.json', '.claude/CLAUDE.md',
+                       '.cursor/rules/agent-kit.mdc', '.cursor/mcp.json', '.cursor/hooks.json'):
+            self.assertIn(self.home / wanted, paths)
+        self.assertIn(kit / 'local', paths, 'the folder itself, so a new file in it counts')
 
     def test_doctor_reports_a_hook_removed_since_setup(self) -> None:
         self.install()

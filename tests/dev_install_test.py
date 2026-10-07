@@ -166,6 +166,18 @@ class DevInstallTests(PackRepos):
         self.assertIn('(includeCoAuthoredBy, env.KIT_TEST_FLAG)', problems[0])
         self.install('--apply')
         self.assertEqual(self.doctor()['problems'], [], 'setup applied the layer')
+        user.write_text('{"env": {"KIT_TEST_FLAG": "1", "KIT_TEST_GONE": "x"}, "enabledPlugins": {"mine@own": true},'
+                        ' "extraKnownMarketplaces": {"own": {"source": {"source": "github", "repo": "o/one"}}}}\n')
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
+        user.write_text('{"env": {"KIT_TEST_FLAG": "2"}, "enabledPlugins": {"mine@own": false},'
+                        ' "extraKnownMarketplaces": {"own": {"source": {"source": "github", "repo": "o/two"}}}}\n')
+        problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('(env.KIT_TEST_FLAG, env.KIT_TEST_GONE, enabledPlugins.mine@own, '
+                      'extraKnownMarketplaces.own)', problems[0], 'removed, changed and dropped entries')
+        self.install('--apply')
+        self.assertEqual(self.doctor()['problems'], [])
         user.write_text('{"theme": "dark"}\n')
         problems = json.loads(self.installed('doctor', code=1).stdout)['problems']
         self.assertEqual(len(problems), 1, problems)

@@ -64,8 +64,8 @@ from kit_env import code_dir, kit_env  # noqa: E402
 from kit_text import default_host_root, fill_servers, install_text, resume_max  # noqa: E402
 from preflight import (Row, capabilities, dependencies, detect_cli, detect_hosts, detect_owner,  # noqa: E402
                        detect_repo_roots, host_login, install_hint, org_access, preflight, print_summary)
-from mcp_plan import McpPlan, mcp_plan  # noqa: E402
-from pack import PACK_DIR, PACK_SKILLS, extension_lists, installed_pack, sync_pack_mcp  # noqa: E402
+from mcp_plan import McpPlan, mcp_plan, sync_pack_mcp  # noqa: E402
+from pack import PACK_DIR, PACK_SKILLS, extension_lists, installed_pack  # noqa: E402
 from preset import Preset, apply_preset, kit_skills, plugin_settings, source_status, validate_catalog  # noqa: E402
 from sentry import INSTANCES_FILE, expand_servers, merge_instances, read_instances  # noqa: E402
 SHELL_MARKERS = ('# BEGIN agent-kit shell', '# END agent-kit shell')
@@ -555,7 +555,7 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset,
                       servers: dict[str, Any]) -> tuple[set[Path], McpPlan]:
     """The kit as this install selects it, in view; returns the paths in it that setup derived rather
     than copied from the source (the team pack's included), which a dev install keeps as copies, and
-    the MCP plan (pack.mcp_plan) whose servers it installs."""
+    the MCP plan (mcp_plan.mcp_plan) whose servers it installs."""
     source = Path(args.source).expanduser().resolve()
     derived = {Path('hooks/registry.json')}
     mcp = McpPlan({}, (), None)
@@ -1388,15 +1388,24 @@ def settings_layer_problem(args: argparse.Namespace, root: Path, state: dict[str
     def owned(kind: str) -> dict[str, Any]:
         return managed.get(f'{kind}:{target / "settings.json"}', {}).get('owned', {})
 
-    rest = {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}
-    applied = owned('settings')
-    stale = sorted(key for key in set(rest) | set(applied)
-                   if key not in rest or key not in applied or rest[key] != applied[key])
+    def differ(prefix: str, want: dict[str, Any], have: dict[str, Any]) -> list[str]:
+        """Each entry added, changed or removed between the layer and the install record."""
+        return [prefix + key for key in sorted(set(want) | set(have))
+                if key not in want or key not in have or want[key] != have[key]]
+
+    # As host_changes builds them: the kit's own env keys and the GIT_CONFIG_* entry are not the
+    # layer's, and a preset's plugins and marketplaces win over the layer's.
     kit_keys = kit_shell(args, root, target)
-    stale += sorted(f'env.{key}' for key, value in layer.get('env', {}).items()
-                    if key not in kit_keys and not key.startswith('GIT_CONFIG_') and owned('environment').get(key) != value)
-    for field, kind in (('enabledPlugins', 'plugins'), ('extraKnownMarketplaces', 'marketplaces')):
-        stale += sorted(f'{field}.{key}' for key in layer.get(field, {}) if key not in owned(kind))
+
+    def layer_env(env: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in env.items() if key not in kit_keys and not key.startswith('GIT_CONFIG_')}
+
+    enabled, markets = plugin_settings(state.get('configuration', {}).get('preset_values', {}).get('plugins', {}))
+    stale = differ('', {key: value for key, value in layer.items() if key not in LAYER_ELSEWHERE}, owned('settings'))
+    stale += differ('env.', layer_env(layer.get('env', {})), layer_env(owned('environment')))
+    stale += differ('enabledPlugins.', {**layer.get('enabledPlugins', {}), **enabled}, owned('plugins'))
+    stale += differ('extraKnownMarketplaces.', {**layer.get('extraKnownMarketplaces', {}), **markets},
+                    owned('marketplaces'))
     if not stale:
         return None
     return (f'the settings layer differs from what setup applied to {target / "settings.json"} '

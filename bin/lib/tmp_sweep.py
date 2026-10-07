@@ -21,6 +21,7 @@ from typing import Iterator, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "hooks/lib"))
 from agent_task import DONE_STATUSES, generated, read_task  # noqa: E402
+from checkout import git  # noqa: E402
 from kit_env import kit_env, work_root as overlay_work_root  # noqa: E402
 
 DEFAULT_DAYS = 14
@@ -92,10 +93,11 @@ def tree_size(path: Path) -> int:
 
 
 def git_out(folder: Path, *args: str) -> str | None:
-    """git's stdout, or None when it fails. No credential prompt: a remote that asks for one fails."""
+    """git's stdout, or None when it fails or times out. Never prompts: a remote that wants a password
+    or an ssh passphrase fails instead."""
+    ssh = os.environ.get("GIT_SSH_COMMAND", "ssh") + " -o BatchMode=yes"
     try:
-        proc = subprocess.run(["git", "-C", str(folder), *args], capture_output=True, text=True, timeout=60,
-                              check=False, stdin=subprocess.DEVNULL, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        proc = git(folder, *args, timeout=60, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": ssh})
     except (OSError, subprocess.TimeoutExpired):
         return None
     return proc.stdout if proc.returncode == 0 else None

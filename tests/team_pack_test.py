@@ -783,13 +783,13 @@ exit 1''')
 class SyncStampTests(unittest.TestCase):
     def test_a_sync_whose_stamp_cannot_be_written_says_so(self) -> None:
         sys.path.insert(0, str(SOURCE / 'bin/lib'))
-        import pack
+        import mcp_plan
 
         with tempfile.TemporaryDirectory() as folder:
             project = Path(folder)
             (project / 'uv.lock').write_text('version = 1\n')
             (project / '.venv').write_text('not a folder\n')
-            said = pack.sync_pack_mcp(('/usr/bin/true', str(project)))
+            said = mcp_plan.sync_pack_mcp(('/usr/bin/true', str(project)))
         self.assertIn(f'team pack mcp/ project synced ({project}), but its stamp could not be written', said)
         self.assertIn('the next agent-setup or agent-kit sync runs it again', said)
 

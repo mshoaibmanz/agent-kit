@@ -4,9 +4,8 @@ keeps under <kit root>/pack."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator
 from dataclasses import dataclass
-import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -48,8 +47,6 @@ PACK_MCP = 'mcp'
 # Never part of a pack: git's own folder, the files macOS and Windows leave in folders, and what a
 # local run of the MCP project leaves (its environment and tool caches).
 NOT_PACK = re.compile(r'\.git|\.DS_Store|Thumbs\.db|\._.*|\.venv|__pycache__|\.pytest_cache|\.ruff_cache')
-# In the kept pack's mcp/.venv: the sha256 of the uv.lock its last successful sync installed.
-SYNC_STAMP = '.agent-kit-synced'
 GH_ARCHIVE_TIMEOUT = 120
 
 PackFiles = dict[str, tuple[bytes, int]]
@@ -343,30 +340,6 @@ def extension_lists(skills: Path, names: Iterable[str], installed: str) -> dict[
         for base in skill_extends(text) - {name}:
             lines.setdefault(base, []).append(line)
     return lines
-
-
-def sync_pack_mcp(command: Sequence[str] | None) -> str | None:
-    """Run command, the uv sync of the team pack's mcp/ project, and say how it went (None: nothing to
-    sync). The environment uv creates there (.venv) belongs to no record: neither drift nor a
-    collision. A success stamps it with the uv.lock it synced; a failed sync leaves no stamp, so the
-    next setup or sync retries it."""
-    if not command:
-        return None
-    project = Path(command[-1])
-    try:
-        result = subprocess.run(list(command), capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return f'team pack mcp/ project not synced ({error}); the next agent-setup or agent-kit sync retries it'
-    if result.returncode:
-        reason = (result.stderr.strip().splitlines() or ['uv sync failed'])[-1]
-        return f'team pack mcp/ project not synced ({reason}); the next agent-setup or agent-kit sync retries it'
-    try:
-        stamp = hashlib.sha256((project / 'uv.lock').read_bytes()).hexdigest()
-        (project / '.venv' / SYNC_STAMP).write_text(stamp + '\n')
-    except OSError as error:
-        return (f'team pack mcp/ project synced ({project}), but its stamp could not be written ({error}); '
-                'the next agent-setup or agent-kit sync runs it again')
-    return f'team pack mcp/ project synced ({project})'
 
 
 def pack_label(commit: str | None) -> str:

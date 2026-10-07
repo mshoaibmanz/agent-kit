@@ -1,20 +1,24 @@
 """The MCP plan an install writes (README "MCP servers"): which catalog servers it can start, which it
-leaves out and why, and whether the team pack's mcp/ project needs a uv sync first."""
+leaves out and why, and the uv sync of the team pack's mcp/ project those servers need."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 from typing import Any, NamedTuple
 
 from kit_text import PACK_DIR, fill_servers
-from pack import PACK_MCP, SYNC_STAMP, Pack
+from pack import PACK_MCP, Pack
 from preflight import install_hint, server_runtime
 
+# In the kept pack's mcp/.venv: the sha256 of the uv.lock its last successful sync installed.
+SYNC_STAMP = '.agent-kit-synced'
 CODE_DIR_PATH = re.compile(r'\{\{CODE_DIR\}\}(?:/[A-Za-z0-9_.-]+)+')
 
 
@@ -95,3 +99,27 @@ def mcp_plan(servers: dict[str, Any], *, view: Path, root: Path, pack: Pack | No
     needs = uv and any('{{PACK_DIR}}' in json.dumps(spec) for spec in runnable.values())
     sync = (uv, 'sync', '--frozen', '--no-dev', '--project', str(project)) if needs and not mcp_synced(project, lock) else None
     return McpPlan(runnable, tuple(skipped), sync)
+
+
+def sync_pack_mcp(command: Sequence[str] | None) -> str | None:
+    """Run command, the uv sync of the team pack's mcp/ project, and say how it went (None: nothing to
+    sync). The environment uv creates there (.venv) belongs to no record: neither drift nor a
+    collision. A success stamps it with the uv.lock it synced; a failed sync leaves no stamp, so the
+    next setup or sync retries it."""
+    if not command:
+        return None
+    project = Path(command[-1])
+    try:
+        result = subprocess.run(list(command), capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f'team pack mcp/ project not synced ({error}); the next agent-setup or agent-kit sync retries it'
+    if result.returncode:
+        reason = (result.stderr.strip().splitlines() or ['uv sync failed'])[-1]
+        return f'team pack mcp/ project not synced ({reason}); the next agent-setup or agent-kit sync retries it'
+    try:
+        stamp = hashlib.sha256((project / 'uv.lock').read_bytes()).hexdigest()
+        (project / '.venv' / SYNC_STAMP).write_text(stamp + '\n')
+    except OSError as error:
+        return (f'team pack mcp/ project synced ({project}), but its stamp could not be written ({error}); '
+                'the next agent-setup or agent-kit sync runs it again')
+    return f'team pack mcp/ project synced ({project})'

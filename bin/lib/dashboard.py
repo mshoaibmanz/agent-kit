@@ -132,4 +132,4 @@ def watch_paths(api: ModuleType) -> list[Path]:
     from kit_env import kit_env_path
 
     setup = Setup(api, False)
-    return watched(setup.kit, Path(kit_env_path()).parent, [setup.roots[h] for h in setup.configured])
+    return watched(setup.kit, Path(kit_env_path()).parent, {h: setup.roots[h] for h in setup.configured})

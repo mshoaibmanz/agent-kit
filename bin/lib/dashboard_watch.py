@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-POLL_SECONDS = 2.0
+from hosts import RENDERED_FILES
+
+POLL_SECONDS = 2
 # Kit files the page reads; a host root's own config files by name (its other files change on every
 # prompt, history and caches among them).
 KIT_FILES = (
@@ -25,41 +28,47 @@ KIT_FILES = (
     "state/mcp-describe.json",
     "pack/agent-kit-preset.toml",
 )
-HOST_FILES = ("settings.json", "settings.local.json", "mcp.json", "hooks.json", "config.toml", "CLAUDE.md", "AGENTS.md")
 RELOAD_JS = (
     "(function(){var v=document.currentScript.getAttribute('data-version');"
     "function poll(){fetch('/version',{cache:'no-store'}).then(function(r){return r.text()})"
-    ".then(function(t){if(t!==v){location.reload()}else{setTimeout(poll,2000)}},"
-    "function(){setTimeout(poll,2000)})}setTimeout(poll,2000)})();\n"
+    f".then(function(t){{if(t!==v){{location.reload()}}else{{setTimeout(poll,{POLL_SECONDS * 1000})}}}},"
+    f"function(){{setTimeout(poll,{POLL_SECONDS * 1000})}})}}setTimeout(poll,{POLL_SECONDS * 1000})}})();\n"
 )
 POLICY = re.compile(r'(http-equiv="Content-Security-Policy" content=")([^"]*)(")')
 
-Fingerprint = tuple[tuple[str, int, int], ...]
+Fingerprint = dict[str, tuple[int, int]]
 
 
-def watched(kit: Path, overlay: Path, host_roots: Iterable[Path]) -> list[Path]:
-    """The config files the page is generated from: the kit's own, the top-level files of its local/
-    folder and of the overlay folder, and each configured host root's config files."""
+def watched(kit: Path, overlay: Path, host_roots: Mapping[str, Path]) -> list[Path]:
+    """The config files the page is generated from: the kit's own, the kit's local/ folder and the
+    overlay folder with their top-level files (a folder's own mtime moves when a file is added or
+    removed), and each configured host's rendered files plus settings.local.json."""
     paths = [kit / name for name in KIT_FILES]
-    for folder in {kit / "local", overlay}:
+    for folder in sorted({kit / "local", overlay}):
+        paths.append(folder)
         try:
             paths += sorted(p for p in folder.iterdir() if p.is_file())
         except OSError:
             pass
-    paths += [root / name for root in host_roots for name in HOST_FILES]
+    for host, root in sorted(host_roots.items()):
+        paths += [root / name for name in (*RENDERED_FILES[host], "settings.local.json")]
     return paths
 
 
 def fingerprint(paths: Iterable[Path]) -> Fingerprint:
-    """(path, mtime ns, size) per path; an absent file is (path, 0, -1), so creating one counts."""
-    out = []
+    """path -> (mtime ns, size); an absent path is (0, -1), so creating one counts."""
+    out = {}
     for path in paths:
         try:
             st = path.stat()
-            out.append((str(path), st.st_mtime_ns, st.st_size))
+            out[str(path)] = (st.st_mtime_ns, st.st_size)
         except OSError:
-            out.append((str(path), 0, -1))
-    return tuple(out)
+            out[str(path)] = (0, -1)
+    return out
+
+
+def first_change(now: Fingerprint, seen: Fingerprint) -> str:
+    return next(path for path in sorted(set(now) | set(seen)) if now.get(path) != seen.get(path))
 
 
 def live_page(text: str, version: str) -> str:
@@ -68,36 +77,26 @@ def live_page(text: str, version: str) -> str:
     if not found:
         raise ValueError("the page has no Content-Security-Policy to extend")
     policy = found.group(2).replace("script-src ", "script-src 'self' ", 1) + "; connect-src 'self'"
-    text = text[: found.start(2)] + policy + text[found.end(2):]
+    text = text[: found.start(2)] + policy + text[found.end(2) :]
     tag = f'<script src="/reload.js" data-version="{html.escape(version)}"></script>\n'
     return text.replace("</body>", tag + "</body>", 1)
 
 
-class Served:
-    """The current page and its version, shared with the server threads."""
+def handler(current: list[tuple[str, str]]) -> type[BaseHTTPRequestHandler]:
+    """current[0] is the served (page, version). A request whose Host is not this server's own
+    127.0.0.1 or localhost address is refused, so a page from another site cannot read this one
+    through a name rebound to 127.0.0.1."""
 
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.version = 0
-        self.text = ""
-
-    def update(self, text: str) -> None:
-        with self.lock:
-            self.version += 1
-            self.text = text
-
-    def current(self) -> tuple[str, str]:
-        with self.lock:
-            return self.text, str(self.version)
-
-
-def handler(served: Served) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802  (http.server's name)
-            text, version = served.current()
+            port = self.connection.getsockname()[1]
+            if self.headers.get("Host", "").lower() not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                self.send_error(403)
+                return
+            text, version = current[0]
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
-                self.reply(live_page(text, version), "text/html; charset=utf-8")
+                self.reply(text, "text/html; charset=utf-8")
             elif path == "/version":
                 self.reply(version, "text/plain; charset=utf-8")
             elif path == "/reload.js":
@@ -126,29 +125,36 @@ def watch(
     port: int,
     opener: Callable[[str], object] | None,
 ) -> int:
-    """Serve rebuild()'s page until Ctrl-C, rebuilding it when a file of paths() changes."""
-    served = Served()
+    """Serve rebuild()'s page until Ctrl-C, rebuilding it when a file of paths() changes. paths() runs
+    on every poll, so a file created since is watched; a failed rebuild keeps the last page."""
     # Each fingerprint is taken before its rebuild, so an edit made during one is caught by the next poll.
-    watching = paths()
-    seen = fingerprint(watching)
-    served.update(rebuild())
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler(served))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    seen = fingerprint(paths())
+    version = 1
+    current = [(live_page(rebuild(), str(version)), str(version))]
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler(current))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/"
     print(f"dashboard: serving {url}; regenerating when a config file changes (Ctrl-C stops)", flush=True)
     if opener:
         opener(url)
+    failure = ""
     try:
         while True:
             time.sleep(POLL_SECONDS)
-            now = fingerprint(watching)
-            if now == seen:
+            try:
+                now = fingerprint(paths())
+                if now == seen:
+                    continue
+                changed, seen = first_change(now, seen), now
+                current[0] = (live_page(rebuild(), str(version + 1)), str(version + 1))
+                version += 1
+            except Exception as error:  # noqa: BLE001  a half-written file must not end the watch
+                if f"{error!r}" != failure:
+                    print(f"dashboard: regenerating failed, still serving the last page: {type(error).__name__}: "
+                          f"{error}", file=sys.stderr, flush=True)
+                failure = f"{error!r}"
                 continue
-            changed = next(new[0] for new, old in zip(now, seen) if new != old)
-            watching = paths()
-            seen = fingerprint(watching)
-            served.update(rebuild())
+            failure = ""
             print(f"dashboard: regenerated ({changed} changed)", flush=True)
     except KeyboardInterrupt:
         pass
