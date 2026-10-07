@@ -85,6 +85,9 @@ STATE = KIT / "state/rendered"
 ROLES = Path(os.environ.get("AGENT_KIT_ROLES", str(KIT / "roles.toml")))
 AGENT_SRC = KIT / "agents"
 MISSING = object()
+# Catalog fields only the dashboard reads; no host gets them. hosts.CATALOG_ONLY is the same tuple
+# (a test pins them equal): a bare agent-kit cannot import bin/lib.
+CATALOG_ONLY = ("credentials", "description")
 # A leaf here that goes missing live is restored, and drift here fails the render.
 GUARDED = ("hooks", "permissions")
 # Each provider's own effort scale: Claude Code's --effort and Codex's model_reasoning_effort.
@@ -789,21 +792,26 @@ def render_settings(
 
 def mcp_catalog() -> dict[str, Any]:
     """The catalog as the host gets it: kit placeholders ({{KIT_DIR}}) filled for this kit and the
-    `credentials` and `description` fields dropped (hosts.fill_servers). An install without the mcp
-    component has no catalog: an empty one."""
+    catalog-only fields (CATALOG_ONLY) dropped. An install without the mcp component has no catalog:
+    an empty one."""
     if not SERVERS.is_file():
         return {"mcpServers": {}}
     catalog = json.loads(SERVERS.read_text())
     servers = catalog.get("mcpServers")
-    # A kit copied without bin/lib (a bare agent-kit) renders a plain catalog as is.
-    if isinstance(servers, dict) and (
-        "{{" in json.dumps(servers)
-        or any(isinstance(s, dict) and {"credentials", "description"} & set(s) for s in servers.values())
-    ):
+    if not isinstance(servers, dict):
+        return catalog
+    # Dropped here, not by hosts.fill_servers: a kit copied without bin/lib (a bare agent-kit) needs
+    # bin/lib only to fill placeholders.
+    servers = {
+        name: {k: v for k, v in spec.items() if k not in CATALOG_ONLY} if isinstance(spec, dict) else spec
+        for name, spec in servers.items()
+    }
+    if "{{" in json.dumps(servers):
         sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
         from hosts import fill_servers
 
-        catalog["mcpServers"] = fill_servers(servers, str(KIT))
+        servers = fill_servers(servers, str(KIT))
+    catalog["mcpServers"] = servers
     return catalog
 
 

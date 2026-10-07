@@ -10,6 +10,7 @@ tunnel or reaches a database.
 
 import atexit
 import contextlib
+import datetime
 import importlib.machinery
 import importlib.util
 import io
@@ -566,12 +567,19 @@ ADD_ARGS = ["--name", "billing", "--user", "reader", "--via", "jump", "--remote"
             "--local-port", "15310"]
 
 
-def scratch_home(text: str = BASE_CONFIG) -> str:
+def scratch_home(text: str = BASE_CONFIG, files: dict[str, str] | None = None) -> str:
+    """A scratch HOME's ssh config; `{SSH}` in text and files is its .ssh folder, so an Include
+    names an absolute path and ssh never reads the real ~/.ssh."""
     home = tempfile.mkdtemp(prefix="home-", dir=TMP)
-    os.makedirs(os.path.join(home, ".ssh"), mode=0o700)
-    config = os.path.join(home, ".ssh", "config")
+    ssh = os.path.join(home, ".ssh")
+    os.makedirs(ssh, mode=0o700)
+    for name, body in (files or {}).items():
+        os.makedirs(os.path.dirname(os.path.join(ssh, name)), exist_ok=True)
+        with open(os.path.join(ssh, name), "w") as f:
+            f.write(body.replace("{SSH}", ssh))
+    config = os.path.join(ssh, "config")
     with open(config, "w") as f:
-        f.write(text)
+        f.write(text.replace("{SSH}", ssh))
     os.chmod(config, 0o644)
     return config
 
@@ -610,7 +618,7 @@ def add_writes_the_block_and_stores_the_password() -> bool:
         "  Port 2222\n  LocalForward 15310 billing.db.example.test:3306\n  ExitOnForwardFailure yes\n"
         "  ServerAliveInterval 30\n  ServerAliveCountMax 3\n"
     )
-    found = ("db-tunnel-billing", "15310", "reader") in [tuple(t) for t in m.parse_tunnels(text)]
+    found = ("db-tunnel-billing", "15310", "reader") in [tuple(t)[:3] for t in m.load_tunnels(config)]
     return (
         not refused and len(prompts) == 1 and text == BASE_CONFIG + "\n" + block and found
         and bool(backup) and open(backup).read() == BASE_CONFIG and os.stat(backup).st_mode & 0o777 == 0o600
@@ -663,9 +671,133 @@ def add_needs_a_terminal() -> bool:
     return r.returncode == 2 and b"terminal" in r.stderr
 
 
+def ssh_g(config: str, host: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    r = subprocess.run(["ssh", "-G", "-F", config, host], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        out.setdefault(key, []).append(value)
+    return out
+
+
+def untouched(config: str, text: str) -> bool:
+    """config still reads text (its {SSH} filled), with no backup and no temporary file beside it."""
+    folder = os.path.dirname(config)
+    with open(config) as f:
+        same = f.read() == text.replace("{SSH}", folder)
+    return same and not [n for n in os.listdir(folder) if n.startswith((".config.", "config.bak-"))]
+
+
+INCLUDED = {"inc/team": "Host db-tunnel-orders\n  HostName other.example.test\n  LocalForward 15310 orders.db:3306\n"}
+INCLUDING = "Include {SSH}/inc/*\n\n" + BASE_CONFIG.replace("db-tunnel-orders", "db-tunnel-legacy")
+
+
+def add_sees_included_aliases_and_ports() -> bool:
+    config = scratch_home(INCLUDING, INCLUDED)
+    alias = run_add(config, ["--name", "orders", *ADD_ARGS[2:-1], "15399"])
+    port = run_add(config, ADD_ARGS)
+    listed = [t[:2] for t in m.load_tunnels(config)]
+    return (
+        alias[0] and not alias[2] and port[0] and not port[2] and untouched(config, INCLUDING)
+        and ("db-tunnel-orders", "15310") in listed
+    )
+
+
+WILDCARD_LAST = BASE_CONFIG + "\nHost *\n  User fallback\n  Port 2200\n"
+
+
+def add_goes_above_the_first_wildcard_host() -> bool:
+    config = scratch_home(WILDCARD_LAST)
+    refused, _, _ = run_add(config, ADD_ARGS)
+    with open(config) as f:
+        text = f.read()
+    got = ssh_g(config, "db-tunnel-billing")
+    return (
+        not refused and text.index("Host db-tunnel-billing") < text.index("Host *")
+        and got["user"] == ["ops"] and got["port"] == ["2222"]
+    )
+
+
+AUTH_BASTION = """\
+Host jump
+  HostName bastion.example.test
+  User ops
+  IdentityFile "{SSH}/jump key"
+  IdentityFile {SSH}/second
+  IdentitiesOnly yes
+  ProxyCommand nc -X 5 -x proxy.example.test:1080 %h %p
+  CertificateFile {SSH}/jump-cert.pub
+"""
+
+
+def add_copies_the_bastions_auth_and_transport() -> bool:
+    config = scratch_home(AUTH_BASTION)
+    refused, _, _ = run_add(config, ADD_ARGS)
+    keys = ("hostname", "user", "port", "proxycommand", "identityfile", "identitiesonly", "certificatefile")
+    new, jump = ssh_g(config, "db-tunnel-billing"), ssh_g(config, "jump")
+    return not refused and all(new.get(k) == jump.get(k) for k in keys) and len(new["identityfile"]) == 2
+
+
+SHADOWED = {"inc/defaults": "Host jump\n  HostName bastion.example.test\n  User ops\n\nHost *\n  User fallback\n"}
+
+
+def add_refuses_a_config_where_the_alias_resolves_otherwise() -> bool:
+    text = "Include {SSH}/inc/*\n"
+    config = scratch_home(text, SHADOWED)
+    refused, shown, prompts = run_add(config, ADD_ARGS)
+    dry = run_add(config, [*ADD_ARGS, "--dry-run"])
+    return refused and not prompts and "user" in shown and dry[0] and untouched(config, text)
+
+
+def add_cancelled_at_the_prompt_writes_nothing() -> bool:
+    config = scratch_home()
+    results = []
+    for error in (KeyboardInterrupt, EOFError):
+        def ask(_prompt: str, error: type[BaseException] = error) -> str:
+            raise error
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                m.add(ADD_ARGS, config=config, ask=ask)
+            results.append(False)
+        except SystemExit:
+            results.append(untouched(config, BASE_CONFIG))
+        except (KeyboardInterrupt, EOFError):  # escaped add: not a clean abort
+            results.append(False)
+    return all(results)
+
+
+def add_matches_the_bastion_alias_in_any_case() -> bool:
+    text = "Host Jump\n  User ops\n  Port 2222\n"
+    config = scratch_home(text)
+    refused, _, _ = run_add(config, [*ADD_ARGS, "--dry-run"])
+    return not refused and untouched(config, text)
+
+
+def two_backups_in_one_second_get_two_names() -> bool:
+    config = scratch_home()
+    now = datetime.datetime(2026, 1, 2, 3, 4, 5)
+    names = {m.backup_config(config, "a", now), m.backup_config(config, "b", now)}
+    return len(names) == 2 and all(os.stat(n).st_mode & 0o777 == 0o600 for n in names)
+
+
+ADD_CHECKS: dict[str, Callable[[], bool]] = {
+    "add refuses an alias or local port an Included file has; load_tunnels reads Includes":
+        add_sees_included_aliases_and_ports,
+    "add puts the block above a trailing Host *, so its User and Port win": add_goes_above_the_first_wildcard_host,
+    "add copies the bastion's IdentityFiles, IdentitiesOnly, ProxyCommand and CertificateFile":
+        add_copies_the_bastions_auth_and_transport,
+    "add (and --dry-run) refuse, before the prompt, a config where ssh -G resolves the alias otherwise":
+        add_refuses_a_config_where_the_alias_resolves_otherwise,
+    "add cancelled at the password prompt writes nothing": add_cancelled_at_the_prompt_writes_nothing,
+    "add matches --via against Host case-insensitively": add_matches_the_bastion_alias_in_any_case,
+    "two backups within one second get two names": two_backups_in_one_second_get_two_names,
+}
+
+
 checks: dict[str, Callable[[], bool]] = {
     "parse: db-tunnel hosts, ports, block users; wildcard/Match/other hosts skipped": lambda: [
-        tuple(t) for t in m.load_tunnels(SSH_CONFIG)
+        tuple(t)[:3] for t in m.load_tunnels(SSH_CONFIG)
     ] == EXPECTED_TUNNELS,
     "kind: staging/stg name segments are STAGING, postgres is not": lambda: [
         m.kind_of(n) for n in ("app-staging", "shop-stg", "db-tunnel-comm-staging", "postgres", "prod-ro")
@@ -800,8 +932,10 @@ checks: dict[str, Callable[[], bool]] = {
         add_staging_names_the_alias_and_a_staging_name_needs_the_flag,
     "add refuses a password on the command line": add_never_takes_a_password_flag,
     "add refuses without a terminal": add_needs_a_terminal,
-    "tunnel_targets describes each forward by its remote and HostName": lambda: m.tunnel_targets(BASE_CONFIG)
-    == {("db-tunnel-orders", "15306"): "orders.db.example.test:3306 through bastion.example.test"},
+    "a tunnel carries its forward's remote and its block's HostName": lambda: [
+        (t.remote, t.hostname) for t in m.load_tunnels(scratch_home())
+    ] == [("orders.db.example.test:3306", "bastion.example.test")],
+    **ADD_CHECKS,
     "a bare tunnel name is refused, not read as a database on the default tunnel": lambda: "pass --tunnel=comm"
     in refusal(lambda: plan(["comm", *Q], logins=fixed_logins())),
     "-D <db> whose name matches a tunnel is still a database": lambda: "is a tunnel"

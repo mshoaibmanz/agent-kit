@@ -102,49 +102,62 @@ if(el&&el!==card){var d=el.closest('details');if(d)d.open=true;el.scrollIntoView
 setTimeout(function(){el.classList.remove('hit')},1800)}else{window.scrollTo(0,0)}}
 document.body.classList.add('views');q.addEventListener('input',filter);window.addEventListener('hashchange',show);show()})();
 /*ah:begin*/
-var AH_STAGING=/(?:^|[^a-z])(?:staging|stg)/i,AH_SECRET=/pass|pwd|secret|token/i;
+var AH_SECRET=/pass|pwd|secret|token/i,AH_LOOKS_SECRET=/:[^\/@]*@|pass|pwd|secret|token/i;
 function ahDec(s){try{return decodeURIComponent(s)}catch(x){return s}}
-function ahFull(re,v){var m=re.exec(v);return m!==null&&m.index===0&&m[0].length===v.length}
-function ahParse(uri){uri=uri.trim();var re=/^mysql:\/\/(?:([^:@\/?#]*)(?::([^@\/?#]*))?@)?([^:@\/?#]+)(?::([0-9]+))?(?:\/([^?#]*))?(?:\?([^#]*))?/i,m=re.exec(uri);
-if(!m||m[0].length!==uri.length)return{error:'Not a mysql:// connection URI.'};
-var f={user:ahDec(m[1]||''),host:m[3],port:m[4]||'3306',name:ahDec(m[5]||'')},secret=m[2]!==undefined,kept=[];
-(m[6]||'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('='),k=ahDec(i<0?kv:kv.slice(0,i)),v=ahDec(i<0?'':kv.slice(i+1));
-if(AH_SECRET.test(k)){secret=true;return}kept.push(kv);
+function ahRules(get){var re=function(k){return new RegExp('^(?:'+get(k)+')$$')},range=function(k){return get(k).split('-').map(Number)};
+return{name:re('name'),user:re('user'),via:re('via'),host:re('host'),port:/^[0-9]{1,5}$$/,local:/^[0-9]+$$/,
+localPorts:range('local-ports'),remotePorts:range('remote-ports'),staging:new RegExp(get('staging'),'i'),
+prefix:get('prefix'),suffix:get('suffix'),service:get('service')}}
+function ahScrub(text){var s=text.trim(),i=s.indexOf('://'),secret=false;if(i<0)return{text:s,secret:false};
+var head=s.slice(0,i+3),rest=s.slice(i+3),at=-1,u,c;
+for(var j=rest.length-1;j>=0&&at<0;j--){if(rest.charAt(j)!=='@')continue;u=rest.slice(0,j);c=u.indexOf(':');if(!/[\/?#]/.test(c<0?u:u.slice(0,c)))at=j}
+if(at>=0){u=rest.slice(0,at);c=u.indexOf(':');if(c>=0){secret=true;u=u.slice(0,c)}rest=(u?u+'@':'')+rest.slice(at+1)}
+var q=rest.indexOf('?');if(q>=0){var h=rest.indexOf('#',q),end=h<0?rest.length:h,kept=[];
+rest.slice(q+1,end).split('&').forEach(function(kv){if(!kv)return;if(AH_SECRET.test(ahDec(kv.split('=')[0])))secret=true;else kept.push(kv)});
+rest=rest.slice(0,q)+(kept.length?'?'+kept.join('&'):'')+rest.slice(end)}
+return{text:head+rest,secret:secret}}
+function ahParse(uri){var m=/^mysql:\/\/(?:([^:@\/?#]+)@)?([^:@\/?#]+)(?::([0-9]+))?(?:\/([^?#]*))?(?:\?([^#]*))?$$/i.exec(uri.trim());
+if(!m)return{error:'Not a mysql:// connection URI.'};
+var f={user:ahDec(m[1]||''),host:m[2],port:m[3]||'3306',name:ahDec(m[4]||'')};
+(m[5]||'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('='),k=ahDec(i<0?kv:kv.slice(0,i)),v=ahDec(i<0?'':kv.slice(i+1));
 if(k==='via')f.via=v;else if(k==='local_port')f.local=v;else if(k==='name')f.name=v;else if(k==='staging')f.staging=v===''||v==='1'||v==='true'});
-var clean='mysql://'+(m[1]?m[1]+'@':'')+m[3]+(m[4]?':'+m[4]:'')+(m[5]!==undefined?'/'+m[5]:'')+(kept.length?'?'+kept.join('&'):'');
-return{fields:f,password:secret,clean:clean}}
-function ahBuild(f,known){var w=[],bad=[],name=(f.name||'').replace(/^db-tunnel-/,'');
-var checks={name:/[a-z0-9][a-z0-9-]*/,user:/[A-Za-z0-9_.@-]+/,via:/[A-Za-z0-9_.-]+/,host:/[A-Za-z0-9.-]+/,port:/[0-9]{1,5}/,local:/[0-9]{4,5}/};
-Object.keys(checks).forEach(function(k){var v=k==='name'?name:(f[k]||'');if(!ahFull(checks[k],v))bad.push(k)});
-var local=parseInt(f.local,10);if(bad.indexOf('local')<0&&(local<1024||local>65535))bad.push('local');
-if(f.via&&/^db-tunnel-/.test(f.via))bad.push('via');
-var alias='db-tunnel-'+(f.staging&&!AH_STAGING.test(name)?name+'-staging':name);
-if(!f.staging&&AH_STAGING.test(name))w.push('The name reads as STAGING: tick Staging, or pick another name.');
+return{fields:f}}
+function ahRead(text){var s=ahScrub(text),notes=[],p=ahParse(s.text);
+if(s.secret)notes.push('A password in the URI was removed and is not shown: ro-mysql add asks for it.');
+if(!p.error)return{value:s.text,fields:p.fields,notes:notes};
+if(AH_LOOKS_SECRET.test(s.text))return{value:'',notes:notes.concat(['The URI could not be read and looked like it held a password, so it was cleared: fill the fields instead.',p.error])};
+return{value:s.text,notes:notes.concat([p.error])}}
+function ahBuild(f,known,r){var w=[],bad=[],raw=f.name||'',name=raw.indexOf(r.prefix)===0?raw.slice(r.prefix.length):raw;
+['name','user','via','host','port','local'].forEach(function(k){if(!r[k].test(k==='name'?raw:(f[k]||'')))bad.push(k)});
+var local=parseInt(f.local,10),port=parseInt(f.port,10);
+if(bad.indexOf('local')<0&&(local<r.localPorts[0]||local>r.localPorts[1]))bad.push('local');
+if(bad.indexOf('port')<0&&(port<r.remotePorts[0]||port>r.remotePorts[1]))bad.push('port');
+if(f.via&&f.via.toLowerCase().indexOf(r.prefix)===0)bad.push('via');
+var alias=r.prefix+(f.staging&&!r.staging.test(name)?name+r.suffix:name);
+if(!f.staging&&r.staging.test(alias)){w.push('The name reads as STAGING: tick Staging, or pick another name.');if(bad.indexOf('name')<0)bad.push('name')}
 if(known.ports.indexOf(String(local))>=0)w.push('Local port '+local+' is already forwarded by a known tunnel: pick another.');
 if(name&&known.aliases.indexOf(alias)>=0)w.push(alias+' already exists.');
-if(bad.length)return{cmd:'',manual:'',warnings:w,missing:bad};
+if(bad.length)return{cmd:'',manual:'',alias:'',warnings:w,missing:bad};
 var cmd='ro-mysql add --name '+name+' --user '+f.user+' --via '+f.via+' --remote '+f.host+':'+f.port+' --local-port '+local+(f.staging?' --staging':'');
-var manual=['# 1. Append to ~/.ssh/config; HostName and User are the bastion\'s (ssh -G '+f.via+' prints them):',
-'Host '+alias,'  # ro-mysql: user='+f.user,'  HostName <hostname of '+f.via+'>','  User <user of '+f.via+'>',
-'  LocalForward '+local+' '+f.host+':'+f.port,'  ExitOnForwardFailure yes','  ServerAliveInterval 30','  ServerAliveCountMax 3',
-'# 2. Store the password (security prompts for it):','security add-generic-password -U -s ro-mysql -a '+f.user+'@'+alias+' -w',
+var manual=['# 1. Print the ssh block, checked with ssh -G, and where it goes in ~/.ssh/config:',cmd+' --dry-run',
+'# 2. Paste it there, then store the password (security prompts for it):','security add-generic-password -U -s '+r.service+' -a '+f.user+'@'+alias+' -w',
 '# 3. Check it:','ro-mysql --tunnels --refresh'].join('\n');
-return{cmd:cmd,manual:manual,warnings:w,missing:[]}}
+return{cmd:cmd,manual:manual,alias:alias,warnings:w,missing:[]}}
 /*ah:end*/
 (function(){var box=document.getElementById('sql-add');if(!box)return;
 var list=function(a){return(box.getAttribute(a)||'').split(' ').filter(Boolean)},known={ports:list('data-ports'),aliases:list('data-aliases')};
+var rules=ahRules(function(k){return box.getAttribute('data-p-'+k)||''});
 var uri=document.getElementById('ah-uri'),warn=document.getElementById('ah-warn'),cmd=document.getElementById('ah-cmd'),man=document.getElementById('ah-manual');
 var cmdCp=document.getElementById('ah-cmd-cp'),manCp=document.getElementById('ah-man-cp'),inputs={};
 uri.placeholder='mysql://'+'reader@orders-db:3306/orders?via=jump&local_port=15310&staging=1';
 box.querySelectorAll('[data-f]').forEach(function(i){inputs[i.getAttribute('data-f')]=i});
 function fields(){var f={};Object.keys(inputs).forEach(function(k){f[k]=inputs[k].type==='checkbox'?inputs[k].checked:inputs[k].value.trim()});return f}
-function update(notes){var r=ahBuild(fields(),known),w=(notes||[]).concat(r.warnings);warn.hidden=!w.length;warn.textContent=w.join(' ');
+function update(notes){var r=ahBuild(fields(),known,rules),w=(notes||[]).concat(r.warnings);warn.hidden=!w.length;warn.textContent=w.join(' ');
 cmd.textContent=r.cmd||'Still needed: '+r.missing.join(', ');cmdCp.setAttribute('data-c',r.cmd);cmdCp.disabled=!r.cmd;
 man.textContent=r.manual;manCp.setAttribute('data-c',r.manual);manCp.disabled=!r.manual}
-uri.addEventListener('input',function(){if(!uri.value.trim()){update();return}var p=ahParse(uri.value),notes=[];
-if(p.error){update([p.error]);return}
-if(p.password){uri.value=p.clean;notes.push('A password in the URI was removed and is not shown: ro-mysql add asks for it.')}
-Object.keys(p.fields).forEach(function(k){var i=inputs[k];if(!i)return;if(i.type==='checkbox')i.checked=!!p.fields[k];else i.value=p.fields[k]});update(notes)});
+uri.addEventListener('input',function(){if(!uri.value.trim()){update();return}var r=ahRead(uri.value);
+if(r.value!==uri.value.trim())uri.value=r.value;
+Object.keys(r.fields||{}).forEach(function(k){var i=inputs[k];if(!i)return;if(i.type==='checkbox')i.checked=!!r.fields[k];else i.value=r.fields[k]});update(r.notes)});
 Object.keys(inputs).forEach(function(k){inputs[k].addEventListener('input',function(){update()})});update()})();
 </script>
 </body>

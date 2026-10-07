@@ -3,7 +3,7 @@ the live install. Read-only apart from the page itself: it reads the kit, the ho
 overlay and the work root, and checks Keychain items for presence only. Every change it offers is a
 command to copy; the page has no server and loads nothing from the network.
 
-Collectors live in dashboard_sections.py and dashboard_unmanaged.py, the renderer in
+Collectors live in dashboard_sections.py, dashboard_sql.py and dashboard_unmanaged.py, the renderer in
 dashboard_html.py with its template dashboard.html, and the credential masking in credentials.py."""
 
 from __future__ import annotations
@@ -35,9 +35,9 @@ from dashboard_sections import (  # noqa: E402
     roles_section,
     run,
     skills_section,
-    sql_section,
     work_section,
 )
+from dashboard_sql import sql_section  # noqa: E402
 from dashboard_unmanaged import unmanaged_section  # noqa: E402
 
 Collector = Callable[[Setup, Section], None]

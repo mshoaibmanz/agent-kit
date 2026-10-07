@@ -23,7 +23,6 @@ from blocking import BLOCKING, hook_name
 from credentials import Credential, credential_name, declared_credentials, holds_secret, show_args, show_url
 from dashboard_html import (
     Action,
-    AddHelper,
     Badge,
     Cell,
     Code,
@@ -53,6 +52,8 @@ from hosts import (
     skill_hosts,
 )
 from kit_env import KEYS, kit_env, layers, parse
+from mcp_describe import Described
+from mcp_describe import read_cache as read_described
 
 LIB = Path(__file__).resolve().parent
 ENGINE = LIB.parents[1]
@@ -336,30 +337,19 @@ def hosts_section(setup: Setup, sec: Section) -> None:
     sec.level = "warn" if drifted else ""
 
 
-def excerpt(text: str, limit: int = 160) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
-
-
-def described(entry: dict[str, Any]) -> tuple[Cell, str]:
+def described(entry: Described | None) -> tuple[Cell, str]:
     """(the Tools cell, a fallback description) from one server's `agent-kit mcp describe` entry."""
-    if not entry:
+    if entry is None:
         return Muted("not described"), ""
-    if entry.get("status") != "ok":
-        return Badge(str(entry.get("status", "error")), "warn"), ""
-    tools = [t for t in entry.get("tools", []) if isinstance(t, dict)]
-    info = entry.get("serverInfo") if isinstance(entry.get("serverInfo"), dict) else {}
-    names = tuple(str(t.get("name", "")) for t in tools)
-    cell: Cell = Fold(f"{len(tools)} tools", (Lines(names),)) if tools else "0 tools"
-    head = " ".join(str(info.get(k, "")) for k in ("name", "version") if info.get(k))
-    fallback = excerpt(entry.get("instructions") or info.get("title") or head)
-    shown: Cell = (cell, Muted(f"{head}, checked {entry.get('checked', '?')}")) if head else cell
-    return shown, fallback
+    if entry.status != "ok":
+        return Badge(entry.status, "warn"), ""
+    names = tuple(name for name, _ in entry.tools)
+    cell: Cell = Fold(f"{len(names)} tools", (Lines(names),)) if names else "0 tools"
+    shown: Cell = (cell, Muted(f"{entry.server}, checked {entry.checked or '?'}")) if entry.server else cell
+    return shown, entry.instructions or entry.server
 
 
 def mcp_section(setup: Setup, sec: Section) -> None:
-    from mcp_describe import read_cache as read_described
-
     sec.sources = [setup.catalog_path] + ([setup.catalog_input] if setup.catalog_input else [])
     if setup.fill_error:
         sec.alerts.append(f"MCP catalog placeholders not filled: {setup.fill_error}")
@@ -371,7 +361,7 @@ def mcp_section(setup: Setup, sec: Section) -> None:
     for name in sorted(setup.filled):
         spec = setup.filled[name] if isinstance(setup.filled[name], dict) else {}
         raw = setup.catalog.get(name) if isinstance(setup.catalog.get(name), dict) else {}
-        tools, fallback = described(cache.get(name, {}))
+        tools, fallback = described(cache.get(name))
         description = str(raw.get("description") or "") or fallback
         if "url" in spec:
             transport, target = "http", show_url(str(spec["url"])).text
@@ -503,7 +493,7 @@ def skills_section(setup: Setup, sec: Section) -> None:
                     md,
                 ),
                 anchor("skills", name),
-                excerpt(desc, 220),
+                desc,
             )
         )
     sec.blocks.append(Table(("Skill", "Source", "Hosts", "Change", "hosts:", "File"), rows))
@@ -562,7 +552,7 @@ def roles_section(setup: Setup, sec: Section) -> None:
         rendered = setup.roots["claude"] / "agents" / f"{name}.md"
         description = ""
         if src.is_file():
-            description = excerpt(frontmatter(src.read_text(errors="replace")).get("description", ""), 220)
+            description = str(frontmatter(src.read_text(errors="replace")).get("description", ""))
         rows.append(
             Row(
                 (
@@ -798,16 +788,6 @@ def docstring_line(path: Path) -> str:
     return text[: end.start() + 1] if end else text
 
 
-def ro_mysql(setup: Setup) -> ModuleType | None:
-    """The kit's ro-mysql as a module, for its tunnel parser and cache reader: running
-    `ro-mysql --tunnels` instead would ask the MySQL login-path store for unannotated tunnels."""
-    for path in (ENGINE / "bin/ro-mysql", setup.source() / "bin/ro-mysql"):
-        module = load_script(path, "ro_mysql_for_dashboard")
-        if module is not None:
-            return module
-    return None
-
-
 def data_section(setup: Setup, sec: Section) -> None:
     rows: TableRows = []
     for name in ("ro-mysql", "bqro"):
@@ -841,96 +821,6 @@ def data_section(setup: Setup, sec: Section) -> None:
     sec.count = len(rows)
     on_path = sum(1 for name in ("ro-mysql", "bqro") if shutil.which(name))
     sec.summary = f"{len(rows)} wrappers, {on_path} on PATH"
-
-
-def tunnel_state(cached: dict[str, str], failed: str) -> Cell:
-    """The tunnel's state as ro-mysql last recorded it, never probed: a rejected login
-    (db-auth-failed), the last --refresh's error or login path, or not checked."""
-    if failed:
-        return (Badge("login rejected", "bad"), Muted("run ro-mysql --rotate in your own terminal"))
-    if not cached:
-        return Badge("not checked")
-    databases, via = cached.get("databases", ""), cached.get("via", "")
-    if databases.startswith("?"):
-        return (Badge("failed", "bad"), Muted(f"{cached.get('checked', '')}: {databases[1:].strip()}"))
-    return (Badge("ok", "ok"), Muted(f"{cached.get('checked', '')} {via}".strip()))
-
-
-def sql_section(setup: Setup, sec: Section) -> None:
-    """One row per db-tunnel-* forward, from ro-mysql's own parser and its --refresh cache (never
-    `ro-mysql --tunnels`, which may read the login-path store), and the add-connection form."""
-    config = Path.home() / ".ssh/config"
-    sec.sources = [config]
-    module = ro_mysql(setup)
-    rows: TableRows = []
-    staging = 0
-    found: list[Any] = []
-    if module is not None:
-        cache = module.read_cache()
-        found = module.load_tunnels(str(config))
-        shared = module.multi_port_aliases(found)
-        try:
-            text = config.read_text(errors="replace")
-        except OSError:
-            text = ""
-        targets = module.tunnel_targets(text) if hasattr(module, "tunnel_targets") else {}
-        try:
-            failed = Path(module.AUTH_FAILED).read_text().split()
-        except OSError:
-            failed = []
-        for t in found:
-            cached = cache.get((t.alias, t.port), {})
-            row = anchor("sql", t.name)
-            if t.user and t.alias not in shared:
-                item = Credential(module.KEYCHAIN_SERVICE, module.keychain_account(t, t.user))
-                cred: Cell = credential_cell(sec, item, f"ro-mysql {t.name}", row)
-            else:
-                cred = Muted("No Keychain item (no annotated user, or a shared alias)")
-            staging += t.kind == "STAGING"
-            rejected = failed[:2] == [t.user, t.alias] if t.user else False
-            databases = cached.get("databases", "?")  # a failed --refresh caches "? <reason>"
-            target = targets.get((t.alias, t.port), "")
-            rows.append(
-                Row(
-                    (
-                        Strong(t.alias),
-                        t.port,
-                        Badge(t.kind, "warn" if t.kind == "PROD" else "ok"),
-                        t.user or "?",
-                        cred,
-                        ", ".join(databases.split(",")) if not databases.startswith("?") else "-",
-                        tunnel_state(cached, "rejected" if rejected else ""),
-                    ),
-                    row,
-                    f"{t.kind} MySQL at {target}" if target else "",
-                )
-            )
-    sec.blocks.append(
-        Table(
-            ("Instance", "Port", "Kind", "DB user", "Keychain item", "Databases (cached)", "State"),
-            rows,
-            empty="No db-tunnel-* LocalForward in ~/.ssh/config.",
-            note="State is what ro-mysql last recorded (its --refresh cache and rejected logins); "
-            "this page opens no tunnel.",
-        )
-    )
-    sec.blocks.append(
-        AddHelper(
-            tuple(sorted({t.port for t in found})),
-            tuple(sorted({t.alias for t in found})),
-        )
-    )
-    sec.actions.append(Action("List tunnels (in your own terminal)", "ro-mysql --tunnels"))
-    sec.actions.append(Action("Store DB passwords (in your own terminal)", "ro-mysql --rotate"))
-    sec.actions.append(
-        Action(
-            "Add a SQL instance (in your own terminal; it prompts for the password)",
-            "ro-mysql add --name <svc> --user <db user> --via <bastion> --remote <host:port> "
-            "--local-port <N> [--staging]",
-        )
-    )
-    sec.count = len(rows)
-    sec.summary = f"{len(rows)} tunnels, {staging} staging"
 
 
 def work_section(setup: Setup, sec: Section) -> None:

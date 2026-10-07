@@ -6,10 +6,13 @@ real credential is used: the Keychain is a fixture script named by AGENT_KIT_SEC
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import html
 import http.server
+import io
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -17,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -111,9 +115,10 @@ def commands(page: str) -> list[str]:
 class Fixture(InstallerUxFixture):
     """The fake home with an install, and the dashboard run through an audit-hook launcher."""
 
-    def install(self, *flags: str, components: tuple[str, ...] = ('rules', 'skills', 'hooks', 'mcp')) -> Path:
+    def install(self, *flags: str, components: tuple[str, ...] = ('rules', 'skills', 'hooks', 'mcp'),
+                servers: dict | None = None) -> Path:
         catalog = self.home / 'catalog.json'
-        catalog.write_text(json.dumps({'mcpServers': {
+        catalog.write_text(json.dumps({'mcpServers': servers or {
             'docs': {'command': 'npx', 'args': ['-y', 'example-docs-server']},
             'tracker': {'url': 'https://mcp.example.com/v1'}}}))
         for tool in ('npx', 'claude'):
@@ -401,14 +406,17 @@ class DashboardPageTests(unittest.TestCase):
     def test_sql_instances_one_row_per_tunnel_from_the_parser_and_cache(self) -> None:
         sql = section(self.page, 'sql')
         text = page_text(sql)
-        self.assertRegex(text, r'db-tunnel-orders-stg\s+STAGING MySQL at db-stg\.example\.test:3306 through '
-                               r'db-tunnel-orders-stg\s+15307\s+STAGING\s+reader\s+Keychain ro-mysql / '
+        self.assertRegex(text, r'db-tunnel-orders-stg\s+db-stg\.example\.test:3306\s+'
+                               r'15307\s+STAGING\s+reader\s+Keychain ro-mysql / '
                                r'reader@db-tunnel-orders-stg\s+missing')
         self.assertRegex(text, r'orders\s+ok\s+2026-01-02 via login path orders-stg-ro', 'cached databases and state')
-        self.assertRegex(text, r'db-tunnel-orders\s+PROD MySQL at db\.example\.test:3306 through db-tunnel-orders\s+'
+        self.assertRegex(text, r'db-tunnel-orders\s+db\.example\.test:3306\s+'
                                r'15306\s+PROD\s+reader\s+Keychain ro-mysql / reader@db-tunnel-orders\s+present\s+-\s+'
                                r'not checked')
+        self.assertNotIn('MySQL at', text, 'the description does not repeat Kind')
+        self.assertNotIn('through db-tunnel', text, 'an alias is never shown as the bastion')
         self.assertIn('id="sql-add" data-ports="15306 15307" data-aliases="db-tunnel-orders db-tunnel-orders-stg"', sql)
+        self.assertIn(' data-p-name="[a-z0-9][a-z0-9-]*"', sql, "the form checks with ro-mysql's own patterns")
         self.assertIn('ro-mysql add --name', page_text(section(self.page, 'actions')))
 
     def test_skills_list_the_source_and_label_a_host_its_hosts_line_leaves_out(self) -> None:
@@ -495,6 +503,17 @@ class DashboardScenarioTests(Fixture):
         self.assertNotIn('add-generic-password', re.sub(r'<script>.*?</script>', '', page, flags=re.S),
                          "an add command outside the add-connection form's script")
         self.assertNotIn('Missing Keychain item', page)
+
+    def test_an_installed_catalog_keeps_descriptions_and_no_host_gets_one(self) -> None:
+        said = 'Searches the example documentation.'
+        self.install(servers={'docs': {'command': 'npx', 'args': ['-y', 'example-docs-server'], 'description': said}})
+        installed = json.loads((self.root / 'mcp/servers.json').read_text())['mcpServers']
+        self.assertEqual(installed['docs'].get('description'), said)
+        outside = [p for p in self.home.rglob('*') if p.is_file() and self.root not in p.parents
+                   and p.name != 'catalog.json' and said.encode() in p.read_bytes()]
+        self.assertEqual(outside, [], 'a host config got the description')
+        page, _ = self.dashboard()
+        self.assertIn(f'<b>docs</b><div class="desc">{said}</div>', section(page, 'mcp'))
 
     def test_a_fresh_install_needs_no_attention(self) -> None:
         self.install()
@@ -716,6 +735,14 @@ class CredentialClassifierTests(unittest.TestCase):
                          '<tr id="mcp-a"><td>a<div class="desc">what it does</div></td><td>b</td></tr>')
         self.assertIn('<div class="desc">one line</div>', render_section(Section('k', 'K', 'one line')))
 
+    def test_a_row_description_is_clamped_once_by_the_renderer(self) -> None:
+        from dashboard_html import Row, row
+
+        shown = re.search(r'<div class="desc">([^<]*)</div>', row(Row(('a',), '', 'word ' * 100)))
+        assert shown is not None
+        self.assertLessEqual(len(shown.group(1)), 220)
+        self.assertTrue(shown.group(1).endswith('...'))
+
     def test_mask_tokens_covers_every_shape(self) -> None:
         text = ' '.join([PLANTED['jwt'], PLANTED['sentry token'], PLANTED['atlassian token'], PLANTED['google token'],
                          'Bearer ' + PLANTED['bearer value'], 'https://u:' + PLANTED['userinfo password'] + '@h/', TOKEN])
@@ -752,14 +779,46 @@ class DescriptionTests(unittest.TestCase):
         missing = [name for servers in catalogs for name, spec in servers.items() if not spec.get('description')]
         self.assertEqual(missing, [], 'MCP catalog entries without a description')
 
-    def test_the_hosts_never_get_a_description(self) -> None:
-        from hosts import fill_servers
+    def test_every_kit_env_key_and_shipped_agent_says_what_it_is(self) -> None:
+        lines = (SOURCE / 'kit.env.example').read_text().splitlines()
+        bare = [line.split('=', 1)[0] for i, line in enumerate(lines)
+                if re.match(r'[A-Z_]+=', line) and not (i and lines[i - 1].startswith('# '))]
+        self.assertEqual(bare, [], 'kit.env.example keys without a comment line above them')
+        from hosts import frontmatter
 
-        sys.path.insert(0, str(SOURCE / 'bin'))
+        agents = sorted((SOURCE / 'agents').glob('*.md'))
+        self.assertTrue(agents)
+        missing = [p.name for p in agents if not str(frontmatter(p.read_text()).get('description', '')).strip()]
+        self.assertEqual(missing, [], 'shipped agents without a frontmatter description')
+
+    def test_the_hosts_never_get_a_description(self) -> None:
+        from hosts import CATALOG_ONLY, fill_servers
+
         api = load_agent_kit()
         hooks = api.render_hooks([{'event': 'Stop', 'command': 'x', 'hosts': ['claude'], 'description': 'd'}], 'claude')
         self.assertEqual(hooks, {'Stop': [{'hooks': [{'type': 'command', 'command': 'x'}]}]})
         self.assertEqual(fill_servers({'w': {'command': 'x', 'description': 'd'}}, '/kit'), {'w': {'command': 'x'}})
+        self.assertEqual(api.CATALOG_ONLY, CATALOG_ONLY)
+
+    def test_validation_keeps_the_description_for_the_installed_catalog(self) -> None:
+        spec = {'command': 'x', 'description': 'Finds pages.', 'type': 'stdio'}
+        self.assertEqual(validate_catalog({'mcpServers': {'w': spec}})['mcpServers']['w'],
+                         {'command': 'x', 'description': 'Finds pages.'})
+
+    def test_a_bare_agent_kit_renders_a_conventional_catalog(self) -> None:
+        bare = Path(tempfile.mkdtemp(prefix='bare-kit-', dir=os.environ.get('TMPDIR')))
+        self.addCleanup(shutil.rmtree, bare, True)
+        (bare / 'bin').mkdir()
+        (bare / 'mcp').mkdir()
+        shutil.copy2(SOURCE / 'bin/agent-kit', bare / 'bin/agent-kit')
+        servers = {'w': {'command': 'x', 'description': 'd', 'credentials': [{'service': 's', 'account': 'a'}]}}
+        (bare / 'mcp/servers.json').write_text(json.dumps({'mcpServers': servers}))
+        code = ('import importlib.machinery as m, importlib.util as u, json, sys; '
+                'l = m.SourceFileLoader("k", sys.argv[1]); mod = u.module_from_spec(u.spec_from_loader("k", l)); '
+                'sys.modules["k"] = mod; l.exec_module(mod); print(json.dumps(mod.mcp_catalog()))')
+        result = subprocess.run([sys.executable, '-c', code, str(bare / 'bin/agent-kit')], capture_output=True,
+                                text=True, timeout=60, env={**os.environ, 'AGENT_KIT_DIR': str(bare)})
+        self.assertEqual(json.loads(result.stdout or '{}'), {'mcpServers': {'w': {'command': 'x'}}}, result.stderr)
 
     def test_a_preset_description_is_one_line_of_text(self) -> None:
         from preset import validate_preset
@@ -773,64 +832,130 @@ class DescriptionTests(unittest.TestCase):
 
 
 def load_agent_kit():
-    import importlib.machinery
-    import importlib.util
+    from dashboard_sections import load_script
 
-    loader = importlib.machinery.SourceFileLoader('agent_kit_for_test', str(SOURCE / 'bin/agent-kit'))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[loader.name] = module
-    loader.exec_module(module)
+    module = load_script(SOURCE / 'bin/agent-kit', 'agent_kit_for_test')
+    assert module is not None
     return module
 
 
 AH_CASES = '''
+const R = ahRules(function (k) { return P[k]; });
 const known = {ports: ['15306'], aliases: ['db-tunnel-orders']};
 const out = {};
-const p = ahParse('mysql://reader:hunter2@billing-db:3307/billing?via=jump&local_port=15310&staging=1');
-out.parsed = p.fields; out.password = p.password; out.clean = p.clean;
-out.qpass = ahParse('mysql://reader@billing-db/billing?via=jump&password=hunter2&local_port=15311');
-out.bad = ahParse('postgres://x@y');
-out.built = ahBuild(p.fields, known);
-out.collide = ahBuild({name: 'orders', user: 'reader', via: 'jump', host: 'db', port: '3306', local: '15306'}, known);
-out.stagingName = ahBuild({name: 'orders-stg', user: 'reader', via: 'jump', host: 'db', port: '3306', local: '15320'}, known);
-out.missing = ahBuild({name: 'Bad Name', user: '', via: 'db-tunnel-x', host: 'db', port: '3306', local: '80'}, known);
+const read = ahRead('mysql://reader:hunter2@billing-db:3307/billing?via=jump&local_port=15310&staging=1');
+out.read = read;
+out.qpass = ahRead('mysql://reader@billing-db/billing?via=jump&password=hunter2&local_port=15311');
+out.bad = ahRead('postgres://x@y');
+out.fragment = ahRead('mysql://reader:hunter2@billing-db/billing#frag');
+out.noScheme = ahRead('reader:hunter2@billing-db');
+out.scrubbed = SCRUB.map(function (c) { return ahScrub(c).text; });
+out.built = ahBuild(read.fields, known, R);
+out.collide = ahBuild({name: 'orders', user: 'reader', via: 'jump', host: 'db', port: '3306', local: '15306'}, known, R);
+out.stagingName = ahBuild({name: 'orders-stg', user: 'reader', via: 'jump', host: 'db', port: '3306', local: '15320'}, known, R);
+out.missing = ahBuild({name: 'Bad Name', user: '', via: 'db-tunnel-x', host: 'db', port: '3306', local: '80'}, known, R);
+out.parity = PARITY.map(function (f) { return ahBuild(f, {ports: [], aliases: []}, R); });
 console.log(JSON.stringify(out));
 '''
+# The r1 probe's userinfo shapes, each with a password that must not survive.
+SCRUB = {
+    'mysql://u:p@ss@host:3306/db': 'mysql://u@host:3306/db',
+    'mysql://u:pa/ss@host/db': 'mysql://u@host/db',
+    'mysql://u:pa#ss@host': 'mysql://u@host',
+    'mysql://u:pa?ss@host': 'mysql://u@host',
+    'mysql://u:pa:ss@host': 'mysql://u@host',
+    'mysql://u:plain@host:3306/db?via=jump&local_port=15310': 'mysql://u@host:3306/db?via=jump&local_port=15310',
+    'mysql://u@host?pwd=x&via=j': 'mysql://u@host?via=j',
+    'mysql://u:p%40ss@host': 'mysql://u@host',
+}
+GOOD = {'name': 'orders', 'user': 'reader', 'via': 'jump', 'host': 'db.example.test', 'port': '3306', 'local': '15310'}
+# One table through ro-mysql's parse_add and the page's ahBuild: the same verdict and alias.
+PARITY = [
+    GOOD,
+    {**GOOD, 'staging': True},
+    {**GOOD, 'name': 'orders-stg'},
+    {**GOOD, 'name': 'orders-stg', 'staging': True},
+    {**GOOD, 'name': 'db-tunnel-orders'},
+    {**GOOD, 'name': 'Orders'},
+    {**GOOD, 'user': 'bad user'},
+    {**GOOD, 'user': 'svc@team'},
+    {**GOOD, 'via': 'db-tunnel-jump'},
+    {**GOOD, 'via': 'DB-TUNNEL-jump'},
+    {**GOOD, 'via': 'Jump.Host_1'},
+    {**GOOD, 'host': 'bad_host'},
+    {**GOOD, 'port': '0'},
+    {**GOOD, 'port': '65535'},
+    {**GOOD, 'port': '99999'},
+    {**GOOD, 'local': '1023'},
+    {**GOOD, 'local': '65535'},
+    {**GOOD, 'local': '65536'},
+]
+
+
+def ro_mysql_module():
+    from dashboard_sections import load_script
+
+    module = load_script(SOURCE / 'bin/ro-mysql', 'ro_mysql_for_test')
+    assert module is not None
+    return module
+
+
+def parse_add_verdict(m, f: dict) -> tuple[bool, str]:
+    """(accepted, alias) of ro-mysql's parse_add for one form row."""
+    argv = ['--name', f['name'], '--user', f['user'], '--via', f['via'], '--remote', f"{f['host']}:{f['port']}",
+            '--local-port', f['local'], *(['--staging'] if f.get('staging') else [])]
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            return True, m.parse_add(argv)[0].alias
+    except SystemExit:
+        return False, ''
 
 
 @unittest.skipUnless(shutil.which('node'), 'node runs the page script')
 class ConnectionHelperScriptTests(unittest.TestCase):
-    """The add-connection form's two functions, run by node from the template itself."""
+    """The add-connection form's functions, run by node from the template itself with the patterns
+    the page gets from ro-mysql."""
 
     out: dict
 
     @classmethod
     def setUpClass(cls) -> None:
+        from dashboard_sql import form_patterns
+
         template = (SOURCE / 'bin/lib/dashboard.html').read_text()
-        code = template[template.index('/*ah:begin*/'):template.index('/*ah:end*/')]
-        result = subprocess.run([str(shutil.which('node')), '-e', code + AH_CASES], capture_output=True, text=True,
-                                timeout=60, check=True)
+        # The page is a string.Template: its $$ is the script's $.
+        code = template[template.index('/*ah:begin*/'):template.index('/*ah:end*/')].replace('$$', '$')
+        data = (f'var P = {json.dumps(dict(form_patterns(ro_mysql_module())))}, SCRUB = {json.dumps(list(SCRUB))}, '
+                f'PARITY = {json.dumps(PARITY)};')
+        result = subprocess.run([str(shutil.which('node')), '-e', code + data + AH_CASES], capture_output=True,
+                                text=True, timeout=60, check=True)
         cls.out = json.loads(result.stdout)
 
     def test_a_pasted_uri_fills_the_fields_and_its_password_is_dropped(self) -> None:
-        self.assertEqual(self.out['parsed'], {'user': 'reader', 'host': 'billing-db', 'port': '3307',
-                                              'name': 'billing', 'via': 'jump', 'local': '15310', 'staging': True})
-        self.assertTrue(self.out['password'])
+        read = self.out['read']
+        self.assertEqual(read['fields'], {'user': 'reader', 'host': 'billing-db', 'port': '3307',
+                                          'name': 'billing', 'via': 'jump', 'local': '15310', 'staging': True})
+        self.assertIn('password in the URI was removed', ' '.join(read['notes']))
         self.assertNotIn('hunter2', json.dumps(self.out))
-        self.assertEqual(self.out['clean'], 'mysql://reader@billing-db:3307/billing?via=jump&local_port=15310&staging=1')
-        self.assertTrue(self.out['qpass']['password'], 'a password query parameter counts too')
-        self.assertIn('error', self.out['bad'])
+        self.assertEqual(read['value'], 'mysql://reader@billing-db:3307/billing?via=jump&local_port=15310&staging=1')
+        self.assertEqual(self.out['qpass']['value'], 'mysql://reader@billing-db/billing?via=jump&local_port=15311')
+        self.assertIn('Not a mysql://', ' '.join(self.out['bad']['notes']))
+        self.assertEqual(self.out['bad']['value'], 'postgres://x@y')
 
-    def test_one_add_command_and_the_manual_steps(self) -> None:
+    def test_the_password_goes_before_any_validation(self) -> None:
+        self.assertEqual(self.out['scrubbed'], list(SCRUB.values()))
+        self.assertEqual(self.out['fragment']['value'], 'mysql://reader@billing-db/billing#frag')
+        self.assertIn('Not a mysql://', ' '.join(self.out['fragment']['notes']))
+        self.assertEqual(self.out['noScheme']['value'], '', 'unreadable text that looks like it has a password is cleared')
+
+    def test_one_add_command_and_the_checked_manual_steps(self) -> None:
         built = self.out['built']
-        self.assertEqual(built['cmd'], 'ro-mysql add --name billing --user reader --via jump --remote '
-                                       'billing-db:3307 --local-port 15310 --staging')
+        cmd = 'ro-mysql add --name billing --user reader --via jump --remote billing-db:3307 --local-port 15310 --staging'
+        self.assertEqual(built['cmd'], cmd)
         self.assertEqual(built['warnings'], [])
         manual = built['manual']
-        self.assertIn('Host db-tunnel-billing-staging\n  # ro-mysql: user=reader\n', manual)
-        self.assertIn('  LocalForward 15310 billing-db:3307\n  ExitOnForwardFailure yes\n', manual)
+        self.assertIn(f'\n{cmd} --dry-run\n', manual)
+        self.assertNotIn('LocalForward', manual, 'the page writes no ssh block: --dry-run prints the checked one')
         self.assertIn('security add-generic-password -U -s ro-mysql -a reader@db-tunnel-billing-staging -w\n', manual)
         self.assertTrue(manual.endswith('ro-mysql --tunnels --refresh'))
 
@@ -841,6 +966,18 @@ class ConnectionHelperScriptTests(unittest.TestCase):
         self.assertIn('reads as STAGING', ' '.join(self.out['stagingName']['warnings']))
         self.assertEqual(self.out['missing']['cmd'], '')
         self.assertEqual(sorted(self.out['missing']['missing']), ['local', 'name', 'user', 'via'])
+
+    def test_the_form_and_ro_mysql_accept_the_same_rows(self) -> None:
+        m = ro_mysql_module()
+        for f, js in zip(PARITY, self.out['parity']):
+            with self.subTest(f=f):
+                self.assertEqual((not js['missing'], js['alias']), parse_add_verdict(m, f))
+
+    def test_the_page_carries_ro_mysqls_patterns_not_copies(self) -> None:
+        template = (SOURCE / 'bin/lib/dashboard.html').read_text()
+        block = template[template.index('/*ah:begin*/'):template.index('/*ah:end*/')]
+        for copy in ('staging|stg', '[a-z0-9][a-z0-9-]*', 'A-Za-z0-9_.@-', '1024', '65535', "'db-tunnel-"):
+            self.assertNotIn(copy, block)
 
 
 FAKE_MCP = '''import json, os, subprocess, sys
@@ -949,11 +1086,180 @@ class McpDescribeTests(Fixture):
         self.assertIn('mcp describe', page_text(section(page, 'actions')))
 
 
+FAKE_STDIO = '''import json, os, signal, subprocess, sys, time
+mode, secret = sys.argv[1], os.environ.get('FAKE_SECRET', '')
+if mode == 'child':
+    code = 'import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(120)'
+    subprocess.Popen([sys.executable, '-c', code, sys.argv[2]], stdin=subprocess.DEVNULL)
+    while not os.path.exists(sys.argv[2]) or not open(sys.argv[2]).read():
+        time.sleep(0.05)
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get('method') == 'initialize':
+        result = {'serverInfo': {'name': 'fake ' + secret, 'version': '1'}, 'instructions': 'Use ' + secret}
+        if mode == 'badresult':
+            result = 'not an object'
+        if mode == 'echoerror':
+            print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'error': {'code': 1, 'message': 'bad ' + secret}}), flush=True)
+            continue
+        print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': result}), flush=True)
+    elif msg.get('method') == 'tools/list':
+        if mode == 'srvreq':
+            print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'method': 'roots/list'}), flush=True)
+        tools = [{'name': 'a', 'description': 'reads with ' + secret}]
+        print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'tools': tools}}), flush=True)
+'''
+
+
+class StreamHandler(http.server.BaseHTTPRequestHandler):
+    """initialize as JSON; tools/list as an event stream kept open with heartbeats, the reply sent
+    first unless the server's `silent`. A `redirect` server answers every POST with a 307."""
+
+    protocol_version = 'HTTP/1.1'
+    seen: list = []
+
+    def log_message(self, *_args) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        cfg = self.server.cfg  # type: ignore[attr-defined]
+        type(self).seen.append((self.server.server_address[1], dict(self.headers)))
+        message = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        if cfg.get('redirect'):
+            self.send_response(307)
+            self.send_header('Location', cfg['redirect'])
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        if message.get('method') == 'notifications/initialized':
+            self.send_response(202)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        if message.get('method') == 'initialize':
+            body = json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': {'serverInfo': {'name': 'sse'}}}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.end_headers()
+        try:
+            if not cfg.get('silent'):
+                reply = {'jsonrpc': '2.0', 'id': message['id'], 'result': {'tools': [{'name': 'lookup'}]}}
+                self.wfile.write(f'event: message\ndata: {json.dumps(reply)}\n\n'.encode())
+            for _ in range(600):
+                self.wfile.write(b': ping\n\n')
+                self.wfile.flush()
+                time.sleep(0.1)
+        except OSError:
+            pass
+
+
+class McpDescribeUnitTests(unittest.TestCase):
+    """mcp_describe against fake servers: cleanup, matching, redaction, redirects and deadlines."""
+
+    def setUp(self) -> None:
+        import types
+
+        self.dir = Path(tempfile.mkdtemp(prefix='describe-', dir=os.environ.get('TMPDIR')))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.script = self.dir / 'fake_stdio.py'
+        self.script.write_text(FAKE_STDIO)
+        self.api = types.SimpleNamespace(resolve=lambda spec: spec)
+
+    def stdio(self, mode: str, *args: str, env: dict | None = None) -> dict:
+        import mcp_describe
+
+        spec = {'command': sys.executable, 'args': [str(self.script), mode, *args], 'env': env or {}}
+        return mcp_describe.describe(self.api, spec, 20)
+
+    def serve(self, **cfg) -> str:
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), StreamHandler)
+        server.cfg = cfg  # type: ignore[attr-defined]
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f'http://127.0.0.1:{server.server_address[1]}/mcp'
+
+    def test_a_child_that_ignores_sigterm_is_killed_with_the_group(self) -> None:
+        mark = self.dir / 'child.pid'
+        entry = self.stdio('child', str(mark))
+        self.assertEqual(entry['status'], 'ok')
+        pid = mark.read_text()
+        for _ in range(50):
+            if subprocess.run(['/bin/ps', '-p', pid], capture_output=True).returncode:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(int(pid), 9)
+            self.fail('the SIGTERM-ignoring child outlived describe')
+
+    def test_a_server_request_is_not_taken_for_the_reply(self) -> None:
+        self.assertEqual(self.stdio('srvreq')['tools'], [{'name': 'a', 'description': 'reads with '}])
+
+    def test_a_result_that_is_not_an_object_is_a_protocol_error(self) -> None:
+        self.assertEqual(self.stdio('badresult'), {'status': 'protocol error'})
+
+    def test_no_env_value_survives_in_what_the_server_says(self) -> None:
+        secret = 'pw-' + 'Zq81mmXv'
+        ok = self.stdio('echo', env={'FAKE_SECRET': secret})
+        failed = self.stdio('echoerror', env={'FAKE_SECRET': secret})
+        self.assertEqual(ok['status'], 'ok')
+        self.assertNotIn(secret, json.dumps(ok))
+        self.assertIn('[redacted]', ok['instructions'])
+        self.assertEqual(failed, {'status': 'error', 'error': 'JSON-RPC error'})
+
+    def test_a_redirect_never_carries_the_headers_elsewhere(self) -> None:
+        import mcp_describe
+
+        StreamHandler.seen = []
+        elsewhere = self.serve()
+        url = self.serve(redirect=elsewhere)
+        token = 'tok-' + 'Lr93kd0aQ'
+        entry = mcp_describe.describe(self.api, {'url': url, 'headers': {'Authorization': f'Bearer {token}'}}, 10)
+        self.assertEqual(entry, {'status': 'redirected'})
+        port = int(elsewhere.rsplit(':', 1)[1].split('/')[0])
+        self.assertEqual([p for p, _ in StreamHandler.seen if p == port], [], 'the redirect target got a request')
+
+    def test_an_open_event_stream_returns_on_the_reply_and_heartbeats_cannot_outlast_the_deadline(self) -> None:
+        import mcp_describe
+
+        headers = {'X-Team': 'static-1'}
+        started = time.monotonic()
+        entry = mcp_describe.describe(self.api, {'url': self.serve(), 'headers': headers}, 20)
+        self.assertEqual(entry.get('tools'), [{'name': 'lookup', 'description': ''}], entry)
+        self.assertLess(time.monotonic() - started, 10)
+        started = time.monotonic()
+        entry = mcp_describe.describe(self.api, {'url': self.serve(silent=True), 'headers': headers}, 2)
+        self.assertEqual(entry, {'status': 'error', 'error': 'timeout'})
+        self.assertLess(time.monotonic() - started, 6)
+
+    def test_the_cache_reader_validates_every_entry(self) -> None:
+        import mcp_describe
+
+        (self.dir / 'state').mkdir()
+        (self.dir / 'state/mcp-describe.json').write_text(json.dumps({'servers': {
+            'good': {'status': 'ok', 'serverInfo': {'name': 'n', 'version': '2'}, 'instructions': 'Hi',
+                     'tools': [{'name': 't', 'description': 'd'}, 'junk'], 'checked': 'today'},
+            'odd': {'status': 'ok', 'serverInfo': 'junk', 'tools': 'junk', 'instructions': ['x']},
+            'junk': 'not an entry'}}))
+        _, cache = mcp_describe.read_cache(self.dir)
+        self.assertEqual(cache['good'], mcp_describe.Described('ok', 'today', '', 'n 2', 'Hi', (('t', 'd'),)))
+        self.assertEqual(cache['odd'], mcp_describe.Described('ok'))
+        self.assertNotIn('junk', cache)
+
+
 if __name__ == '__main__':
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite([loader.loadTestsFromTestCase(case) for case in
                                 (CredentialClassifierTests, DescriptionTests, ConnectionHelperScriptTests,
-                                 DashboardPageTests, DashboardScenarioTests, McpDescribeTests)])
+                                 DashboardPageTests, DashboardScenarioTests, McpDescribeTests,
+                                 McpDescribeUnitTests)])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     sys.stdout.write(json.dumps({'cases': result.testsRun, 'successful': result.wasSuccessful(),
                                 'failures': len(result.failures), 'errors': len(result.errors)}, indent=2) + '\n')
