@@ -517,10 +517,11 @@ def host_changes(args: argparse.Namespace, view: Path, host: str, home: Path, ov
         # Claude's hooks, commands and skill texts read <config dir>/local, linked to the kit's overlay. A folder
         # or another link there is the user's, even over setup's: kept, and both doctors report it.
         local, problem = target / 'local', overlay.claude_link_problem(target, root)
-        if kept := bool(problem) and (local.is_dir() or local.is_symlink()):
+        kept = bool(problem) and (local.is_dir() or local.is_symlink())
+        if kept:
             print('agent-setup: left in place: ' + problem, file=sys.stderr)
-        ours = problem or (local.is_symlink() and os.readlink(local) == str(root / 'local'))
-        changes.append(Change('link' if ours and not kept else 'forget', local, str(root / 'local')))
+        mine = not kept and (bool(problem) or (local.is_symlink() and os.readlink(local) == str(root / 'local')))
+        changes.append(Change('link' if mine else 'forget', local, str(root / 'local')))
     for change in changes:
         if change.kind not in ('hooks', 'cursor-hooks'):
             continue
@@ -745,11 +746,17 @@ def prior_record(root: Path, target: Path, kind: str | None = None) -> dict:
                                          previous.get('managed', {}).get(str(target), {}))
 
 
-def layout_folder(target: Path, made: Callable[[Path], bool] = lambda _: False) -> bool:
+def layout_folder(target: Path, made: Callable[[Path], bool]) -> bool:
     """Whether target is a folder holding only files made says setup wrote: an overlay skill turned a kit
     file into a folder there (or back), and those files go first, by the plan or by rollback."""
     return target.is_dir() and not target.is_symlink() and all(
         made(path) for path in target.rglob('*') if path.is_symlink() or not path.is_dir())
+
+
+def retired_folder(root: Path, target: Path) -> bool:
+    """Whether target, under root, is a layout_folder of files an earlier install there recorded."""
+    return root in target.parents and layout_folder(
+        target, lambda path: file_digest(path) == prior_record(root, path, 'link' if path.is_symlink() else 'file').get('hash'))
 
 
 class Collision(ValueError):
@@ -801,9 +808,8 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
         if same:
             record.update(hash=wanted_hash, present=present, before_hash=current_hash, noop=True)
             return record
-        owned = (prior and current_hash is not None and current_hash == prior.get('hash')) or (root in target.parents and layout_folder(
-            target, lambda path: file_digest(path) == prior_record(root, path, 'link' if path.is_symlink() else 'file').get('hash')))
-        if present and not owned and not backup:
+        owned = bool(prior) and current_hash is not None and current_hash == prior.get('hash')
+        if present and not owned and not backup and not retired_folder(root, target):
             raise Collision(f'Existing user content is preserved; select --collision backup or skip, or another destination: {target}')
         record.update(hash=wanted_hash, present=present, before_hash=current_hash)
         return record
@@ -1017,7 +1023,7 @@ def rollback_record(record: dict) -> None:
     if kind in ('file', 'link', 'remove'):
         current = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
         if current is None:
-            if layout_folder(target):
+            if layout_folder(target, made=lambda _: False):  # emptied: its files rolled back first
                 shutil.rmtree(target)
             if target.exists() or target.is_symlink():
                 raise ValueError(f'Recreated user content is preserved: {target}')

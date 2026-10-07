@@ -185,9 +185,10 @@ def folder_entries(folder: Path) -> Iterator[Entry]:
 
 
 def pack_files(entries: Iterable[Entry], label: str, allow_links: bool = True) -> PackFiles:
-    """Every file of a pack (path -> content, mode); label (`preset <spec>`) opens each refusal. A link
-    that names a file in the pack reads as that file (any link refuses without allow_links); a link out of the pack or to a folder, a special
-    file, or two paths that differ only in case or Unicode normalization (one file on macOS) refuses."""
+    """Every file of a pack (path -> content, mode); label (`preset <spec>`) opens each refusal. A
+    link that names a file in the pack reads as that file (any link refuses without allow_links); a
+    link out of the pack or to a folder, a special file, or two paths that differ only in case or
+    Unicode normalization (one file on macOS) refuses."""
     files: PackFiles = {}
     links: dict[str, str] = {}
     folded: dict[str, str] = {}
@@ -265,9 +266,8 @@ def utf8_text(data: bytes, relative: str, label: str) -> str:
 
 def build_pack(files: PackFiles, label: str, commit: str | None, words: int = PACK_RULES_WORDS) -> Pack | None:
     """The pack in files (skills/ and rules.md), None when it has neither; label as pack_files takes
-    it. Refused when a file looks
-    like a credential (by name, a token format or a private key), a skill is malformed, or rules.md is
-    over words words."""
+    it. Refused when a file looks like a credential (by name, a token format or a private key), a
+    skill is malformed, or rules.md is over words words."""
     if not files:
         return None
     for relative, (data, _) in sorted(files.items()):

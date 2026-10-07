@@ -314,7 +314,65 @@ class Wrapper(Fixture):
         self.assertIn("sentry.beta.invalid is a configured instance's host", proc.stderr)
         self.assertFalse(log.exists())
         check = self.run_bin("sentry-mcp", "--check", "--host", "h.invalid", env={**env, "SENTRY_URL": "https://u.invalid"})
-        self.assertIn("(host https://u.invalid,", check.stdout)
+        self.assertIn("(host u.invalid,", check.stdout)
+
+    def test_the_legacy_item_never_reaches_a_configured_host_in_any_spelling(self) -> None:
+        """Hosts compare as the server resolves them (WHATWG URL host): a default port, userinfo, a
+        trailing dot, percent-encoding or a backslash cannot carry the legacy token to a configured
+        host, nor can the server's default sentry.io when an instance is configured for it."""
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {"beta": {"host": "sentry.beta.invalid", "keychain": self.beta_item}})
+        self.items.write_text(f"{self.beta_item}=beta-token\n{sentry.LEGACY_SERVICE}=legacy-token\n")
+        script(self.root / "path/npx", FAKE_NPX)
+        log = self.root / "npx.log"
+        env = {"PATH": f"{self.root / 'path'}:/usr/bin:/bin", "NPX_LOG": str(log)}
+        urls = ("https://sentry.beta.invalid:443/", "https://me:@sentry.beta.invalid", "https://sentry.beta.invalid./",
+                "https://sentry%2Ebeta.invalid", "https://SENTRY.beta.invalid\\@other.invalid")
+        cases = [([], {"SENTRY_URL": url}) for url in urls]
+        cases += [([], {"SENTRY_HOST": "sentry.beta.invalid:443"}), (["--url=https://x:@sentry.beta.invalid"], {}),
+                  (["--host", "other.invalid", "--host", "sentry.beta.invalid."], {})]
+        for args, extra in cases:
+            proc = self.run_bin("sentry-mcp", *args, env={**env, **extra})
+            with self.subTest(args=args, env=extra):
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("sentry.beta.invalid is a configured instance's host", proc.stderr)
+                self.assertFalse(log.exists())
+        proc = self.run_bin("sentry-mcp", env={**env, "SENTRY_URL": "https://bücher.invalid"})
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("is not a plain host name", proc.stderr)
+        self.assertFalse(log.exists())
+        self.write(self.kit / "mcp" / sentry.INSTANCES_FILE, {"beta": {"host": "https://SENTRY.io/", "keychain": self.beta_item}})
+        proc = self.run_bin("sentry-mcp", env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sentry.io is a configured instance's host", proc.stderr)
+        self.assertFalse(log.exists())
+        proc = self.run_bin("sentry-mcp", env={**env, "SENTRY_HOST": "sentry.beta.invalid:8443"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.read_text().splitlines()[1:], ["token=legacy-token", "host=sentry.beta.invalid:8443"])
+
+    def test_an_instance_takes_its_own_host_with_the_default_port(self) -> None:
+        self.items.write_text(f"agent-kit-test/sentry-alpha={TOKEN}\n")
+        script(self.root / "path/npx", FAKE_NPX)
+        log = self.root / "npx.log"
+        env = {"PATH": f"{self.root / 'path'}:/usr/bin:/bin", "NPX_LOG": str(log)}
+        for args, extra in (([], {"SENTRY_URL": "https://sentry.alpha.invalid:443/"}), (["--url", "https://Sentry.Alpha.invalid:443"], {})):
+            log.unlink(missing_ok=True)
+            proc = self.run_bin("sentry-mcp", *args, env={**env, **extra})
+            with self.subTest(args=args, env=extra):
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(log.read_text().splitlines()[1:], [f"token={TOKEN}", "host=sentry.alpha.invalid"])
+        proc = self.run_bin("sentry-mcp", "--url", "https://sentry.alpha.invalid:8443", env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("SENTRY_URL sentry.alpha.invalid:8443", proc.stderr)
+
+    def test_no_dsn_reaches_the_server(self) -> None:
+        """The server reports its own errors to SENTRY_DSN or DEFAULT_SENTRY_DSN; neither is passed on."""
+        self.items.write_text(f"agent-kit-test/sentry-alpha={TOKEN}\n")
+        script(self.root / "path/npx", '#!/bin/sh\nenv | grep -c "SENTRY_DSN=" > "$NPX_LOG"\nexit 0\n')
+        log = self.root / "npx.log"
+        dsn = {"SENTRY_DSN": "https://o.invalid/1", "DEFAULT_SENTRY_DSN": "https://o.invalid/2"}
+        proc = self.run_bin("sentry-mcp", env={"PATH": f"{self.root / 'path'}:/usr/bin:/bin", "NPX_LOG": str(log), **dsn})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(log.read_text().strip(), "0")
 
     def test_two_instances_may_share_a_host(self) -> None:
         shared = {"host": "sentry.shared.invalid"}

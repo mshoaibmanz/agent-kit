@@ -221,19 +221,19 @@ class LoadedPreset(NamedTuple):
     commit: str | None
 
 
-def _pack_preset(files: PackFiles, spec: str, commit: str | None) -> tuple[str, Pack | None]:
+def _pack_preset(files: PackFiles, label: str, commit: str | None) -> tuple[str, Pack | None]:
     """(the preset text, the pack) of a pack's files. The text's line endings are normalized, as a
     text read of the file does, so its sha256 does not depend on how it was fetched."""
     found = PACK_TOML in files
-    text = preset_text(files.pop(PACK_TOML, (b'', 0))[0], PACK_TOML, spec)
-    pack = build_pack(files, f'preset {spec}', commit)
+    text = preset_text(files.pop(PACK_TOML, (b'', 0))[0], PACK_TOML, label)
+    pack = build_pack(files, label, commit)
     if not found and pack is None:
-        raise ValueError(f'preset {spec}: holds no {PACK_TOML}, {PACK_SKILLS}/ or rules.md')
+        raise ValueError(f'{label}: holds no {PACK_TOML}, {PACK_SKILLS}/ or rules.md')
     return text, pack
 
 
-def preset_text(data: bytes, name: str, spec: str) -> str:
-    return utf8_text(data, name, f'preset {spec}').replace('\r\n', '\n').replace('\r', '\n')
+def preset_text(data: bytes, name: str, label: str) -> str:
+    return utf8_text(data, name, label).replace('\r\n', '\n').replace('\r', '\n')
 
 
 def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
@@ -243,33 +243,34 @@ def load_preset(spec: str, head: str | None = None) -> LoadedPreset:
     other name is read alone. gh:owner/repo[/path] is read at head, the commit at the head of the
     default branch (resolved here unless given), with the user's own gh login. PresetUnavailable when
     a gh: fetch fails; ValueError when the preset or pack is invalid or holds a secret."""
+    label = f'preset {spec}'
     if spec.startswith('gh:'):
         repo, path = _gh_repo(spec)
         root, _, toml = (path or PACK_TOML).rpartition('/')
         commit: str | None = head or gh_head(repo)
         if toml == PACK_TOML:
-            files = pack_files(gh_entries(repo, commit, root, spec), f'preset {spec}')
+            files = pack_files(gh_entries(repo, commit, root, spec), label)
             if path and PACK_TOML not in files:
-                raise ValueError(f'preset {spec}: no {path} in the repository')
-            text, pack = _pack_preset(files, spec, commit)
+                raise ValueError(f'{label}: no {path} in the repository')
+            text, pack = _pack_preset(files, label, commit)
         else:
-            text, pack = preset_text(gh_file(repo, commit, path or toml), toml, spec), None
+            text, pack = preset_text(gh_file(repo, commit, path or toml), toml, label), None
     else:
         local = Path(spec).expanduser()
         if not local.exists():
-            raise ValueError(f'preset {spec}: no such file or folder')
+            raise ValueError(f'{label}: no such file or folder')
         # A link to a preset file is read where it points: its folder there is the pack root.
         file = local.resolve()
         if local.is_dir() or file.name == PACK_TOML:
             folder = local if local.is_dir() else file.parent
             commit = git_head(folder)
-            text, pack = _pack_preset(pack_files(folder_entries(folder), f'preset {spec}'), spec, commit)
+            text, pack = _pack_preset(pack_files(folder_entries(folder), label), label, commit)
         else:
-            text, pack, commit = preset_text(file.read_bytes(), file.name, spec), None, None
+            text, pack, commit = preset_text(file.read_bytes(), file.name, label), None, None
     try:
         preset = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
-        raise ValueError(f'preset {spec}: not valid TOML: {error}') from None
+        raise ValueError(f'{label}: not valid TOML: {error}') from None
     validate_preset(preset, spec)
     sha = pack.digest(text.encode()) if pack else hashlib.sha256(text.encode()).hexdigest()
     return LoadedPreset(preset, sha, pack, commit)
