@@ -10,7 +10,12 @@ Instances come from mcp/sentry-instances.json and the overlay's copy (bin/lib/se
 instance's token is read from its store by this tool, the way bin/sentry-mcp reads it, and goes only into the
 Authorization header of requests to that instance. Results are cached in state/sentry-map.json for
 24h; `find` refreshes once on a miss. A missing or failing instance prints a warning and is
-skipped. Last seen is the newest error event in the last 90 days (Discover), per project."""
+skipped. Last seen is the newest error event in the last 90 days (Discover), per project.
+
+The same project slug can exist on several instances and orgs; each row's status says which copy
+is live: the newest last-seen per slug and label (prod/staging) is `live`, the others `older` or
+`stale` (no error in the window), and a copy in an unlabelled org `label unknown`. Live rows come
+first, per slug, prod before staging; `--json` carries the same `status` field."""
 
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ from typing import Any, Iterable, Optional
 KIT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(KIT / "bin" / "lib"))
 
-from sentry import Instance, KeychainDenied, KeychainMissing, load_instances, read_token  # noqa: E402
+from sentry import LABELS, Instance, KeychainDenied, KeychainMissing, load_instances, read_token  # noqa: E402
 
 CACHE = Path(os.environ.get("SENTRY_MAP_CACHE") or KIT / "state" / "sentry-map.json")
 TTL = 24 * 3600
@@ -255,11 +260,41 @@ def match(all_rows: list[dict[str, str]], terms: list[str]) -> tuple[list[dict[s
     return ([r for s, r in scored if s == best] if best else []), False
 
 
-COLUMNS = ("instance", "server", "region_url", "org", "label", "project", "platform", "environments", "last_seen")
+COLUMNS = (
+    "status", "label", "project", "instance", "server", "region_url", "org", "platform", "environments", "last_seen",
+)
+STATUSES = ("live", "older", "stale", "label unknown")
+
+
+def mark_live(found: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Each row with a status, sorted for reading: per project slug, prod then staging then
+    unlabelled orgs, and within a label live, older, stale, newest first. The copy with the newest
+    last error per slug and label is `live` (every copy tied on that date is: last_seen is a day);
+    other copies with an error in the window are `older`, copies with none `stale`. A copy in an
+    org with no label is `label unknown`: which environment it serves is not known."""
+    newest: dict[tuple[str, str], str] = {}
+    for r in found:
+        if r["label"] in LABELS and r["last_seen"] != "-":
+            key = (r["project"], r["label"])
+            newest[key] = max(newest.get(key, ""), r["last_seen"])
+    out = []
+    for r in found:
+        if r["label"] not in LABELS:
+            status = "label unknown"
+        elif r["last_seen"] == "-":
+            status = "stale"
+        else:
+            status = "live" if r["last_seen"] == newest[(r["project"], r["label"])] else "older"
+        out.append({**r, "status": status})
+    out.sort(key=lambda r: (r["instance"], r["org"]))
+    out.sort(key=lambda r: r["last_seen"] if r["last_seen"] != "-" else "", reverse=True)
+    label_rank = {label: i for i, label in enumerate(LABELS)}
+    out.sort(key=lambda r: (r["project"], label_rank.get(r["label"], len(LABELS)), STATUSES.index(r["status"])))
+    return out
 
 
 def show(found: list[dict[str, str]], as_json: bool) -> None:
-    found = sorted(found, key=lambda r: (r["instance"], r["org"], r["project"]))
+    found = mark_live(found)
     if as_json:
         print(json.dumps(found, indent=1))
         return

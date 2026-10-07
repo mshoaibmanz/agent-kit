@@ -33,9 +33,14 @@ any MCP call:
 "$AGENT_KIT_DIR/bin/sentry-map" find <service|repo|keyword>
 ```
 
-Each line gives the instance, its MCP server, regionUrl, org, label (prod/staging), project slug,
-platform, environments and the last error date. Then:
+Each line gives a status, the label (prod/staging), project slug, instance, its MCP server,
+regionUrl, org, platform, environments and the last error date. `--json` gives the same fields.
+Then:
 
+- **Use the `live` row for each label.** The same slug can sit on several instances and orgs; the
+  `live` copy has the newest error for that label. `older` and `stale` (no error in 90 days) copies
+  are leftovers: don't read issues from them unless the user asks. `label unknown` means the org
+  has no prod/staging label in the instance config; say so rather than guess its environment.
 - Call the **MCP server the line names**, passing that `organizationSlug` and `regionUrl`. A
   server that is not in your tool list was not configured when the session started.
 - **Prod vs staging comes from the label and the environment**, not from the project name. The

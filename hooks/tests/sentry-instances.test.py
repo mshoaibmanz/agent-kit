@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -421,6 +422,58 @@ class Match(unittest.TestCase):
         found, exact = self.mod.match(self.rows, ["shop-billing-api"])
         self.assertFalse(exact)
         self.assertEqual([r["project"] for r in found], ["web-billing-api-ledger", "web-billing-api-gateway"])
+
+
+def cached_org(slug: str, last_seen: str, project: str = "billing") -> dict:
+    return {"slug": slug, "name": slug, "region_url": f"https://{slug}.invalid",
+            "projects": [{"slug": project, "platform": "python", "environments": ["production"], "last_seen": last_seen}]}
+
+
+class LiveCopy(Fixture):
+    """One slug on two instances, each with prod and staging copies, from a fresh cache: `find`
+    never crawls, so no case reaches Sentry or a token."""
+
+    install = Wrapper.install
+    run_bin = Wrapper.run_bin
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cache = self.root / "map.json"
+        now = time.time()
+        alpha = [cached_org("main", "2026-10-06"), cached_org("alt", "2026-09-01"), cached_org("main", "2026-10-07", "auth")]
+        beta = [cached_org("betaprd", "2026-08-15"), cached_org("oldprd", ""), cached_org("betastg", "2026-10-05"),
+                cached_org("misc", "2026-10-07")]
+        self.cache.write_text(json.dumps({"instances": {
+            "alpha": {"host": "sentry.alpha.invalid", "fetched_at": now, "orgs": alpha},
+            "beta": {"host": "sentry.beta.invalid", "fetched_at": now, "orgs": beta},
+        }}))
+
+    def find(self, *args: str) -> subprocess.CompletedProcess:
+        proc = self.run_bin("sentry-map", "find", "billing", *args, env={"SENTRY_MAP_CACHE": str(self.cache)})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc
+
+    def test_the_newest_copy_per_label_is_live_and_unknown_labels_sort_last(self) -> None:
+        found = json.loads(self.find("--json").stdout)
+        self.assertEqual([(r["status"], r["label"], r["instance"], r["org"], r["last_seen"]) for r in found], [
+            ("live", "prod", "alpha", "main", "2026-10-06"),
+            ("older", "prod", "beta", "betaprd", "2026-08-15"),
+            ("stale", "prod", "beta", "oldprd", "-"),
+            ("live", "staging", "beta", "betastg", "2026-10-05"),
+            ("older", "staging", "alpha", "alt", "2026-09-01"),
+            ("label unknown", "unknown", "beta", "misc", "2026-10-07"),
+        ])
+
+    def test_the_table_leads_with_the_status(self) -> None:
+        lines = self.find().stdout.splitlines()
+        self.assertEqual(lines[0].split()[:3], ["status", "label", "project"])
+        self.assertEqual([line.split()[:2] for line in lines[1:3]], [["live", "prod"], ["older", "prod"]])
+        self.assertTrue(lines[-1].startswith("label unknown"), lines[-1])
+
+    def test_copies_tied_on_the_newest_day_are_all_live(self) -> None:
+        mod = load_sentry_map()
+        rows = [{"project": "p", "label": "prod", "instance": i, "org": "o", "last_seen": "2026-10-01"} for i in ("a", "b")]
+        self.assertEqual([r["status"] for r in mod.mark_live(rows)], ["live", "live"])
 
 
 if __name__ == "__main__":
