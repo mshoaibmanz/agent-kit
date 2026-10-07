@@ -47,11 +47,10 @@ die() { printf 'agent-run: %s\n' "$1" >&2; exit "${2:-1}"; }
 usage() { sed -n '5,6p' "$0" | sed 's/^# *//' >&2; exit 2; }
 
 src=${BASH_SOURCE[0]}
-while [ -L "$src" ]; do
-  l=$(readlink "$src")
-  case $l in /*) src=$l ;; *) src=${src%/*}/$l ;; esac
-done
-KIT=$(cd -P "${src%/*}/.." && pwd) || die "cannot resolve the kit directory" 1
+. "$(dirname "$(readlink -f "$src" 2>/dev/null || printf '%s' "$src")")/../hooks/lib/kit-root.sh" ||
+  die "cannot load hooks/lib/kit-root.sh beside $src" 1
+KIT=$(kit_root "$src") || die "cannot resolve the kit directory" 1
+export AGENT_KIT_DIR=$KIT
 
 role='' wt='' base='' since='' out='' effort='' model='' objective='' timeout='' dry=''
 while [ $# -gt 0 ]; do

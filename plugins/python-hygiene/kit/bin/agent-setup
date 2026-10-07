@@ -19,7 +19,8 @@ if sys.version_info < (3, 11):
              f'Fix: {_FIX or "install Python 3.11 or newer"}, then rerun with it.')
 
 import argparse
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+import contextlib
 from dataclasses import dataclass
 import hashlib
 import importlib.machinery
@@ -51,6 +52,7 @@ ROLE_ALIASES = {'worker': 'engineer', 'scout': 'researcher', 'adversary': 'secon
                 'thermo-quality': 'quality-reviewer', 'review-cross': 'cross-reviewer'}
 sys.path.insert(0, str(SOURCE / 'bin/lib'))
 from blocking import BLOCKING  # noqa: E402
+import checkout  # noqa: E402
 from hosts import (HOSTS, SANDBOX_BEGIN, SANDBOX_COMPONENTS, SANDBOX_END, default_host_root, fill_servers,  # noqa: E402
                    install_text, keep_host_tables, resume_max, skill_hosts, strip_legacy_sandbox)
 from kit_env import kit_env  # noqa: E402
@@ -68,6 +70,12 @@ DEFAULTS: dict[str, Any] = {
     'zoekt_url': '', 'work_root': str(Path.home() / 'agent-work'), 'claude_bin': 'claude', 'codex_bin': 'codex',
     'cursor_bin': 'cursor', 'codex_gcloud': 'off', 'blocking_hooks': False, 'mcp_catalog': None}
 SAVED_KEYS = (*DEFAULTS, 'role_model', 'role_effort', 'host_root', 'project_root')
+# A dev install copies these rather than linking them, so rollback and --no-dev run from the install
+# when the checkout is broken: agent-setup and what it imports (kit_env reads hook-io).
+SETUP_CODE = ('bin/agent-setup', 'bin/lib', 'hooks/lib/host.py', 'hooks/lib/session.py', 'hooks/lib/kit_env.py',
+              'hooks/lib/hook-io')
+# What update forwards to sync; any other setup flag would change a saved choice.
+UPDATE_FLAGS = ('action', 'root_dir', 'source', 'dev', 'collision', 'confirm_hook_support')
 
 
 def digest(data: bytes) -> str:
@@ -154,12 +162,19 @@ def selected_registry(source: Path, components: set[str], blocking: bool) -> lis
     if 'hooks' not in components:
         return []
     rows = json.loads((source / 'hooks/registry.json').read_text())
-    return [row for row in rows if blocking or Path(row['command'].split()[0]).name not in BLOCKING]
+    selected = [row for row in rows if blocking or Path(row['command'].split()[0]).name not in BLOCKING]
+    # A kit commit that drops a hook its registry still runs would leave every host calling a missing file.
+    names = {Path(row['command'].split()[0]).name for row in selected}
+    missing = sorted(name for name in names if not (source / 'hooks' / name).is_file())
+    if missing:
+        raise ValueError(f"the kit's hooks/registry.json runs {', '.join(missing)}, which its hooks/ lacks")
+    return selected
 
 
-def role_overrides(path: Path, models: list[str], efforts: list[str]) -> None:
+def role_overrides(path: Path, models: list[str], efforts: list[str]) -> bool:
+    """Writes the overrides into roles.toml at path; False when there are none."""
     if not models and not efforts:
-        return
+        return False
     roles = tomllib.loads(path.read_text())
     for flag, values in [('model', models), ('effort', efforts)]:
         for setting in values:
@@ -168,15 +183,33 @@ def role_overrides(path: Path, models: list[str], efforts: list[str]) -> None:
                 raise ValueError(f'Expected existing-role=value for --role-{flag}')
             roles['roles'][name][flag] = value
     path.write_text(toml_text(roles))
+    return True
+
+
+@contextlib.contextmanager
+def scoped_environ(**values: str | None) -> Iterator[None]:
+    """os.environ with values set (None unsets one) inside the block, as it was after it."""
+    saved = dict(os.environ)
+    for key, value in values.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 def kit_api(source: Path) -> Any:
-    os.environ['AGENT_KIT_DIR'] = str(source)
+    """source's bin/agent-kit as a module: its kit is source, fixed when the module loads."""
     loader = importlib.machinery.SourceFileLoader('agent_setup_kit', str(source / 'bin/agent-kit'))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[loader.name] = module
-    loader.exec_module(module)
+    with scoped_environ(AGENT_KIT_DIR=str(source)):
+        loader.exec_module(module)
     return module
 
 
@@ -270,14 +303,8 @@ def setup_resume(root: Path, overlays: dict[str, str]) -> int:
 def installed_work_root(root: Path) -> Path:
     """The work root as hooks resolve it under this install's overlay (Codex's sandbox names it)."""
     from kit_env import work_root
-    saved = dict(os.environ)
-    os.environ.pop('CLAUDE_OUT_ROOT', None)
-    os.environ['KIT_ENV'] = str(root / 'local/setup-paths.env')
-    try:
+    with scoped_environ(CLAUDE_OUT_ROOT=None, KIT_ENV=str(root / 'local/setup-paths.env')):
         return Path(work_root())
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
 
 
 def seed_host_view(args: argparse.Namespace, host: str, target: Path, host_view: Path) -> dict:
@@ -465,8 +492,11 @@ def catalog_path(args: argparse.Namespace) -> Path:
     return Path(args.mcp_catalog).expanduser() if args.mcp_catalog else Path(args.source).expanduser().resolve() / 'mcp/servers.json'
 
 
-def installation_view(args: argparse.Namespace, view: Path, preset: Preset, servers: dict[str, Any]) -> None:
+def installation_view(args: argparse.Namespace, view: Path, preset: Preset, servers: dict[str, Any]) -> set[Path]:
+    """The kit as this install selects it, in view; returns the paths in it that setup derived rather
+    than copied from the source (the team pack's included), which a dev install keeps as copies."""
     source = Path(args.source).expanduser().resolve()
+    derived = {Path('hooks/registry.json')}
     for name in ('bin', 'hooks', 'git-hooks', 'agents', 'commands', 'rules', 'hosts', 'skills', 'references'):
         path = source / name
         if path.is_dir():
@@ -477,6 +507,7 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
         for relative, (data, mode) in preset.pack.files.items():
             skill = relative.startswith(PACK_SKILLS + '/')
             for path in (view / PACK_DIR / relative, *([view / relative] if skill else [])):
+                derived.add(path.relative_to(view))
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
                 path.chmod(0o755 if mode & 0o111 else 0o644)
@@ -488,8 +519,9 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
     registry = selected_registry(view, set(args.components), args.blocking_hooks)
     (view / 'hooks/registry.json').write_text(json.dumps(registry, indent=2) + '\n')
     # The preset's role overrides first, so the user's own (flags, earlier answers) win.
-    role_overrides(view / 'roles.toml', [*preset.answers.get('role_model', []), *args.role_model],
-                   [*preset.answers.get('role_effort', []), *args.role_effort])
+    if role_overrides(view / 'roles.toml', [*preset.answers.get('role_model', []), *args.role_model],
+                      [*preset.answers.get('role_effort', []), *args.role_effort]):
+        derived.add(Path('roles.toml'))
     kit_api(view).load_roles()
     if 'mcp' in args.components:
         # A server whose runtime is missing is left out, so no host starts a command that cannot run.
@@ -501,11 +533,14 @@ def installation_view(args: argparse.Namespace, view: Path, preset: Preset, serv
                     if not server_runtime(spec) or shutil.which(spec['command'])}
         (view / 'mcp').mkdir()
         (view / 'mcp/servers.json').write_text(json.dumps({'mcpServers': runnable}, indent=2) + '\n')
+        derived.add(Path('mcp/servers.json'))
+    return derived
 
 
 def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[str], servers: dict[str, Any]) -> list[Change]:
-    installation_view(args, view, preset, servers)
+    derived = installation_view(args, view, preset, servers)
     root = Path(args.root_dir).expanduser().absolute()
+    source = Path(args.source).expanduser().resolve()
     home = Path.home()
     changes = []
     selected = selected_skills(args, preset)
@@ -530,8 +565,14 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
                 continue
             content = path.read_bytes()
             if relative.parts[0] == 'skills' and path.suffix == '.md':
-                content = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
-                                       strict=relative.parts[1] not in pack_skills).encode()
+                filled = install_text(content.decode(), str(root), relative.parts[1], export=path.name == 'SKILL.md',
+                                      strict=relative.parts[1] not in pack_skills).encode()
+                if filled != content:
+                    derived.add(relative)
+                content = filled
+            if args.dev and relative not in derived and not any(relative.is_relative_to(code) for code in SETUP_CODE):
+                changes.append(Change('link', root / relative, str(source / relative)))
+                continue
             changes.append(Change('file', root / relative, content, path.stat().st_mode & 0o777))
     # The preset's layer is written when it has values or an earlier install wrote one.
     overlays = {'preset.env': preset.env_text(), 'setup-paths.env': overlay_text(args, from_preset)}
@@ -563,8 +604,8 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
 
 
 def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change], preset: Preset) -> list[Change]:
-    """Removals for what an earlier install managed and this plan no longer produces: kit files gone
-    from the source, a deselected skill's files, the selected hosts' agent files for renamed roles
+    """Removals for what an earlier install managed and this plan no longer produces: kit files (copies
+    or dev links) gone from the source, a deselected skill's files, the selected hosts' agent files for renamed roles
     (when this plan renders that agents folder or selects roles), and skill links that are deselected or no longer
     eligible for their host (`hosts:`). A removal refuses changed content unless --collision backup."""
     root = Path(args.root_dir).expanduser().absolute()
@@ -580,7 +621,8 @@ def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[
         if record['kind'] not in ('file', 'link') or str(target) in planned:
             continue
         retired = False
-        if record['kind'] == 'file' and root in target.parents:
+        # A kit file in the root is a 'file' record, or a 'link' one a dev install made into its checkout.
+        if root in target.parents:
             relative = target.relative_to(root)
             if relative.parts[0] in ('local', 'state', '.install-state'):
                 continue
@@ -637,14 +679,22 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
                 if target.read_text() in (legacy.get('owned', ''), legacy.get('owned', '') + '\n') or backup:
                     prior = {'hash': digest(target.read_bytes())}
                     record['retired_identity'] = 'text:' + str(target)
+        root = Path(args.root_dir).expanduser().absolute()
+        other = 'file' if change.kind == 'link' else 'link'
+        if not prior and root in target.parents and (switched := prior_record(root, target, other)):
+            # A kit file switching between a copy and a dev link: the earlier install's record, of
+            # the other kind, still owns it.
+            prior = switched
+            record['retired_identity'] = other + ':' + str(target)
+        current_hash = file_digest(target)
         if change.kind == 'link':
             wanted_hash = digest(change.wanted.encode())
-            current_hash = digest(os.readlink(target).encode()) if target.is_symlink() else None
+            same = target.is_symlink() and current_hash == wanted_hash
             record['link'] = change.wanted
         else:
             wanted_hash = digest(change.wanted)
-            current_hash = digest(target.read_bytes()) if target.is_file() and not target.is_symlink() else None
-        if current_hash == wanted_hash:
+            same = target.is_file() and not target.is_symlink() and current_hash == wanted_hash
+        if same:
             record.update(hash=wanted_hash, present=present, before_hash=current_hash, noop=True)
             return record
         if present and (not prior or current_hash is None or current_hash != prior.get('hash')) and not backup:
@@ -960,20 +1010,29 @@ def plugin_conflicts(args: argparse.Namespace) -> list[str]:
 
 @dataclass(frozen=True)
 class Plan:
-    """A previewed install: its summary rows, the changes apply makes (prepared), and every record,
-    no-ops included, that current.json keeps."""
+    """A previewed install: its summary rows, the changes apply makes (prepared), every record, no-ops
+    included, that current.json keeps, and the full plan --json prints (report)."""
     rows: list[Row]
     prepared: list[tuple[Change, dict]]
     records: list[tuple[Change, dict]]
     collisions: list[tuple[str, bool]]
+    report: dict[str, Any]
 
     @property
     def blocked(self) -> bool:
         return any(row.blocks for row in self.rows)
 
 
+def show_plan(args: argparse.Namespace, planned: Plan) -> None:
+    """The preview's summary, or with --json the full plan."""
+    if args.json:
+        output(planned.report)
+    else:
+        print_summary(planned.rows, planned.prepared, args, Path(args.root_dir).expanduser().absolute())
+
+
 def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], notes: list[Row]) -> Plan:
-    """Plan the install, check it against what is on disk, and print the summary (or --json)."""
+    """Plan the install and check it against what is on disk; prints nothing (show_plan does)."""
     root = Path(args.root_dir).expanduser().absolute()
     source = Path(args.source).expanduser().resolve()
     if args.github_owner and not re.fullmatch(r'[A-Za-z0-9_.-]+', args.github_owner):
@@ -1027,21 +1086,43 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], not
     duplicates = plugin_conflicts(args)
     targets = {host: host_target(args, host, Path.home()) for host in args.hosts}
     summary = preflight(args, targets, deps, support, duplicates, collisions, notes, servers, preset.recommended_hosts)
-    if not args.json:
-        print_summary(summary, prepared, args, root)
-    else:
-        output({'mode': 'apply' if args.apply else 'preview', 'hosts': args.hosts,
+    report = {'mode': 'apply' if args.apply else 'preview', 'hosts': args.hosts,
             'summary': [{'section': row.section, 'line': row.line, 'blocks': row.blocks} for row in summary],
             'components': args.components, 'blocking_hooks': args.blocking_hooks, 'role_routing': routes,
             'component_dependencies': ['roles and review references for blocking hooks'] if 'hooks' in args.components and args.blocking_hooks else [],
-            'root': str(root), 'source_checkout': str(source), 'host_targets': {host: str(target) for host, target in targets.items()}, 'changes': len(prepared), 'dependencies': deps, 'capabilities': support,
+            'root': str(root), 'source_checkout': str(source), 'dev': args.dev, 'host_targets': {host: str(target) for host, target in targets.items()}, 'changes': len(prepared), 'dependencies': deps, 'capabilities': support,
             'conflicting_plugins': duplicates, 'collisions': [path for path, _ in collisions], 'skipped_collisions': skipped,
             'paths': [{'kind': change.kind, 'path': str(change.target)} for change, record in prepared],
             'shell_activation': 'export PATH=' + shlex.quote(str(root / 'bin')) + ':"$PATH"' if 'data-wrappers' in args.components else None,
             'auth': 'Reuse each provider login; no auth files are read or copied.',
             'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
-            'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'})
-    return Plan(summary, prepared, records, collisions)
+            'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'}
+    return Plan(summary, prepared, records, collisions, report)
+
+
+def configured(args: argparse.Namespace, preset: Preset, answered: set[str], preset_owned: set[str]) -> dict[str, Any]:
+    """The install's saved configuration as current.json records it: every answer of this run."""
+    configuration = {key: getattr(args, key) for key in SAVED_KEYS}
+    # The catalog as an absolute path, so a later update that reselects mcp keeps it.
+    configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
+    configuration['answered'] = sorted(answered)
+    # Kept across runs: once a preset drops a key, the next run's saved preset no longer names
+    # it, and only this record keeps the default out of setup-paths.env, above kit.env.
+    configuration['preset_owned'] = sorted(preset_owned)
+    if preset.record:
+        # The preset outlives this run: a later update without --preset applies the same values.
+        configuration.update(preset=preset.record, preset_values=preset.saved())
+    configuration['source_checkout'] = str(Path(args.source).expanduser().resolve())
+    configuration['dev'] = args.dev
+    configuration['confirm_hook_support'] = args.confirm_hook_support
+    # Every selected host's root as installed, however it was named (--host-root, CLAUDE_CONFIG_DIR,
+    # CODEX_HOME): a later run in a shell without that variable renders into the same root.
+    configuration['host_roots'] = {**args.host_roots,
+                                   **{host: str(host_target(args, host, Path.home())) for host in args.hosts}}
+    configuration['project_roots'] = dict(args.project_roots)
+    if args.project_root and 'cursor' in args.hosts:
+        configuration['project_roots']['cursor'] = args.project_root
+    return configuration
 
 
 def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[str], preset_owned: set[str]) -> int:
@@ -1050,7 +1131,6 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
     if planned.blocked:
         raise ValueError('apply blocked: ' + '; '.join(row.line for row in planned.rows if row.blocks))
     root = Path(args.root_dir).expanduser().absolute()
-    source = Path(args.source).expanduser().resolve()
     identifier = time.strftime('%Y%m%dT%H%M%S') + '-' + str(os.getpid())
     journal = root / '.install-state' / identifier
     journal.mkdir(parents=True, exist_ok=False)
@@ -1079,24 +1159,7 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
                 if record.get('retired_identity'):
                     managed.pop(record['retired_identity'], None)
                 managed[record['kind'] + ':' + record['target']] = record
-        configuration = {key: getattr(args, key) for key in SAVED_KEYS}
-        # The catalog as an absolute path, so a later update that reselects mcp keeps it.
-        configuration['mcp_catalog'] = str(Path(args.mcp_catalog).expanduser().absolute()) if args.mcp_catalog else None
-        configuration['answered'] = sorted(answered)
-        # Kept across runs: once a preset drops a key, the next run's saved preset no longer names
-        # it, and only this record keeps the default out of setup-paths.env, above kit.env.
-        configuration['preset_owned'] = sorted(preset_owned)
-        if preset.record:
-            # The preset outlives this run: a later update without --preset applies the same values.
-            configuration.update(preset=preset.record, preset_values=preset.saved())
-        configuration['source_checkout'] = str(source)
-        # Every selected host's root as installed, however it was named (--host-root, CLAUDE_CONFIG_DIR,
-        # CODEX_HOME): a later run in a shell without that variable renders into the same root.
-        configuration['host_roots'] = {**args.host_roots,
-                                       **{host: str(host_target(args, host, Path.home())) for host in args.hosts}}
-        configuration['project_roots'] = dict(args.project_roots)
-        if args.project_root and 'cursor' in args.hosts:
-            configuration['project_roots']['cursor'] = args.project_root
+        configuration = configured(args, preset, answered, preset_owned)
         atomic(root / '.install-state/current.json', (json.dumps({'id': identifier, 'managed': managed,
                'configuration': configuration}, indent=2) + '\n').encode())
         (root / '.install-state/pending.json').unlink(missing_ok=True)
@@ -1119,7 +1182,8 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
                 (root / '.install-state/current.json').unlink(missing_ok=True)
             (root / '.install-state/pending.json').unlink(missing_ok=True)
         raise
-    undo = shlex.join([sys.executable, str(source / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
+    # The install's own copy: it rolls back while the checkout is mid-rebase or gone.
+    undo = shlex.join([sys.executable, str(root / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
     if args.json:
         output({'installed': len(records), 'journal': identifier, 'rollback': undo})
     else:
@@ -1201,7 +1265,19 @@ def doctor(args: argparse.Namespace) -> int:
         problems.append(f'{len(drift)} installed path(s) changed since setup: rerun agent-setup --apply with '
                         '--collision skip to keep your edits, or --collision backup to replace them (the install '
                         'journal keeps your version)')
-    preset = state.get('configuration', {}).get('preset')
+    configuration = state.get('configuration', {})
+    dev = None
+    if configuration.get('dev'):
+        source = Path(configuration.get('source_checkout', ''))
+        # Uncommitted edits are what a dev install is for: counted, not a problem.
+        dev = {'source': str(source), 'dirty': checkout.dirty(source),
+               'links': sum(record['kind'] == 'link' and root in Path(record['target']).parents
+                            for record in state.get('managed', {}).values())}
+        broken = checkout.dev_problems(root, source, state.get('managed', {}).values())
+        problems.extend(broken)
+        if not broken and (pending := sync_pending(root, state)):
+            problems.append(pending)
+    preset = configuration.get('preset')
     if preset:
         preset['source_status'] = source_status(preset)
     logins = {}
@@ -1209,15 +1285,90 @@ def doctor(args: argparse.Namespace) -> int:
         logged, how = host_login(host, getattr(args, host + '_bin'), host_target(args, host, Path.home()))
         logins[host] = {'logged_in': logged, 'checked': how}
     output({'wrappers': [str(root / 'bin' / name) for name in ('ro-mysql', 'bqro') if (root / 'bin' / name).is_file()], 'installed': bool(state), 'root': str(root), 'drift': drift,
-            'problems': problems, 'preset': preset, 'dependencies': deps, 'native_auth': logins})
+            'problems': problems, 'preset': preset, 'dev': dev, 'dependencies': deps, 'native_auth': logins})
     for problem in problems:
         print('agent-setup doctor: ' + problem, file=sys.stderr)
     return 1 if problems else 0
 
 
+def sync_pending(root: Path, state: dict[str, Any]) -> str | None:
+    """A dev install's doctor: the changes agent-kit sync would make (its preview, in process), which
+    are what an edit to a derived file or a new kit file waits for."""
+    args = parser().parse_args(['sync', '--root-dir', str(root)])
+    try:
+        preset, _, from_preset, notes = resolve(args, root, state, state.get('configuration', {}))
+        planned = preview(args, preset, from_preset, notes)
+    except Exception as error:  # noqa: BLE001 (doctor diagnoses: a checkout mid-merge breaks the preview in any way)
+        return f'agent-kit sync cannot preview this install: {type(error).__name__}: {" ".join(str(error).split())}'
+    if planned.blocked:
+        # Such a change is left out of prepared, so a sync that would refuse can count none pending.
+        return 'agent-kit sync is blocked: ' + '; '.join(f'{row.section}: {row.line}' for row in planned.rows if row.blocks)
+    pending = len(planned.prepared)
+    return f'{pending} derived change(s) pending: run agent-kit sync' if pending else None
+
+
+def update(args: argparse.Namespace, root: Path, state: dict[str, Any]) -> int:
+    """Fast-forward the recorded source checkout (or --source) to its upstream, then reapply every saved
+    choice with that commit's `agent-setup sync`, the saved preset read again from its source. The
+    upstream commit's own `sync --dry-run` previews the reapply from an export first; when it fails or
+    blocks, the checkout does not move. Not atomic: a sync that fails after the fast-forward prints the
+    reset that moves the checkout back."""
+    defaults = vars(parser().parse_args(['update']))
+    extra = sorted(key for key, value in vars(args).items() if key not in UPDATE_FLAGS and value != defaults[key])
+    if extra:
+        raise ValueError('update reapplies saved choices; change them with --apply (refused: '
+                         + ', '.join(args.journal if key == 'journal' else '--' + key.replace('_', '-') for key in extra) + ')')
+    if not state:
+        raise ValueError(f'not installed at {root}: run agent-setup --apply first (or pass --root-dir)')
+    configuration = state.get('configuration', {})
+    source = Path(args.source or configuration.get('source_checkout') or '').expanduser().absolute()
+    if not (source / 'bin/agent-setup').is_file():
+        raise ValueError(f'update refused: the source checkout {source} is missing; clone the kit and pass --source')
+    record = configuration.get('preset')
+    # What the new installer's sync takes over the saved choices.
+    flags = ['--root-dir', str(root), *(['--preset', record['source']] if record else []),
+             *(['--dev' if args.dev else '--no-dev'] if args.dev is not None else []),
+             *(['--collision', args.collision] if args.collision else []),
+             *(['--confirm-hook-support', *args.confirm_hook_support] if args.confirm_hook_support else [])]
+    before, after = checkout.upstream_ahead(source)
+    if after != before:
+        with tempfile.TemporaryDirectory(prefix='agent-kit-update-') as folder:
+            checkout.export(source, after, Path(folder))
+            # A catalog or local preset the checkout tracks is previewed as the upstream has it; the
+            # sync below keeps the saved paths.
+            catalog = configuration.get('mcp_catalog')
+            local = [*(['--preset', checkout.exported(record['source'], source, Path(folder))]
+                       if record and not record['source'].startswith('gh:') else []),
+                     *(['--mcp-catalog', checkout.exported(catalog, source, Path(folder))] if catalog else [])]
+            trial = subprocess.run([sys.executable, str(Path(folder) / 'bin/agent-setup'), 'sync', '--dry-run',
+                                    '--source', folder, *flags, *local], capture_output=True, text=True,
+                                   stdin=subprocess.DEVNULL)
+        if trial.returncode:
+            sys.stderr.write(trial.stdout + trial.stderr)
+            raise checkout.refusal(source, f'cannot install its upstream {checkout.short(after)}: its agent-setup '
+                                   'preview failed or blocked (above)')
+        checkout.fast_forward(source, after)
+    # --source only here: argparse keeps a repeated flag's last value, so in flags it would replace the trial's export.
+    applied = subprocess.run([sys.executable, str(source / 'bin/agent-setup'), 'sync', '--source', str(source), *flags],
+                             stdin=subprocess.DEVNULL)
+    if applied.returncode and after != before:
+        live = " Meanwhile this dev install's links already run the new commit." if configuration.get('dev') else ''
+        sys.stderr.write(f'agent-setup: the checkout moved to {checkout.short(after)}, but reapplying failed (above). '
+                         f'Fix it and rerun agent-setup update, or move the checkout back: '
+                         f'git -C {shlex.quote(str(source))} reset --keep {before}.{live}\n')
+    pack = (load_json(root / '.install-state/current.json', {}).get('configuration', {}).get('preset') or {}).get('commit')
+    current = ' (already current)' if before == after else ''
+    sys.stdout.write(f'kit: {source} {checkout.short(before)} -> {checkout.short(after)}{current}\n')
+    if record:
+        sys.stdout.write(f'pack: {record["source"]} {checkout.short(record.get("commit"))} -> {checkout.short(pack)}\n')
+    return applied.returncode
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description='Choose components, preview changes, apply and roll back agent-kit.')
-    result.add_argument('action', choices=('setup', 'doctor', 'rollback'), nargs='?', default='setup')
+    result.add_argument('action', choices=('setup', 'doctor', 'rollback', 'sync', 'update'), nargs='?', default='setup',
+                        help='sync: reapply every saved choice, applying only what changed (agent-kit sync runs it); '
+                        'update: fast-forward the recorded source checkout, then sync')
     result.add_argument('journal', nargs='?')
     result.add_argument('--source', help='Source checkout; installed setup inherits its recorded original checkout')
     result.add_argument('--root-dir', default=os.environ.get('AGENT_KIT_DIR', str(Path.home() / '.local/share/agent-kit')))
@@ -1241,18 +1392,23 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--blocking-hooks', action=argparse.BooleanOptionalAction, default=None,
                         help='Enable selected blocking guards/review gates; the saved choice when omitted')
     result.add_argument('--hook-runtime', choices=('local', 'cloud', 'unsupported'), default='local')
-    result.add_argument('--confirm-hook-support', nargs='+', choices=('cursor',), default=[],
-                        help='Confirm native Cursor hook support after checking the installed host.')
+    result.add_argument('--confirm-hook-support', nargs='+', choices=('cursor', 'none'),
+                        help='Confirm native Cursor hook support after checking the installed host; saved for later '
+                        'runs until given again (none clears it)')
     result.add_argument('--collision', choices=('refuse', 'backup', 'skip'), default=None,
                         help='Where you already have content: refuse (default), backup it, or skip that path')
     result.add_argument('--preset', help='Team defaults and pack: a local folder or TOML file, or gh:owner/repo[/path] '
                         '(default path agent-kit-preset.toml); skills/ and rules.md beside a folder\'s or an '
                         'agent-kit-preset.toml are its team pack')
+    result.add_argument('--dev', action=argparse.BooleanOptionalAction, default=None,
+                        help='Link kit files into the source checkout, so an edit there is live at once; '
+                        'kept by later runs until --no-dev')
     result.add_argument('--yes', action='store_true', help='Take every default and detected value; no prompts')
     result.add_argument('--verbose', action='store_true', help='List every planned path under the summary')
     result.add_argument('--json', action='store_true', help='Print the full plan as JSON instead of the summary')
     result.add_argument('--interactive', action='store_true')
     result.add_argument('--apply', action='store_true')
+    result.add_argument('--dry-run', action='store_true', help='sync: list what would change; fail when a row blocks')
     return result
 
 
@@ -1310,9 +1466,33 @@ def main() -> int:
     if args.interactive and setup_run:
         # The answers of an interactive run that stopped before apply: a rerun starts from them.
         saved = {**saved, **load_json(root / '.install-state/answers.json', {})}
+    if args.action == 'update':
+        return update(args, root.absolute(), state)
+    if args.action == 'rollback':
+        if not args.journal:
+            raise ValueError('rollback needs the journal id printed by setup')
+        return rollback(args)
+    preset, answered, from_preset, notes = resolve(args, root, state, saved)
+    if args.interactive and setup_run:
+        return interactive(args, root, preset, answered, from_preset, notes)
+    if args.action == 'doctor':
+        return doctor(args)
+    planned = preview(args, preset, from_preset, notes)
+    if args.action == 'sync':
+        return sync(args, planned, preset, answered, from_preset)
+    show_plan(args, planned)
+    return apply(args, planned, preset, answered, from_preset) if args.apply else 0
+
+
+def resolve(args: argparse.Namespace, root: Path, state: dict[str, Any], saved: dict[str, Any]) -> tuple[Preset, set[str], set[str], list[Row]]:
+    """args with every saved answer resolved (resolve_answers) and the source checkout; for setup and
+    sync also the preset. Returns (the preset, the keys the user chose, the keys the preset layer owns,
+    the summary notes)."""
+    plans_install = args.action in ('setup', 'sync')
     if args.source is None:
         installed = root.exists() and root.samefile(SOURCE)
-        if setup_run and installed:
+        # sync reapplies the checkout the install records, whichever agent-setup runs it.
+        if (plans_install and installed) or args.action == 'sync':
             origin = saved.get('source_checkout')
             if not isinstance(origin, str) or not origin or not Path(origin).is_dir():
                 raise ValueError('Original source checkout is unavailable; pass --source /path/to/checkout. Doctor and rollback remain available without it.')
@@ -1321,8 +1501,8 @@ def main() -> int:
             args.source = str(SOURCE)
     given = {key for key in DEFAULTS if getattr(args, key) is not None}
     preset = (apply_preset(args.preset, saved, Path(args.source), args.interactive,
-                           installed_pack(root.absolute(), state, managed_drift)) if setup_run else Preset())
-    guided = setup_run and (args.interactive or args.yes or bool(args.preset))
+                           installed_pack(root.absolute(), state, managed_drift)) if plans_install else Preset())
+    guided = plans_install and (args.interactive or args.yes or bool(args.preset))
     detected_hosts = detect_hosts()
     # --host-root names one host's root; with no --hosts that host is claude.
     detected = {'hosts': ['claude'] if args.host_root else detected_hosts,
@@ -1330,7 +1510,20 @@ def main() -> int:
                 **{host + '_bin': detect_cli(host) for host in HOSTS}}
     answered, from_preset = resolve_answers(args, given, saved, preset, detected)
     args.collision = args.collision or saved.get('collision', 'refuse')
+    args.dev = bool(saved.get('dev')) if args.dev is None else args.dev
+    # Saved, so update and sync reapply unattended; an install from before it was saved confirmed Cursor
+    # by installing Cursor hooks. Given again it replaces the saved list, and `none` clears it.
+    if args.confirm_hook_support is None:
+        cursor = any(key.startswith('cursor-hooks:') for key in state.get('managed', {}))
+        args.confirm_hook_support = saved.get('confirm_hook_support', ['cursor'] if cursor else [])
+    elif 'none' in args.confirm_hook_support and args.confirm_hook_support != ['none']:
+        raise ValueError('--confirm-hook-support none clears the saved confirmations; give it alone')
+    else:
+        args.confirm_hook_support = sorted(set(args.confirm_hook_support) - {'none'})
     notes = [Row(*note) for note in preset.notes]
+    if args.dev and plans_install:
+        notes.append(Row('Ready', f'dev install: kit files link into {Path(args.source).expanduser().resolve()}, '
+                                  'so an edit there is live; agent-kit sync re-renders the hosts'))
     if guided and not args.github_owner:
         owner, origin = detect_owner(args.repo_roots)
         if owner:
@@ -1357,35 +1550,66 @@ def main() -> int:
             name = ROLE_ALIASES.get(name, name)
             values[name] = name + separator + setting
         setattr(args, key, [value for value in values.values() if value.partition('=')[2]])
-    if args.interactive and setup_run:
+    if args.interactive and args.action == 'setup':
         interview(args, detected_hosts, preset, answered)
-        answers = {key: getattr(args, key) for key in (*SAVED_KEYS, 'collision', 'host_roots')}
-        answers['answered'] = sorted(answered)
-        args.apply = False
-        planned = preview(args, preset, from_preset - answered, notes)
-        if args.collision == 'refuse' and planned.collisions:
-            choice = ask('Some paths hold your own content: [b]ackup and replace, [s]kip them, or [a]bort? [a]: ', args).lower()
-            if choice[:1] in ('b', 's'):
-                args.collision = answers['collision'] = 'backup' if choice[:1] == 'b' else 'skip'
-                planned = preview(args, preset, from_preset - answered, notes)
-        if planned.blocked:
-            # Saved only when the run stops here: the rerun after the fix offers them as defaults.
-            atomic(root / '.install-state/answers.json', (json.dumps(answers, indent=2) + '\n').encode())
-            print('agent-setup: apply is blocked: fix the items under Needs attention, then rerun; '
-                  'your answers are saved as its defaults.', file=sys.stderr)
-            return 2
-        if not args.yes and ask('Apply this previewed selection? [y/N]: ', args).lower() != 'y':
-            return 0
-        args.apply = True
-        return apply(args, planned, preset, answered, from_preset - answered)
-    if setup_run:
-        planned = preview(args, preset, from_preset, notes)
-        return apply(args, planned, preset, answered, from_preset) if args.apply else 0
-    if args.action == 'rollback':
-        if not args.journal:
-            raise ValueError('rollback needs the journal id printed by setup')
-        return rollback(args)
-    return doctor(args)
+    return preset, answered, from_preset, notes
+
+
+def interactive(args: argparse.Namespace, root: Path, preset: Preset, answered: set[str], from_preset: set[str],
+                notes: list[Row]) -> int:
+    """The interviewed run's preview, collision choice and confirmation; a blocked one saves its answers."""
+    answers = {key: getattr(args, key) for key in (*SAVED_KEYS, 'collision', 'host_roots')}
+    answers['answered'] = sorted(answered)
+    args.apply = False
+    planned = preview(args, preset, from_preset - answered, notes)
+    show_plan(args, planned)
+    if args.collision == 'refuse' and planned.collisions:
+        choice = ask('Some paths hold your own content: [b]ackup and replace, [s]kip them, or [a]bort? [a]: ', args).lower()
+        if choice[:1] in ('b', 's'):
+            args.collision = answers['collision'] = 'backup' if choice[:1] == 'b' else 'skip'
+            planned = preview(args, preset, from_preset - answered, notes)
+            show_plan(args, planned)
+    if planned.blocked:
+        # Saved only when the run stops here: the rerun after the fix offers them as defaults.
+        atomic(root / '.install-state/answers.json', (json.dumps(answers, indent=2) + '\n').encode())
+        print('agent-setup: apply is blocked: fix the items under Needs attention, then rerun; '
+              'your answers are saved as its defaults.', file=sys.stderr)
+        return 2
+    if not args.yes and ask('Apply this previewed selection? [y/N]: ', args).lower() != 'y':
+        return 0
+    args.apply = True
+    return apply(args, planned, preset, answered, from_preset - answered)
+
+
+def sync(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set[str], from_preset: set[str]) -> int:
+    """agent-kit sync and update: reapply every saved choice, printing the changes and blocking rows only.
+    Applies only when something changed, so an unchanged install gets no journal; --dry-run lists the
+    changes and fails when a row blocks."""
+    root = Path(args.root_dir).expanduser().absolute()
+    for row in planned.rows:
+        if row.blocks:
+            print(f'agent-setup: {row.section}: {row.line}', file=sys.stderr)
+    for change, _ in planned.prepared:
+        print(f'  {change.kind:12} {change.target}')
+    if planned.blocked:
+        print('sync: blocked: fix the rows above, then rerun', file=sys.stderr)
+        return 2
+    # A changed answer with no file to change (update --source naming a clone with the same files) is
+    # still saved, under a journal of no records, so rollback restores the earlier configuration. A key an
+    # older install never saved is derived again on every run, except the checkout it installs from.
+    saved = load_json(root / '.install-state/current.json', {}).get('configuration', {})
+    configuration = json.loads(json.dumps(configured(args, preset, answered, from_preset)))
+    changed = sorted(key for key in configuration
+                     if configuration[key] != saved.get(key) and (key in saved or key == 'source_checkout'))
+    if changed and not planned.prepared:
+        print(f'  {"configuration":12} {", ".join(changed)}')
+    if not planned.prepared and not changed:
+        print(f'sync: nothing changed; {root} matches {Path(args.source).expanduser().resolve()}')
+        return 0
+    if args.dry_run:
+        print(f'sync: {len(planned.prepared) or 1} change(s) to apply; rerun without --dry-run to apply them')
+        return 0
+    return apply(args, planned, preset, answered, from_preset)
 
 
 def interview(args: argparse.Namespace, detected: list[str], preset: Preset, answered: set[str]) -> None:

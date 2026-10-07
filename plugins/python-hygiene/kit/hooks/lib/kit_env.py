@@ -24,12 +24,34 @@ def _declared_keys() -> tuple[str, ...]:
 KEYS = _declared_keys()
 
 
+def kit_root(script: str) -> Path:
+    """The kit an entry point (bin/<name>, hooks/<name>) runs from: $AGENT_KIT_DIR, else its folder's
+    parent. Links are followed only until a folder holding an agent-setup install (.install-state): a
+    dev install links each kit file into its checkout, whose overlay, roles and rendered state are not
+    the install's. hooks/lib/kit-root.sh is the shell twin."""
+    if os.environ.get("AGENT_KIT_DIR"):
+        return Path(os.environ["AGENT_KIT_DIR"])
+    path = Path(os.path.abspath(script))
+    for _ in range(40):
+        kit = Path(os.path.realpath(path.parent)).parent
+        if not path.is_symlink() or (kit / ".install-state").is_dir():
+            return kit
+        path = Path(os.path.join(path.parent, os.readlink(path)))
+    raise OSError(f"{script}: link chain too long")
+
+
+def kit_dir() -> Path:
+    """The kit for library code: $AGENT_KIT_DIR, which an entry point sets from kit_root, else the kit
+    holding this file."""
+    return Path(os.environ.get("AGENT_KIT_DIR") or Path(__file__).resolve().parents[2])
+
+
 def kit_env_path() -> str:
     """$KIT_ENV, else <config dir>/local/kit.env. Its folder is the overlay (jira-prefs.md and others)."""
     config = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     if os.environ.get("KIT_ENV"):
         return os.environ["KIT_ENV"]
-    kit = Path(os.environ.get("AGENT_KIT_DIR") or Path(__file__).resolve().parents[2])
+    kit = kit_dir()
     for candidate in (kit / "local/setup-paths.env", kit / "local/kit.env"):
         if candidate.is_file():
             return str(candidate)

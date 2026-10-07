@@ -115,7 +115,7 @@ contrast. Do not carry real content in the lightest ink token.
 **Masthead + stat strip.** Every number comes from `stats.json`; none are typed by hand.
 
 ```html
-<p class="eyebrow">example-api · PR 1234</p>
+<p class="eyebrow">sample-app · PR 1234</p>
 <h1>Gate invoice export on ledger period state</h1>
 <p class="sub">…</p>
 <div class="meta-row">

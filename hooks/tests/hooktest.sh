@@ -291,7 +291,8 @@ rm -f "$M/gate-off-$SID-off"
 # -H: $H is a symlink into ~/.agents; plain -R copies the link, and rm below would hit the real lib.
 C="$T/hooks-copy"; cp -RH "$H" "$C"; rm -f "$C/lib/test-run"
 overlay "$T/kit.env"
-out=$(pre "git status" $SID "$REPO" | "$C/test-exec-gate"); empty "the pre-filter exits on a non-test command before loading lib/test-run" "$out"
+# cwd /: the pre-filter matches the raw payload, so a TMPDIR path naming a refused word ("dev") would pass it.
+out=$(pre "git status" $SID / | "$C/test-exec-gate"); empty "the pre-filter exits on a non-test command before loading lib/test-run" "$out"
 out=$(pre "pytest -k x" $SID "$REPO" | "$C/test-exec-gate"); check "...while a test run without it says the gate is off" "$out" 'systemMessage'
 export KIT_ENV=$START_KIT
 

@@ -32,7 +32,8 @@ class GCPortabilityTests(unittest.TestCase):
         (self.kit / "bin").mkdir(parents=True)
         (self.kit / "hooks/lib").mkdir(parents=True)
         (self.kit / "local").mkdir()
-        for relative in ("bin/claude-gc", "hooks/lib/gc-lock.py", "hooks/lib/hook-io", "hooks/lib/host-words"):
+        for relative in ("bin/claude-gc", "hooks/lib/gc-lock.py", "hooks/lib/hook-io", "hooks/lib/host-words",
+                         "hooks/lib/kit-root.sh"):
             shutil.copy2(SOURCE / relative, self.kit / relative)
         self.env = {
             "HOME": str(self.home),

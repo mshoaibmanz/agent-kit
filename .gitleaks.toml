@@ -1,7 +1,7 @@
 # Secret and internal-data scan for this public repo (gitleaks >= 8.25). Run by scripts/scan.sh over
 # the tree AND the git history, in CI and in the pre-push hook. The generic rules below catch what a
 # company config tends to leak; the company's own names are checked from a denylist that is never
-# committed (LEAK_TERMS, see scripts/scan.sh). Every allowlist entry says why it is safe.
+# committed (sources and format: scripts/leak-check.sh). Every allowlist entry says why it is safe.
 title = "agent-kit public scan"
 
 [extend]
@@ -77,8 +77,8 @@ description = "A named cloud project: --project[_id]=<id>, projects/<id>, gcloud
 regex = '''(?:--project(?:_id)?=|\bprojects/|config set project )([a-z][a-z0-9-]{4,28}[a-z0-9])\b'''
 secretGroup = 1
   [[rules.allowlists]]
-  description = "the made-up jobs projects tests/run-tests.sh passes to bqro"
-  paths = ['''^tests/run-tests\.sh$''']
+  description = "the made-up jobs projects the tests pass to bqro"
+  paths = ['''^tests/run-tests\.sh$''', '''^tests/dev_install_test\.py$''']
   regexTarget = "secret"
   regexes = ['''^(?:kit-jobs|env-jobs|flag-jobs)$''']
 
@@ -86,7 +86,7 @@ secretGroup = 1
   description = "Local work-project folder names in synthetic task resolver tests"
   paths = ['''^hooks/tests/agent-task\.test\.py$''']
   regexTarget = "secret"
-  regexes = ['^(?:cbtest|repack)$']
+  regexes = ['^(?:cbtest|invoices)$']
   [[rules.allowlists]]
   description = "A fake jobs project used by the injected bq executable fixture"
   paths = ['''^hooks/tests/hooktest\.sh$''']

@@ -18,6 +18,7 @@ import unicodedata
 from urllib.parse import quote
 import zlib
 
+from checkout import git
 from hosts import skill_hosts
 from preflight import install_hint
 
@@ -271,8 +272,7 @@ def git_head(folder: Path) -> str | None:
     """The commit of a git repository folder, None when it has uncommitted changes."""
     if not (folder / '.git').exists() or not shutil.which('git'):
         return None
-    head, status = (subprocess.run(['git', '--no-optional-locks', '-C', str(folder), *arguments], capture_output=True, text=True,
-                                   timeout=10, stdin=subprocess.DEVNULL)
+    head, status = (git(folder, '--no-optional-locks', *arguments, timeout=10)
                     for arguments in (['rev-parse', 'HEAD'], ['status', '--porcelain', '--untracked-files=all']))
     return head.stdout.strip() if head.returncode == 0 and status.returncode == 0 and not status.stdout else None
 

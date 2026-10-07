@@ -810,6 +810,8 @@ class DescriptionTests(unittest.TestCase):
         (bare / 'bin').mkdir()
         (bare / 'mcp').mkdir()
         shutil.copy2(SOURCE / 'bin/agent-kit', bare / 'bin/agent-kit')
+        # agent-kit finds its kit with hooks/lib (kit_env); bin/lib (hosts.fill_servers) stays out.
+        shutil.copytree(SOURCE / 'hooks/lib', bare / 'hooks/lib')
         servers = {'w': {'command': 'x', 'description': 'd', 'credentials': [{'service': 's', 'account': 'a'}]}}
         (bare / 'mcp/servers.json').write_text(json.dumps({'mcpServers': servers}))
         code = ('import importlib.machinery as m, importlib.util as u, json, sys; '

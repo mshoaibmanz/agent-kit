@@ -1,5 +1,6 @@
 {
   "extraPaths": ["bin/lib", "hooks/lib", "tests"],
+  "pythonVersion": "3.11",
   "typeCheckingMode": "basic",
   "reportPossiblyUnboundVariable": "none",
   "reportOptionalMemberAccess": "none",
@@ -19,5 +20,5 @@
       "reportArgumentType": "none"
     }
   ],
-  "exclude": ["plugins/**/kit", ".claude/worktrees", "state"]
+  "exclude": ["plugins/**", ".claude/**", "state", "**/__pycache__"]
 }

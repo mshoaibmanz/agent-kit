@@ -1,15 +1,18 @@
 #!/bin/bash
-# git pre-push hook: the CI leak scan, locally, before anything leaves the machine.
-# Install once per clone:  ln -sf ../../scripts/pre-push .git/hooks/pre-push
-# Needs gitleaks (on PATH, or GITLEAKS=<path>) and your org denylist: LEAK_TERMS_FILE, default
-# ~/.config/claude-kit/leak-terms.txt (newline-separated EREs; never commit it). A push without the
-# denylist is refused, as CI refuses one.
-set -uo pipefail
-# git runs hooks from the repo root.
-KIT=$(git rev-parse --show-toplevel) || exit 1
-export LEAK_TERMS_FILE=${LEAK_TERMS_FILE:-$HOME/.config/claude-kit/leak-terms.txt}
-export REQUIRE_LEAK_TERMS=1
-if ! bash "$KIT/scripts/scan.sh"; then
-  echo "pre-push: the leak scan found something (above). Fix it, amend, and push again." >&2
-  exit 1
+# The install the README recommends (`ln -sf ../../scripts/pre-push .git/hooks/pre-push`) runs this shim;
+# the hook itself is .githooks/pre-push. Without the shim that link dangles and git skips it.
+# git runs the link from every worktree of the clone, so the hook run is the pushing worktree's own.
+# The old install's list settings still apply: LEAK_TERMS_FILE here, ~/.config/claude-kit/leak-terms.txt
+# in scripts/leak-check.sh.
+top=$(git rev-parse --show-toplevel) || exit 2
+if [ -n "${LEAK_TERMS_FILE:-}" ] && [ -z "${AGENT_KIT_LEAK_TERMS:-}" ]; then
+  export AGENT_KIT_LEAK_TERMS="$LEAK_TERMS_FILE"
 fi
+[ ! -f "$top/.githooks/pre-push" ] || exec "$BASH" "$top/.githooks/pre-push" "$@"
+# A branch from before the move: its own scripts/pre-push is the hook it shipped with. The variable
+# stops a copy of this shim from running itself again.
+if [ -z "${AGENT_KIT_PRE_PUSH_SHIM:-}" ] && [ -f "$top/scripts/pre-push" ]; then
+  export AGENT_KIT_PRE_PUSH_SHIM=1
+  exec "$BASH" "$top/scripts/pre-push" "$@"
+fi
+exit 0
