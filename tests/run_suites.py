@@ -56,6 +56,8 @@ DROPPED = (
     "CODEX_HOME",
     "AGENT_WORK_ROOT",
     "KIT_ENV",
+    # Setup writes its PATH block to ${ZDOTDIR:-$HOME}/.zshrc: a set ZDOTDIR would be the user's own.
+    "ZDOTDIR",
 )
 TAIL_LINES = 60
 

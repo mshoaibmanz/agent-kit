@@ -19,7 +19,7 @@ if sys.version_info < (3, 11):
              f'Fix: {_FIX or "install Python 3.11 or newer"}, then rerun with it.')
 
 import argparse
-from collections.abc import Callable, Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 import contextlib
 from dataclasses import dataclass, replace
 import hashlib
@@ -79,8 +79,11 @@ MANAGED_MARKERS = ('# BEGIN agent-kit managed', '# END agent-kit managed')
 DEFAULTS: dict[str, Any] = {
     'hosts': [], 'components': ['rules', 'skills'], 'skills': None, 'repo_roots': [], 'github_owner': '',
     'zoekt_url': '', 'work_root': str(Path.home() / 'agent-work'), 'claude_bin': 'claude', 'codex_bin': 'codex',
-    'cursor_bin': 'cursor', 'codex_gcloud': 'off', 'blocking_hooks': False, 'mcp_catalog': None}
+    'cursor_bin': 'cursor', 'codex_gcloud': 'off', 'blocking_hooks': False, 'mcp_catalog': None,
+    'shell_path': True, 'shell_rc': []}
 SAVED_KEYS = (*DEFAULTS, 'role_model', 'role_effort', 'host_root', 'project_root')
+# Change kinds that own one marked block inside a text file the user keeps.
+BLOCK_KINDS = ('text', 'toml', 'shell')
 # A dev install copies these rather than linking them, so rollback and --no-dev run from the install
 # when the checkout is broken: agent-setup and what it imports (kit_env reads hook-io).
 SETUP_CODE = ('bin/agent-setup', 'bin/lib', 'hooks/lib/host.py', 'hooks/lib/session.py', 'hooks/lib/kit_env.py',
@@ -177,11 +180,83 @@ def managed_block(text: str, begin: str, end: str) -> tuple[str, str]:
     return text[:first] + text[last:], text[first:last]
 
 
+def block_markers(kind: str) -> tuple[str, str]:
+    return {'text': (TEXT_BEGIN, TEXT_END), 'toml': (TOML_BEGIN, TOML_END), 'shell': SHELL_MARKERS}[kind]
+
+
 def setup_block(text: str, kind: str) -> tuple[str, str]:
-    """managed_block for this installer's text or toml block. In TOML, tables the host appended
-    inside it (Codex hook and project trust, before the file's trailing comment) count as outside."""
-    begin, end = (TEXT_BEGIN, TEXT_END) if kind == 'text' else (TOML_BEGIN, TOML_END)
+    """managed_block for this installer's text, toml or shell-rc block. In TOML, tables the host
+    appended inside it (Codex hook and project trust, before the file's trailing comment) count as outside."""
+    begin, end = block_markers(kind)
     return managed_block(keep_host_tables(text, begin, end) if kind == 'toml' else text, begin, end)
+
+
+def path_block(bin_dir: Path, fish: bool) -> str:
+    """The shell-rc block's body: bin_dir first on PATH, once, however often the file is read."""
+    quoted = shlex.quote(str(bin_dir))
+    if fish:
+        return f'contains -- {quoted} $PATH; or set -gx PATH {quoted} $PATH'
+    return f'case ":${{PATH}}:" in\n  *:{quoted}:*) ;;\n  *) export PATH={quoted}"${{PATH:+:$PATH}}" ;;\nesac'
+
+
+def sources_bashrc(path: Path) -> bool:
+    text = path.read_text(errors='replace') if path.is_file() else ''
+    return any(re.search(r'(?:^|[\s;&|])(?:\.|source)\s+["\']?[^\s;&|]*\.bashrc\b', line)
+               for line in text.splitlines() if not line.lstrip().startswith('#'))
+
+
+def shell_rc_files(shell: str, home: Path, environ: Mapping[str, str]) -> list[Path]:
+    """The startup files a new terminal of this login shell reads, where setup puts the kit on PATH."""
+    name = Path(shell).name
+    if name == 'zsh':
+        return [Path(environ.get('ZDOTDIR') or home).expanduser() / '.zshrc']
+    if name == 'bash':
+        files = [home / '.bashrc']
+        if sys.platform == 'darwin':
+            # macOS terminals start login shells, which read the first of these and not ~/.bashrc.
+            login = next((home / candidate for candidate in ('.bash_profile', '.bash_login', '.profile')
+                          if (home / candidate).is_file()), home / '.bash_profile')
+            if not sources_bashrc(login):
+                files.append(login)
+        return files
+    if name == 'fish':
+        return [Path(environ.get('XDG_CONFIG_HOME') or home / '.config').expanduser() / 'fish/conf.d/agent-kit.fish']
+    return []
+
+
+def splice_block(text: str, old: str, wanted: str) -> tuple[int, str, str]:
+    """Where and how text changes so its shell block reads wanted ('' takes it out): (index, the text
+    removed there, the text inserted there). An absent block is appended after a blank line; a removed one
+    takes that blank line and its newline with it."""
+    if old:
+        start = text.index(old)
+        end = start + len(old)
+        if not wanted:
+            end += text[end:end + 1] == '\n'
+            start -= text[:start].endswith('\n\n')
+        return start, text[start:end], wanted
+    if not wanted:
+        return len(text), '', ''
+    separator = '' if not text else '\n' if text.endswith('\n') else '\n\n'
+    return len(text), '', separator + wanted + '\n'
+
+
+def unsplice(text: str, record: dict) -> str:
+    """text with record's splice undone: byte for byte when the inserted text is still where it went."""
+    index, removed, inserted = record['index'], record['removed'], record['inserted']
+    untouched = digest(text.encode()) == record.get('after_document_hash')
+    if untouched or (inserted and text[index:index + len(inserted)] == inserted):
+        return text[:index] + removed + text[index + len(inserted):]
+    if inserted and text.count(inserted) == 1:
+        index = text.index(inserted)
+        return text[:index] + removed + text[index + len(inserted):]
+    # Edited around the splice: the block alone goes back, in place or after the user's text.
+    _, block = setup_block(text, 'shell')
+    if block:
+        return text.replace(block, record['previous'], 1)
+    if not record['previous']:
+        return text
+    return text + splice_block(text, '', record['previous'])[2]
 
 
 def selected_registry(source: Path, components: set[str], blocking: bool) -> list[dict]:
@@ -689,6 +764,7 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
     resume = setup_resume(root, overlays) if args.hosts else 0
     for host in args.hosts:
         changes.extend(host_changes(args, view, host, home, overlays, resume, preset, mcp))
+    changes.extend(path_changes(args, root))
     previous = load_json(root / '.install-state/current.json', {})
     for record in previous.get('managed', {}).values():
         target = Path(record['target'])
@@ -703,6 +779,41 @@ def plan(args: argparse.Namespace, view: Path, preset: Preset, from_preset: set[
         unique[identity] = change
     # Removals first: a retired file may stand where a folder of new files goes, or the other way round.
     return sorted(unique.values(), key=lambda change: change.kind != 'remove'), mcp
+
+
+def path_targets(args: argparse.Namespace, root: Path) -> tuple[dict[Path, str], list[Row]]:
+    """The shell startup files that put <root>/bin first on PATH, each with its block body, and the
+    summary rows that say so (or why not)."""
+    bin_dir = root / 'bin'
+    if not args.shell_path:
+        return {}, [Row('Skipped', f'PATH: --no-path; run the kit\'s commands from {bin_dir}, or put it on PATH yourself')]
+    if not args.shell_rc:
+        return {}, [Row('Skipped', f'PATH: login shell {os.environ.get("SHELL") or "unset"} is not zsh, bash or fish; '
+                                   f'pass --shell-rc <startup file>, or put {bin_dir} on PATH yourself')]
+    targets, rows = {}, []
+    for name in args.shell_rc:
+        target = Path(name)
+        if target.is_symlink():
+            rows.append(Row('Skipped', f'PATH: {target} is a link, left as it is; pass --shell-rc <the file it links to>, '
+                                       f'or put {bin_dir} on PATH there yourself'))
+            continue
+        targets[target] = path_block(bin_dir, target.suffix == '.fish')
+    if targets:
+        rows.append(Row('Ready', f'PATH: {bin_dir} goes first on PATH through {", ".join(map(str, targets))}; '
+                                 '--no-path opts out'))
+    return targets, rows
+
+
+def path_changes(args: argparse.Namespace, root: Path) -> list[Change]:
+    """A shell block per startup file path_targets names, and a removal for any an earlier install wrote
+    and this one no longer names (--no-path, another --shell-rc)."""
+    targets, _ = path_targets(args, root)
+    changes = [Change('shell', target, text) for target, text in targets.items()]
+    named = {str(Path(name)) for name in args.shell_rc} if args.shell_path else set()
+    for record in load_json(root / '.install-state/current.json', {}).get('managed', {}).values():
+        if record['kind'] == 'shell' and record['target'] not in named:
+            changes.append(Change('shell', Path(record['target']), ''))
+    return changes
 
 
 def retirements(args: argparse.Namespace, view: Path, home: Path, changes: list[Change], preset: Preset) -> list[Change]:
@@ -871,6 +982,21 @@ def prepare_change(change: Change, args: argparse.Namespace) -> dict | None:
         if change.kind == 'cursor-hooks':
             record['previous_version'] = document.get('version')
         return record
+    if change.kind == 'shell':
+        # The user's startup file: one block spliced in or out (splice_block), the rest left byte for byte.
+        original = target.read_text() if present else ''
+        _, old = setup_block(original, 'shell')
+        wanted = SHELL_MARKERS[0] + '\n' + change.wanted.rstrip() + '\n' + SHELL_MARKERS[1] if change.wanted else ''
+        # created: setup made the file, so taking the block out of it leaves no empty file behind.
+        record.update(owned=wanted, previous=old, existed=present, created=prior.get('created', False) if prior else not present,
+                      mode=target.stat().st_mode & 0o777 if present else 0o644)
+        if old == wanted:
+            record['noop'] = True
+            return record
+        if old and old != prior.get('owned') and not backup:
+            raise Collision(f'User edited the managed block; it is preserved: {target}')
+        record['before_document_hash'] = digest(target.read_bytes()) if present else None
+        return record
     if change.kind in ('text', 'toml'):
         original = target.read_text() if present else ''
         if change.kind == 'toml':
@@ -928,6 +1054,13 @@ def apply_change(change: Change, record: dict, journal: Path, number: int) -> No
     target = change.target
     validate_planned_change(change, record)
     record['before_document_hash'] = digest(target.read_bytes()) if target.is_file() and not target.is_symlink() else None
+    spliced = ''
+    if change.kind == 'shell':
+        # Journaled before the write, so rollback can undo exactly this splice even after a crash.
+        original = target.read_text() if target.exists() else ''
+        index, removed, inserted = splice_block(original, record['previous'], record['owned'])
+        spliced = original[:index] + inserted + original[index + len(removed):]
+        record.update(index=index, removed=removed, inserted=inserted, after_document_hash=digest(spliced.encode()))
     record['mutation_started'] = True
     journal_file = journal / 'journal.json'
     if journal_file.exists():
@@ -964,6 +1097,11 @@ def apply_change(change: Change, record: dict, journal: Path, number: int) -> No
                     updated.pop(event, None)
             document[field] = updated
         atomic(target, (json.dumps(document, indent=2) + '\n').encode(), 0o600)
+    elif change.kind == 'shell':
+        if spliced or (record['existed'] and not record['created']):
+            atomic(target, spliced.encode(), record['mode'])
+        else:
+            target.unlink(missing_ok=True)
     else:
         original = target.read_text() if target.exists() else ''
         outside, old = setup_block(original, change.kind)
@@ -1077,6 +1215,15 @@ def rollback_record(record: dict) -> None:
             atomic(target, (json.dumps(document, indent=2) + '\n').encode(), 0o600)
         else:
             target.unlink()
+    elif kind == 'shell':
+        text = target.read_text() if target.exists() else ''
+        if setup_block(text, kind)[1] != record['owned']:
+            raise ValueError(f'Changed shell PATH block is preserved during rollback: {target}')
+        restored = unsplice(text, record)
+        if restored or record['existed']:
+            atomic(target, restored.encode(), record['mode'])
+        else:
+            target.unlink(missing_ok=True)
     else:
         outside, current = setup_block(target.read_text(), kind)
         if current != record['owned']:
@@ -1154,6 +1301,16 @@ def show_plan(args: argparse.Namespace, planned: Plan) -> None:
         output(planned.report)
     else:
         print_summary(planned.rows, planned.prepared, args, Path(args.root_dir).expanduser().absolute())
+        if not args.apply and (line := activation_line(planned.report)):
+            print('After --apply: ' + line[0].lower() + line[1:])
+
+
+def activation_line(report: dict[str, Any]) -> str | None:
+    """How the shell already open gets the kit's commands, when this run writes a PATH block."""
+    path = report.get('path') or {}
+    if not path.get('writes') or not path.get('activate'):
+        return None
+    return f'Open a new terminal, or run `{path["activate"]}` in this one, to put {path["bin"]} on PATH.'
 
 
 def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], answered: set[str],
@@ -1195,7 +1352,9 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], ans
         routes = role_plan(args, view)
     prepared = [(change, record) for change, record in records if not record.get('noop')]
     deps = dependencies(args, servers)
-    notes = [*notes, *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped),
+    path_files, path_rows = path_targets(args, root)
+    notes = [*notes, *path_rows,
+             *(Row('Skipped', f'{path}: your own content, left in place (--collision skip)') for path in skipped),
              *(Row('Skipped', line) for line in mcp.skipped)]
     if preset.record and args.github_owner:
         notes.append(org_access(args.github_owner, args.zoekt_url))
@@ -1220,7 +1379,9 @@ def preview(args: argparse.Namespace, preset: Preset, from_preset: set[str], ans
             'root': str(root), 'source_checkout': str(source), 'dev': args.dev, 'host_targets': {host: str(target) for host, target in targets.items()}, 'changes': len(prepared), 'dependencies': deps, 'capabilities': support,
             'conflicting_plugins': duplicates, 'collisions': [path for path, _ in collisions], 'skipped_collisions': skipped,
             'paths': [{'kind': change.kind, 'path': str(change.target)} for change, record in prepared],
-            'shell_activation': 'export PATH=' + shlex.quote(str(root / 'bin')) + ':"$PATH"' if 'data-wrappers' in args.components else None,
+            'path': {'bin': str(root / 'bin'), 'files': [str(path) for path in path_files],
+                     'writes': any(change.kind == 'shell' and change.wanted for change, _ in prepared),
+                     'activate': 'source ' + shlex.quote(str(next(iter(path_files)))) if path_files else None},
             'auth': 'Reuse each provider login; no auth files are read or copied.',
             'cursor_rules': 'project rules' if args.project_root else 'export only: activate through Cursor Customize > Rules',
             'next': 'Review native hook trust in each host after opting into hooks.' if 'hooks' in args.components else 'Use your existing provider login.'}
@@ -1287,6 +1448,8 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
             if record['kind'] in ('remove', 'forget'):
                 managed.pop('file:' + record['target'], None)
                 managed.pop('link:' + record['target'], None)
+            elif record['kind'] == 'shell' and not record['owned']:
+                managed.pop('shell:' + record['target'], None)
             else:
                 if record.get('retired_identity'):
                     managed.pop(record['retired_identity'], None)
@@ -1317,12 +1480,13 @@ def apply(args: argparse.Namespace, planned: Plan, preset: Preset, answered: set
     # The install's own copy: it rolls back while the checkout is mid-rebase or gone.
     undo = shlex.join([sys.executable, str(root / 'bin/agent-setup'), 'rollback', identifier, '--root-dir', str(root)])
     synced = sync_pack_mcp(planned.sync)
+    activate = activation_line(planned.report)
     if args.json:
         output({'installed': len(records), 'journal': identifier, 'rollback': undo,
-                **({'mcp_sync': synced} if synced else {})})
+                **({'mcp_sync': synced} if synced else {}), **({'path': activate} if activate else {})})
     else:
         sys.stdout.write(f'Installed {len(records)} changes (journal {identifier}).\nRoll back with: {undo}\n'
-                         + (f'MCP: {synced}\n' if synced else ''))
+                         + (f'MCP: {synced}\n' if synced else '') + (activate + '\n' if activate else ''))
     return 0
 
 
@@ -1368,7 +1532,7 @@ def managed_drift(records: Iterable[dict[str, Any]]) -> list[str]:
             actual = digest(os.readlink(target).encode()) if target.is_symlink() else digest(target.read_bytes()) if target.is_file() else None
             if actual != record['hash']:
                 drift.append(str(target))
-        elif record['kind'] in ('text', 'toml'):
+        elif record['kind'] in BLOCK_KINDS:
             if not target.exists() or setup_block(target.read_text(), record['kind'])[1] != record['owned']:
                 drift.append(str(target))
         else:
@@ -1384,6 +1548,26 @@ def managed_drift(records: Iterable[dict[str, Any]]) -> list[str]:
                     drift.append(str(target))
                     break
     return drift
+
+
+def path_problems(root: Path, state: dict[str, Any]) -> list[str]:
+    """Each shell startup file the install put <root>/bin on PATH through whose block is gone or no longer
+    the one this root needs. --no-path installs have none."""
+    configuration = state.get('configuration', {})
+    if not configuration.get('shell_path', False):
+        return []
+    problems = []
+    for name in configuration.get('shell_rc', []):
+        target = Path(name)
+        if target.is_symlink():
+            continue  # never written: the preview lists it under Skipped
+        _, block = setup_block(target.read_text() if target.is_file() else '', 'shell')
+        wanted = SHELL_MARKERS[0] + '\n' + path_block(root / 'bin', target.suffix == '.fish') + '\n' + SHELL_MARKERS[1]
+        if block != wanted:
+            problems.append(f'{target} {"lacks the" if not block else "has a stale"} agent-kit PATH block, so a new terminal '
+                            f'{"does not find" if not block else "may not find"} the kit\'s commands in {root / "bin"}: rerun '
+                            'agent-setup --apply (agent-kit sync on a dev install), or --apply --no-path to opt out')
+    return problems
 
 
 def overlay_report(root: Path, state: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -1424,6 +1608,7 @@ def doctor(args: argparse.Namespace) -> int:
                         '--collision skip to keep your edits, or --collision backup to replace them (the install '
                         'journal keeps your version)')
     configuration = state.get('configuration', {})
+    problems.extend(path_problems(root, state))
     personal, found = overlay_report(root, state)
     problems.extend(found)
     dev = None
@@ -1623,6 +1808,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--dev', action=argparse.BooleanOptionalAction, default=None,
                         help='Link kit files into the source checkout, so an edit there is live at once; '
                         'kept by later runs until --no-dev')
+    result.add_argument('--path', dest='shell_path', action=argparse.BooleanOptionalAction, default=None,
+                        help="Put the kit's bin first on PATH through a managed block in your shell's startup file "
+                        '(the default; --no-path opts out); the saved choice when omitted')
+    result.add_argument('--shell-rc', action='append', default=None, metavar='FILE',
+                        help='The startup file for that block instead of the one $SHELL implies (repeatable); '
+                        'saved for later runs')
     result.add_argument('--yes', action='store_true', help='Take every default and detected value; no prompts')
     result.add_argument('--verbose', action='store_true', help='List every planned path under the summary')
     result.add_argument('--json', action='store_true', help='Print the full plan as JSON instead of the summary')
@@ -1733,7 +1924,12 @@ def resolve(args: argparse.Namespace, root: Path, state: dict[str, Any], saved: 
     detected = {'hosts': ['claude'] if args.host_root else detected_hosts,
                 'repo_roots': detect_repo_roots() if guided else [],
                 **{host + '_bin': detect_cli(host) for host in HOSTS}}
+    if args.shell_rc is not None:
+        args.shell_rc = [str(Path(name).expanduser().absolute()) for name in args.shell_rc]
     answered, from_preset = resolve_answers(args, given, saved, preset, detected)
+    # Detected once, then saved: a later run from another shell keeps the files this install wrote.
+    if plans_install and args.shell_path and not args.shell_rc:
+        args.shell_rc = [str(path) for path in shell_rc_files(os.environ.get('SHELL', ''), Path.home(), os.environ)]
     args.collision = args.collision or saved.get('collision', 'refuse')
     args.dev = bool(saved.get('dev')) if args.dev is None else args.dev
     # Saved, so update and sync reapply unattended; an install from before it was saved confirmed Cursor
